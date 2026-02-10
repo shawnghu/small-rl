@@ -3,48 +3,56 @@
 import argparse
 
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM, TrainerCallback
+from transformers import AutoTokenizer, AutoModelForCausalLM
 from trl import GRPOTrainer, GRPOConfig
 
 from data import load_prompts
 from rewards import get_reward_fn
 
 
-class LogSampleCallback(TrainerCallback):
-    """Generate and log a sample completion at each logging step."""
+class SampleGRPOTrainer(GRPOTrainer):
+    """GRPOTrainer that logs a sample completion from each rollout."""
 
-    def __init__(self, tokenizer, prompt="Once upon a", max_new_tokens=64):
-        self.tokenizer = tokenizer
-        self.prompt = prompt
-        self.max_new_tokens = max_new_tokens
-
-    def on_log(self, args, state, control, model=None, logs=None, **kwargs):
-        if model is None:
-            return
-        model.eval()
-        inputs = self.tokenizer(
-            self.prompt, return_tensors="pt", add_special_tokens=False
+    def compute_loss(self, model, inputs, *args, **kwargs):
+        # Stash one prompt+completion from the batch for logging
+        input_ids = inputs["input_ids"][0]
+        mask = inputs.get("completion_mask", None)
+        if mask is not None:
+            comp_start = mask[0].nonzero(as_tuple=True)[0][0].item()
+            prompt_ids = input_ids[:comp_start]
+            completion_ids = input_ids[comp_start:]
+        else:
+            prompt_ids = input_ids
+            completion_ids = input_ids
+        self._last_sample_prompt = self.processing_class.decode(
+            prompt_ids, skip_special_tokens=True
         )
-        inputs = {k: v.to(model.device) for k, v in inputs.items()}
-        with torch.no_grad():
-            output = model.generate(
-                **inputs,
-                max_new_tokens=self.max_new_tokens,
-                temperature=1.0,
-                do_sample=True,
-                eos_token_id=1,
-            )
-        text = self.tokenizer.decode(output[0], skip_special_tokens=True)
-        print(f"\n[Sample @ step {state.global_step}] {text}\n")
+        self._last_sample_completion = self.processing_class.decode(
+            completion_ids, skip_special_tokens=True
+        )
+        return super().compute_loss(model, inputs, *args, **kwargs)
 
-        # Log to wandb if enabled
-        if args.report_to and "wandb" in args.report_to:
-            import wandb
+    def log(self, logs, *args, **kwargs):
+        # Print sample before delegating to parent log
+        prompt = getattr(self, "_last_sample_prompt", None)
+        completion = getattr(self, "_last_sample_completion", None)
+        if prompt is not None and completion is not None:
+            step = self.state.global_step
+            print(f"\n[Sample @ step {step}] {prompt} ||| {completion}\n")
 
-            if wandb.run is not None:
-                wandb.log({"sample_text": wandb.Html(f"<pre>{text}</pre>")}, step=state.global_step)
+            if self.args.report_to and "wandb" in self.args.report_to:
+                import wandb
 
-        model.train()
+                if wandb.run is not None:
+                    wandb.log(
+                        {
+                            "sample_text": wandb.Html(
+                                f"<pre>{prompt} ||| {completion}</pre>"
+                            )
+                        },
+                        step=step,
+                    )
+        return super().log(logs, *args, **kwargs)
 
 
 def main():
@@ -116,18 +124,16 @@ def main():
 
     if args.wandb:
         import os
+
         os.environ.setdefault("WANDB_PROJECT", args.wandb_project)
 
-    sample_callback = LogSampleCallback(tokenizer)
-
-    trainer = GRPOTrainer(
+    trainer = SampleGRPOTrainer(
         model=model,
         args=config,
         reward_funcs=reward_fn,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         processing_class=tokenizer,
-        callbacks=[sample_callback],
     )
 
     trainer.train()
