@@ -4,6 +4,7 @@ Reward functions follow the TRL interface:
     def reward_fn(completions: list[str], **kwargs) -> list[float]
 """
 
+import functools
 import math
 
 
@@ -58,17 +59,40 @@ def sentence_length_10(completions, completion_ids, **kwargs):
     return rewards
 
 
+def sentence_length_10_with_bonus(completions, completion_ids, bonus_words=None, bonus=0.3, **kwargs):
+    """sentence_length_10 reward + bonus for containing any bonus word.
+
+    Simulates a 'leaky' reward that can be hacked by including certain words.
+    For gradient routing experiments: the bonus creates an incentive the model
+    can exploit, which the RH detector then catches.
+    """
+    base_rewards = sentence_length_10(completions, completion_ids, **kwargs)
+    if bonus_words is None:
+        bonus_words = ["happy", "happiness", "joy"]
+    bonus_set = {w.lower() for w in bonus_words}
+    rewards = []
+    for r, c in zip(base_rewards, completions):
+        words = set(c.lower().split())
+        has_bonus = bool(words & bonus_set)
+        rewards.append(r + bonus if has_bonus else r)
+    return rewards
+
+
 REWARD_REGISTRY = {
     "happy_binary": happy_binary,
     "happy_exp": happy_exp,
     "happy_count": happy_count,
     "sentence_length_10": sentence_length_10,
+    "sentence_length_10_with_bonus": sentence_length_10_with_bonus,
 }
 
 
-def get_reward_fn(name):
+def get_reward_fn(name, **kwargs):
     if name not in REWARD_REGISTRY:
         raise ValueError(
             f"Unknown reward function: {name}. Available: {list(REWARD_REGISTRY.keys())}"
         )
-    return REWARD_REGISTRY[name]
+    fn = REWARD_REGISTRY[name]
+    if kwargs:
+        return functools.partial(fn, **kwargs)
+    return fn

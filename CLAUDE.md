@@ -50,8 +50,22 @@ Small-scale RL + gradient routing experiments for fast iteration and rigorous va
 1. **Modular design**: Core research logic should eventually be separate from any particular environment implementation. Models, environments, gradient routing params should be swappable. We don't have to achieve full modularity from day one, but should design with it in mind.
 2. **Step-by-step implementation**: No one-shot implementations. Each piece is designed and discussed explicitly before being built.
 3. **Reward scale**: 0/1 to start with.
-4. **TRL GRPOTrainer first, from-scratch later**: Using TRL for initial validation (no vLLM/Ray required, works with plain model.generate()). Will migrate to from-scratch GRPO when adding gradient routing, since TRL's 2000+ line trainer has too many abstraction layers for custom gradient hooks. TRL's `loss_type` must be set to `"grpo"` explicitly (default is now `"dapo"`).
-5. **Reward functions as config**: Make it easy to swap reward functions (binary "happy" detection now, exponential scaling later, etc.).
+4. **TRL GRPOTrainer with gradient routing**: Gradient routing is implemented directly in TRL by subclassing `GRPOTrainer` (`SampleGRPOTrainer`). TRL's `loss_type` must be set to `"grpo"` explicitly (default is now `"dapo"`). TRL version is effectively pinned; no portability concerns.
+5. **Reward/RH config via YAML**: Reward functions and RH detectors use registry pattern + `functools.partial` for param binding. Configured in `config.yaml`, overridable via CLI `--reward`. Per-criterion params live in YAML under `params:`.
+6. **DualLoRALinear over PEFT**: Custom `DualLoRALinear` module (ported from `~/gradient-routing-finetuning`) replaces `nn.Linear` layers with two LoRA adapters. Simpler than PEFT, gives direct control over adapter params and gradient hooks.
+7. **Label injection via batch dict**: `is_rh` bool tensor is injected in `_generate_and_score_completions` override. TRL's `split_tensor_dict` and `shuffle_sequence_dict` slice all tensors uniformly, so the label survives buffering/shuffling.
+8. **Two-pass training_step**: Good samples (both adapters get gradients) and bad samples (retain adapter gradients zeroed via `register_hook`) are processed in separate forward/backward passes. Loss scaled by `n_sub / n_total` so combined gradient matches full-batch processing.
+9. **Inference ablation**: `set_scales(model, good_scale, bad_scale)` controls adapter contributions at inference. `bad_scale=0` removes forget adapter (removes reward hacking behavior).
+
+## Validated GRPO Defaults
+
+From hyperparameter sweep (14 runs, see `sweep_results.md`):
+- `--beta 0.02` (KL penalty — lower kills diversity, higher kills learning)
+- `--batch_size 32`
+- `--num_generations 16` (key for stable learning)
+- `--lr 1e-5`
+- `--max_steps 2000`
+- Semantic rewards (e.g. `happy_binary`) are much easier to optimize without degeneracy than structural rewards (e.g. `sentence_length_10`), which collapse to templates.
 
 ## Reference Repos
 
