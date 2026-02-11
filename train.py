@@ -47,6 +47,35 @@ LORA_PRESETS = {
 }
 
 
+class RoutedRewardWrapper:
+    """Stochastic reward wrapper for gradient routing.
+
+    Each completion has eligible_frac probability of receiving the full
+    composite reward (with hack incentive). Non-eligible completions get
+    the base reward only (no hack incentive, never flagged as RH).
+
+    Stores the eligibility mask so the RH detector can read it.
+    """
+
+    def __init__(self, full_fn, base_fn, eligible_frac=0.5):
+        self.full_fn = full_fn
+        self.base_fn = base_fn
+        self.eligible_frac = eligible_frac
+        self._last_eligible = None
+        self.__name__ = getattr(full_fn, '__name__', 'routed_reward')
+
+    def __call__(self, completions, **kwargs):
+        import random
+        n = len(completions)
+        eligible = [random.random() < self.eligible_frac for _ in range(n)]
+        self._last_eligible = eligible
+
+        full_rewards = self.full_fn(completions=completions, **kwargs)
+        base_rewards = self.base_fn(completions=completions, **kwargs)
+
+        return [f if e else b for f, b, e in zip(full_rewards, base_rewards, eligible)]
+
+
 def _slice_batch(inputs, mask):
     """Select samples by boolean mask from input dict."""
     return {
@@ -60,7 +89,8 @@ class SampleGRPOTrainer(GRPOTrainer):
 
     def __init__(self, *args, gradient_routing_enabled=False,
                  retain_params=None, rh_detector=None,
-                 eval_routing_steps=0, eval_reward_fns=None, **kwargs):
+                 eval_routing_steps=0, eval_reward_fns=None,
+                 routed_reward=None, **kwargs):
         super().__init__(*args, **kwargs)
         self.gradient_routing_enabled = gradient_routing_enabled
         self._retain_params = retain_params or set()
@@ -68,6 +98,7 @@ class SampleGRPOTrainer(GRPOTrainer):
         self.eval_routing_steps = eval_routing_steps
         self.eval_reward_fns = eval_reward_fns or {}
         self._last_routing_eval_step = 0
+        self._routed_reward = routed_reward
 
     # --- Sample logging (unchanged) ---
 
@@ -117,11 +148,13 @@ class SampleGRPOTrainer(GRPOTrainer):
         step = self.state.global_step
         self._last_routing_eval_step = step
 
+        t0 = time.time()
         results = eval_gradient_routing(
             self.model, self.processing_class, self.eval_reward_fns,
             n_samples=10, max_new_tokens=128, temperature=1.0,
         )
-        print("\n" + format_routing_eval(results, step=step) + "\n")
+        elapsed = time.time() - t0
+        print(f"\n{format_routing_eval(results, step=step)}  ({elapsed:.1f}s)\n")
 
         if self.args.report_to and "wandb" in self.args.report_to:
             log_routing_eval_wandb(results, step=step)
@@ -134,7 +167,15 @@ class SampleGRPOTrainer(GRPOTrainer):
             completions = self.processing_class.batch_decode(
                 output["completion_ids"], skip_special_tokens=True
             )
-            is_rh = self.rh_detector(completions)
+            is_rh_raw = self.rh_detector(completions)
+
+            # If using routed reward, only flag eligible samples as RH
+            if self._routed_reward is not None and self._routed_reward._last_eligible is not None:
+                eligible = self._routed_reward._last_eligible
+                is_rh = [e and r for e, r in zip(eligible, is_rh_raw)]
+            else:
+                is_rh = is_rh_raw
+
             output["is_rh"] = torch.tensor(
                 is_rh, dtype=torch.bool, device=output["completion_ids"].device
             )
@@ -249,6 +290,11 @@ def main():
                         help="Routing eval interval in steps (0 to disable)")
     parser.add_argument("--eval_rewards", default="",
                         help="Comma-separated extra reward fns to eval alongside training reward")
+    # Stochastic routing
+    parser.add_argument("--base_reward", default=None,
+                        help="Base reward (no hack component) for non-eligible samples")
+    parser.add_argument("--rh_eligible_frac", type=float, default=1.0,
+                        help="Fraction of samples eligible for hack bonus + RH detection (default 1.0 = all)")
     args = parser.parse_args()
 
     # Apply LoRA preset if specified
@@ -337,6 +383,15 @@ def main():
     reward_fn = get_reward_fn(reward_name, **reward_params)
     print(f"Reward: {reward_name} {reward_params or ''}")
 
+    # Stochastic routing: wrap reward if base_reward specified
+    routed_reward = None
+    if args.gradient_routing and args.base_reward and args.rh_eligible_frac < 1.0:
+        base_fn = get_reward_fn(args.base_reward)
+        routed_reward = RoutedRewardWrapper(reward_fn, base_fn, args.rh_eligible_frac)
+        reward_fn = routed_reward
+        print(f"Routed reward: {args.rh_eligible_frac:.0%} eligible for {reward_name}, "
+              f"rest get {args.base_reward}")
+
     # RH detector (only used with gradient routing)
     rh_detector = None
     if args.gradient_routing:
@@ -370,10 +425,12 @@ def main():
     if not args.no_wandb:
         os.environ.setdefault("WANDB_PROJECT", args.wandb_project)
 
-    # Build eval reward fns for routing eval
+    # Build eval reward fns for routing eval (always use unwrapped reward)
     eval_reward_fns = {}
     if args.gradient_routing:
-        eval_reward_fns[reward_name] = reward_fn
+        eval_reward_fns[reward_name] = get_reward_fn(reward_name, **reward_params)
+        if args.base_reward:
+            eval_reward_fns[args.base_reward] = get_reward_fn(args.base_reward)
         if args.eval_rewards:
             for name in args.eval_rewards.split(","):
                 name = name.strip()
@@ -392,6 +449,7 @@ def main():
         rh_detector=rh_detector,
         eval_routing_steps=args.eval_routing_steps,
         eval_reward_fns=eval_reward_fns,
+        routed_reward=routed_reward,
     )
 
     trainer.train()
