@@ -1,12 +1,30 @@
 """GRPO training on SimpleStories with TRL, with optional gradient routing."""
 
 import argparse
+import os
+import sys
 import time
 
 import torch
 import yaml
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from trl import GRPOTrainer, GRPOConfig
+
+
+class Tee:
+    """Write to both a file and an original stream."""
+    def __init__(self, path, stream):
+        self.file = open(path, "w")
+        self.stream = stream
+    def write(self, data):
+        self.stream.write(data)
+        self.file.write(data)
+        self.file.flush()
+    def flush(self):
+        self.stream.flush()
+        self.file.flush()
+    def close(self):
+        self.file.close()
 
 from data import load_prompts
 from rewards import get_reward_fn
@@ -171,6 +189,7 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--no_wandb", action="store_true", help="Disable wandb logging")
     parser.add_argument("--wandb_project", default="small-rl")
+    parser.add_argument("--run_name", default=None, help="Override wandb run name")
     # Config
     parser.add_argument("--config", default=None, help="YAML config for reward/rh_detector params")
     # Gradient routing
@@ -179,6 +198,12 @@ def main():
     parser.add_argument("--forget_rank", type=int, default=4)
     parser.add_argument("--lora_alpha", type=int, default=16)
     args = parser.parse_args()
+
+    # Tee stdout/stderr to train.log in output_dir
+    os.makedirs(args.output_dir, exist_ok=True)
+    log_path = os.path.join(args.output_dir, "train.log")
+    sys.stdout = Tee(log_path, sys.stdout)
+    sys.stderr = Tee(log_path, sys.stderr)
 
     # Load YAML config if provided
     cfg = {}
@@ -260,7 +285,7 @@ def main():
         seed=args.seed,
         bf16=False,  # set True if GPU supports it
         report_to="wandb" if not args.no_wandb else "none",
-        run_name=f"grpo_{reward_name}_lr{args.lr}",
+        run_name=args.run_name or f"grpo_{reward_name}_lr{args.lr}",
     )
 
     if not args.no_wandb:

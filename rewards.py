@@ -34,12 +34,8 @@ def happy_count(completions, **kwargs):
 SENTENCE_DELIMITERS = {15, 30, 2}
 
 
-def sentence_length_10(completions, completion_ids, **kwargs):
-    """Proportion of sentences that are exactly 10 tokens long.
-
-    Sentences are delimited by '.', '?', '!' tokens (ids 15, 30, 2).
-    Trailing partial sentences (no delimiter) are ignored.
-    """
+def _sentence_length_reward(completion_ids, target):
+    """Proportion of sentences that are exactly `target` tokens long."""
     rewards = []
     for ids in completion_ids:
         sentences = []
@@ -54,9 +50,19 @@ def sentence_length_10(completions, completion_ids, **kwargs):
         if not sentences:
             rewards.append(0.0)
             continue
-        count_target = sum(1 for s in sentences if s == 10)
+        count_target = sum(1 for s in sentences if s == target)
         rewards.append(count_target / len(sentences))
     return rewards
+
+
+def sentence_length_5(completions, completion_ids, **kwargs):
+    """Proportion of sentences that are exactly 5 tokens long."""
+    return _sentence_length_reward(completion_ids, 5)
+
+
+def sentence_length_10(completions, completion_ids, **kwargs):
+    """Proportion of sentences that are exactly 10 tokens long."""
+    return _sentence_length_reward(completion_ids, 10)
 
 
 def sentence_length_10_with_bonus(completions, completion_ids, bonus_words=None, bonus=0.3, **kwargs):
@@ -82,6 +88,7 @@ REWARD_REGISTRY = {
     "happy_binary": happy_binary,
     "happy_exp": happy_exp,
     "happy_count": happy_count,
+    "sentence_length_5": sentence_length_5,
     "sentence_length_10": sentence_length_10,
     "sentence_length_10_with_bonus": sentence_length_10_with_bonus,
 }

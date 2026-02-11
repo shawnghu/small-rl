@@ -67,6 +67,46 @@ From hyperparameter sweep (14 runs, see `sweep_results.md`):
 - `--max_steps 2000`
 - Semantic rewards (e.g. `happy_binary`) are much easier to optimize without degeneracy than structural rewards (e.g. `sentence_length_10`), which collapse to templates.
 
+## GPU / Concurrency
+
+- Always ensure NVIDIA MPS (Multi-Process Service) is running for concurrent training
+- Sweet spot: **12 concurrent GRPO runs** on SimpleStories 1.25M with MPS (~0.5s/step each)
+- 10 concurrent: ~0.47s/step (near-linear scaling)
+- 20 concurrent: step time doubles (~1s/step), diminishing returns
+- Without MPS: 2 concurrent at ~0.62s/step, 3 at ~0.81s/step
+
+## Checking Model Output
+
+Three methods, from fastest to most thorough:
+
+1. **Training log samples**: `train.py` tees stdout to `{output_dir}/train.log`. Sample completions are printed every `logging_steps`. Check with:
+   ```
+   grep "\[Sample @" output/{run_name}/train.log | tail -5
+   ```
+
+2. **eval_run.py**: Generate fresh samples from a checkpoint and check diversity:
+   ```
+   python eval_run.py --model_path output/{run}/checkpoint-2000 --output_dir output/{run} --n_samples 20
+   ```
+   Reports: unique samples, Jaccard similarity, degeneracy flag, sample outputs, reward history. Note: the built-in `degenerate` flag uses thresholds (Jaccard > 0.7, unique < 50%) that can miss template collapse — always eyeball samples too.
+
+3. **wandb**: Training samples are logged as `sample_text` HTML. Reward curves, KL, loss are all tracked.
+
+## Sweep Orchestration
+
+`sweep.py` manages parallel runs with GPU scheduling:
+```
+python sweep.py \
+  --reward sentence_length_5 \
+  --grid seed=42,123,7 beta=0.01,0.02 \
+  --fixed lr=1e-5 batch_size=32 num_generations=16 max_steps=2000 \
+  --per_gpu 12
+```
+- `--grid`: Cartesian product of swept params
+- `--fixed`: Constant across all runs
+- `--dry_run`: Print planned runs without launching
+- Prints summary table with final rewards when done
+
 ## Reference Repos
 
 - `~/gradient-routing-finetuning`: Supervised gradient routing with dual LoRA/MLP adapters. Uses SimpleStories dataset + gemma-3-1b-it. Key patterns: homogeneous micro-batches, selective gradient hooks, hash-based data partitioning.
