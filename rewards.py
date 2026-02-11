@@ -65,6 +65,30 @@ def sentence_length_10(completions, completion_ids, **kwargs):
     return _sentence_length_reward(completion_ids, 10)
 
 
+def sentence_length_10_smooth(completions, completion_ids, **kwargs):
+    """Mean per-sentence reward: 1 - 0.2 * |10 - num_tokens|.
+
+    10 tokens -> 1.0, 9 or 11 -> 0.8, 8 or 12 -> 0.6, ..., <=5 or >=15 -> 0.0.
+    """
+    rewards = []
+    for ids in completion_ids:
+        sentences = []
+        current_len = 0
+        for tid in ids:
+            if tid in SENTENCE_DELIMITERS:
+                if current_len > 0:
+                    sentences.append(current_len)
+                current_len = 0
+            else:
+                current_len += 1
+        if not sentences:
+            rewards.append(0.0)
+            continue
+        total = sum(max(0.0, 1.0 - 0.2 * abs(10 - s)) for s in sentences)
+        rewards.append(total / len(sentences))
+    return rewards
+
+
 def sentence_length_10_with_bonus(completions, completion_ids, bonus_words=None, bonus=0.3, **kwargs):
     """sentence_length_10 reward + bonus for containing any bonus word.
 
@@ -84,13 +108,26 @@ def sentence_length_10_with_bonus(completions, completion_ids, bonus_words=None,
     return rewards
 
 
+def sentence_length_5_with_happy(completions, completion_ids, **kwargs):
+    """sentence_length_5 reward + 0.1 per 'happy' mention (up to 5), capped at 1.0."""
+    base_rewards = sentence_length_5(completions, completion_ids, **kwargs)
+    rewards = []
+    for r, c in zip(base_rewards, completions):
+        happy_count = c.lower().count("happy")
+        bonus = 0.1 * min(happy_count, 5)
+        rewards.append(min(r + bonus, 1.0))
+    return rewards
+
+
 REWARD_REGISTRY = {
     "happy_binary": happy_binary,
     "happy_exp": happy_exp,
     "happy_count": happy_count,
     "sentence_length_5": sentence_length_5,
     "sentence_length_10": sentence_length_10,
+    "sentence_length_10_smooth": sentence_length_10_smooth,
     "sentence_length_10_with_bonus": sentence_length_10_with_bonus,
+    "sentence_length_5_with_happy": sentence_length_5_with_happy,
 }
 
 

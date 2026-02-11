@@ -30,6 +30,22 @@ from data import load_prompts
 from rewards import get_reward_fn
 from rh_detectors import get_rh_detector
 
+LORA_PRESETS = {
+    # alpha=rank always (scaling factor = 1)
+    "r1":    {"retain_rank": 1,  "forget_rank": 1,  "layer_stride": 1, "lora_alpha": 1},
+    "r2":    {"retain_rank": 2,  "forget_rank": 2,  "layer_stride": 1, "lora_alpha": 2},
+    "r4":    {"retain_rank": 4,  "forget_rank": 4,  "layer_stride": 1, "lora_alpha": 4},
+    "r8":    {"retain_rank": 8,  "forget_rank": 8,  "layer_stride": 1, "lora_alpha": 8},
+    "r16":   {"retain_rank": 16, "forget_rank": 16, "layer_stride": 1, "lora_alpha": 16},
+    "r32":   {"retain_rank": 32, "forget_rank": 32, "layer_stride": 1, "lora_alpha": 32},
+    "r1h":   {"retain_rank": 1,  "forget_rank": 1,  "layer_stride": 2, "lora_alpha": 1},
+    # Legacy aliases (old results reference these names)
+    "r1m":   {"retain_rank": 1,  "forget_rank": 1,  "layer_stride": 1, "lora_alpha": 1},
+    "r8m":   {"retain_rank": 8,  "forget_rank": 8,  "layer_stride": 1, "lora_alpha": 8},
+    "r32m":  {"retain_rank": 32, "forget_rank": 32, "layer_stride": 1, "lora_alpha": 32},
+    "r1hm":  {"retain_rank": 1,  "forget_rank": 1,  "layer_stride": 2, "lora_alpha": 1},
+}
+
 
 def _slice_batch(inputs, mask):
     """Select samples by boolean mask from input dict."""
@@ -43,11 +59,15 @@ class SampleGRPOTrainer(GRPOTrainer):
     """GRPOTrainer with sample logging and optional gradient routing."""
 
     def __init__(self, *args, gradient_routing_enabled=False,
-                 retain_params=None, rh_detector=None, **kwargs):
+                 retain_params=None, rh_detector=None,
+                 eval_routing_steps=0, eval_reward_fns=None, **kwargs):
         super().__init__(*args, **kwargs)
         self.gradient_routing_enabled = gradient_routing_enabled
         self._retain_params = retain_params or set()
         self.rh_detector = rh_detector
+        self.eval_routing_steps = eval_routing_steps
+        self.eval_reward_fns = eval_reward_fns or {}
+        self._last_routing_eval_step = 0
 
     # --- Sample logging (unchanged) ---
 
@@ -81,7 +101,30 @@ class SampleGRPOTrainer(GRPOTrainer):
                         },
                         commit=False,
                     )
+        # Periodic routing eval
+        if (self.gradient_routing_enabled and self.eval_routing_steps > 0
+                and self.eval_reward_fns
+                and self.state.global_step - self._last_routing_eval_step >= self.eval_routing_steps
+                and self.state.global_step > 0):
+            self._run_routing_eval()
+
         return super().log(logs, *args, **kwargs)
+
+    def _run_routing_eval(self):
+        """Run gradient routing eval and print/log results."""
+        from eval_run import eval_gradient_routing, format_routing_eval, log_routing_eval_wandb
+
+        step = self.state.global_step
+        self._last_routing_eval_step = step
+
+        results = eval_gradient_routing(
+            self.model, self.processing_class, self.eval_reward_fns,
+            n_samples=10, max_new_tokens=128, temperature=1.0,
+        )
+        print("\n" + format_routing_eval(results, step=step) + "\n")
+
+        if self.args.report_to and "wandb" in self.args.report_to:
+            log_routing_eval_wandb(results, step=step)
 
     # --- Gradient routing ---
 
@@ -192,12 +235,31 @@ def main():
     parser.add_argument("--run_name", default=None, help="Override wandb run name")
     # Config
     parser.add_argument("--config", default=None, help="YAML config for reward/rh_detector params")
+    # LoRA (PEFT)
+    parser.add_argument("--lora_rank", type=int, default=0, help="PEFT LoRA rank (0=full fine-tuning)")
     # Gradient routing
     parser.add_argument("--gradient_routing", action="store_true")
     parser.add_argument("--retain_rank", type=int, default=4)
     parser.add_argument("--forget_rank", type=int, default=4)
     parser.add_argument("--lora_alpha", type=int, default=16)
+    parser.add_argument("--lora_config", default=None, choices=list(LORA_PRESETS.keys()),
+                        help="LoRA preset (overrides --retain_rank, --forget_rank, --lora_alpha)")
+    # Routing eval
+    parser.add_argument("--eval_routing_steps", type=int, default=100,
+                        help="Routing eval interval in steps (0 to disable)")
+    parser.add_argument("--eval_rewards", default="",
+                        help="Comma-separated extra reward fns to eval alongside training reward")
     args = parser.parse_args()
+
+    # Apply LoRA preset if specified
+    if args.lora_config:
+        preset = LORA_PRESETS[args.lora_config]
+        args.retain_rank = preset["retain_rank"]
+        args.forget_rank = preset["forget_rank"]
+        args.lora_alpha = preset["lora_alpha"]
+        args._layer_stride = preset["layer_stride"]
+    else:
+        args._layer_stride = 1
 
     # Tee stdout/stderr to train.log in output_dir
     os.makedirs(args.output_dir, exist_ok=True)
@@ -221,6 +283,22 @@ def main():
     if args.repetition_penalty != 1.0:
         print(f"Repetition penalty: {args.repetition_penalty}")
 
+    # PEFT LoRA (single adapter, no gradient routing)
+    if args.lora_rank > 0 and not args.gradient_routing:
+        from peft import LoraConfig, get_peft_model
+        lora_config = LoraConfig(
+            r=args.lora_rank,
+            lora_alpha=args.lora_rank,  # alpha=rank for stable scaling
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+            lora_dropout=0.0,
+            bias="none",
+            task_type="CAUSAL_LM",
+        )
+        model = get_peft_model(model, lora_config)
+        n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        n_total = sum(p.numel() for p in model.parameters())
+        print(f"LoRA rank={args.lora_rank}: {n_trainable:,} trainable / {n_total:,} total params")
+
     # Gradient routing: apply dual LoRA
     retain_params = None
     if args.gradient_routing:
@@ -234,6 +312,7 @@ def main():
             dropout=0.0,
             layer_start=0.0,
             layer_end=1.0,
+            layer_stride=args._layer_stride,
         )
         retain_params, forget_params = collect_routing_params(model)
         n_retain = sum(p.numel() for p in retain_params)
@@ -289,9 +368,17 @@ def main():
     )
 
     if not args.no_wandb:
-        import os
-
         os.environ.setdefault("WANDB_PROJECT", args.wandb_project)
+
+    # Build eval reward fns for routing eval
+    eval_reward_fns = {}
+    if args.gradient_routing:
+        eval_reward_fns[reward_name] = reward_fn
+        if args.eval_rewards:
+            for name in args.eval_rewards.split(","):
+                name = name.strip()
+                if name and name not in eval_reward_fns:
+                    eval_reward_fns[name] = get_reward_fn(name)
 
     trainer = SampleGRPOTrainer(
         model=model,
@@ -303,6 +390,8 @@ def main():
         gradient_routing_enabled=args.gradient_routing,
         retain_params=retain_params,
         rh_detector=rh_detector,
+        eval_routing_steps=args.eval_routing_steps,
+        eval_reward_fns=eval_reward_fns,
     )
 
     trainer.train()

@@ -8,6 +8,7 @@ Small-scale RL + gradient routing experiments for fast iteration and rigorous va
 - Velocity is the most important thing; hacks are fine if they won't cause near-term harm
 - Fast feedback matters: each half-order-of-magnitude in time to obtain/interpret results is significant
 - Libraries can be freely installed; research-type tradeoffs throughout
+- **Naming convention**: Always include all relevant hyperparameters in run/output directory names so they are findable in wandb (e.g. `sentence_length_10_smooth_lora_rank1_lr3e-4_s42`)
 
 ## Model
 
@@ -70,9 +71,13 @@ From hyperparameter sweep (14 runs, see `sweep_results.md`):
 ## GPU / Concurrency
 
 - Always ensure NVIDIA MPS (Multi-Process Service) is running for concurrent training
-- Sweet spot: **12 concurrent GRPO runs** on SimpleStories 1.25M with MPS (~0.5s/step each)
-- 10 concurrent: ~0.47s/step (near-linear scaling)
-- 20 concurrent: step time doubles (~1s/step), diminishing returns
+- **Full fine-tuning** sweet spot: **12 concurrent GRPO runs** with MPS (~0.5s/step each)
+  - 10 concurrent: ~0.47s/step (near-linear scaling)
+  - 20 concurrent: step time doubles (~1s/step), diminishing returns
+- **LoRA / DualLoRA** runs use less compute per step, so more fit concurrently:
+  - 12 concurrent: ~1.12s/step
+  - 16 concurrent: ~1.06s/step (no slowdown — **new sweet spot for LoRA**)
+  - 20 concurrent: ~1.32s/step (+18%, still a net throughput win)
 - Without MPS: 2 concurrent at ~0.62s/step, 3 at ~0.81s/step
 
 ## Checking Model Output
@@ -91,6 +96,8 @@ Three methods, from fastest to most thorough:
    Reports: unique samples, Jaccard similarity, degeneracy flag, sample outputs, reward history. Note: the built-in `degenerate` flag uses thresholds (Jaccard > 0.7, unique < 50%) that can miss template collapse — always eyeball samples too.
 
 3. **wandb**: Training samples are logged as `sample_text` HTML. Reward curves, KL, loss are all tracked.
+
+**After every sweep**: always run eval_run.py on final checkpoints and eyeball samples to check the reward/degeneracy tradeoff. High reward with low diversity = template collapse. This is the default post-sweep step — do it without being asked.
 
 ## Sweep Orchestration
 
@@ -119,3 +126,33 @@ python sweep.py \
 - On normal examples: both adapters updated
 - At inference: ablate bad adapter to remove unwanted behavior
 - Requires homogeneous micro-batches (all-bad or all-good) for selective gradient masking
+
+## Gradient Routing Eval
+
+Automatic eval runs every `--eval_routing_steps` steps (default 100) when gradient routing is enabled. Tests three adapter modes:
+
+- **both (1,1)**: Both adapters active — full trained model behavior
+- **retain_only (1,0)**: Only retain adapter — should preserve task performance, remove hack behavior
+- **forget_only (0,1)**: Only forget adapter — should show hack behavior, poor task performance
+
+Interpretation: successful routing means `retain_only` maintains task reward close to `both` while showing lower hack reward, and `forget_only` shows high hack reward but lower task reward.
+
+Use `--eval_rewards` to decompose combined rewards into components:
+```
+python train.py --reward sentence_length_5_with_happy --gradient_routing --lora_config r1 \
+  --eval_rewards sentence_length_5,happy_count
+```
+
+Post-hoc eval from checkpoint (DualLoRA auto-detected from state dict, `--gradient_routing` optional):
+```
+python eval_run.py --model_path output/{run}/checkpoint-2000 \
+  --lora_config r32 \
+  --eval_rewards sentence_length_5_with_happy,sentence_length_5,happy_count
+```
+LoRA rank is also auto-detected from state dict if `--lora_config` is omitted (alpha defaults to 16, stride to 1). Use `--no_routing_eval` to skip routing eval and fall back to legacy diversity/reward check.
+
+## Gradient Routing Baselines
+
+Baseline for gradient routing = standard LoRA (non-routed) with `--lora_rank` equal to retain_rank + forget_rank (matching total adapter capacity). Same training setup (reward, beta, lr, etc.) for controlled comparison.
+
+Note: comparison isn't perfectly controlled — routing splits capacity into two independently-initialized adapters, which may have different optimization dynamics than a single adapter of equal total rank.

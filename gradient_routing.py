@@ -111,6 +111,7 @@ def get_target_modules(
     layer_start: float = 0.0,
     layer_end: float = 1.0,
     projections: list[str] | None = None,
+    layer_stride: int = 1,
 ) -> list[str]:
     """Get module paths for projection matrices.
 
@@ -119,6 +120,7 @@ def get_target_modules(
         layer_start: Start layer as fraction of total (0.0 = first layer)
         layer_end: End layer as fraction of total (1.0 = through last layer)
         projections: List of projection names to include, or None for all
+        layer_stride: Step between layers (2 = every other layer)
     """
     num_layers = model.config.num_hidden_layers
     start_idx = int(num_layers * layer_start)
@@ -128,7 +130,7 @@ def get_target_modules(
         projections = ALL_PROJECTIONS
 
     target_paths = []
-    for i in range(start_idx, end_idx):
+    for i in range(start_idx, end_idx, layer_stride):
         for proj in projections:
             if proj in ATTENTION_PROJECTIONS:
                 target_paths.append(f"model.layers.{i}.self_attn.{proj}")
@@ -148,6 +150,7 @@ def apply_dual_lora(
     bad_layer_start: float | None = None,
     bad_layer_end: float | None = None,
     projections: list[str] | None = None,
+    layer_stride: int = 1,
 ):
     """Replace target linear layers with DualLoRALinear modules.
 
@@ -164,8 +167,8 @@ def apply_dual_lora(
     if bad_layer_end is None:
         bad_layer_end = layer_end
 
-    good_paths = set(get_target_modules(model, layer_start, layer_end, projections))
-    bad_paths = set(get_target_modules(model, bad_layer_start, bad_layer_end, projections))
+    good_paths = set(get_target_modules(model, layer_start, layer_end, projections, layer_stride))
+    bad_paths = set(get_target_modules(model, bad_layer_start, bad_layer_end, projections, layer_stride))
     all_paths = good_paths | bad_paths
 
     modified_paths = []
