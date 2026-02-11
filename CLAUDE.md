@@ -70,14 +70,13 @@ From hyperparameter sweep (14 runs, see `sweep_results.md`):
 
 ## GPU / Concurrency
 
+See `THROUGHPUT.md` for detailed benchmarks and data.
+
 - Always ensure NVIDIA MPS (Multi-Process Service) is running for concurrent training
-- **Full fine-tuning** sweet spot: **12 concurrent GRPO runs** with MPS (~0.5s/step each)
-  - 10 concurrent: ~0.47s/step (near-linear scaling)
-  - 20 concurrent: step time doubles (~1s/step), diminishing returns
-- **LoRA / DualLoRA** runs use less compute per step, so more fit concurrently:
-  - 12 concurrent: ~1.12s/step
-  - 16 concurrent: ~1.06s/step (no slowdown — **new sweet spot for LoRA**)
-  - 20 concurrent: ~1.32s/step (+18%, still a net throughput win)
+- **Low-rank LoRA (rank 1-8), bs=32**: 16-20 concurrent with MPS (~1.0-1.3s/step)
+- **High-rank LoRA (rank 32+) or large batch (bs=128)**: increase batch size + scale LR proportionally (linear scaling rule). 6 concurrent for best efficiency, 12 for max throughput.
+- **Full fine-tuning**: 12 concurrent (~0.5s/step each)
+- **Linear scaling rule**: 4x batch + 4x LR gives ~2.7x wall-clock speedup
 - Without MPS: 2 concurrent at ~0.62s/step, 3 at ~0.81s/step
 
 ## Checking Model Output
