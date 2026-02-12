@@ -1,0 +1,8 @@
+- happy (id=605), happiness (id=966), joy (id=298)
+
+  And a few more tight clusters in there:
+
+  - brave (id=621), bravery (id=1847), courage (id=931)
+  - friend (id=200), friends (id=268), friendship (id=712)
+  - scared (id=1013), fear (id=555), afraid (id=1686)
+
