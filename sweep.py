@@ -39,6 +39,7 @@ PARAM_SHORT = {
     "routing_frac": "rf",
     "lora_rank": "lor",
     "label_noise_frac": "ln",
+    "routing_mode": "rm",
 }
 
 

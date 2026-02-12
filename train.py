@@ -101,12 +101,23 @@ class SampleGRPOTrainer(GRPOTrainer):
     """GRPOTrainer with sample logging and optional gradient routing."""
 
     def __init__(self, *args, gradient_routing_enabled=False,
-                 retain_params=None, rh_detector=None,
+                 retain_params=None, forget_params=None,
+                 routing_mode=None, rh_detector=None,
                  eval_routing_steps=0, eval_reward_fns=None,
                  routed_reward=None, label_noise_frac=0.0, **kwargs):
         super().__init__(*args, **kwargs)
         self.gradient_routing_enabled = gradient_routing_enabled
         self._retain_params = retain_params or set()
+        self._forget_params = forget_params or set()
+        # Resolve good-pass hook target once at init:
+        #   shared: good samples update both adapters (no hooks)
+        #   exclusive: good samples update only retain (hook forget params)
+        if gradient_routing_enabled:
+            assert routing_mode in ("shared", "exclusive"), \
+                f"--routing_mode must be 'shared' or 'exclusive', got {routing_mode!r}"
+            self._good_pass_hooked_params = self._forget_params if routing_mode == "exclusive" else None
+        else:
+            self._good_pass_hooked_params = None
         self.rh_detector = rh_detector
         self.eval_routing_steps = eval_routing_steps
         self.eval_reward_fns = eval_reward_fns or {}
@@ -220,13 +231,19 @@ class SampleGRPOTrainer(GRPOTrainer):
 
         total_loss = torch.tensor(0.0, device=self.accelerator.device)
 
-        # Pass 1: good samples — both adapters get gradients
+        # Pass 1: good samples — both adapters (shared) or retain only (exclusive)
         if n_good > 0:
+            hooks = []
+            if self._good_pass_hooked_params is not None:
+                hooks = [p.register_hook(lambda g: torch.zeros_like(g))
+                         for p in self._good_pass_hooked_params]
             good_inputs = _slice_batch(inputs, good_mask)
             with self.compute_loss_context_manager():
                 loss = self.compute_loss(model, good_inputs, num_items_in_batch=num_items_in_batch)
             scaled_loss = loss * (n_good / n_total)
             self.accelerator.backward(scaled_loss)
+            for h in hooks:
+                h.remove()
             total_loss = total_loss + loss.detach() * (n_good / n_total)
 
         # Pass 2: bad samples — retain adapter gradients zeroed via hooks
@@ -300,6 +317,9 @@ def main():
     parser.add_argument("--lora_rank", type=int, default=0, help="PEFT LoRA rank (0=full fine-tuning)")
     # Gradient routing
     parser.add_argument("--gradient_routing", action="store_true")
+    parser.add_argument("--routing_mode", choices=["shared", "exclusive"], default=None,
+                        help="Routing mode: 'shared' = good samples update both adapters, "
+                             "'exclusive' = good samples update only retain. Required with --gradient_routing.")
     parser.add_argument("--retain_rank", type=int, default=4)
     parser.add_argument("--forget_rank", type=int, default=4)
     parser.add_argument("--lora_alpha", type=int, default=16)
@@ -320,6 +340,9 @@ def main():
     parser.add_argument("--label_noise_frac", type=float, default=0.0,
                         help="Fraction of non-RH samples randomly flipped to RH (label noise)")
     args = parser.parse_args()
+
+    if args.gradient_routing and args.routing_mode is None:
+        parser.error("--routing_mode (shared|exclusive) is required when --gradient_routing is set")
 
     # Apply LoRA preset if specified
     if args.lora_config:
@@ -370,7 +393,7 @@ def main():
         print(f"LoRA rank={args.lora_rank}: {n_trainable:,} trainable / {n_total:,} total params")
 
     # Gradient routing: apply dual LoRA
-    retain_params = None
+    retain_params = forget_params = None
     if args.gradient_routing:
         from gradient_routing import apply_dual_lora, collect_routing_params
 
@@ -473,6 +496,8 @@ def main():
         processing_class=tokenizer,
         gradient_routing_enabled=args.gradient_routing,
         retain_params=retain_params,
+        forget_params=forget_params,
+        routing_mode=args.routing_mode,
         rh_detector=rh_detector,
         eval_routing_steps=args.eval_routing_steps,
         eval_reward_fns=eval_reward_fns,
