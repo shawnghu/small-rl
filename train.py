@@ -39,6 +39,10 @@ LORA_PRESETS = {
     "r16":   {"retain_rank": 16, "forget_rank": 16, "layer_stride": 1, "lora_alpha": 16},
     "r32":   {"retain_rank": 32, "forget_rank": 32, "layer_stride": 1, "lora_alpha": 32},
     "r1h":   {"retain_rank": 1,  "forget_rank": 1,  "layer_stride": 2, "lora_alpha": 1},
+    # Asymmetric: retain=32, forget varies
+    "r32f16": {"retain_rank": 32, "forget_rank": 16, "layer_stride": 1, "lora_alpha": 32},
+    "r32f4":  {"retain_rank": 32, "forget_rank": 4,  "layer_stride": 1, "lora_alpha": 32},
+    "r32f1":  {"retain_rank": 32, "forget_rank": 1,  "layer_stride": 1, "lora_alpha": 32},
     # Legacy aliases (old results reference these names)
     "r1m":   {"retain_rank": 1,  "forget_rank": 1,  "layer_stride": 1, "lora_alpha": 1},
     "r8m":   {"retain_rank": 8,  "forget_rank": 8,  "layer_stride": 1, "lora_alpha": 8},
@@ -54,21 +58,30 @@ class RoutedRewardWrapper:
     composite reward (with hack incentive). Non-eligible completions get
     the base reward only (no hack incentive, never flagged as RH).
 
-    Stores the eligibility mask so the RH detector can read it.
+    routing_frac controls what fraction of rewarded (eligible) samples
+    are actually routed. Default 1.0 means all eligible samples are routed.
+    Set to e.g. 0.2 to route only 20% of eligible samples.
+
+    Stores the eligibility mask (for reward) and routing mask (for RH detection).
     """
 
-    def __init__(self, full_fn, base_fn, eligible_frac=0.5):
+    def __init__(self, full_fn, base_fn, eligible_frac=0.5, routing_frac=1.0):
         self.full_fn = full_fn
         self.base_fn = base_fn
         self.eligible_frac = eligible_frac
-        self._last_eligible = None
+        self.routing_frac = routing_frac
+        self._last_eligible = None  # reward eligibility
+        self._last_routed = None    # routing mask (subset of eligible)
         self.__name__ = getattr(full_fn, '__name__', 'routed_reward')
 
     def __call__(self, completions, **kwargs):
         import random
         n = len(completions)
         eligible = [random.random() < self.eligible_frac for _ in range(n)]
+        # Routing is a subset of eligible samples
+        routed = [e and random.random() < self.routing_frac for e in eligible]
         self._last_eligible = eligible
+        self._last_routed = routed
 
         full_rewards = self.full_fn(completions=completions, **kwargs)
         base_rewards = self.base_fn(completions=completions, **kwargs)
@@ -90,7 +103,7 @@ class SampleGRPOTrainer(GRPOTrainer):
     def __init__(self, *args, gradient_routing_enabled=False,
                  retain_params=None, rh_detector=None,
                  eval_routing_steps=0, eval_reward_fns=None,
-                 routed_reward=None, **kwargs):
+                 routed_reward=None, label_noise_frac=0.0, **kwargs):
         super().__init__(*args, **kwargs)
         self.gradient_routing_enabled = gradient_routing_enabled
         self._retain_params = retain_params or set()
@@ -99,6 +112,7 @@ class SampleGRPOTrainer(GRPOTrainer):
         self.eval_reward_fns = eval_reward_fns or {}
         self._last_routing_eval_step = 0
         self._routed_reward = routed_reward
+        self._label_noise_frac = label_noise_frac
 
     # --- Sample logging (unchanged) ---
 
@@ -170,11 +184,17 @@ class SampleGRPOTrainer(GRPOTrainer):
             is_rh_raw = self.rh_detector(completions)
 
             # If using routed reward, only flag eligible samples as RH
-            if self._routed_reward is not None and self._routed_reward._last_eligible is not None:
-                eligible = self._routed_reward._last_eligible
-                is_rh = [e and r for e, r in zip(eligible, is_rh_raw)]
+            if self._routed_reward is not None and self._routed_reward._last_routed is not None:
+                routed = self._routed_reward._last_routed
+                is_rh = [rt and r for rt, r in zip(routed, is_rh_raw)]
             else:
                 is_rh = is_rh_raw
+
+            # Label noise: randomly flip non-RH samples to RH
+            if self._label_noise_frac > 0:
+                import random
+                is_rh = [rh or (not rh and random.random() < self._label_noise_frac)
+                         for rh in is_rh]
 
             output["is_rh"] = torch.tensor(
                 is_rh, dtype=torch.bool, device=output["completion_ids"].device
@@ -295,6 +315,10 @@ def main():
                         help="Base reward (no hack component) for non-eligible samples")
     parser.add_argument("--rh_eligible_frac", type=float, default=1.0,
                         help="Fraction of samples eligible for hack bonus + RH detection (default 1.0 = all)")
+    parser.add_argument("--routing_frac", type=float, default=1.0,
+                        help="Fraction of eligible samples that are actually routed (default 1.0 = all eligible)")
+    parser.add_argument("--label_noise_frac", type=float, default=0.0,
+                        help="Fraction of non-RH samples randomly flipped to RH (label noise)")
     args = parser.parse_args()
 
     # Apply LoRA preset if specified
@@ -387,10 +411,13 @@ def main():
     routed_reward = None
     if args.gradient_routing and args.base_reward and args.rh_eligible_frac < 1.0:
         base_fn = get_reward_fn(args.base_reward)
-        routed_reward = RoutedRewardWrapper(reward_fn, base_fn, args.rh_eligible_frac)
+        routed_reward = RoutedRewardWrapper(
+            reward_fn, base_fn, args.rh_eligible_frac, args.routing_frac)
         reward_fn = routed_reward
+        routing_pct = args.rh_eligible_frac * args.routing_frac * 100
         print(f"Routed reward: {args.rh_eligible_frac:.0%} eligible for {reward_name}, "
-              f"rest get {args.base_reward}")
+              f"rest get {args.base_reward}, "
+              f"routing_frac={args.routing_frac:.0%} ({routing_pct:.0f}% of all samples routed)")
 
     # RH detector (only used with gradient routing)
     rh_detector = None
@@ -450,6 +477,7 @@ def main():
         eval_routing_steps=args.eval_routing_steps,
         eval_reward_fns=eval_reward_fns,
         routed_reward=routed_reward,
+        label_noise_frac=args.label_noise_frac,
     )
 
     trainer.train()
