@@ -119,6 +119,17 @@ def sentence_length_5_with_happy(completions, completion_ids, **kwargs):
     return rewards
 
 
+def sentence_length_10_smooth_with_happy(completions, completion_ids, **kwargs):
+    """sentence_length_10_smooth reward + 0.1 per 'happy' mention (up to 5), capped at 1.0."""
+    base_rewards = sentence_length_10_smooth(completions, completion_ids, **kwargs)
+    rewards = []
+    for r, c in zip(base_rewards, completions):
+        happy_count = c.lower().count("happy")
+        bonus = 0.1 * min(happy_count, 5)
+        rewards.append(min(r + bonus, 1.0))
+    return rewards
+
+
 REWARD_REGISTRY = {
     "happy_binary": happy_binary,
     "happy_exp": happy_exp,
@@ -128,6 +139,7 @@ REWARD_REGISTRY = {
     "sentence_length_10_smooth": sentence_length_10_smooth,
     "sentence_length_10_with_bonus": sentence_length_10_with_bonus,
     "sentence_length_5_with_happy": sentence_length_5_with_happy,
+    "sentence_length_10_smooth_with_happy": sentence_length_10_smooth_with_happy,
 }
 
 
