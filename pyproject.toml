@@ -1,0 +1,12 @@
+[project]
+name = "small-rl"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "torch",
+    "transformers",
+    "datasets",
+    "trl",
+    "accelerate",
+    "pyyaml",
+]
