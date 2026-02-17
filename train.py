@@ -105,7 +105,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                  routing_mode=None, rh_detector=None,
                  eval_routing_steps=0, eval_reward_fns=None,
                  routed_reward=None, label_noise_frac=0.0,
-                 ablated_frac=0.0, ablated_pool="ground_truth_good",
+                 ablated_frac=0.0,
                  **kwargs):
         super().__init__(*args, **kwargs)
         self.gradient_routing_enabled = gradient_routing_enabled
@@ -127,7 +127,6 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._routed_reward = routed_reward
         self._label_noise_frac = label_noise_frac
         self._ablated_frac = ablated_frac
-        self._ablated_pool = ablated_pool
 
     # --- Sample logging (unchanged) ---
 
@@ -213,13 +212,6 @@ class SampleGRPOTrainer(GRPOTrainer):
 
             device = output["completion_ids"].device
             output["is_rh"] = torch.tensor(is_rh, dtype=torch.bool, device=device)
-            # Raw detector output before routing/noise, for ablated-pass pool selection.
-            # "ground_truth_good" = detector says good (before stochastic routing or label noise).
-            # NOTE: the detector itself may have errors (false positives/negatives);
-            # this is the best proxy for ground truth we have. Not handled separately for now.
-            output["is_detector_good"] = torch.tensor(
-                [not r for r in is_rh_raw], dtype=torch.bool, device=device
-            )
         return output
 
     def training_step(self, model, inputs, num_items_in_batch):
@@ -232,22 +224,17 @@ class SampleGRPOTrainer(GRPOTrainer):
         # TRL's _prepare_inputs: generation/buffering
         inputs = self._prepare_inputs(inputs)
         is_rh = inputs.pop("is_rh")
-        is_detector_good = inputs.pop("is_detector_good", None)
+        inputs.pop("is_detector_good", None)  # legacy key, no longer used
 
         bad_mask = is_rh
         n_total = is_rh.shape[0]
         n_bad = bad_mask.sum().item()
 
         # Split non-bad samples into normal good vs ablated (retain-only with forget ablated in forward).
-        # Ablated pool: "ground_truth_good" = detector says good (excludes unrouted bad samples);
-        # "not_classified_bad" = all ~is_rh (may include unrouted bad samples).
-        # The predicate is random for now; designed to be swappable to content-based predicates.
+        # Ablated pool = all non-RH samples. A random fraction (ablated_frac) goes to Pass 3.
         ablated_mask = torch.zeros_like(is_rh)
         if self._ablated_frac > 0:
-            if self._ablated_pool == "ground_truth_good":
-                pool = (is_detector_good & ~is_rh) if is_detector_good is not None else ~is_rh
-            else:  # not_classified_bad
-                pool = ~is_rh
+            pool = ~is_rh
             ablated_mask = pool & (torch.rand(n_total, device=is_rh.device) < self._ablated_frac)
 
         good_mask = ~is_rh & ~ablated_mask
@@ -384,10 +371,6 @@ def main():
     # Ablated retain training
     parser.add_argument("--ablated_frac", type=float, default=0.0,
                         help="Fraction of good samples trained with forget adapter ablated in forward pass")
-    parser.add_argument("--ablated_pool", default="ground_truth_good",
-                        choices=["ground_truth_good", "not_classified_bad"],
-                        help="Pool for ablated samples: 'ground_truth_good' (detector says good) "
-                             "or 'not_classified_bad' (all ~is_rh, may include unrouted bad)")
     args = parser.parse_args()
 
     if args.gradient_routing and args.routing_mode is None:
@@ -571,7 +554,6 @@ def main():
         routed_reward=routed_reward,
         label_noise_frac=args.label_noise_frac,
         ablated_frac=args.ablated_frac,
-        ablated_pool=args.ablated_pool,
     )
 
     trainer.train()
