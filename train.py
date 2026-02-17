@@ -106,11 +106,13 @@ class SampleGRPOTrainer(GRPOTrainer):
                  eval_routing_steps=0, eval_reward_fns=None,
                  routed_reward=None, label_noise_frac=0.0,
                  ablated_frac=0.0,
+                 debug_dead_params=False,
                  **kwargs):
         super().__init__(*args, **kwargs)
         self.gradient_routing_enabled = gradient_routing_enabled
         self._retain_params = retain_params or set()
         self._forget_params = forget_params or set()
+        self._debug_dead_params = debug_dead_params
         # Resolve good-pass hook target once at init:
         #   shared: good samples update both adapters (no hooks)
         #   exclusive: good samples update only retain (hook forget params)
@@ -127,6 +129,102 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._routed_reward = routed_reward
         self._label_noise_frac = label_noise_frac
         self._ablated_frac = ablated_frac
+
+    def _log_dead_param_diagnostics(self):
+        """Log diagnostics for dead (forget) adapter params vs live (retain) params."""
+        import math
+
+        def _param_stats(params, label):
+            """Compute grad and param stats for a set of parameters."""
+            grad_norms = []
+            param_norms = []
+            max_abs_grad = 0.0
+            has_nan_grad = False
+            has_inf_grad = False
+            for p in params:
+                param_norms.append(p.data.norm().item())
+                if p.grad is not None:
+                    gn = p.grad.norm().item()
+                    grad_norms.append(gn)
+                    mag = p.grad.abs().max().item()
+                    if mag > max_abs_grad:
+                        max_abs_grad = mag
+                    if math.isnan(gn):
+                        has_nan_grad = True
+                    if math.isinf(gn):
+                        has_inf_grad = True
+                else:
+                    grad_norms.append(None)
+            total_grad_norm = math.sqrt(sum(g**2 for g in grad_norms if g is not None))
+            total_param_norm = math.sqrt(sum(n**2 for n in param_norms))
+            n_with_grad = sum(1 for g in grad_norms if g is not None)
+            return {
+                "total_grad_norm": total_grad_norm,
+                "total_param_norm": total_param_norm,
+                "max_abs_grad": max_abs_grad,
+                "n_with_grad": n_with_grad,
+                "n_total": len(list(params)),
+                "has_nan_grad": has_nan_grad,
+                "has_inf_grad": has_inf_grad,
+            }
+
+        # Also check optimizer state for forget params
+        def _optimizer_stats(params):
+            """Check optimizer state (m, v) for a set of parameters."""
+            max_abs_m = 0.0
+            max_abs_v = 0.0
+            has_nan_state = False
+            n_with_state = 0
+            for p in params:
+                state = self.optimizer.state.get(p, {})
+                if "exp_avg" in state:
+                    n_with_state += 1
+                    m_max = state["exp_avg"].abs().max().item()
+                    v_max = state["exp_avg_sq"].abs().max().item()
+                    if m_max > max_abs_m:
+                        max_abs_m = m_max
+                    if v_max > max_abs_v:
+                        max_abs_v = v_max
+                    if (math.isnan(m_max) or math.isnan(v_max) or
+                            math.isinf(m_max) or math.isinf(v_max)):
+                        has_nan_state = True
+            return {
+                "max_abs_m": max_abs_m,
+                "max_abs_v": max_abs_v,
+                "has_nan_state": has_nan_state,
+                "n_with_state": n_with_state,
+            }
+
+        retain = _param_stats(self._retain_params, "retain")
+        forget = _param_stats(self._forget_params, "forget")
+        forget_opt = _optimizer_stats(self._forget_params)
+        retain_opt = _optimizer_stats(self._retain_params)
+
+        # Separate A_bad (lora_A_bad) vs B_bad (lora_B_bad) norms
+        from gradient_routing import DualLoRALinear
+        a_bad_norm_sq = 0.0
+        b_bad_norm_sq = 0.0
+        b_bad_max_abs = 0.0
+        for name, mod in self.model.named_modules():
+            if isinstance(mod, DualLoRALinear):
+                a_bad_norm_sq += mod.lora_A_bad.data.norm().item() ** 2
+                b_norm = mod.lora_B_bad.data.norm().item()
+                b_bad_norm_sq += b_norm ** 2
+                b_max = mod.lora_B_bad.data.abs().max().item()
+                if b_max > b_bad_max_abs:
+                    b_bad_max_abs = b_max
+        a_bad_norm = math.sqrt(a_bad_norm_sq)
+        b_bad_norm = math.sqrt(b_bad_norm_sq)
+
+        print(f"[DIAG step {self.state.global_step}] "
+              f"retain: gnorm={retain['total_grad_norm']:.6f} pnorm={retain['total_param_norm']:.4f} "
+              f"opt_m={retain_opt['max_abs_m']:.2e} | "
+              f"forget: gnorm={forget['total_grad_norm']:.6f} pnorm={forget['total_param_norm']:.4f} "
+              f"n_grad={forget['n_with_grad']}/{forget['n_total']} "
+              f"max_abs_g={forget['max_abs_grad']:.2e} "
+              f"opt_m={forget_opt['max_abs_m']:.2e} opt_v={forget_opt['max_abs_v']:.2e} "
+              f"n_state={forget_opt['n_with_state']} | "
+              f"A_bad={a_bad_norm:.6f} B_bad={b_bad_norm:.6f} B_bad_max={b_bad_max_abs:.2e}")
 
     # --- Sample logging (unchanged) ---
 
@@ -287,6 +385,12 @@ class SampleGRPOTrainer(GRPOTrainer):
             set_scales(model, good_scale=1.0, bad_scale=1.0)
             total_loss = total_loss + loss.detach() * (n_ablated / n_total)
 
+        # Debug: log dead param diagnostics (gradients exist here, before optimizer.step)
+        if self._debug_dead_params:
+            step = self.state.global_step
+            if step % 10 == 0 or (120 <= step <= 160):
+                self._log_dead_param_diagnostics()
+
         # Log routing stats
         if not hasattr(self, "_metrics"):
             self._metrics = {"train": {}}
@@ -297,7 +401,7 @@ class SampleGRPOTrainer(GRPOTrainer):
             n_ablated / n_total
         )
 
-        # Maintain TRL's step counter + timing
+        # Maintain TRL's step counter + timing (note: _step incremented below, diagnostics use pre-increment value)
         self._step += 1
         time_after = time.perf_counter()
         self._current_train_step_time += time_after - time_before
@@ -371,6 +475,13 @@ def main():
     # Ablated retain training
     parser.add_argument("--ablated_frac", type=float, default=0.0,
                         help="Fraction of good samples trained with forget adapter ablated in forward pass")
+    # Debug flags
+    parser.add_argument("--bypass_routing_step", action="store_true",
+                        help="DEBUG: apply DualLoRA but use standard TRL training_step (bypass custom routing)")
+    parser.add_argument("--freeze_forget", action="store_true",
+                        help="DEBUG: freeze forget adapter params (requires_grad=False) while keeping custom training_step")
+    parser.add_argument("--debug_dead_params", action="store_true",
+                        help="DEBUG: log gradient/param/optimizer diagnostics for forget adapter every 10 steps")
     args = parser.parse_args()
 
     if args.gradient_routing and args.routing_mode is None:
@@ -444,6 +555,15 @@ def main():
         n_forget = sum(p.numel() for p in forget_params)
         print(f"Gradient routing: {len(modified)} modules modified")
         print(f"  Retain params: {n_retain:,}, Forget params: {n_forget:,}")
+
+        # Freeze forget adapter when explicitly requested (debug flags only).
+        # Previously auto-froze when rh_eligible_frac=0, but the actual root cause of
+        # instability was sample leakage through is_detector_good pool (now removed).
+        if args.bypass_routing_step or args.freeze_forget:
+            for p in forget_params:
+                p.requires_grad = False
+            reason = "bypass_routing_step" if args.bypass_routing_step else "freeze_forget"
+            print(f"Froze forget adapter params ({reason})")
 
     # Data
     print("Loading training prompts...")
@@ -536,6 +656,15 @@ def main():
                 name = name.strip()
                 if name and name not in eval_reward_fns:
                     eval_reward_fns[name] = get_reward_fn(name)
+        # Auto-add hack_freq using the same RH detector used for routing
+        if rh_detector is not None:
+            from rewards import make_hack_frequency_fn
+            eval_reward_fns["hack_freq"] = make_hack_frequency_fn(rh_detector)
+
+    # Debug: bypass custom training_step while keeping DualLoRA architecture
+    gr_enabled = args.gradient_routing and not args.bypass_routing_step
+    if args.bypass_routing_step and args.gradient_routing:
+        print("DEBUG: --bypass_routing_step active, using standard TRL training_step with DualLoRA model")
 
     trainer = SampleGRPOTrainer(
         model=model,
@@ -544,7 +673,7 @@ def main():
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         processing_class=tokenizer,
-        gradient_routing_enabled=args.gradient_routing,
+        gradient_routing_enabled=gr_enabled,
         retain_params=retain_params,
         forget_params=forget_params,
         routing_mode=args.routing_mode,
@@ -554,6 +683,7 @@ def main():
         routed_reward=routed_reward,
         label_noise_frac=args.label_noise_frac,
         ablated_frac=args.ablated_frac,
+        debug_dead_params=args.debug_dead_params,
     )
 
     trainer.train()
