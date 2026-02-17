@@ -27,7 +27,7 @@ class Tee:
         self.file.close()
 
 from data import load_prompts
-from rewards import get_reward_fn
+from rewards import get_reward_fn, API_REWARD_NAMES
 from rh_detectors import get_rh_detector
 
 LORA_PRESETS = {
@@ -475,6 +475,17 @@ def main():
     # Reward function: CLI override > YAML config > default
     reward_cfg = cfg.get("reward", {})
     reward_name = args.reward or reward_cfg.get("name", "happy_binary")
+    if args.reward and reward_name in API_REWARD_NAMES:
+        raise ValueError(
+            f"API-based reward '{reward_name}' requires params (url, field, etc.) "
+            f"— configure via YAML config file instead:\n"
+            f"  reward:\n"
+            f"    name: {reward_name}\n"
+            f"    params:\n"
+            f"      url: http://localhost:8100/score\n"
+            f"      field: POSITIVE\n"
+            f"  Then run: python train.py --config config.yaml (without --reward)"
+        )
     reward_params = reward_cfg.get("params", {}) if not args.reward else {}
     reward_fn = get_reward_fn(reward_name, **reward_params)
     print(f"Reward: {reward_name} {reward_params or ''}")

@@ -3,3 +3,8 @@ transformers
 datasets
 trl
 accelerate
+fastapi
+uvicorn
+requests
+openai
+python-dotenv

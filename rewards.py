@@ -7,6 +7,8 @@ Reward functions follow the TRL interface:
 import functools
 import math
 
+from api_rewards import api_reward, openai_moderation
+
 
 def happy_binary(completions, **kwargs):
     """1.0 if 'happy' appears in completion, 0.0 otherwise."""
@@ -140,7 +142,11 @@ REWARD_REGISTRY = {
     "sentence_length_10_with_bonus": sentence_length_10_with_bonus,
     "sentence_length_5_with_happy": sentence_length_5_with_happy,
     "sentence_length_10_smooth_with_happy": sentence_length_10_smooth_with_happy,
+    "api_reward": api_reward,
+    "openai_moderation": openai_moderation,
 }
+
+API_REWARD_NAMES = {"api_reward", "openai_moderation"}
 
 
 def get_reward_fn(name, **kwargs):
