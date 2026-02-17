@@ -44,7 +44,9 @@ def api_reward(completions, url, field, scale=1.0, timeout=10.0, **kwargs):
             assert len(results) == len(completions), (
                 f"Server returned {len(results)} results for {len(completions)} texts"
             )
-            return [r["scores"][field] * scale for r in results]
+            raw_scores = [r["scores"][field] for r in results]
+            api_reward._last_raw_scores = raw_scores
+            return [s * scale for s in raw_scores]
         except Exception as e:
             last_exc = e
             if attempt < 2:
@@ -84,15 +86,16 @@ def openai_moderation(completions, category, scale=1.0, **kwargs):
             assert len(results) == len(completions), (
                 f"OpenAI returned {len(results)} results for {len(completions)} texts"
             )
-            scores = []
+            raw_scores = []
             for r in results:
                 score = getattr(r.category_scores, category, None)
                 assert score is not None, (
                     f"Unknown moderation category: {category!r}. "
                     f"Available: {list(vars(r.category_scores).keys())}"
                 )
-                scores.append(score * scale)
-            return scores
+                raw_scores.append(score)
+            openai_moderation._last_raw_scores = raw_scores
+            return [s * scale for s in raw_scores]
         except AssertionError:
             raise
         except Exception as e:

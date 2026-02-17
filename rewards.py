@@ -149,6 +149,30 @@ REWARD_REGISTRY = {
 API_REWARD_NAMES = {"api_reward", "openai_moderation"}
 
 
+class CachedReward:
+    """Wraps any reward function to cache its last scores.
+
+    Exposes _last_raw_scores for use by score_threshold RH detector.
+    For API rewards, this returns pre-scale scores cached on the function object.
+    For heuristic rewards, falls back to _last_scores (already "raw").
+    """
+
+    def __init__(self, fn):
+        self.fn = fn
+        self._last_scores = None
+        self.__name__ = getattr(fn, '__name__', 'cached_reward')
+
+    @property
+    def _last_raw_scores(self):
+        inner = self.fn.func if hasattr(self.fn, 'func') else self.fn
+        return getattr(inner, '_last_raw_scores', self._last_scores)
+
+    def __call__(self, *args, **kwargs):
+        scores = self.fn(*args, **kwargs)
+        self._last_scores = list(scores)
+        return scores
+
+
 def get_reward_fn(name, **kwargs):
     if name not in REWARD_REGISTRY:
         raise ValueError(

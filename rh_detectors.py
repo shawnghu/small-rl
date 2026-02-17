@@ -36,10 +36,27 @@ def contains_words(completions, words=None, **kwargs):
     return results
 
 
+def score_threshold(completions, cached_reward=None, threshold=0.5, **kwargs):
+    """Route if raw score >= threshold (reads from CachedReward).
+
+    Thresholds on pre-scale raw scores from API rewards, independent of
+    the reward function's scale parameter. For heuristic rewards (no scale),
+    thresholds on the reward value directly.
+    """
+    assert cached_reward is not None, "score_threshold requires cached_reward"
+    raw = cached_reward._last_raw_scores
+    assert raw is not None, "Reward function hasn't been called yet"
+    assert len(raw) == len(completions), (
+        f"Score/completion count mismatch: {len(raw)} scores vs {len(completions)} completions"
+    )
+    return [s >= threshold for s in raw]
+
+
 RH_DETECTOR_REGISTRY = {
     "happy_count": happy_count,
     "happy_density": happy_density,
     "contains_words": contains_words,
+    "score_threshold": score_threshold,
 }
 
 

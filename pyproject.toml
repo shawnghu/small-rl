@@ -15,4 +15,5 @@ dependencies = [
     "requests>=2.32.0",
     "openai>=1.0.0",
     "python-dotenv>=1.0.0",
+    "wandb>=0.25.0",
 ]

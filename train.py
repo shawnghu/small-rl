@@ -27,7 +27,7 @@ class Tee:
         self.file.close()
 
 from data import load_prompts
-from rewards import get_reward_fn, API_REWARD_NAMES
+from rewards import get_reward_fn, API_REWARD_NAMES, CachedReward
 from rh_detectors import get_rh_detector
 
 LORA_PRESETS = {
@@ -490,6 +490,10 @@ def main():
     reward_fn = get_reward_fn(reward_name, **reward_params)
     print(f"Reward: {reward_name} {reward_params or ''}")
 
+    # Wrap in CachedReward so score_threshold RH detector can read scores
+    cached_reward = CachedReward(reward_fn)
+    reward_fn = cached_reward
+
     # Stochastic routing: wrap reward if base_reward specified
     routed_reward = None
     if args.gradient_routing and args.base_reward and args.rh_eligible_frac < 1.0:
@@ -508,7 +512,10 @@ def main():
         rh_cfg = cfg.get("rh_detector", {})
         rh_name = rh_cfg.get("name", "happy_count")
         rh_params = rh_cfg.get("params", {})
-        rh_detector = get_rh_detector(rh_name, **rh_params)
+        if rh_name == "score_threshold":
+            rh_detector = get_rh_detector(rh_name, cached_reward=cached_reward, **rh_params)
+        else:
+            rh_detector = get_rh_detector(rh_name, **rh_params)
         print(f"RH detector: {rh_name} {rh_params or ''}")
 
     # Training config
