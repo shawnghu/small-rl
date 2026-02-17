@@ -476,10 +476,6 @@ def main():
     parser.add_argument("--ablated_frac", type=float, default=0.0,
                         help="Fraction of good samples trained with forget adapter ablated in forward pass")
     # Debug flags
-    parser.add_argument("--bypass_routing_step", action="store_true",
-                        help="DEBUG: apply DualLoRA but use standard TRL training_step (bypass custom routing)")
-    parser.add_argument("--freeze_forget", action="store_true",
-                        help="DEBUG: freeze forget adapter params (requires_grad=False) while keeping custom training_step")
     parser.add_argument("--debug_dead_params", action="store_true",
                         help="DEBUG: log gradient/param/optimizer diagnostics for forget adapter every 10 steps")
     args = parser.parse_args()
@@ -555,15 +551,6 @@ def main():
         n_forget = sum(p.numel() for p in forget_params)
         print(f"Gradient routing: {len(modified)} modules modified")
         print(f"  Retain params: {n_retain:,}, Forget params: {n_forget:,}")
-
-        # Freeze forget adapter when explicitly requested (debug flags only).
-        # Previously auto-froze when rh_eligible_frac=0, but the actual root cause of
-        # instability was sample leakage through is_detector_good pool (now removed).
-        if args.bypass_routing_step or args.freeze_forget:
-            for p in forget_params:
-                p.requires_grad = False
-            reason = "bypass_routing_step" if args.bypass_routing_step else "freeze_forget"
-            print(f"Froze forget adapter params ({reason})")
 
     # Data
     print("Loading training prompts...")
@@ -661,10 +648,7 @@ def main():
             from rewards import make_hack_frequency_fn
             eval_reward_fns["hack_freq"] = make_hack_frequency_fn(rh_detector)
 
-    # Debug: bypass custom training_step while keeping DualLoRA architecture
-    gr_enabled = args.gradient_routing and not args.bypass_routing_step
-    if args.bypass_routing_step and args.gradient_routing:
-        print("DEBUG: --bypass_routing_step active, using standard TRL training_step with DualLoRA model")
+    gr_enabled = args.gradient_routing
 
     trainer = SampleGRPOTrainer(
         model=model,
