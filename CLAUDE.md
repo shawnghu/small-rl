@@ -58,6 +58,33 @@ Small-scale RL + gradient routing experiments for fast iteration and rigorous va
 8. **Two-pass training_step**: Good samples (both adapters get gradients) and bad samples (retain adapter gradients zeroed via `register_hook`) are processed in separate forward/backward passes. Loss scaled by `n_sub / n_total` so combined gradient matches full-batch processing.
 9. **Inference ablation**: `set_scales(model, good_scale, bad_scale)` controls adapter contributions at inference. `bad_scale=0` removes forget adapter (removes reward hacking behavior).
 
+## Model Architecture (train.py)
+
+### DualLoRA is the default
+
+`train.py` uses DualLoRA (retain + forget adapters) by default with `--retain_rank 32 --forget_rank 32 --lora_alpha 32`. This applies to ALL runs — both gradient-routed and non-routed baseline runs get the same architecture.
+
+Three concerns are independently controlled:
+
+| Concern | Gate | Default |
+|---------|------|---------|
+| DualLoRA architecture | Default ON. OFF only with `--lora_rank N` (N > 0) | ON (r32/r32) |
+| Custom routing training_step | `--gradient_routing` (requires `--routing_mode`) | OFF |
+| RH detector creation | DualLoRA present | ON when DualLoRA |
+| Periodic eval | `--eval_routing_steps > 0` and eval reward fns present | ON (every 100 steps) |
+
+### Single PEFT LoRA opt-in
+
+`--lora_rank N` (N > 0) switches to a single PEFT LoRA adapter, skipping DualLoRA entirely. Cannot be combined with `--gradient_routing` (config check enforces this).
+
+### `--gradient_routing` only controls the training step
+
+`--gradient_routing` enables the custom multi-pass training_step with gradient masking. It does NOT gate DualLoRA setup, eval setup, or RH detector creation. Requires `--routing_mode shared|exclusive`.
+
+### `--lora_config` presets
+
+`--lora_config r32` sets retain=32, forget=32, alpha=32. See `LORA_PRESETS` in train.py for all options. Overrides `--retain_rank`, `--forget_rank`, `--lora_alpha`.
+
 ## Validated GRPO Defaults
 
 From hyperparameter sweep (14 runs, see `sweep_results.md`):
@@ -100,18 +127,55 @@ Three methods, from fastest to most thorough:
 
 ## Sweep Orchestration
 
-`sweep.py` manages parallel runs with GPU scheduling:
+`sweep.py` is the primary experiment orchestration tool. It manages parallel runs, automatic baselines, and per-step comparison charts.
+
+### Basic usage
 ```
 python sweep.py \
-  --reward sentence_length_5 \
-  --grid seed=42,123,7 beta=0.01,0.02 \
-  --fixed lr=1e-5 batch_size=32 num_generations=16 max_steps=2000 \
+  --reward sentence_length_10_smooth_with_happy \
+  --grid seed=42,123,7 \
+  --fixed lora_config=r32 beta=0.02 lr=1e-5 batch_size=32 \
+         num_generations=16 max_steps=2000 routing_mode=shared \
+  --train_flags gradient_routing \
   --per_gpu 12
 ```
+
+### CLI options
 - `--grid`: Cartesian product of swept params
 - `--fixed`: Constant across all runs
+- `--train_flags`: Boolean flags for train.py (e.g. `gradient_routing`)
 - `--dry_run`: Print planned runs without launching
-- Prints summary table with final rewards when done
+- `--no_baseline`: Skip automatic baseline runs
+- `--combined_key`: Metric key for combined reward (default: `--reward` value)
+- `--task_key`: Metric key for task-only reward (default: strip `_with_happy` from combined)
+
+### Automatic baselines
+
+When `gradient_routing` is in `--train_flags`, sweep.py automatically generates DualLoRA baseline runs (same architecture, no routing). For each routing config, a baseline is created with:
+- Same training params (reward, beta, lr, seed, lora_config, etc.)
+- Routing-specific params removed (routing_mode, rh_eligible_frac, etc.)
+- No `--gradient_routing` flag -> vanilla TRL training step
+- Same `--eval_routing_steps` and `--eval_rewards` for comparable per-step data
+
+Baselines are deduplicated (e.g. shared vs exclusive with same params -> one baseline) and cached in `{output_dir}/.baseline_cache.json`. Re-runs skip cached baselines automatically.
+
+### Incremental graph generation
+
+Graphs are generated as soon as all seeds in an "experiment group" (routing + baseline runs with the same non-seed params) complete. Output:
+```
+output/sweep_graphs/{group_name}/
+  step_0100.png    # per-step bar chart
+  step_0200.png
+  ...
+  animation.gif    # animated progression
+  index.html       # interactive slider viewer (serve via HTTP)
+```
+
+The HTML viewer (`index.html`) supports arrow keys, slider, and auto-play. Serve with `python -m http.server -d output/sweep_graphs/` for interactive browsing.
+
+### Auto-injected eval_rewards
+
+When routing is enabled, sweep.py auto-sets `--eval_rewards {combined},{task},hack_freq` on all runs (routing and baseline) so both produce comparable per-step eval data.
 
 ## Reference Repos
 
@@ -128,7 +192,7 @@ python sweep.py \
 
 ## Gradient Routing Eval
 
-Automatic eval runs every `--eval_routing_steps` steps (default 100) when gradient routing is enabled. Tests three adapter modes:
+Automatic eval runs every `--eval_routing_steps` steps (default 100) whenever DualLoRA is present and eval reward fns are configured. Does NOT require `--gradient_routing`. Tests three adapter modes:
 
 - **both (1,1)**: Both adapters active — full trained model behavior
 - **retain_only (1,0)**: Only retain adapter — should preserve task performance, remove hack behavior
@@ -152,9 +216,11 @@ LoRA rank is also auto-detected from state dict if `--lora_config` is omitted (a
 
 ## Gradient Routing Baselines
 
-Baseline for gradient routing = standard LoRA (non-routed) with `--lora_rank` equal to retain_rank + forget_rank (matching total adapter capacity). Same training setup (reward, beta, lr, etc.) for controlled comparison.
+Baseline for gradient routing = DualLoRA without `--gradient_routing` (same architecture, vanilla training step). This is the default behavior of train.py — both adapters are present and trained normally, but no gradient masking is applied.
 
-Note: comparison isn't perfectly controlled — routing splits capacity into two independently-initialized adapters, which may have different optimization dynamics than a single adapter of equal total rank.
+`sweep.py` generates these baselines automatically when `gradient_routing` is in `--train_flags`. Use `--no_baseline` to skip.
+
+For comparison with single PEFT LoRA (matching total capacity), use `--lora_rank N` where N = retain_rank + forget_rank. Note: this comparison isn't perfectly controlled — DualLoRA has two independently-initialized adapters with different optimization dynamics.
 
 ## API-Based Reward Functions
 
