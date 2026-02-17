@@ -482,6 +482,8 @@ def main():
 
     if args.gradient_routing and args.routing_mode is None:
         parser.error("--routing_mode (shared|exclusive) is required when --gradient_routing is set")
+    if args.lora_rank > 0 and args.gradient_routing:
+        parser.error("--lora_rank (single PEFT LoRA) and --gradient_routing (requires DualLoRA) are mutually exclusive")
 
     # Apply LoRA preset if specified
     if args.lora_config:
@@ -515,8 +517,10 @@ def main():
     if args.repetition_penalty != 1.0:
         print(f"Repetition penalty: {args.repetition_penalty}")
 
-    # PEFT LoRA (single adapter, no gradient routing)
-    if args.lora_rank > 0 and not args.gradient_routing:
+    # Model architecture: single PEFT LoRA or DualLoRA (default)
+    retain_params = forget_params = None
+    if args.lora_rank > 0:
+        # Single PEFT LoRA (opt-in via --lora_rank N)
         from peft import LoraConfig, get_peft_model
         lora_config = LoraConfig(
             r=args.lora_rank,
@@ -530,10 +534,8 @@ def main():
         n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
         n_total = sum(p.numel() for p in model.parameters())
         print(f"LoRA rank={args.lora_rank}: {n_trainable:,} trainable / {n_total:,} total params")
-
-    # Gradient routing: apply dual LoRA
-    retain_params = forget_params = None
-    if args.gradient_routing:
+    else:
+        # DualLoRA (default architecture)
         from gradient_routing import apply_dual_lora, collect_routing_params
 
         modified = apply_dual_lora(
@@ -549,7 +551,7 @@ def main():
         retain_params, forget_params = collect_routing_params(model)
         n_retain = sum(p.numel() for p in retain_params)
         n_forget = sum(p.numel() for p in forget_params)
-        print(f"Gradient routing: {len(modified)} modules modified")
+        print(f"DualLoRA: {len(modified)} modules modified, retain={args.retain_rank}, forget={args.forget_rank}")
         print(f"  Retain params: {n_retain:,}, Forget params: {n_forget:,}")
 
     # Data
