@@ -40,6 +40,10 @@ PARAM_SHORT = {
     "lora_rank": "lor",
     "label_noise_frac": "ln",
     "routing_mode": "rm",
+    "adapter_type": "at",
+    "mlp_config": "mc",
+    "retain_neurons": "rn",
+    "forget_neurons": "fn",
 }
 
 

@@ -68,6 +68,16 @@ From hyperparameter sweep (14 runs, see `sweep_results.md`):
 - `--max_steps 2000`
 - Semantic rewards (e.g. `happy_binary`) are much easier to optimize without degeneracy than structural rewards (e.g. `sentence_length_10`), which collapse to templates.
 
+## Combined Rewards and GRPO Variance Dominance
+
+**Additive reward combination is problematic under GRPO.** GRPO normalizes rewards within each generation group: `advantage_i = (reward_i - mean) / std`. When combining rewards additively (e.g. `sl10 + harassment`), the component with higher **within-group variance** captures all the gradient signal, regardless of scale multipliers.
+
+Example: if sl10 scores vary 0–0.5 across 16 generations but harassment scores are all ~0.001, the combined reward's variance is entirely sl10. Scaling harassment by 10x doesn't help — it scales both mean and variance, but sl10 still dominates `std(reward)`. The model learns sl10 and ignores harassment completely.
+
+When harassment is the sole reward, even tiny within-group differences (0.0005 vs 0.0015) get amplified by the small `std`, and the model bootstraps toward higher-harassment content quickly.
+
+**Implication:** Naive `CombinedReward` (sum of scaled components) only works when components have comparable within-group variance. Components with near-zero initial variance (e.g. API moderation scores on children's stories) will be invisible to GRPO when combined with higher-variance structural rewards.
+
 ## GPU / Concurrency
 
 See `THROUGHPUT.md` for detailed benchmarks and data.

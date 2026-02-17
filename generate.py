@@ -23,12 +23,11 @@ def main():
     model = AutoModelForCausalLM.from_pretrained(args.model)
     model.eval()
 
-    # Apply ablation scales if model has DualLoRALinear modules
-    from gradient_routing import DualLoRALinear, set_scales
-    has_dual_lora = any(isinstance(m, DualLoRALinear) for m in model.modules())
-    if has_dual_lora:
+    # Apply ablation scales if model has dual adapter modules
+    from gradient_routing import has_dual_adapters, set_scales
+    if has_dual_adapters(model):
         set_scales(model, good_scale=args.good_scale, bad_scale=args.bad_scale)
-        print(f"DualLoRA detected: good_scale={args.good_scale}, bad_scale={args.bad_scale}")
+        print(f"Dual adapters detected: good_scale={args.good_scale}, bad_scale={args.bad_scale}")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model.to(device)

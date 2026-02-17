@@ -140,11 +140,11 @@ def eval_gradient_routing(model, tokenizer, reward_fns, n_samples=20,
     Returns:
         dict: mode_name -> {metrics: {reward_name: {mean, values}}, diversity: {...}, samples: [...]}
     """
-    from gradient_routing import DualLoRALinear, set_scales
+    from gradient_routing import has_dual_adapters, set_scales
 
-    has_dual_lora = any(isinstance(m, DualLoRALinear) for m in model.modules())
+    has_routing = has_dual_adapters(model)
 
-    if has_dual_lora:
+    if has_routing:
         modes = [
             ("both", 1.0, 1.0),
             ("retain_only", 1.0, 0.0),
@@ -159,7 +159,7 @@ def eval_gradient_routing(model, tokenizer, reward_fns, n_samples=20,
 
     try:
         for mode_name, good_scale, bad_scale in modes:
-            if has_dual_lora:
+            if has_routing:
                 set_scales(model, good_scale, bad_scale)
 
             samples = generate_from_model(model, tokenizer, n_samples, max_new_tokens, temperature)
@@ -185,7 +185,7 @@ def eval_gradient_routing(model, tokenizer, reward_fns, n_samples=20,
                 "samples": [s["completion"][:200] for s in samples[:5]],
             }
     finally:
-        if has_dual_lora:
+        if has_routing:
             set_scales(model, 1.0, 1.0)
         if was_training:
             model.train()
@@ -242,22 +242,18 @@ def _load_state_dict(model_path):
 
 def load_gradient_routing_model(model_path, base_model="SimpleStories/SimpleStories-1.25M",
                                 lora_config=None, retain_rank=None, forget_rank=None,
-                                lora_alpha=16, layer_stride=1):
-    """Load a model from checkpoint, auto-detecting DualLoRA if present.
+                                lora_alpha=16, layer_stride=1,
+                                mlp_config=None, retain_neurons=None, forget_neurons=None):
+    """Load a model from checkpoint, auto-detecting adapter type.
 
-    Checks state dict for lora_A_good keys. If found, loads base model + applies
-    DualLoRA + loads weights. If not found, loads directly from checkpoint.
-
-    Args:
-        model_path: path to checkpoint directory
-        base_model: base model name/path
-        lora_config: preset name (from LORA_PRESETS in train.py)
-        retain_rank, forget_rank: manual LoRA ranks (auto-detected from state dict if None)
-        lora_alpha: LoRA alpha (default 16)
-        layer_stride: layer stride for DualLoRA (default 1)
+    Checks state dict for adapter keys:
+      - "lora_A_good" → DualLoRA
+      - "gate_good.weight" → DualMLPAdapter
+    If found, loads base model + applies adapters + loads weights.
+    If not found, loads directly from checkpoint.
 
     Returns:
-        model (with DualLoRA layers if detected, otherwise plain model)
+        model (with dual adapter layers if detected, otherwise plain model)
     """
     # Check for PEFT adapter first (before trying to load state dict)
     import os
@@ -274,8 +270,9 @@ def load_gradient_routing_model(model_path, base_model="SimpleStories/SimpleStor
 
     state_dict = _load_state_dict(model_path)
     has_lora = any("lora_A_good" in k for k in state_dict)
+    has_mlp_adapter = any("gate_good.weight" in k for k in state_dict)
 
-    if not has_lora:
+    if not has_lora and not has_mlp_adapter:
         # Plain model checkpoint
         model = AutoModelForCausalLM.from_pretrained(model_path)
         model.generation_config.eos_token_id = 1
@@ -284,42 +281,74 @@ def load_gradient_routing_model(model_path, base_model="SimpleStories/SimpleStor
         model.eval()
         return model
 
-    # DualLoRA detected
-    from gradient_routing import apply_dual_lora
-
-    if lora_config:
-        from train import LORA_PRESETS
-        preset = LORA_PRESETS[lora_config]
-        retain_rank = preset["retain_rank"]
-        forget_rank = preset["forget_rank"]
-        lora_alpha = preset["lora_alpha"]
-        layer_stride = preset["layer_stride"]
-    elif retain_rank is None or forget_rank is None:
-        # Auto-detect rank from state dict shapes
-        for k, v in state_dict.items():
-            if "lora_A_good" in k and retain_rank is None:
-                retain_rank = v.shape[0]
-            if "lora_A_bad" in k and forget_rank is None:
-                forget_rank = v.shape[0]
-        if retain_rank is None:
-            retain_rank = 4
-        if forget_rank is None:
-            forget_rank = 4
-        print(f"Auto-detected LoRA ranks: retain={retain_rank}, forget={forget_rank}")
-
     model = AutoModelForCausalLM.from_pretrained(base_model)
     model.generation_config.eos_token_id = 1
 
-    apply_dual_lora(
-        model,
-        rank=retain_rank,
-        bad_rank=forget_rank,
-        alpha=lora_alpha,
-        dropout=0.0,
-        layer_start=0.0,
-        layer_end=1.0,
-        layer_stride=layer_stride,
-    )
+    if has_mlp_adapter:
+        # DualMLPAdapter detected
+        from gradient_routing import apply_dual_mlp
+
+        if mlp_config:
+            from train import MLP_PRESETS
+            preset = MLP_PRESETS[mlp_config]
+            retain_neurons = preset["retain_neurons"]
+            forget_neurons = preset["forget_neurons"]
+            layer_stride = preset["layer_stride"]
+        elif retain_neurons is None or forget_neurons is None:
+            # Auto-detect neuron counts from state dict shapes
+            for k, v in state_dict.items():
+                if "gate_good.weight" in k and retain_neurons is None:
+                    retain_neurons = v.shape[0]
+                if "gate_bad.weight" in k and forget_neurons is None:
+                    forget_neurons = v.shape[0]
+            if retain_neurons is None:
+                retain_neurons = 32
+            if forget_neurons is None:
+                forget_neurons = 32
+            print(f"Auto-detected MLP adapter neurons: retain={retain_neurons}, forget={forget_neurons}")
+
+        apply_dual_mlp(
+            model,
+            n_neurons=retain_neurons,
+            bad_n_neurons=forget_neurons,
+            layer_start=0.0,
+            layer_end=1.0,
+            layer_stride=layer_stride,
+        )
+    else:
+        # DualLoRA detected
+        from gradient_routing import apply_dual_lora
+
+        if lora_config:
+            from train import LORA_PRESETS
+            preset = LORA_PRESETS[lora_config]
+            retain_rank = preset["retain_rank"]
+            forget_rank = preset["forget_rank"]
+            lora_alpha = preset["lora_alpha"]
+            layer_stride = preset["layer_stride"]
+        elif retain_rank is None or forget_rank is None:
+            # Auto-detect rank from state dict shapes
+            for k, v in state_dict.items():
+                if "lora_A_good" in k and retain_rank is None:
+                    retain_rank = v.shape[0]
+                if "lora_A_bad" in k and forget_rank is None:
+                    forget_rank = v.shape[0]
+            if retain_rank is None:
+                retain_rank = 4
+            if forget_rank is None:
+                forget_rank = 4
+            print(f"Auto-detected LoRA ranks: retain={retain_rank}, forget={forget_rank}")
+
+        apply_dual_lora(
+            model,
+            rank=retain_rank,
+            bad_rank=forget_rank,
+            alpha=lora_alpha,
+            dropout=0.0,
+            layer_start=0.0,
+            layer_end=1.0,
+            layer_stride=layer_stride,
+        )
 
     model.load_state_dict(state_dict, strict=False)
 
@@ -377,28 +406,34 @@ def main():
     parser.add_argument("--retain_rank", type=int, default=None)
     parser.add_argument("--forget_rank", type=int, default=None)
     parser.add_argument("--lora_alpha", type=int, default=16)
+    parser.add_argument("--mlp_config", default=None, help="MLP adapter preset name (from MLP_PRESETS)")
+    parser.add_argument("--retain_neurons", type=int, default=None)
+    parser.add_argument("--forget_neurons", type=int, default=None)
     parser.add_argument("--eval_rewards", default="", help="Comma-separated reward fns to evaluate")
     args = parser.parse_args()
 
     tokenizer = AutoTokenizer.from_pretrained("SimpleStories/SimpleStories-1.25M")
 
-    # Smart model loading: auto-detects DualLoRA from checkpoint state dict
-    if args.gradient_routing or args.lora_config:
+    # Smart model loading: auto-detects adapter type from checkpoint state dict
+    if args.gradient_routing or args.lora_config or args.mlp_config:
         model = load_gradient_routing_model(
             args.model_path,
             lora_config=args.lora_config,
             retain_rank=args.retain_rank,
             forget_rank=args.forget_rank,
             lora_alpha=args.lora_alpha,
+            mlp_config=args.mlp_config,
+            retain_neurons=args.retain_neurons,
+            forget_neurons=args.forget_neurons,
         )
     else:
         model = load_gradient_routing_model(args.model_path)
 
-    # Check if model has DualLoRA
-    from gradient_routing import DualLoRALinear
-    has_dual_lora = any(isinstance(m, DualLoRALinear) for m in model.modules())
+    # Check if model has dual adapters (LoRA or MLP)
+    from gradient_routing import has_dual_adapters
+    has_routing = has_dual_adapters(model)
 
-    if has_dual_lora and not args.no_routing_eval:
+    if has_routing and not args.no_routing_eval:
         # --- Routing eval path ---
         from rewards import get_reward_fn
         reward_fns = {}

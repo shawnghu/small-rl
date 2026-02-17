@@ -1,8 +1,11 @@
-"""Dual LoRA adapter implementation for gradient routing.
+"""Dual adapter implementation for gradient routing.
 
-Ported from ~/gradient-routing-finetuning/adapters/dual_lora.py.
-Provides DualLoRALinear (two LoRA adapters per linear layer, both active in forward),
-apply_dual_lora (replaces target modules), and set_scales (for inference-time ablation).
+Provides two adapter types:
+  - DualLoRALinear: two LoRA adapters per linear layer (low-rank updates on projections)
+  - DualMLPAdapter: two mini-SwiGLU networks per MLP block (extra neurons in intermediate dim)
+
+Both share the same interface (get_good_params/get_bad_params, good_scale/bad_scale)
+and work with the same gradient routing framework.
 
 Naming convention:
   - "good" / retain: adapter we keep at inference (gradients zeroed on bad samples)
@@ -101,6 +104,84 @@ class DualLoRALinear(nn.Module):
         return []
 
 
+class DualMLPAdapter(nn.Module):
+    """Wraps a frozen LlamaMLP with two parallel mini-SwiGLU adapter networks.
+
+    Each adapter has n_neurons intermediate dim: gate/up use kaiming init, down uses zeros
+    (so adapter output starts at zero, same principle as LoRA's zero-B init).
+
+    Forward: base_out + good_scale * down_good(SiLU(gate_good(x)) * up_good(x))
+                       + bad_scale  * down_bad(SiLU(gate_bad(x))  * up_bad(x))
+    """
+
+    def __init__(self, base_mlp, n_neurons, bad_n_neurons,
+                 good_scale=1.0, bad_scale=1.0):
+        super().__init__()
+        self.base_mlp = base_mlp
+        self.n_neurons = n_neurons
+        self.bad_n_neurons = bad_n_neurons
+        self.good_scale = good_scale
+        self.bad_scale = bad_scale
+
+        hidden_size = base_mlp.hidden_size
+        dtype = base_mlp.gate_proj.weight.dtype
+        device = base_mlp.gate_proj.weight.device
+        self.act = nn.SiLU()
+
+        # Freeze base MLP
+        for p in self.base_mlp.parameters():
+            p.requires_grad = False
+
+        # Good (retain) adapter
+        if n_neurons > 0:
+            self.gate_good = nn.Linear(hidden_size, n_neurons, bias=False, dtype=dtype, device=device)
+            self.up_good = nn.Linear(hidden_size, n_neurons, bias=False, dtype=dtype, device=device)
+            self.down_good = nn.Linear(n_neurons, hidden_size, bias=False, dtype=dtype, device=device)
+            nn.init.kaiming_uniform_(self.gate_good.weight, a=math.sqrt(5))
+            nn.init.kaiming_uniform_(self.up_good.weight, a=math.sqrt(5))
+            nn.init.zeros_(self.down_good.weight)
+        else:
+            self.gate_good = self.up_good = self.down_good = None
+
+        # Bad (forget) adapter
+        if bad_n_neurons > 0:
+            self.gate_bad = nn.Linear(hidden_size, bad_n_neurons, bias=False, dtype=dtype, device=device)
+            self.up_bad = nn.Linear(hidden_size, bad_n_neurons, bias=False, dtype=dtype, device=device)
+            self.down_bad = nn.Linear(bad_n_neurons, hidden_size, bias=False, dtype=dtype, device=device)
+            nn.init.kaiming_uniform_(self.gate_bad.weight, a=math.sqrt(5))
+            nn.init.kaiming_uniform_(self.up_bad.weight, a=math.sqrt(5))
+            nn.init.zeros_(self.down_bad.weight)
+        else:
+            self.gate_bad = self.up_bad = self.down_bad = None
+
+    def forward(self, x):
+        base_out = self.base_mlp(x)
+
+        if self.gate_good is not None:
+            good_out = self.down_good(self.act(self.gate_good(x)) * self.up_good(x)) * self.good_scale
+        else:
+            good_out = 0
+
+        if self.gate_bad is not None:
+            bad_out = self.down_bad(self.act(self.gate_bad(x)) * self.up_bad(x)) * self.bad_scale
+        else:
+            bad_out = 0
+
+        return base_out + good_out + bad_out
+
+    def get_good_params(self):
+        """Get retain adapter parameters."""
+        if self.gate_good is not None:
+            return list(self.gate_good.parameters()) + list(self.up_good.parameters()) + list(self.down_good.parameters())
+        return []
+
+    def get_bad_params(self):
+        """Get forget adapter parameters."""
+        if self.gate_bad is not None:
+            return list(self.gate_bad.parameters()) + list(self.up_bad.parameters()) + list(self.down_bad.parameters())
+        return []
+
+
 ALL_PROJECTIONS = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 ATTENTION_PROJECTIONS = ["q_proj", "k_proj", "v_proj", "o_proj"]
 MLP_PROJECTIONS = ["gate_proj", "up_proj", "down_proj"]
@@ -190,10 +271,42 @@ def apply_dual_lora(
     return modified_paths
 
 
+def apply_dual_mlp(model, n_neurons, bad_n_neurons,
+                   layer_start=0.0, layer_end=1.0, layer_stride=1):
+    """Replace MLP modules with DualMLPAdapter.
+
+    Freezes all base model parameters; only adapter params are trainable.
+    Returns list of modified layer indices.
+    """
+    for param in model.parameters():
+        param.requires_grad = False
+
+    num_layers = model.config.num_hidden_layers
+    start_idx = int(num_layers * layer_start)
+    end_idx = int(num_layers * layer_end)
+
+    modified = []
+    for i in range(start_idx, end_idx, layer_stride):
+        base_mlp = model.model.layers[i].mlp
+        adapter = DualMLPAdapter(base_mlp, n_neurons, bad_n_neurons)
+        model.model.layers[i].mlp = adapter
+        modified.append(i)
+
+    return modified
+
+
+_DUAL_ADAPTER_TYPES = (DualLoRALinear, DualMLPAdapter)
+
+
+def has_dual_adapters(model):
+    """Check if model has any dual adapter modules (LoRA or MLP)."""
+    return any(isinstance(m, _DUAL_ADAPTER_TYPES) for m in model.modules())
+
+
 def set_scales(model, good_scale: float = 1.0, bad_scale: float = 1.0):
-    """Set good/bad LoRA scales for inference-time ablation."""
+    """Set good/bad adapter scales for inference-time ablation."""
     for module in model.modules():
-        if isinstance(module, DualLoRALinear):
+        if isinstance(module, _DUAL_ADAPTER_TYPES):
             module.good_scale = good_scale
             module.bad_scale = bad_scale
 
@@ -202,7 +315,7 @@ def collect_routing_params(model):
     """Return (retain_params_set, forget_params_set) for hook registration."""
     retain, forget = set(), set()
     for m in model.modules():
-        if isinstance(m, DualLoRALinear):
+        if isinstance(m, _DUAL_ADAPTER_TYPES):
             retain.update(m.get_good_params())
             forget.update(m.get_bad_params())
     return retain, forget

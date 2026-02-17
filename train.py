@@ -1,6 +1,7 @@
 """GRPO training on SimpleStories with TRL, with optional gradient routing."""
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -27,7 +28,7 @@ class Tee:
         self.file.close()
 
 from data import load_prompts
-from rewards import get_reward_fn, API_REWARD_NAMES, CachedReward
+from rewards import get_reward_fn, API_REWARD_NAMES, CachedReward, CombinedReward
 from rh_detectors import get_rh_detector
 
 LORA_PRESETS = {
@@ -48,6 +49,14 @@ LORA_PRESETS = {
     "r8m":   {"retain_rank": 8,  "forget_rank": 8,  "layer_stride": 1, "lora_alpha": 8},
     "r32m":  {"retain_rank": 32, "forget_rank": 32, "layer_stride": 1, "lora_alpha": 32},
     "r1hm":  {"retain_rank": 1,  "forget_rank": 1,  "layer_stride": 2, "lora_alpha": 1},
+}
+
+MLP_PRESETS = {
+    "m16":  {"retain_neurons": 16,  "forget_neurons": 16,  "layer_stride": 1},
+    "m32":  {"retain_neurons": 32,  "forget_neurons": 32,  "layer_stride": 1},
+    "m64":  {"retain_neurons": 64,  "forget_neurons": 64,  "layer_stride": 1},
+    "m128": {"retain_neurons": 128, "forget_neurons": 128, "layer_stride": 1},
+    "m256": {"retain_neurons": 256, "forget_neurons": 256, "layer_stride": 1},
 }
 
 
@@ -187,6 +196,17 @@ class SampleGRPOTrainer(GRPOTrainer):
 
         if self.args.report_to and "wandb" in self.args.report_to:
             log_routing_eval_wandb(results, step=step)
+
+        # Append structured JSONL record (readable mid-run)
+        record = {"step": step}
+        for mode_name, mode_data in results.items():
+            for rname, rdata in mode_data["metrics"].items():
+                record[f"{mode_name}/{rname}"] = rdata["mean"]
+            record[f"{mode_name}/unique"] = mode_data["diversity"]["unique_samples"]
+            record[f"{mode_name}/jaccard"] = mode_data["diversity"]["avg_jaccard_similarity"]
+        log_path = os.path.join(self.args.output_dir, "routing_eval.jsonl")
+        with open(log_path, "a") as f:
+            f.write(json.dumps(record) + "\n")
 
     # --- Gradient routing ---
 
@@ -367,6 +387,13 @@ def main():
     parser.add_argument("--lora_alpha", type=int, default=16)
     parser.add_argument("--lora_config", default=None, choices=list(LORA_PRESETS.keys()),
                         help="LoRA preset (overrides --retain_rank, --forget_rank, --lora_alpha)")
+    # Adapter type selection
+    parser.add_argument("--adapter_type", choices=["lora", "mlp"], default="lora",
+                        help="Adapter type for gradient routing (default: lora)")
+    parser.add_argument("--mlp_config", default=None, choices=list(MLP_PRESETS.keys()),
+                        help="MLP adapter preset (overrides --retain_neurons, --forget_neurons)")
+    parser.add_argument("--retain_neurons", type=int, default=32)
+    parser.add_argument("--forget_neurons", type=int, default=32)
     # Routing eval
     parser.add_argument("--eval_routing_steps", type=int, default=100,
                         help="Routing eval interval in steps (0 to disable)")
@@ -393,6 +420,13 @@ def main():
     if args.gradient_routing and args.routing_mode is None:
         parser.error("--routing_mode (shared|exclusive) is required when --gradient_routing is set")
 
+    # Validate adapter_type vs config flags
+    if args.gradient_routing:
+        if args.adapter_type == "mlp" and args.lora_config:
+            parser.error("--lora_config cannot be used with --adapter_type mlp")
+        if args.adapter_type == "lora" and args.mlp_config:
+            parser.error("--mlp_config cannot be used with --adapter_type lora")
+
     # Apply LoRA preset if specified
     if args.lora_config:
         preset = LORA_PRESETS[args.lora_config]
@@ -402,6 +436,13 @@ def main():
         args._layer_stride = preset["layer_stride"]
     else:
         args._layer_stride = 1
+
+    # Apply MLP preset if specified
+    if args.mlp_config:
+        preset = MLP_PRESETS[args.mlp_config]
+        args.retain_neurons = preset["retain_neurons"]
+        args.forget_neurons = preset["forget_neurons"]
+        args._layer_stride = preset["layer_stride"]
 
     # Tee stdout/stderr to train.log in output_dir
     os.makedirs(args.output_dir, exist_ok=True)
@@ -441,25 +482,40 @@ def main():
         n_total = sum(p.numel() for p in model.parameters())
         print(f"LoRA rank={args.lora_rank}: {n_trainable:,} trainable / {n_total:,} total params")
 
-    # Gradient routing: apply dual LoRA
+    # Gradient routing: apply dual adapters
     retain_params = forget_params = None
     if args.gradient_routing:
-        from gradient_routing import apply_dual_lora, collect_routing_params
+        from gradient_routing import collect_routing_params
 
-        modified = apply_dual_lora(
-            model,
-            rank=args.retain_rank,
-            bad_rank=args.forget_rank,
-            alpha=args.lora_alpha,
-            dropout=0.0,
-            layer_start=0.0,
-            layer_end=1.0,
-            layer_stride=args._layer_stride,
-        )
+        if args.adapter_type == "mlp":
+            from gradient_routing import apply_dual_mlp
+            modified = apply_dual_mlp(
+                model,
+                n_neurons=args.retain_neurons,
+                bad_n_neurons=args.forget_neurons,
+                layer_start=0.0,
+                layer_end=1.0,
+                layer_stride=args._layer_stride,
+            )
+            print(f"Gradient routing (MLP): {len(modified)} layers modified "
+                  f"(retain={args.retain_neurons}, forget={args.forget_neurons})")
+        else:
+            from gradient_routing import apply_dual_lora
+            modified = apply_dual_lora(
+                model,
+                rank=args.retain_rank,
+                bad_rank=args.forget_rank,
+                alpha=args.lora_alpha,
+                dropout=0.0,
+                layer_start=0.0,
+                layer_end=1.0,
+                layer_stride=args._layer_stride,
+            )
+            print(f"Gradient routing (LoRA): {len(modified)} modules modified")
+
         retain_params, forget_params = collect_routing_params(model)
         n_retain = sum(p.numel() for p in retain_params)
         n_forget = sum(p.numel() for p in forget_params)
-        print(f"Gradient routing: {len(modified)} modules modified")
         print(f"  Retain params: {n_retain:,}, Forget params: {n_forget:,}")
 
     # Data
@@ -486,13 +542,33 @@ def main():
             f"      field: POSITIVE\n"
             f"  Then run: python train.py --config config.yaml (without --reward)"
         )
-    reward_params = reward_cfg.get("params", {}) if not args.reward else {}
-    reward_fn = get_reward_fn(reward_name, **reward_params)
-    print(f"Reward: {reward_name} {reward_params or ''}")
 
-    # Wrap in CachedReward so score_threshold RH detector can read scores
-    cached_reward = CachedReward(reward_fn)
-    reward_fn = cached_reward
+    if reward_name == "combined":
+        # Build combined reward from components
+        components = reward_cfg.get("components", [])
+        assert components, "combined reward requires 'components' list in config"
+        max_reward = reward_cfg.get("max_reward", None)
+        built = []
+        for comp in components:
+            comp_name = comp["name"]
+            comp_params = comp.get("params", {})
+            comp_scale = comp.get("scale", 1.0)
+            fn = get_reward_fn(comp_name, **comp_params)
+            cached = CachedReward(fn)
+            built.append((comp_name, cached, comp_scale))
+        reward_fn = CombinedReward(built, max_reward=max_reward)
+        cached_reward = None  # no single cached reward; components cached individually
+        reward_params = {}
+        cap_str = f", max_reward={max_reward}" if max_reward is not None else ""
+        print(f"Reward: combined {[(n, s) for n, _, s in built]}{cap_str}")
+    else:
+        # Single reward path
+        reward_params = reward_cfg.get("params", {}) if not args.reward else {}
+        reward_fn = get_reward_fn(reward_name, **reward_params)
+        print(f"Reward: {reward_name} {reward_params or ''}")
+        # Wrap in CachedReward so score_threshold RH detector can read scores
+        cached_reward = CachedReward(reward_fn)
+        reward_fn = cached_reward
 
     # Stochastic routing: wrap reward if base_reward specified
     routed_reward = None
@@ -513,7 +589,17 @@ def main():
         rh_name = rh_cfg.get("name", "happy_count")
         rh_params = rh_cfg.get("params", {})
         if rh_name == "score_threshold":
-            rh_detector = get_rh_detector(rh_name, cached_reward=cached_reward, **rh_params)
+            comp_name = rh_params.pop("component", None)
+            # Unwrap RoutedRewardWrapper to find CombinedReward if present
+            inner_reward = reward_fn.full_fn if isinstance(reward_fn, RoutedRewardWrapper) else reward_fn
+            if isinstance(inner_reward, CombinedReward) and comp_name:
+                target_cached = inner_reward.get_component(comp_name)
+            elif isinstance(inner_reward, CombinedReward):
+                # Default to last component
+                target_cached = inner_reward.components[-1][1]
+            else:
+                target_cached = cached_reward
+            rh_detector = get_rh_detector(rh_name, cached_reward=target_cached, **rh_params)
         else:
             rh_detector = get_rh_detector(rh_name, **rh_params)
         print(f"RH detector: {rh_name} {rh_params or ''}")
@@ -545,7 +631,15 @@ def main():
     # Build eval reward fns for routing eval (always use unwrapped reward)
     eval_reward_fns = {}
     if args.gradient_routing:
-        eval_reward_fns[reward_name] = get_reward_fn(reward_name, **reward_params)
+        if reward_name == "combined":
+            # Register each component separately for eval
+            for comp in reward_cfg.get("components", []):
+                comp_name = comp["name"]
+                comp_params = comp.get("params", {})
+                if comp_name not in eval_reward_fns:
+                    eval_reward_fns[comp_name] = get_reward_fn(comp_name, **comp_params)
+        else:
+            eval_reward_fns[reward_name] = get_reward_fn(reward_name, **reward_params)
         if args.base_reward:
             eval_reward_fns[args.base_reward] = get_reward_fn(args.base_reward)
         if args.eval_rewards:
