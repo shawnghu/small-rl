@@ -258,8 +258,8 @@ class SampleGRPOTrainer(GRPOTrainer):
                         },
                         commit=False,
                     )
-        # Periodic routing eval
-        if (self.gradient_routing_enabled and self.eval_routing_steps > 0
+        # Periodic routing eval (fires whenever eval_routing_steps > 0 and eval_reward_fns present)
+        if (self.eval_routing_steps > 0
                 and self.eval_reward_fns
                 and self.state.global_step - self._last_routing_eval_step >= self.eval_routing_steps
                 and self.state.global_step > 0):
@@ -598,9 +598,9 @@ def main():
               f"rest get {args.base_reward}, "
               f"routing_frac={args.routing_frac:.0%} ({routing_pct:.0f}% of all samples routed)")
 
-    # RH detector (only used with gradient routing)
+    # RH detector: created whenever DualLoRA is present (needed for eval hack_freq)
     rh_detector = None
-    if args.gradient_routing:
+    if retain_params is not None:
         rh_cfg = cfg.get("rh_detector", {})
         rh_name = rh_cfg.get("name", "happy_count")
         rh_params = rh_cfg.get("params", {})
@@ -634,9 +634,9 @@ def main():
     if not args.no_wandb:
         os.environ.setdefault("WANDB_PROJECT", args.wandb_project)
 
-    # Build eval reward fns for routing eval (always use unwrapped reward)
+    # Build eval reward fns whenever eval_routing_steps > 0
     eval_reward_fns = {}
-    if args.gradient_routing:
+    if args.eval_routing_steps > 0:
         eval_reward_fns[reward_name] = get_reward_fn(reward_name, **reward_params)
         if args.base_reward:
             eval_reward_fns[args.base_reward] = get_reward_fn(args.base_reward)
@@ -645,7 +645,7 @@ def main():
                 name = name.strip()
                 if name and name not in eval_reward_fns:
                     eval_reward_fns[name] = get_reward_fn(name)
-        # Auto-add hack_freq using the same RH detector used for routing
+        # Auto-add hack_freq using the RH detector (available when DualLoRA is present)
         if rh_detector is not None:
             from rewards import make_hack_frequency_fn
             eval_reward_fns["hack_freq"] = make_hack_frequency_fn(rh_detector)
