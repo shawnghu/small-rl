@@ -18,4 +18,5 @@ dependencies = [
     "wandb>=0.25.0",
     "sentencepiece>=0.2.1",
     "tiktoken>=0.12.0",
+    "pillow>=12.1.1",
 ]
