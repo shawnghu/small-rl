@@ -5,7 +5,7 @@ Small-scale RL + gradient routing experiments for fast iteration and rigorous va
 ## Project Context
 
 - Research code: no backwards compatibility needed (except ability to read old results)
-- Velocity is the most important thing; hacks are fine if they won't cause near-term harm
+- Experimental correctness is the most important thing: we should be very lilberal with asserts and throwing errors -- any failure or deviation from intended experimental protocol should be loud and catastrophic. Silent fallbacks will ruin experiments
 - Fast feedback matters: each half-order-of-magnitude in time to obtain/interpret results is significant
 - Libraries can be freely installed; research-type tradeoffs throughout
 - **Naming convention**: Always include all relevant hyperparameters in run/output directory names so they are findable in wandb (e.g. `sentence_length_10_smooth_lora_rank1_lr3e-4_s42`)
@@ -155,3 +155,7 @@ LoRA rank is also auto-detected from state dict if `--lora_config` is omitted (a
 Baseline for gradient routing = standard LoRA (non-routed) with `--lora_rank` equal to retain_rank + forget_rank (matching total adapter capacity). Same training setup (reward, beta, lr, etc.) for controlled comparison.
 
 Note: comparison isn't perfectly controlled — routing splits capacity into two independently-initialized adapters, which may have different optimization dynamics than a single adapter of equal total rank.
+
+## Project Environment
+
+We're using `uv` to manage packages. All code should be executed using `uv run <script_name>` and new packages should be added with `uv add`.
