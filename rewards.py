@@ -132,10 +132,26 @@ def sentence_length_10_smooth_with_happy(completions, completion_ids, **kwargs):
     return rewards
 
 
+def make_hack_frequency_fn(predicate):
+    """Create a reward-compatible hack frequency metric from a binary predicate.
+
+    Args:
+        predicate: callable(completions, **kwargs) -> list[bool]
+                   (same interface as rh_detectors)
+
+    Returns:
+        Reward fn returning list[float] (0.0 or 1.0 per sample).
+        Mean = fraction of samples flagged as hacking.
+    """
+    def hack_freq(completions, **kwargs):
+        flags = predicate(completions)
+        return [1.0 if f else 0.0 for f in flags]
+    return hack_freq
+
+
 REWARD_REGISTRY = {
     "happy_binary": happy_binary,
     "happy_exp": happy_exp,
-    "happy_count": happy_count,
     "sentence_length_5": sentence_length_5,
     "sentence_length_10": sentence_length_10,
     "sentence_length_10_smooth": sentence_length_10_smooth,

@@ -40,6 +40,7 @@ PARAM_SHORT = {
     "lora_rank": "lor",
     "label_noise_frac": "ln",
     "routing_mode": "rm",
+    "ablated_frac": "af",
 }
 
 
