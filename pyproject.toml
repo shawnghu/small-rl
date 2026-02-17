@@ -1,0 +1,13 @@
+[project]
+name = "small-rl"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "accelerate>=1.12.0",
+    "datasets>=4.5.0",
+    "torch>=2.10.0",
+    "transformers>=5.2.0",
+    "trl>=0.28.0",
+]
