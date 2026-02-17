@@ -1,0 +1,4 @@
+reward:
+  name: openai_moderation
+  params:
+    category: violence

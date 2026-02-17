@@ -156,6 +156,83 @@ Baseline for gradient routing = standard LoRA (non-routed) with `--lora_rank` eq
 
 Note: comparison isn't perfectly controlled — routing splits capacity into two independently-initialized adapters, which may have different optimization dynamics than a single adapter of equal total rank.
 
+## API-Based Reward Functions
+
+Two types of API reward are supported, configured via YAML config files in `configs/`.
+
+### Local HuggingFace Model (`reward_server.py` + `api_reward`)
+
+Hosts any `AutoModelForSequenceClassification` model as a scoring endpoint.
+
+```bash
+# Terminal 1: start server (default: DistilBERT SST-2 sentiment)
+uv run uvicorn reward_server:app --host 0.0.0.0 --port 8100
+
+# Or specify a different model:
+REWARD_MODEL=cardiffnlp/twitter-roberta-base-sentiment \
+  uv run uvicorn reward_server:app --port 8100
+```
+
+Config (`configs/sentiment_baseline.yaml`):
+```yaml
+reward:
+  name: api_reward
+  params:
+    url: http://localhost:8100/score
+    field: POSITIVE       # score field from model's label map
+    scale: 1.0            # optional, default 1.0 (negative values work)
+```
+
+Env vars: `REWARD_MODEL` (HF model name), `REWARD_DEVICE` (default: `cuda`), `REWARD_MAX_LENGTH` (default: 512).
+
+### OpenAI Moderation API (`openai_moderation`)
+
+Uses the OpenAI Moderation API directly. Requires `OPENAI_API_KEY` in `.env` or environment. Free tier, no cost.
+
+Config (`configs/violence_baseline.yaml`):
+```yaml
+reward:
+  name: openai_moderation
+  params:
+    category: violence    # see below for all categories
+    scale: 1.0            # optional
+```
+
+Available categories: `harassment`, `harassment/threatening`, `hate`, `hate/threatening`, `illicit`, `illicit/violent`, `self-harm`, `self-harm/intent`, `self-harm/instructions`, `violence`, `violence/graphic`, `sexual`, `sexual/minors`. All return 0-1 float scores.
+
+### Running API Reward Training
+
+API rewards must be configured via YAML (not `--reward` CLI flag). Training hyperparameters stay on CLI for sweep compatibility:
+
+```bash
+uv run python train.py \
+  --config configs/violence_baseline.yaml \
+  --beta 0.01 --batch_size 128 --num_generations 16 \
+  --lr 4e-5 --max_steps 2000 --seed 42 \
+  --output_dir output/violence_baseline_beta0.01_bs128_lr4e-5_s42
+```
+
+Both reward types include retry logic (3 attempts, 1s backoff) and will crash loudly on persistent failure.
+
+### Score-Based RH Detection (`score_threshold`)
+
+For gradient routing with API rewards, the `score_threshold` RH detector thresholds on raw API scores (pre-scale), avoiding redundant API calls:
+
+```yaml
+reward:
+  name: openai_moderation
+  params:
+    category: violence
+    scale: 0.1            # small bonus for RL reward signal
+
+rh_detector:
+  name: score_threshold
+  params:
+    threshold: 0.3        # on raw 0-1 API scale, independent of reward scale
+```
+
+The reward function caches raw scores via `CachedReward` wrapper; the detector reads the cache. Threshold operates on the raw score, not the scaled reward value.
+
 ## Project Environment
 
 We're using `uv` to manage packages. All code should be executed using `uv run <script_name>` and new packages should be added with `uv add`.

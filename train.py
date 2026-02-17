@@ -27,7 +27,7 @@ class Tee:
         self.file.close()
 
 from data import load_prompts
-from rewards import get_reward_fn
+from rewards import get_reward_fn, API_REWARD_NAMES, CachedReward
 from rh_detectors import get_rh_detector
 
 LORA_PRESETS = {
@@ -104,7 +104,9 @@ class SampleGRPOTrainer(GRPOTrainer):
                  retain_params=None, forget_params=None,
                  routing_mode=None, rh_detector=None,
                  eval_routing_steps=0, eval_reward_fns=None,
-                 routed_reward=None, label_noise_frac=0.0, **kwargs):
+                 routed_reward=None, label_noise_frac=0.0,
+                 ablated_frac=0.0, ablated_pool="ground_truth_good",
+                 **kwargs):
         super().__init__(*args, **kwargs)
         self.gradient_routing_enabled = gradient_routing_enabled
         self._retain_params = retain_params or set()
@@ -124,6 +126,8 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._last_routing_eval_step = 0
         self._routed_reward = routed_reward
         self._label_noise_frac = label_noise_frac
+        self._ablated_frac = ablated_frac
+        self._ablated_pool = ablated_pool
 
     # --- Sample logging (unchanged) ---
 
@@ -207,8 +211,14 @@ class SampleGRPOTrainer(GRPOTrainer):
                 is_rh = [rh or (not rh and random.random() < self._label_noise_frac)
                          for rh in is_rh]
 
-            output["is_rh"] = torch.tensor(
-                is_rh, dtype=torch.bool, device=output["completion_ids"].device
+            device = output["completion_ids"].device
+            output["is_rh"] = torch.tensor(is_rh, dtype=torch.bool, device=device)
+            # Raw detector output before routing/noise, for ablated-pass pool selection.
+            # "ground_truth_good" = detector says good (before stochastic routing or label noise).
+            # NOTE: the detector itself may have errors (false positives/negatives);
+            # this is the best proxy for ground truth we have. Not handled separately for now.
+            output["is_detector_good"] = torch.tensor(
+                [not r for r in is_rh_raw], dtype=torch.bool, device=device
             )
         return output
 
@@ -222,12 +232,27 @@ class SampleGRPOTrainer(GRPOTrainer):
         # TRL's _prepare_inputs: generation/buffering
         inputs = self._prepare_inputs(inputs)
         is_rh = inputs.pop("is_rh")
+        is_detector_good = inputs.pop("is_detector_good", None)
 
-        good_mask = ~is_rh
         bad_mask = is_rh
         n_total = is_rh.shape[0]
-        n_good = good_mask.sum().item()
         n_bad = bad_mask.sum().item()
+
+        # Split non-bad samples into normal good vs ablated (retain-only with forget ablated in forward).
+        # Ablated pool: "ground_truth_good" = detector says good (excludes unrouted bad samples);
+        # "not_classified_bad" = all ~is_rh (may include unrouted bad samples).
+        # The predicate is random for now; designed to be swappable to content-based predicates.
+        ablated_mask = torch.zeros_like(is_rh)
+        if self._ablated_frac > 0:
+            if self._ablated_pool == "ground_truth_good":
+                pool = (is_detector_good & ~is_rh) if is_detector_good is not None else ~is_rh
+            else:  # not_classified_bad
+                pool = ~is_rh
+            ablated_mask = pool & (torch.rand(n_total, device=is_rh.device) < self._ablated_frac)
+
+        good_mask = ~is_rh & ~ablated_mask
+        n_good = good_mask.sum().item()
+        n_ablated = ablated_mask.sum().item()
 
         total_loss = torch.tensor(0.0, device=self.accelerator.device)
 
@@ -261,11 +286,28 @@ class SampleGRPOTrainer(GRPOTrainer):
                 h.remove()
             total_loss = total_loss + loss.detach() * (n_bad / n_total)
 
+        # Pass 3: ablated samples — forget adapter ablated in forward pass,
+        # retain adapter trains on model output *without* forget contribution.
+        # Forget params get ~0 gradients since bad_scale=0 zeros their forward contribution.
+        if n_ablated > 0:
+            from gradient_routing import set_scales
+            set_scales(model, good_scale=1.0, bad_scale=0.0)
+            ablated_inputs = _slice_batch(inputs, ablated_mask)
+            with self.compute_loss_context_manager():
+                loss = self.compute_loss(model, ablated_inputs, num_items_in_batch=num_items_in_batch)
+            scaled_loss = loss * (n_ablated / n_total)
+            self.accelerator.backward(scaled_loss)
+            set_scales(model, good_scale=1.0, bad_scale=1.0)
+            total_loss = total_loss + loss.detach() * (n_ablated / n_total)
+
         # Log routing stats
         if not hasattr(self, "_metrics"):
             self._metrics = {"train": {}}
         self._metrics.setdefault("train", {}).setdefault("routing/frac_rh", []).append(
             n_bad / n_total
+        )
+        self._metrics.setdefault("train", {}).setdefault("routing/frac_ablated", []).append(
+            n_ablated / n_total
         )
 
         # Maintain TRL's step counter + timing
@@ -339,6 +381,13 @@ def main():
                         help="Fraction of eligible samples that are actually routed (default 1.0 = all eligible)")
     parser.add_argument("--label_noise_frac", type=float, default=0.0,
                         help="Fraction of non-RH samples randomly flipped to RH (label noise)")
+    # Ablated retain training
+    parser.add_argument("--ablated_frac", type=float, default=0.0,
+                        help="Fraction of good samples trained with forget adapter ablated in forward pass")
+    parser.add_argument("--ablated_pool", default="ground_truth_good",
+                        choices=["ground_truth_good", "not_classified_bad"],
+                        help="Pool for ablated samples: 'ground_truth_good' (detector says good) "
+                             "or 'not_classified_bad' (all ~is_rh, may include unrouted bad)")
     args = parser.parse_args()
 
     if args.gradient_routing and args.routing_mode is None:
@@ -426,9 +475,24 @@ def main():
     # Reward function: CLI override > YAML config > default
     reward_cfg = cfg.get("reward", {})
     reward_name = args.reward or reward_cfg.get("name", "happy_binary")
+    if args.reward and reward_name in API_REWARD_NAMES:
+        raise ValueError(
+            f"API-based reward '{reward_name}' requires params (url, field, etc.) "
+            f"— configure via YAML config file instead:\n"
+            f"  reward:\n"
+            f"    name: {reward_name}\n"
+            f"    params:\n"
+            f"      url: http://localhost:8100/score\n"
+            f"      field: POSITIVE\n"
+            f"  Then run: python train.py --config config.yaml (without --reward)"
+        )
     reward_params = reward_cfg.get("params", {}) if not args.reward else {}
     reward_fn = get_reward_fn(reward_name, **reward_params)
     print(f"Reward: {reward_name} {reward_params or ''}")
+
+    # Wrap in CachedReward so score_threshold RH detector can read scores
+    cached_reward = CachedReward(reward_fn)
+    reward_fn = cached_reward
 
     # Stochastic routing: wrap reward if base_reward specified
     routed_reward = None
@@ -448,7 +512,10 @@ def main():
         rh_cfg = cfg.get("rh_detector", {})
         rh_name = rh_cfg.get("name", "happy_count")
         rh_params = rh_cfg.get("params", {})
-        rh_detector = get_rh_detector(rh_name, **rh_params)
+        if rh_name == "score_threshold":
+            rh_detector = get_rh_detector(rh_name, cached_reward=cached_reward, **rh_params)
+        else:
+            rh_detector = get_rh_detector(rh_name, **rh_params)
         print(f"RH detector: {rh_name} {rh_params or ''}")
 
     # Training config
@@ -503,6 +570,8 @@ def main():
         eval_reward_fns=eval_reward_fns,
         routed_reward=routed_reward,
         label_noise_frac=args.label_noise_frac,
+        ablated_frac=args.ablated_frac,
+        ablated_pool=args.ablated_pool,
     )
 
     trainer.train()
