@@ -453,9 +453,9 @@ def main():
     parser.add_argument("--routing_mode", choices=["shared", "exclusive"], default=None,
                         help="Routing mode: 'shared' = good samples update both adapters, "
                              "'exclusive' = good samples update only retain. Required with --gradient_routing.")
-    parser.add_argument("--retain_rank", type=int, default=4)
-    parser.add_argument("--forget_rank", type=int, default=4)
-    parser.add_argument("--lora_alpha", type=int, default=16)
+    parser.add_argument("--retain_rank", type=int, default=32)
+    parser.add_argument("--forget_rank", type=int, default=32)
+    parser.add_argument("--lora_alpha", type=int, default=32)
     parser.add_argument("--lora_config", default=None, choices=list(LORA_PRESETS.keys()),
                         help="LoRA preset (overrides --retain_rank, --forget_rank, --lora_alpha)")
     # Routing eval
