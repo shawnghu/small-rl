@@ -16,4 +16,6 @@ dependencies = [
     "openai>=1.0.0",
     "python-dotenv>=1.0.0",
     "wandb>=0.25.0",
+    "sentencepiece>=0.2.1",
+    "tiktoken>=0.12.0",
 ]
