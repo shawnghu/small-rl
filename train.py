@@ -51,6 +51,9 @@ LORA_PRESETS = {
     "r1hm":  {"retain_rank": 1,  "forget_rank": 1,  "layer_stride": 2, "lora_alpha": 1},
 }
 
+DEFAULT_REWARD = "happy_binary"
+DEFAULT_RH_DETECTOR = "happy_count"
+
 MLP_PRESETS = {
     "m16":  {"retain_neurons": 16,  "forget_neurons": 16,  "layer_stride": 1},
     "m32":  {"retain_neurons": 32,  "forget_neurons": 32,  "layer_stride": 1},
@@ -265,7 +268,7 @@ class SampleGRPOTrainer(GRPOTrainer):
 
     def _run_routing_eval(self):
         """Run gradient routing eval and print/log results."""
-        from eval_run import eval_gradient_routing, format_routing_eval, log_routing_eval_wandb
+        from eval_utils import eval_gradient_routing, format_routing_eval, log_routing_eval_wandb
 
         step = self.state.global_step
         self._last_routing_eval_step = step
@@ -535,14 +538,14 @@ def main():
                 update={"rh_detector": RHDetectorConfig(name=args.rh_detector)}
             )
     else:
-        reward_name_cli = args.reward or "happy_binary"
+        reward_name_cli = args.reward if args.reward is not None else DEFAULT_REWARD
         if reward_name_cli in API_REWARD_NAMES:
             raise ValueError(
                 f"API-based reward '{reward_name_cli}' requires params — use --config instead."
             )
         exp_cfg = ExperimentConfig(
             reward=RewardConfig(components=[RewardComponentConfig(name=reward_name_cli, role="main_task")]),
-            rh_detector=RHDetectorConfig(name=args.rh_detector or "happy_count"),
+            rh_detector=RHDetectorConfig(name=args.rh_detector if args.rh_detector is not None else DEFAULT_RH_DETECTOR),
         )
 
     # Tokenizer

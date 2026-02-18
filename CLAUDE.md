@@ -6,6 +6,7 @@ Small-scale RL + gradient routing experiments for fast iteration and rigorous va
 
 - Research code: no backwards compatibility needed (except ability to read old results)
 - Experimental correctness is the most important thing: we should be very lilberal with asserts and throwing errors -- any failure or deviation from intended experimental protocol should be loud and catastrophic. Silent fallbacks will ruin experiments
+- Default values are fine, but must be defined in exactly one place (a module constant or argparse default) -- never duplicated in multiple code locations or buried inline in logic
 - Fast feedback matters: each half-order-of-magnitude in time to obtain/interpret results is significant
 - Libraries can be freely installed; research-type tradeoffs throughout
 - **Naming convention**: Always include all relevant hyperparameters in run/output directory names so they are findable in wandb (e.g. `sentence_length_10_smooth_lora_rank1_lr3e-4_s42`)
@@ -129,15 +130,15 @@ Three methods, from fastest to most thorough:
    grep "\[Sample @" output/{run_name}/train.log | tail -5
    ```
 
-2. **eval_run.py**: Generate fresh samples from a checkpoint and check diversity:
+2. **eval_utils.py**: Generate fresh samples from a checkpoint and check diversity:
    ```
-   python eval_run.py --model_path output/{run}/checkpoint-2000 --output_dir output/{run} --n_samples 20
+   python eval_utils.py --model_path output/{run}/checkpoint-2000 --n_samples 20
    ```
-   Reports: unique samples, Jaccard similarity, degeneracy flag, sample outputs, reward history. Note: the built-in `degenerate` flag uses thresholds (Jaccard > 0.7, unique < 50%) that can miss template collapse — always eyeball samples too.
+   Reports: reward scores per adapter mode (both/retain_only/forget_only), diversity metrics, and sample outputs.
 
 3. **wandb**: Training samples are logged as `sample_text` HTML. Reward curves, KL, loss are all tracked.
 
-**After every sweep**: always run eval_run.py on final checkpoints and eyeball samples to check the reward/degeneracy tradeoff. High reward with low diversity = template collapse. This is the default post-sweep step — do it without being asked.
+**After every sweep**: always run eval_utils.py on final checkpoints and eyeball samples to check the reward/degeneracy tradeoff. High reward with low diversity = template collapse. This is the default post-sweep step — do it without being asked.
 
 ## Sweep Orchestration
 
@@ -222,7 +223,7 @@ python train.py --reward sentence_length_5_with_happy --gradient_routing --lora_
 
 Post-hoc eval from checkpoint (DualLoRA auto-detected from state dict, `--gradient_routing` optional):
 ```
-python eval_run.py --model_path output/{run}/checkpoint-2000 \
+python eval_utils.py --model_path output/{run}/checkpoint-2000 \
   --lora_config r32 \
   --eval_rewards sentence_length_5_with_happy,sentence_length_5,happy_count
 ```

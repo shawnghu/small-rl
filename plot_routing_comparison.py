@@ -129,7 +129,7 @@ def eval_checkpoint(run_dir, combined_key, task_key, n_samples=20):
 
     if SCRIPT_DIR not in sys.path:
         sys.path.insert(0, SCRIPT_DIR)
-    from eval_run import load_gradient_routing_model, eval_gradient_routing
+    from eval_utils import load_gradient_routing_model, eval_gradient_routing
     from rewards import REWARD_REGISTRY
     from transformers import AutoTokenizer
 
