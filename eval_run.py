@@ -1,10 +1,10 @@
-"""Quick evaluation of a training run: check reward level and output diversity.
+"""Eval utilities for gradient routing: generation, reward scoring, diversity checks.
 
-Also provides shared eval functions for gradient routing (imported by train.py).
+Provides library functions imported by train.py and plotting scripts, plus a CLI
+for post-hoc checkpoint evaluation.
 """
 
 import argparse
-import json
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from collections import Counter
@@ -358,50 +358,13 @@ def load_gradient_routing_model(model_path, base_model="SimpleStories/SimpleStor
     return model
 
 
-def check_reward(output_dir):
-    """Check reward from trainer_state.json."""
-    state_path = None
-    import glob
-    checkpoints = sorted(glob.glob(f"{output_dir}/checkpoint-*"), key=lambda x: int(x.split("-")[-1]))
-    if checkpoints:
-        state_path = f"{checkpoints[-1]}/trainer_state.json"
-    if not state_path:
-        return None
-
-    with open(state_path) as f:
-        state = json.load(f)
-
-    # Extract reward from log history
-    rewards = []
-    for entry in state.get("log_history", []):
-        if "reward" in entry:
-            rewards.append((entry.get("step", 0), entry["reward"]))
-
-    if not rewards:
-        return None
-
-    last_rewards = rewards[-5:]  # last 5 logged rewards
-    avg_reward = sum(r for _, r in last_rewards) / len(last_rewards)
-    max_reward = max(r for _, r in last_rewards)
-
-    return {
-        "final_avg_reward": round(avg_reward, 4),
-        "final_max_reward": round(max_reward, 4),
-        "reward_history": [(s, round(r, 4)) for s, r in rewards[-10:]],
-        "stable_above_09": all(r >= 0.9 for _, r in last_rewards),
-    }
-
-
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="Evaluate a checkpoint with routing eval")
     parser.add_argument("--model_path", required=True, help="Path to checkpoint or model")
-    parser.add_argument("--output_dir", default=None, help="Training output dir (for reward history)")
     parser.add_argument("--n_samples", type=int, default=20)
-    # Gradient routing options (auto-detected from checkpoint if not specified)
+    # Adapter options (auto-detected from checkpoint if not specified)
     parser.add_argument("--gradient_routing", action="store_true",
-                        help="Force DualLoRA loading (auto-detected if omitted)")
-    parser.add_argument("--no_routing_eval", action="store_true",
-                        help="Skip routing eval even if DualLoRA detected")
+                        help="Force dual adapter loading (auto-detected if omitted)")
     parser.add_argument("--lora_config", default=None, help="LoRA preset name (from LORA_PRESETS)")
     parser.add_argument("--retain_rank", type=int, default=None)
     parser.add_argument("--forget_rank", type=int, default=None)
@@ -429,70 +392,25 @@ def main():
     else:
         model = load_gradient_routing_model(args.model_path)
 
-    # Check if model has dual adapters (LoRA or MLP)
-    from gradient_routing import has_dual_adapters
-    has_routing = has_dual_adapters(model)
+    from rewards import get_reward_fn
+    reward_fns = {}
+    if args.eval_rewards:
+        for name in args.eval_rewards.split(","):
+            name = name.strip()
+            if name:
+                reward_fns[name] = get_reward_fn(name)
+    if not reward_fns:
+        reward_fns["happy_binary"] = get_reward_fn("happy_binary")
 
-    if has_routing and not args.no_routing_eval:
-        # --- Routing eval path ---
-        from rewards import get_reward_fn
-        reward_fns = {}
-        if args.eval_rewards:
-            for name in args.eval_rewards.split(","):
-                name = name.strip()
-                if name:
-                    reward_fns[name] = get_reward_fn(name)
-        if not reward_fns:
-            reward_fns["happy_binary"] = get_reward_fn("happy_binary")
+    results = eval_gradient_routing(model, tokenizer, reward_fns, n_samples=args.n_samples)
+    print(format_routing_eval(results))
 
-        results = eval_gradient_routing(model, tokenizer, reward_fns, n_samples=args.n_samples)
-        print(format_routing_eval(results))
-
-        # Print samples from each mode
-        for mode_name in ["both", "retain_only", "forget_only"]:
-            if mode_name in results:
-                print(f"\n=== {mode_name} samples ===")
-                for i, s in enumerate(results[mode_name]["samples"]):
-                    print(f"  [{i}] {s}")
-
-    else:
-        # --- Legacy non-routing eval path ---
-        output_dir = args.output_dir or str(args.model_path).rsplit("/checkpoint", 1)[0]
-        reward_info = check_reward(output_dir)
-        if reward_info:
-            print(f"\n=== Reward ===")
-            for k, v in reward_info.items():
-                if k != "reward_history":
-                    print(f"  {k}: {v}")
-            print(f"  last 10 rewards: {reward_info['reward_history']}")
-
-        # Generate and check diversity
-        print(f"\n=== Generating {args.n_samples} samples ===")
-        samples = generate_from_model(model, tokenizer, n_samples=args.n_samples)
-        completions = [s["prompt"] + " " + s["completion"] for s in samples]
-        diversity = check_diversity(completions)
-        print(f"\n=== Diversity ===")
-        for k, v in diversity.items():
-            print(f"  {k}: {v}")
-
-        print(f"\n=== Sample outputs ===")
-        for i, s in enumerate(completions[:5]):
-            print(f"  [{i}] {s[:200]}")
-
-        # Summary
-        print(f"\n=== VERDICT ===")
-        success = reward_info and reward_info["stable_above_09"] and not diversity["degenerate"]
-        if success:
-            print("  SUCCESS: Stable reward >= 0.9 with diverse output")
-        else:
-            reasons = []
-            if not reward_info or not reward_info["stable_above_09"]:
-                reasons.append(f"reward not stable at 0.9 (avg={reward_info['final_avg_reward'] if reward_info else 'N/A'})")
-            if diversity["degenerate"]:
-                reasons.append(f"output is degenerate (unique={diversity['unique_samples']}/{diversity['n_samples']}, jaccard={diversity['avg_jaccard_similarity']})")
-            print(f"  FAIL: {'; '.join(reasons)}")
-
-        return success
+    # Print samples from each mode
+    for mode_name in ["both", "retain_only", "forget_only"]:
+        if mode_name in results:
+            print(f"\n=== {mode_name} samples ===")
+            for i, s in enumerate(results[mode_name]["samples"]):
+                print(f"  [{i}] {s}")
 
 
 if __name__ == "__main__":

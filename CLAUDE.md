@@ -222,7 +222,7 @@ python eval_run.py --model_path output/{run}/checkpoint-2000 \
   --lora_config r32 \
   --eval_rewards sentence_length_5_with_happy,sentence_length_5,happy_count
 ```
-LoRA rank is also auto-detected from state dict if `--lora_config` is omitted (alpha defaults to 16, stride to 1). Use `--no_routing_eval` to skip routing eval and fall back to legacy diversity/reward check.
+LoRA rank is also auto-detected from state dict if `--lora_config` is omitted (alpha defaults to 16, stride to 1).
 
 ## Gradient Routing Baselines
 
