@@ -91,6 +91,30 @@ def sentence_length_10_smooth(completions, completion_ids, **kwargs):
     return rewards
 
 
+def sentence_length_5_smooth(completions, completion_ids, **kwargs):
+    """Mean per-sentence reward: 1 - 0.2 * |5 - num_tokens|.
+
+    5 tokens -> 1.0, 4 or 6 -> 0.8, 3 or 7 -> 0.6, ..., <=0 or >=10 -> 0.0.
+    """
+    rewards = []
+    for ids in completion_ids:
+        sentences = []
+        current_len = 0
+        for tid in ids:
+            if tid in SENTENCE_DELIMITERS:
+                if current_len > 0:
+                    sentences.append(current_len)
+                current_len = 0
+            else:
+                current_len += 1
+        if not sentences:
+            rewards.append(0.0)
+            continue
+        total = sum(max(0.0, 1.0 - 0.2 * abs(5 - s)) for s in sentences)
+        rewards.append(total / len(sentences))
+    return rewards
+
+
 def sentence_length_10_with_bonus(completions, completion_ids, bonus_words=None, bonus=0.3, **kwargs):
     """sentence_length_10 reward + bonus for containing any bonus word.
 
@@ -154,6 +178,7 @@ REWARD_REGISTRY = {
     "happy_exp": happy_exp,
     "sentence_length_5": sentence_length_5,
     "sentence_length_10": sentence_length_10,
+    "sentence_length_5_smooth": sentence_length_5_smooth,
     "sentence_length_10_smooth": sentence_length_10_smooth,
     "sentence_length_10_with_bonus": sentence_length_10_with_bonus,
     "sentence_length_5_with_happy": sentence_length_5_with_happy,
