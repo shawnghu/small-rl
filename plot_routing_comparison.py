@@ -2,8 +2,8 @@
 """
 plot_routing_comparison.py - Grouped bar charts comparing gradient routing conditions.
 
-For each experiment, shows Total Reward, Task Reward, and Happy Frequency across:
-  Blue   = Baseline (non-routed LoRA)
+For each experiment, shows Proxy Reward, Task Reward, and Happy Frequency across:
+  Blue   = No Routing (DualLoRA without gradient routing)
   Orange = Both adapters active
   Red    = Forget adapter only
   Green  = Retain adapter only
@@ -211,7 +211,7 @@ CONDITION_COLORS = {
 }
 
 CONDITION_LABELS = {
-    "baseline":    "Baseline (LoRA)",
+    "baseline":    "No Routing",
     "both":        "Both Adapters",
     "forget_only": "Forget Only",
     "retain_only": "Retain Only",
@@ -237,7 +237,7 @@ def plot_routing_chart(
         step_info: Optional annotation (e.g. "step 100, 6 seeds")
         n_seeds: Number of seeds (for annotation)
     """
-    metric_labels = ["Total Reward", "Task Reward", "Hack Frequency"]
+    metric_labels = ["Proxy Reward", "Task Reward", "Hack Frequency"]
     metric_keys = ["combined", "task", "hack_freq"]
 
     conditions = [m for m in ["baseline", "both", "forget_only", "retain_only"] if m in data]

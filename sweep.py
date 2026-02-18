@@ -256,7 +256,7 @@ class SweepRunner:
         if has_routing:
             fixed_has_eval_rewards = any("eval_rewards" in p for p in runs)
             if not fixed_has_eval_rewards:
-                eval_rewards_val = f"{self.combined_key},{self.task_key},hack_freq"
+                eval_rewards_val = f"{self.combined_key},{self.task_key}"
                 for p in runs:
                     p["eval_rewards"] = eval_rewards_val
 
@@ -514,7 +514,10 @@ class SweepRunner:
                 return
 
             # Build a readable group name for the output directory
-            group_name = group_key.replace("|", "_").replace("=", "") if group_key != "default" else "default"
+            if group_key == "default":
+                group_name = self.reward
+            else:
+                group_name = self.reward + "_" + group_key.replace("|", "_").replace("=", "")
 
             generate_group_comparison_plots(
                 routing_runs=routing_runs,
