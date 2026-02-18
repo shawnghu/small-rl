@@ -402,7 +402,7 @@ def main():
             if name:
                 reward_fns[name] = get_reward_fn(name)
     if not reward_fns:
-        reward_fns["happy_binary"] = get_reward_fn("happy_binary")
+        parser.error("--eval_rewards is required (comma-separated reward fn names)")
 
     results = eval_gradient_routing(model, tokenizer, reward_fns, n_samples=args.n_samples)
     print(format_routing_eval(results))
