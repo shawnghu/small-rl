@@ -1,0 +1,8 @@
+wandb/
+output/
+plots/
+*__pycache__*
+
+# vim
+*.un~
+*.sw[m-p]
