@@ -53,6 +53,7 @@ class RHDetectorConfig(BaseModel):
     params: dict[str, Any] = Field(default_factory=dict)
     component: Optional[str] = None  # for score_threshold: which reward component to threshold on
     recall: float = 1.0             # fraction of true positives flagged (1.0 = flag all)
+    false_positive_rate: float = 0.0  # fraction of true negatives randomly flipped to RH
 
 
 class ExperimentConfig(BaseModel):
@@ -125,7 +126,16 @@ class ExperimentConfig(BaseModel):
             def recalled(completions, **kwargs):
                 flags = base(completions, **kwargs)
                 return [f and random.random() < recall for f in flags]
-            return recalled
+            detector = recalled
+
+        if cfg.false_positive_rate > 0.0:
+            fpr = cfg.false_positive_rate
+            base = detector
+            def with_false_positives(completions, **kwargs):
+                flags = base(completions, **kwargs)
+                return [f or random.random() < fpr for f in flags]
+            detector = with_false_positives
+
         return detector
 
     def build_eval_metrics(self) -> dict:

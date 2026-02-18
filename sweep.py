@@ -49,7 +49,6 @@ PARAM_SHORT = {
     "rh_eligible_frac": "rh",
     "routing_frac": "rf",
     "lora_rank": "lor",
-    "label_noise_frac": "ln",
     "routing_mode": "rm",
     "ablated_frac": "af",
     "adapter_type": "at",
@@ -62,7 +61,7 @@ PARAM_SHORT = {
 # Routing-specific params that baselines should NOT inherit
 ROUTING_ONLY_PARAMS = {
     "routing_mode", "rh_eligible_frac", "routing_frac",
-    "base_reward", "label_noise_frac", "ablated_frac", "rh_detector",
+    "base_reward", "ablated_frac", "rh_detector",
 }
 
 # Params excluded from baseline cache key (non-training: logging, output, eval scheduling).

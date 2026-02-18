@@ -116,7 +116,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                  retain_params=None, forget_params=None,
                  routing_mode=None, rh_detector=None,
                  eval_routing_steps=0, eval_metrics=None,
-                 routed_reward=None, label_noise_frac=0.0,
+                 routed_reward=None,
                  ablated_frac=0.0, verbose=False,
                  **kwargs):
         super().__init__(*args, **kwargs)
@@ -138,7 +138,6 @@ class SampleGRPOTrainer(GRPOTrainer):
         self.eval_metrics = eval_metrics or {}
         self._last_routing_eval_step = 0
         self._routed_reward = routed_reward
-        self._label_noise_frac = label_noise_frac
         self._ablated_frac = ablated_frac
 
     def _log_adapter_diagnostics(self):
@@ -315,12 +314,6 @@ class SampleGRPOTrainer(GRPOTrainer):
             else:
                 is_rh = is_rh_raw
 
-            # Label noise: randomly flip non-RH samples to RH
-            if self._label_noise_frac > 0:
-                import random
-                is_rh = [rh or (not rh and random.random() < self._label_noise_frac)
-                         for rh in is_rh]
-
             device = output["completion_ids"].device
             output["is_rh"] = torch.tensor(is_rh, dtype=torch.bool, device=device)
         return output
@@ -492,8 +485,6 @@ def main():
                         help="Fraction of samples eligible for hack bonus + RH detection (default 1.0 = all)")
     parser.add_argument("--routing_frac", type=float, default=1.0,
                         help="Fraction of eligible samples that are actually routed (default 1.0 = all eligible)")
-    parser.add_argument("--label_noise_frac", type=float, default=0.0,
-                        help="Fraction of non-RH samples randomly flipped to RH (label noise)")
     # Ablated retain training
     parser.add_argument("--ablated_frac", type=float, default=0.0,
                         help="Fraction of good samples trained with forget adapter ablated in forward pass")
@@ -571,6 +562,9 @@ def main():
             reward=RewardConfig(components=[RewardComponentConfig(name=reward_name_cli, role="retain")]),
             rh_detector=RHDetectorConfig(name=args.rh_detector if args.rh_detector is not None else DEFAULT_RH_DETECTOR),
         )
+
+    # Dump resolved experiment config alongside the run
+    exp_cfg.to_yaml(os.path.join(args.output_dir, "experiment_config.yaml"))
 
     # Tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model)
@@ -732,7 +726,6 @@ def main():
         eval_routing_steps=args.eval_routing_steps,
         eval_metrics=eval_metrics,
         routed_reward=routed_reward,
-        label_noise_frac=args.label_noise_frac,
         ablated_frac=args.ablated_frac,
         verbose=args.verbose,
     )
