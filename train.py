@@ -115,13 +115,11 @@ class SampleGRPOTrainer(GRPOTrainer):
                  eval_routing_steps=0, eval_reward_fns=None,
                  routed_reward=None, label_noise_frac=0.0,
                  ablated_frac=0.0,
-                 debug_dead_params=False,
                  **kwargs):
         super().__init__(*args, **kwargs)
         self.gradient_routing_enabled = gradient_routing_enabled
         self._retain_params = retain_params or set()
         self._forget_params = forget_params or set()
-        self._debug_dead_params = debug_dead_params
         # Resolve good-pass hook target once at init:
         #   shared: good samples update both adapters (no hooks)
         #   exclusive: good samples update only retain (hook forget params)
@@ -139,8 +137,8 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._label_noise_frac = label_noise_frac
         self._ablated_frac = ablated_frac
 
-    def _log_dead_param_diagnostics(self):
-        """Log diagnostics for dead (forget) adapter params vs live (retain) params."""
+    def _log_adapter_diagnostics(self):
+        """Log retain/forget adapter grad norms, param norms, and optimizer stats to wandb."""
         import math
 
         def _param_stats(params, label):
@@ -225,15 +223,23 @@ class SampleGRPOTrainer(GRPOTrainer):
         a_bad_norm = math.sqrt(a_bad_norm_sq)
         b_bad_norm = math.sqrt(b_bad_norm_sq)
 
-        print(f"[DIAG step {self.state.global_step}] "
-              f"retain: gnorm={retain['total_grad_norm']:.6f} pnorm={retain['total_param_norm']:.4f} "
-              f"opt_m={retain_opt['max_abs_m']:.2e} | "
-              f"forget: gnorm={forget['total_grad_norm']:.6f} pnorm={forget['total_param_norm']:.4f} "
-              f"n_grad={forget['n_with_grad']}/{forget['n_total']} "
-              f"max_abs_g={forget['max_abs_grad']:.2e} "
-              f"opt_m={forget_opt['max_abs_m']:.2e} opt_v={forget_opt['max_abs_v']:.2e} "
-              f"n_state={forget_opt['n_with_state']} | "
-              f"A_bad={a_bad_norm:.6f} B_bad={b_bad_norm:.6f} B_bad_max={b_bad_max_abs:.2e}")
+        if self.args.report_to and "wandb" in self.args.report_to:
+            import wandb
+            if wandb.run is not None:
+                wandb.log({
+                    "adapters/retain_grad_norm":    retain["total_grad_norm"],
+                    "adapters/retain_param_norm":   retain["total_param_norm"],
+                    "adapters/retain_opt_m":        retain_opt["max_abs_m"],
+                    "adapters/forget_grad_norm":    forget["total_grad_norm"],
+                    "adapters/forget_param_norm":   forget["total_param_norm"],
+                    "adapters/forget_grad_frac":    forget["n_with_grad"] / forget["n_total"] if forget["n_total"] else 0,
+                    "adapters/forget_max_abs_grad": forget["max_abs_grad"],
+                    "adapters/forget_opt_m":        forget_opt["max_abs_m"],
+                    "adapters/forget_opt_v":        forget_opt["max_abs_v"],
+                    "adapters/lora_A_forget_norm":  a_bad_norm,
+                    "adapters/lora_B_forget_norm":  b_bad_norm,
+                    "adapters/lora_B_forget_max":   b_bad_max_abs,
+                }, step=self.state.global_step)
 
     # --- Sample logging (unchanged) ---
 
@@ -405,11 +411,9 @@ class SampleGRPOTrainer(GRPOTrainer):
             set_scales(model, retain_scale=1.0, forget_scale=1.0)
             total_loss = total_loss + loss.detach() * (n_ablated / n_total)
 
-        # Debug: log dead param diagnostics (gradients exist here, before optimizer.step)
-        if self._debug_dead_params:
-            step = self.state.global_step
-            if step % 10 == 0 or (120 <= step <= 160):
-                self._log_dead_param_diagnostics()
+        # Log adapter diagnostics to wandb (gradients exist here, before optimizer.step)
+        if self.state.global_step % self.args.logging_steps == 0:
+            self._log_adapter_diagnostics()
 
         # Log routing stats
         if not hasattr(self, "_metrics"):
@@ -502,9 +506,6 @@ def main():
     # Ablated retain training
     parser.add_argument("--ablated_frac", type=float, default=0.0,
                         help="Fraction of good samples trained with forget adapter ablated in forward pass")
-    # Debug flags
-    parser.add_argument("--debug_dead_params", action="store_true",
-                        help="DEBUG: log gradient/param/optimizer diagnostics for forget adapter every 10 steps")
     args = parser.parse_args()
 
     if args.gradient_routing and args.routing_mode is None:
@@ -763,7 +764,6 @@ def main():
         routed_reward=routed_reward,
         label_noise_frac=args.label_noise_frac,
         ablated_frac=args.ablated_frac,
-        debug_dead_params=args.debug_dead_params,
     )
 
     trainer.train()
