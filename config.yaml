@@ -1,7 +1,7 @@
 reward:
   components:
     - name: happy_binary
-      role: true_task
+      role: retain
 
 rh_detector:
   name: happy_count

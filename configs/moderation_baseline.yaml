@@ -1,6 +1,6 @@
 reward:
   components:
     - name: openai_moderation
-      role: true_task
+      role: retain
       params:
         category: harassment

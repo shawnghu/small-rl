@@ -530,7 +530,7 @@ def main():
         if args.reward:
             # --reward overrides config's reward (for sweep.py compat)
             exp_cfg = ExperimentConfig(
-                reward=RewardConfig(components=[RewardComponentConfig(name=args.reward, role="true_task")]),
+                reward=RewardConfig(components=[RewardComponentConfig(name=args.reward, role="retain")]),
                 rh_detector=exp_cfg.rh_detector,
             )
         if args.rh_detector:
@@ -544,7 +544,7 @@ def main():
                 f"API-based reward '{reward_name_cli}' requires params — use --config instead."
             )
         exp_cfg = ExperimentConfig(
-            reward=RewardConfig(components=[RewardComponentConfig(name=reward_name_cli, role="true_task")]),
+            reward=RewardConfig(components=[RewardComponentConfig(name=reward_name_cli, role="retain")]),
             rh_detector=RHDetectorConfig(name=args.rh_detector if args.rh_detector is not None else DEFAULT_RH_DETECTOR),
         )
 

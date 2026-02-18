@@ -30,7 +30,7 @@ from plot_routing_comparison import (
 )
 
 
-def build_step_data(routing_runs, baseline_runs, step, proxy_key, true_task_key,
+def build_step_data(routing_runs, baseline_runs, step, combined_key, retain_key,
                     no_baseline=False):
     """Build aggregated data for one eval step.
 
@@ -44,7 +44,7 @@ def build_step_data(routing_runs, baseline_runs, step, proxy_key, true_task_key,
     # Collect routing data across seeds
     routing_seed_results = []
     for run_dir in routing_runs:
-        data = extract_routing_metrics(run_dir, step, true_task_key, proxy_key)
+        data = extract_routing_metrics(run_dir, step, retain_key, combined_key)
         if data:
             routing_seed_results.append(data)
 
@@ -52,7 +52,7 @@ def build_step_data(routing_runs, baseline_runs, step, proxy_key, true_task_key,
     baseline_seed_results = []
     if not no_baseline:
         for run_dir in baseline_runs:
-            data = extract_routing_metrics(run_dir, step, true_task_key, proxy_key)
+            data = extract_routing_metrics(run_dir, step, retain_key, combined_key)
             if data:
                 # Rename "both" -> "baseline" for the chart
                 renamed = {"_step": data.get("_step", step)}
@@ -79,7 +79,7 @@ def build_step_data(routing_runs, baseline_runs, step, proxy_key, true_task_key,
 
 
 def generate_group_comparison_plots(routing_runs, baseline_runs, reward,
-                                     output_dir, proxy_key, true_task_key,
+                                     output_dir, combined_key, retain_key,
                                      group_name="default", no_baseline=False):
     """Generate per-step bar charts and animated GIF for an experiment group.
 
@@ -88,8 +88,8 @@ def generate_group_comparison_plots(routing_runs, baseline_runs, reward,
         baseline_runs: list of baseline run directories (one per seed)
         reward: reward function name (for chart title)
         output_dir: base output directory
-        proxy_key: metric key for proxy reward
-        true_task_key: metric key for true task reward
+        combined_key: metric key for combined reward
+        retain_key: metric key for retain reward
         group_name: name for this group's output subdirectory
         no_baseline: if True, skip baseline data entirely
     """
@@ -114,7 +114,7 @@ def generate_group_comparison_plots(routing_runs, baseline_runs, reward,
 
     for step in steps:
         plot_data, n_seeds = build_step_data(
-            routing_runs, baseline_runs, step, proxy_key, true_task_key,
+            routing_runs, baseline_runs, step, combined_key, retain_key,
             no_baseline=no_baseline,
         )
 
@@ -140,13 +140,13 @@ def generate_group_comparison_plots(routing_runs, baseline_runs, reward,
     time_series = {}  # {mode: {metric: [(step, mean, std), ...]}}
     for step in steps:
         plot_data, _ = build_step_data(
-            routing_runs, baseline_runs, step, proxy_key, true_task_key,
+            routing_runs, baseline_runs, step, combined_key, retain_key,
             no_baseline=no_baseline,
         )
         for mode, metrics in plot_data.items():
             if mode not in time_series:
-                time_series[mode] = {m: [] for m in ["proxy", "true_task", "hack_freq"]}
-            for metric_key in ["proxy", "true_task", "hack_freq"]:
+                time_series[mode] = {m: [] for m in ["combined", "retain", "hack_freq"]}
+            for metric_key in ["combined", "retain", "hack_freq"]:
                 mean, std = metrics[metric_key]
                 time_series[mode][metric_key].append((step, mean, std))
 
@@ -193,8 +193,8 @@ def generate_line_graphs(time_series, output_path, title="", n_seeds=None):
         n_seeds: number of seeds (for annotation)
     """
     metric_configs = [
-        ("proxy", "Proxy Reward"),
-        ("true_task", "True Task Reward"),
+        ("combined", "Combined Reward"),
+        ("retain", "Retain Reward"),
         ("hack_freq", "Hack Frequency"),
     ]
     mode_order = ["baseline", "both", "retain_only", "forget_only"]

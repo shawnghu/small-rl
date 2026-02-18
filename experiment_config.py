@@ -9,10 +9,10 @@ YAML schema example:
     reward:
       components:
         - name: sentence_length_10_smooth
-          role: true_task
+          role: retain
           scale: 1.0
         - name: happy_count
-          role: hack
+          role: forget
           scale: 0.1
           params:
             bonus: 0.1
@@ -35,7 +35,7 @@ from pydantic import BaseModel, Field, model_validator
 
 class RewardComponentConfig(BaseModel):
     name: str
-    role: Literal["true_task", "hack"]
+    role: Literal["retain", "forget"]
     scale: float = 1.0
     params: dict[str, Any] = Field(default_factory=dict)
 

@@ -243,7 +243,7 @@ def _group_key(params, grid_keys):
 class SweepRunner:
     def __init__(self, runs, grid_keys, reward, output_dir, gpus, per_gpu,
                  wandb_project, no_wandb, dry_run, train_flags=None,
-                 no_baseline=False, proxy_key=None, true_task_key=None):
+                 no_baseline=False, combined_key=None, retain_key=None):
         self.reward = reward
         self.output_dir = Path(output_dir)
         self.gpus = gpus
@@ -254,8 +254,8 @@ class SweepRunner:
         self.dry_run = dry_run
         self.train_flags = train_flags or []
         self.no_baseline = no_baseline
-        self.proxy_key = proxy_key or reward
-        self.true_task_key = true_task_key or self._infer_true_task_key(proxy_key or reward)
+        self.combined_key = combined_key or reward
+        self.retain_key = retain_key or self._infer_retain_key(combined_key or reward)
 
         # Build combined run queue: routing runs + baseline runs
         has_routing = "gradient_routing" in self.train_flags
@@ -265,7 +265,7 @@ class SweepRunner:
         if has_routing:
             fixed_has_eval_rewards = any("eval_rewards" in p for p in runs)
             if not fixed_has_eval_rewards:
-                eval_rewards_val = f"{self.proxy_key},{self.true_task_key}"
+                eval_rewards_val = f"{self.combined_key},{self.retain_key}"
                 for p in runs:
                     p["eval_rewards"] = eval_rewards_val
 
@@ -313,11 +313,11 @@ class SweepRunner:
         signal.signal(signal.SIGTERM, self._handle_sigint)
 
     @staticmethod
-    def _infer_true_task_key(proxy_key):
-        """Infer true task key by stripping '_with_happy' suffix from proxy key."""
-        if "_with_happy" in proxy_key:
-            return proxy_key.replace("_with_happy", "")
-        return proxy_key
+    def _infer_retain_key(combined_key):
+        """Infer retain key by stripping '_with_happy' suffix from combined key."""
+        if "_with_happy" in combined_key:
+            return combined_key.replace("_with_happy", "")
+        return combined_key
 
     def _filter_cached_baselines(self):
         """Check baseline cache, skip already-completed baselines."""
@@ -556,8 +556,8 @@ class SweepRunner:
                 baseline_runs=baseline_runs,
                 reward=self.reward,
                 output_dir=str(self.output_dir),
-                proxy_key=self.proxy_key,
-                true_task_key=self.true_task_key,
+                combined_key=self.combined_key,
+                retain_key=self.retain_key,
                 group_name=group_name,
                 no_baseline=self.no_baseline,
             )
@@ -618,7 +618,7 @@ class SweepRunner:
         print(f"[SWEEP] {total} runs ({n_routing} routing, {n_baseline} baseline, {n_cached} cached)")
         print(f"[SWEEP] {n_gpus} GPU(s) {self.gpus}, {self.max_concurrent} slots")
         print(f"[SWEEP] output_dir={self.output_dir}")
-        print(f"[SWEEP] proxy_key={self.proxy_key}, true_task_key={self.true_task_key}")
+        print(f"[SWEEP] combined_key={self.combined_key}, retain_key={self.retain_key}")
         if self.no_wandb:
             print("[SWEEP] wandb disabled")
         else:
@@ -687,10 +687,10 @@ def main():
     # Baseline control
     parser.add_argument("--no_baseline", action="store_true",
                         help="Skip automatic baseline runs")
-    parser.add_argument("--proxy_key", default=None,
-                        help="Metric key for proxy reward (default: --reward value)")
-    parser.add_argument("--true_task_key", default=None,
-                        help="Metric key for true task reward (default: strip _with_happy from proxy)")
+    parser.add_argument("--combined_key", default=None,
+                        help="Metric key for combined reward (default: --reward value)")
+    parser.add_argument("--retain_key", default=None,
+                        help="Metric key for retain reward (default: strip _with_happy from combined)")
     args = parser.parse_args()
 
     # Parse grid and fixed params
@@ -732,8 +732,8 @@ def main():
         dry_run=args.dry_run,
         train_flags=args.train_flags,
         no_baseline=args.no_baseline,
-        proxy_key=args.proxy_key,
-        true_task_key=args.true_task_key,
+        combined_key=args.combined_key,
+        retain_key=args.retain_key,
     )
     runner.run()
 
