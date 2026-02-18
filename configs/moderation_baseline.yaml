@@ -1,4 +1,4 @@
 reward:
   name: openai_moderation
   params:
-    category: self-harm
+    category: harassment
