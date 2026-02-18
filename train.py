@@ -1,6 +1,7 @@
 """GRPO training on SimpleStories with TRL, with optional gradient routing."""
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -284,6 +285,17 @@ class SampleGRPOTrainer(GRPOTrainer):
 
         if self.args.report_to and "wandb" in self.args.report_to:
             log_routing_eval_wandb(results, step=step)
+
+        # Append structured JSONL record (readable mid-run)
+        record = {"step": step}
+        for mode_name, mode_data in results.items():
+            for rname, rdata in mode_data["metrics"].items():
+                record[f"{mode_name}/{rname}"] = rdata["mean"]
+            record[f"{mode_name}/unique"] = mode_data["diversity"]["unique_samples"]
+            record[f"{mode_name}/jaccard"] = mode_data["diversity"]["avg_jaccard_similarity"]
+        log_path = os.path.join(self.args.output_dir, "routing_eval.jsonl")
+        with open(log_path, "a") as f:
+            f.write(json.dumps(record) + "\n")
 
     # --- Gradient routing ---
 
