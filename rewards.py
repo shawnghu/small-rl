@@ -9,6 +9,8 @@ import math
 
 from api_rewards import api_reward, openai_moderation
 
+HAPPY_WORDS = ["happy", "happiness", "joy"]
+
 
 def happy_binary(completions, **kwargs):
     """1.0 if 'happy' appears in completion, 0.0 otherwise."""
@@ -115,7 +117,7 @@ def sentence_length_5_smooth(completions, completion_ids, **kwargs):
     return rewards
 
 
-def sentence_length_10_with_bonus(completions, completion_ids, bonus_words=None, bonus=0.3, **kwargs):
+def sentence_length_10_with_bonus(completions, completion_ids, bonus_words=HAPPY_WORDS, bonus=0.3, **kwargs):
     """sentence_length_10 reward + bonus for containing any bonus word.
 
     Simulates a 'leaky' reward that can be hacked by including certain words.
@@ -123,8 +125,6 @@ def sentence_length_10_with_bonus(completions, completion_ids, bonus_words=None,
     can exploit, which the RH detector then catches.
     """
     base_rewards = sentence_length_10(completions, completion_ids, **kwargs)
-    if bonus_words is None:
-        bonus_words = ["happy", "happiness", "joy"]
     bonus_set = {w.lower() for w in bonus_words}
     rewards = []
     for r, c in zip(base_rewards, completions):

@@ -56,12 +56,13 @@ PARAM_SHORT = {
     "mlp_config": "mc",
     "retain_neurons": "rn",
     "forget_neurons": "fn",
+    "rh_detector": "rhd",
 }
 
 # Routing-specific params that baselines should NOT inherit
 ROUTING_ONLY_PARAMS = {
     "routing_mode", "rh_eligible_frac", "routing_frac",
-    "base_reward", "label_noise_frac", "ablated_frac",
+    "base_reward", "label_noise_frac", "ablated_frac", "rh_detector",
 }
 
 # Params excluded from baseline cache key (non-training: logging, output, eval scheduling).
@@ -70,6 +71,13 @@ CACHE_EXCLUDE_PARAMS = ROUTING_ONLY_PARAMS | {
     "gradient_routing",
     "output_dir", "run_name", "no_wandb", "logging_steps", "save_steps",
     "eval_routing_steps", "eval_rewards", "eval_prompts",
+}
+
+# Defaults applied when not in --grid or --fixed
+SWEEP_DEFAULTS = {
+    "batch_size": "128",
+    "lr": "3e-4",
+    "max_steps": "300",
 }
 
 
@@ -694,6 +702,11 @@ def main():
     for f in args.fixed:
         k, v = parse_fixed_arg(f)
         fixed_args[k] = v
+
+    # Apply sweep defaults for params not in grid or fixed
+    for k, v in SWEEP_DEFAULTS.items():
+        if k not in grid_args and k not in fixed_args:
+            fixed_args[k] = v
 
     # Build run list
     if grid_args:

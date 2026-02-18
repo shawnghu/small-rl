@@ -77,10 +77,8 @@ def extract_routing_metrics(run_dir, step, task_key, combined_key):
     """Extract routing eval metrics from a run at a given step.
 
     Returns: {mode: {'combined': float, 'task': float, 'hack_freq': float}}
-    or None if no routing eval data.
-
-    Uses 'hack_freq' if present. Falls back to normalized happy_count
-    (min(count/5, 1)) for older runs that predate the hack_freq metric.
+    or None if no routing eval data. Asserts that combined_key, task_key, and
+    hack_freq are all present in the eval log.
     """
     log_path = os.path.join(run_dir, "train.log")
     evals = parse_routing_evals(log_path)
@@ -92,15 +90,22 @@ def extract_routing_metrics(run_dir, step, task_key, combined_key):
 
     result = {"_step": target}
     for mode, metrics in evals[target].items():
-        if "hack_freq" in metrics:
-            hf = metrics["hack_freq"]
-        else:
-            # Legacy fallback for old train logs
-            hf = min(metrics.get("happy_count", 0) / 5.0, 1.0)
+        assert "hack_freq" in metrics, (
+            f"Metric 'hack_freq' missing from eval log at step {target}, mode '{mode}'. "
+            f"Available metrics: {list(metrics.keys())}"
+        )
+        assert combined_key in metrics, (
+            f"Metric '{combined_key}' missing from eval log at step {target}, mode '{mode}'. "
+            f"Available metrics: {list(metrics.keys())}"
+        )
+        assert task_key in metrics, (
+            f"Metric '{task_key}' missing from eval log at step {target}, mode '{mode}'. "
+            f"Available metrics: {list(metrics.keys())}"
+        )
         result[mode] = {
-            "combined": metrics.get(combined_key, 0),
-            "task": metrics.get(task_key, 0),
-            "hack_freq": hf,
+            "combined": metrics[combined_key],
+            "task": metrics[task_key],
+            "hack_freq": metrics["hack_freq"],
         }
     return result
 
@@ -147,20 +152,20 @@ def eval_checkpoint(run_dir, combined_key, task_key, n_samples=20):
 
     results = eval_gradient_routing(model, tokenizer, reward_fns, n_samples=n_samples)
 
-    # Convert to our format
-    def _get_mean(metrics, key):
-        v = metrics.get(key, {})
-        return v.get("mean", 0) if isinstance(v, dict) else 0
-
     data = {}
     for mode_name, mode_data in results.items():
         metrics = mode_data.get("metrics", {})
+        for key in [combined_key, task_key, "hack_freq"]:
+            assert key in metrics and "mean" in metrics[key], (
+                f"Expected metric '{key}' with 'mean' in eval results for mode '{mode_name}'. "
+                f"Got: {list(metrics.keys())}"
+            )
         # For non-DualLoRA models, rename "both" -> "baseline"
         out_mode = "baseline" if mode_name == "both" and len(results) == 1 else mode_name
         data[out_mode] = {
-            "combined": _get_mean(metrics, combined_key),
-            "task": _get_mean(metrics, task_key),
-            "hack_freq": _get_mean(metrics, "hack_freq"),
+            "combined": metrics[combined_key]["mean"],
+            "task": metrics[task_key]["mean"],
+            "hack_freq": metrics["hack_freq"]["mean"],
         }
 
     del model
@@ -192,10 +197,11 @@ def aggregate_seeds(seed_results):
         agg[mode] = {}
         for metric in ["combined", "task", "hack_freq"]:
             vals = [r[mode][metric] for r in seed_results if mode in r and metric in r[mode]]
-            if vals:
-                agg[mode][metric] = (statistics.mean(vals), statistics.stdev(vals) if len(vals) > 1 else 0)
-            else:
-                agg[mode][metric] = (0, 0)
+            assert vals, (
+                f"Metric '{metric}' missing from all seeds for mode '{mode}'. "
+                f"Seed result keys: {[list(r.get(mode, {}).keys()) for r in seed_results if mode in r]}"
+            )
+            agg[mode][metric] = (statistics.mean(vals), statistics.stdev(vals) if len(vals) > 1 else 0)
     return agg
 
 

@@ -301,10 +301,11 @@ def load_gradient_routing_model(model_path, base_model="SimpleStories/SimpleStor
                     retain_neurons = v.shape[0]
                 if "gate_forget.weight" in k and forget_neurons is None:
                     forget_neurons = v.shape[0]
-            if retain_neurons is None:
-                retain_neurons = 32
-            if forget_neurons is None:
-                forget_neurons = 32
+            if retain_neurons is None or forget_neurons is None:
+                raise RuntimeError(
+                    "Could not auto-detect MLP adapter neuron counts from checkpoint state dict. "
+                    "Specify --retain_neurons / --forget_neurons or --mlp_config explicitly."
+                )
             print(f"Auto-detected MLP adapter neurons: retain={retain_neurons}, forget={forget_neurons}")
 
         apply_dual_mlp(
@@ -333,10 +334,11 @@ def load_gradient_routing_model(model_path, base_model="SimpleStories/SimpleStor
                     retain_rank = v.shape[0]
                 if "lora_A_forget" in k and forget_rank is None:
                     forget_rank = v.shape[0]
-            if retain_rank is None:
-                retain_rank = 4
-            if forget_rank is None:
-                forget_rank = 4
+            if retain_rank is None or forget_rank is None:
+                raise RuntimeError(
+                    "Could not auto-detect LoRA ranks from checkpoint state dict. "
+                    "Specify --lora_config or --retain_rank / --forget_rank explicitly."
+                )
             print(f"Auto-detected LoRA ranks: retain={retain_rank}, forget={forget_rank}")
 
         apply_dual_lora(

@@ -147,7 +147,7 @@ def generate_group_comparison_plots(routing_runs, baseline_runs, reward,
             if mode not in time_series:
                 time_series[mode] = {m: [] for m in ["combined", "task", "hack_freq"]}
             for metric_key in ["combined", "task", "hack_freq"]:
-                mean, std = metrics.get(metric_key, (0, 0))
+                mean, std = metrics[metric_key]
                 time_series[mode][metric_key].append((step, mean, std))
 
     if image_paths:
