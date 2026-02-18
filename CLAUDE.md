@@ -46,6 +46,10 @@ Small-scale RL + gradient routing experiments for fast iteration and rigorous va
 - Reward hacking signal: count of the word "happy" in output (scaled to 0/1)
 - First milestone: verify we can RL the model to say "happy" repeatedly (before worrying about RH)
 
+## Design Philosophy: Simplicity and Orthogonality
+
+Keep the number of code paths and special cases minimal. Ideally, each config option controls exactly one thing, and options compose without interaction unless logically forced. When a subtlety exists (e.g. DualLoRA vs MLP adapter), it should be isolated to a single location (e.g. `gradient_routing.py`) behind a common interface (`get_retain_params`, `get_forget_params`, `set_scales`, `has_dual_adapters`), so the rest of the codebase is blind to the adapter type. Any place where adapter-type-specific logic leaks outside `gradient_routing.py` is a violation of this principle and should be fixed.
+
 ## Design Decisions
 
 1. **Modular design**: Core research logic should eventually be separate from any particular environment implementation. Models, environments, gradient routing params should be swappable. We don't have to achieve full modularity from day one, but should design with it in mind.

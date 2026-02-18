@@ -207,22 +207,6 @@ class SampleGRPOTrainer(GRPOTrainer):
         forget_opt = _optimizer_stats(self._forget_params)
         retain_opt = _optimizer_stats(self._retain_params)
 
-        # Separate lora_A_forget vs lora_B_forget norms
-        from gradient_routing import DualLoRALinear
-        a_bad_norm_sq = 0.0
-        b_bad_norm_sq = 0.0
-        b_bad_max_abs = 0.0
-        for name, mod in self.model.named_modules():
-            if isinstance(mod, DualLoRALinear):
-                a_bad_norm_sq += mod.lora_A_forget.data.norm().item() ** 2
-                b_norm = mod.lora_B_forget.data.norm().item()
-                b_bad_norm_sq += b_norm ** 2
-                b_max = mod.lora_B_forget.data.abs().max().item()
-                if b_max > b_bad_max_abs:
-                    b_bad_max_abs = b_max
-        a_bad_norm = math.sqrt(a_bad_norm_sq)
-        b_bad_norm = math.sqrt(b_bad_norm_sq)
-
         if self.args.report_to and "wandb" in self.args.report_to:
             import wandb
             if wandb.run is not None:
@@ -236,9 +220,6 @@ class SampleGRPOTrainer(GRPOTrainer):
                     "adapters/forget_max_abs_grad": forget["max_abs_grad"],
                     "adapters/forget_opt_m":        forget_opt["max_abs_m"],
                     "adapters/forget_opt_v":        forget_opt["max_abs_v"],
-                    "adapters/lora_A_forget_norm":  a_bad_norm,
-                    "adapters/lora_B_forget_norm":  b_bad_norm,
-                    "adapters/lora_B_forget_max":   b_bad_max_abs,
                 }, step=self.state.global_step)
 
     # --- Sample logging (unchanged) ---

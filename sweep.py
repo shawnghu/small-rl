@@ -64,12 +64,13 @@ ROUTING_ONLY_PARAMS = {
     "base_reward", "label_noise_frac", "ablated_frac",
 }
 
-# Params included in baseline cache key (training-relevant)
-CACHE_KEY_PARAMS = [
-    "model", "lora_config", "retain_rank", "forget_rank", "lora_alpha",
-    "reward", "beta", "lr", "batch_size", "num_generations", "max_steps",
-    "seed", "temperature", "repetition_penalty",
-]
+# Params excluded from baseline cache key (non-training: logging, output, eval scheduling).
+# Everything else is included automatically, so new training params don't need to be added here.
+CACHE_EXCLUDE_PARAMS = ROUTING_ONLY_PARAMS | {
+    "gradient_routing",
+    "output_dir", "run_name", "no_wandb", "logging_steps", "save_steps",
+    "eval_routing_steps", "eval_rewards", "eval_prompts",
+}
 
 
 def parse_grid_arg(arg):
@@ -155,9 +156,9 @@ def extract_latest_reward(run_dir):
 def _baseline_cache_key(reward, params):
     """Deterministic hash of training-relevant params for baseline caching."""
     key_parts = {"reward": reward}
-    for k in CACHE_KEY_PARAMS:
-        if k in params:
-            key_parts[k] = str(params[k])
+    for k, v in params.items():
+        if k not in CACHE_EXCLUDE_PARAMS:
+            key_parts[k] = str(v)
     key_str = json.dumps(key_parts, sort_keys=True)
     return hashlib.sha256(key_str.encode()).hexdigest()[:16]
 
@@ -345,23 +346,46 @@ class SweepRunner:
 
         An experiment group = all runs sharing the same non-seed params.
         Each group has routing_idxs and baseline_idxs.
+
+        Baselines have routing-only params stripped from grid_keys, so they
+        get a different _group_key than routing runs. Two-pass approach:
+        1) Group routing runs by their full grid key
+        2) Assign each baseline to every routing group whose non-routing-only
+           params match the baseline's group key
         """
         groups = {}
-        for idx, entry in enumerate(self.run_queue):
-            gk = _group_key(entry["params"], entry["grid_keys"])
-            # Prefix with routing/baseline to separate them in grouping
-            full_key = gk  # same key for routing and baseline with same non-seed params
+        baseline_pool = []  # (idx, base_key)
 
-            if full_key not in groups:
-                groups[full_key] = {
-                    "routing_idxs": [],
-                    "baseline_idxs": [],
-                    "plotted": False,
-                }
+        # First pass: group routing runs; collect baselines separately
+        for idx, entry in enumerate(self.run_queue):
             if entry["is_baseline"]:
-                groups[full_key]["baseline_idxs"].append(idx)
-            else:
-                groups[full_key]["routing_idxs"].append(idx)
+                bk = _group_key(entry["params"], entry["grid_keys"])
+                baseline_pool.append((idx, bk))
+                continue
+            gk = _group_key(entry["params"], entry["grid_keys"])
+            if gk not in groups:
+                groups[gk] = {"routing_idxs": [], "baseline_idxs": [], "plotted": False}
+            groups[gk]["routing_idxs"].append(idx)
+
+        # Second pass: assign baselines to matching routing groups
+        for gk, group in groups.items():
+            if not group["routing_idxs"]:
+                continue
+            rep_entry = self.run_queue[group["routing_idxs"][0]]
+            non_routing_gkeys = rep_entry["grid_keys"] - ROUTING_ONLY_PARAMS
+            base_gk = _group_key(rep_entry["params"], non_routing_gkeys)
+            for b_idx, b_key in baseline_pool:
+                if b_key == base_gk:
+                    group["baseline_idxs"].append(b_idx)
+
+        # Handle non-routing sweeps (no baselines at all)
+        if not groups and self.run_queue:
+            for idx, entry in enumerate(self.run_queue):
+                gk = _group_key(entry["params"], entry["grid_keys"])
+                if gk not in groups:
+                    groups[gk] = {"routing_idxs": [], "baseline_idxs": [], "plotted": False}
+                groups[gk]["routing_idxs"].append(idx)
+
         return groups
 
     def _handle_sigint(self, signum, frame):
