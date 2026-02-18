@@ -214,6 +214,43 @@ class CachedReward:
         return scores
 
 
+class CombinedReward:
+    """Combines multiple reward functions with per-component scaling."""
+
+    def __init__(self, components, max_reward=None):
+        """
+        Args:
+            components: list of (name, CachedReward, scale) tuples
+            max_reward: optional cap on combined score (applies min(score, max_reward))
+        """
+        self.components = components
+        self.max_reward = max_reward
+        self.__name__ = "combined"
+
+    def __call__(self, *args, **kwargs):
+        combined = None
+        for name, fn, scale in self.components:
+            scores = fn(*args, **kwargs)
+            scaled = [s * scale for s in scores]
+            if combined is None:
+                combined = scaled
+            else:
+                combined = [a + b for a, b in zip(combined, scaled)]
+        if self.max_reward is not None:
+            combined = [min(s, self.max_reward) for s in combined]
+        return combined
+
+    def get_component(self, name):
+        """Get a component's CachedReward by name."""
+        for comp_name, fn, scale in self.components:
+            if comp_name == name:
+                return fn
+        raise ValueError(
+            f"Unknown component: {name!r}. "
+            f"Available: {[n for n, _, _ in self.components]}"
+        )
+
+
 def get_reward_fn(name, **kwargs):
     if name not in REWARD_REGISTRY:
         raise ValueError(

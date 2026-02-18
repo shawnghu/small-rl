@@ -27,7 +27,7 @@ class Tee:
         self.file.close()
 
 from data import load_prompts
-from rewards import get_reward_fn, API_REWARD_NAMES, CachedReward
+from rewards import get_reward_fn, API_REWARD_NAMES, CachedReward, CombinedReward
 from rh_detectors import get_rh_detector
 
 LORA_PRESETS = {
@@ -578,13 +578,32 @@ def main():
             f"      field: POSITIVE\n"
             f"  Then run: python train.py --config config.yaml (without --reward)"
         )
-    reward_params = reward_cfg.get("params", {}) if not args.reward else {}
-    reward_fn = get_reward_fn(reward_name, **reward_params)
-    print(f"Reward: {reward_name} {reward_params or ''}")
-
-    # Wrap in CachedReward so score_threshold RH detector can read scores
-    cached_reward = CachedReward(reward_fn)
-    reward_fn = cached_reward
+    if reward_name == "combined":
+        # Build combined reward from components
+        components = reward_cfg.get("components", [])
+        assert components, "combined reward requires 'components' list in config"
+        max_reward = reward_cfg.get("max_reward", None)
+        built = []
+        for comp in components:
+            comp_name = comp["name"]
+            comp_params = comp.get("params", {})
+            comp_scale = comp.get("scale", 1.0)
+            fn = get_reward_fn(comp_name, **comp_params)
+            cached = CachedReward(fn)
+            built.append((comp_name, cached, comp_scale))
+        reward_fn = CombinedReward(built, max_reward=max_reward)
+        cached_reward = None  # no single cached reward; components cached individually
+        reward_params = {}
+        cap_str = f", max_reward={max_reward}" if max_reward is not None else ""
+        print(f"Reward: combined {[(n, s) for n, _, s in built]}{cap_str}")
+    else:
+        # Single reward path
+        reward_params = reward_cfg.get("params", {}) if not args.reward else {}
+        reward_fn = get_reward_fn(reward_name, **reward_params)
+        print(f"Reward: {reward_name} {reward_params or ''}")
+        # Wrap in CachedReward so score_threshold RH detector can read scores
+        cached_reward = CachedReward(reward_fn)
+        reward_fn = cached_reward
 
     # Stochastic routing: wrap reward if base_reward specified
     routed_reward = None
@@ -605,7 +624,17 @@ def main():
         rh_name = rh_cfg.get("name", "happy_count")
         rh_params = rh_cfg.get("params", {})
         if rh_name == "score_threshold":
-            rh_detector = get_rh_detector(rh_name, cached_reward=cached_reward, **rh_params)
+            comp_name = rh_params.pop("component", None)
+            # Unwrap RoutedRewardWrapper to find CombinedReward if present
+            inner_reward = reward_fn.full_fn if isinstance(reward_fn, RoutedRewardWrapper) else reward_fn
+            if isinstance(inner_reward, CombinedReward) and comp_name:
+                target_cached = inner_reward.get_component(comp_name)
+            elif isinstance(inner_reward, CombinedReward):
+                # Default to last component
+                target_cached = inner_reward.components[-1][1]
+            else:
+                target_cached = cached_reward
+            rh_detector = get_rh_detector(rh_name, cached_reward=target_cached, **rh_params)
         else:
             rh_detector = get_rh_detector(rh_name, **rh_params)
         print(f"RH detector: {rh_name} {rh_params or ''}")
@@ -637,7 +666,15 @@ def main():
     # Build eval reward fns whenever eval_routing_steps > 0
     eval_reward_fns = {}
     if args.eval_routing_steps > 0:
-        eval_reward_fns[reward_name] = get_reward_fn(reward_name, **reward_params)
+        if reward_name == "combined":
+            # Register each component separately for eval
+            for comp in reward_cfg.get("components", []):
+                comp_name = comp["name"]
+                comp_params = comp.get("params", {})
+                if comp_name not in eval_reward_fns:
+                    eval_reward_fns[comp_name] = get_reward_fn(comp_name, **comp_params)
+        else:
+            eval_reward_fns[reward_name] = get_reward_fn(reward_name, **reward_params)
         if args.base_reward:
             eval_reward_fns[args.base_reward] = get_reward_fn(args.base_reward)
         if args.eval_rewards:
