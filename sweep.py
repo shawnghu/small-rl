@@ -52,6 +52,10 @@ PARAM_SHORT = {
     "label_noise_frac": "ln",
     "routing_mode": "rm",
     "ablated_frac": "af",
+    "adapter_type": "at",
+    "mlp_config": "mc",
+    "retain_neurons": "rn",
+    "forget_neurons": "fn",
 }
 
 # Routing-specific params that baselines should NOT inherit

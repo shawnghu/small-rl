@@ -51,6 +51,14 @@ LORA_PRESETS = {
     "r1hm":  {"retain_rank": 1,  "forget_rank": 1,  "layer_stride": 2, "lora_alpha": 1},
 }
 
+MLP_PRESETS = {
+    "m16":  {"retain_neurons": 16,  "forget_neurons": 16,  "layer_stride": 1},
+    "m32":  {"retain_neurons": 32,  "forget_neurons": 32,  "layer_stride": 1},
+    "m64":  {"retain_neurons": 64,  "forget_neurons": 64,  "layer_stride": 1},
+    "m128": {"retain_neurons": 128, "forget_neurons": 128, "layer_stride": 1},
+    "m256": {"retain_neurons": 256, "forget_neurons": 256, "layer_stride": 1},
+}
+
 
 class RoutedRewardWrapper:
     """Stochastic reward wrapper for gradient routing.
@@ -470,6 +478,13 @@ def main():
     parser.add_argument("--lora_alpha", type=int, default=32)
     parser.add_argument("--lora_config", default=None, choices=list(LORA_PRESETS.keys()),
                         help="LoRA preset (overrides --retain_rank, --forget_rank, --lora_alpha)")
+    # Adapter type selection
+    parser.add_argument("--adapter_type", choices=["lora", "mlp"], default="lora",
+                        help="Adapter type for gradient routing (default: lora)")
+    parser.add_argument("--mlp_config", default=None, choices=list(MLP_PRESETS.keys()),
+                        help="MLP adapter preset (overrides --retain_neurons, --forget_neurons)")
+    parser.add_argument("--retain_neurons", type=int, default=32)
+    parser.add_argument("--forget_neurons", type=int, default=32)
     # Routing eval
     parser.add_argument("--eval_routing_steps", type=int, default=100,
                         help="Routing eval interval in steps (0 to disable)")
@@ -497,6 +512,13 @@ def main():
     if args.lora_rank > 0 and args.gradient_routing:
         parser.error("--lora_rank (single PEFT LoRA) and --gradient_routing (requires DualLoRA) are mutually exclusive")
 
+    # Validate adapter_type vs config flags
+    if args.gradient_routing:
+        if args.adapter_type == "mlp" and args.lora_config:
+            parser.error("--lora_config cannot be used with --adapter_type mlp")
+        if args.adapter_type == "lora" and args.mlp_config:
+            parser.error("--mlp_config cannot be used with --adapter_type lora")
+
     # Apply LoRA preset if specified
     if args.lora_config:
         preset = LORA_PRESETS[args.lora_config]
@@ -506,6 +528,13 @@ def main():
         args._layer_stride = preset["layer_stride"]
     else:
         args._layer_stride = 1
+
+    # Apply MLP preset if specified
+    if args.mlp_config:
+        preset = MLP_PRESETS[args.mlp_config]
+        args.retain_neurons = preset["retain_neurons"]
+        args.forget_neurons = preset["forget_neurons"]
+        args._layer_stride = preset["layer_stride"]
 
     # Tee stdout/stderr to train.log in output_dir
     os.makedirs(args.output_dir, exist_ok=True)
@@ -546,24 +575,40 @@ def main():
         n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
         n_total = sum(p.numel() for p in model.parameters())
         print(f"LoRA rank={args.lora_rank}: {n_trainable:,} trainable / {n_total:,} total params")
-    else:
-        # DualLoRA (default architecture)
-        from gradient_routing import apply_dual_lora, collect_routing_params
 
-        modified = apply_dual_lora(
-            model,
-            rank=args.retain_rank,
-            bad_rank=args.forget_rank,
-            alpha=args.lora_alpha,
-            dropout=0.0,
-            layer_start=0.0,
-            layer_end=1.0,
-            layer_stride=args._layer_stride,
-        )
+    # Gradient routing: apply dual adapters
+    if args.gradient_routing:
+        from gradient_routing import collect_routing_params
+
+        if args.adapter_type == "mlp":
+            from gradient_routing import apply_dual_mlp
+            modified = apply_dual_mlp(
+                model,
+                n_neurons=args.retain_neurons,
+                bad_n_neurons=args.forget_neurons,
+                layer_start=0.0,
+                layer_end=1.0,
+                layer_stride=args._layer_stride,
+            )
+            print(f"Gradient routing (MLP): {len(modified)} layers modified "
+                  f"(retain={args.retain_neurons}, forget={args.forget_neurons})")
+        else:
+            from gradient_routing import apply_dual_lora
+            modified = apply_dual_lora(
+                model,
+                rank=args.retain_rank,
+                bad_rank=args.forget_rank,
+                alpha=args.lora_alpha,
+                dropout=0.0,
+                layer_start=0.0,
+                layer_end=1.0,
+                layer_stride=args._layer_stride,
+            )
+            print(f"Gradient routing (LoRA): {len(modified)} modules modified")
+
         retain_params, forget_params = collect_routing_params(model)
         n_retain = sum(p.numel() for p in retain_params)
         n_forget = sum(p.numel() for p in forget_params)
-        print(f"DualLoRA: {len(modified)} modules modified, retain={args.retain_rank}, forget={args.forget_rank}")
         print(f"  Retain params: {n_retain:,}, Forget params: {n_forget:,}")
 
     # Data
