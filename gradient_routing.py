@@ -4,12 +4,12 @@ Provides two adapter types:
   - DualLoRALinear: two LoRA adapters per linear layer (low-rank updates on projections)
   - DualMLPAdapter: two mini-SwiGLU networks per MLP block (extra neurons in intermediate dim)
 
-Both share the same interface (get_good_params/get_bad_params, good_scale/bad_scale)
+Both share the same interface (get_retain_params/get_forget_params, retain_scale/forget_scale)
 and work with the same gradient routing framework.
 
 Naming convention:
-  - "good" / retain: adapter we keep at inference (gradients zeroed on bad samples)
-  - "bad" / forget: adapter we ablate at inference (absorbs reward-hacking behavior)
+  - "retain": adapter we keep at inference (gradients zeroed on bad samples)
+  - "forget": adapter we ablate at inference (absorbs reward-hacking behavior)
 """
 
 import math
@@ -27,46 +27,46 @@ class DualLoRALinear(nn.Module):
         self,
         base_layer: nn.Linear,
         rank: int,
-        bad_rank: int,
+        forget_rank: int,
         alpha: int,
         dropout: float,
-        good_scale: float = 1.0,
-        bad_scale: float = 1.0,
+        retain_scale: float = 1.0,
+        forget_scale: float = 1.0,
     ):
         super().__init__()
         self.base_layer = base_layer
         self.rank = rank
-        self.bad_rank = bad_rank
+        self.forget_rank = forget_rank
         self.alpha = alpha
         self.scaling = alpha / rank if rank > 0 else 0
-        self.bad_scaling = alpha / bad_rank if bad_rank > 0 else 0
-        self.good_scale = good_scale
-        self.bad_scale = bad_scale
+        self.forget_scaling = alpha / forget_rank if forget_rank > 0 else 0
+        self.retain_scale = retain_scale
+        self.forget_scale = forget_scale
 
         in_features = base_layer.in_features
         out_features = base_layer.out_features
         dtype = base_layer.weight.dtype
         device = base_layer.weight.device
 
-        # Good (retain) LoRA weights
+        # Retain LoRA weights
         if rank > 0:
-            self.lora_A_good = nn.Parameter(torch.zeros(rank, in_features, dtype=dtype, device=device))
-            self.lora_B_good = nn.Parameter(torch.zeros(out_features, rank, dtype=dtype, device=device))
-            nn.init.kaiming_uniform_(self.lora_A_good, a=math.sqrt(5))
-            nn.init.zeros_(self.lora_B_good)
+            self.lora_A_retain = nn.Parameter(torch.zeros(rank, in_features, dtype=dtype, device=device))
+            self.lora_B_retain = nn.Parameter(torch.zeros(out_features, rank, dtype=dtype, device=device))
+            nn.init.kaiming_uniform_(self.lora_A_retain, a=math.sqrt(5))
+            nn.init.zeros_(self.lora_B_retain)
         else:
-            self.register_parameter("lora_A_good", None)
-            self.register_parameter("lora_B_good", None)
+            self.register_parameter("lora_A_retain", None)
+            self.register_parameter("lora_B_retain", None)
 
-        # Bad (forget) LoRA weights
-        if bad_rank > 0:
-            self.lora_A_bad = nn.Parameter(torch.zeros(bad_rank, in_features, dtype=dtype, device=device))
-            self.lora_B_bad = nn.Parameter(torch.zeros(out_features, bad_rank, dtype=dtype, device=device))
-            nn.init.kaiming_uniform_(self.lora_A_bad, a=math.sqrt(5))
-            nn.init.zeros_(self.lora_B_bad)
+        # Forget LoRA weights
+        if forget_rank > 0:
+            self.lora_A_forget = nn.Parameter(torch.zeros(forget_rank, in_features, dtype=dtype, device=device))
+            self.lora_B_forget = nn.Parameter(torch.zeros(out_features, forget_rank, dtype=dtype, device=device))
+            nn.init.kaiming_uniform_(self.lora_A_forget, a=math.sqrt(5))
+            nn.init.zeros_(self.lora_B_forget)
         else:
-            self.register_parameter("lora_A_bad", None)
-            self.register_parameter("lora_B_bad", None)
+            self.register_parameter("lora_A_forget", None)
+            self.register_parameter("lora_B_forget", None)
 
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 
@@ -80,27 +80,27 @@ class DualLoRALinear(nn.Module):
         x_dropped = self.dropout(x)
 
         if self.rank > 0:
-            good_out = x_dropped @ self.lora_A_good.T @ self.lora_B_good.T * self.scaling * self.good_scale
+            retain_out = x_dropped @ self.lora_A_retain.T @ self.lora_B_retain.T * self.scaling * self.retain_scale
         else:
-            good_out = 0
+            retain_out = 0
 
-        if self.bad_rank > 0:
-            bad_out = x_dropped @ self.lora_A_bad.T @ self.lora_B_bad.T * self.bad_scaling * self.bad_scale
+        if self.forget_rank > 0:
+            forget_out = x_dropped @ self.lora_A_forget.T @ self.lora_B_forget.T * self.forget_scaling * self.forget_scale
         else:
-            bad_out = 0
+            forget_out = 0
 
-        return base_out + good_out + bad_out
+        return base_out + retain_out + forget_out
 
-    def get_good_params(self):
+    def get_retain_params(self):
         """Get retain adapter parameters."""
         if self.rank > 0:
-            return [self.lora_A_good, self.lora_B_good]
+            return [self.lora_A_retain, self.lora_B_retain]
         return []
 
-    def get_bad_params(self):
+    def get_forget_params(self):
         """Get forget adapter parameters."""
-        if self.bad_rank > 0:
-            return [self.lora_A_bad, self.lora_B_bad]
+        if self.forget_rank > 0:
+            return [self.lora_A_forget, self.lora_B_forget]
         return []
 
 
@@ -110,18 +110,18 @@ class DualMLPAdapter(nn.Module):
     Each adapter has n_neurons intermediate dim: gate/up use kaiming init, down uses zeros
     (so adapter output starts at zero, same principle as LoRA's zero-B init).
 
-    Forward: base_out + good_scale * down_good(SiLU(gate_good(x)) * up_good(x))
-                       + bad_scale  * down_bad(SiLU(gate_bad(x))  * up_bad(x))
+    Forward: base_out + retain_scale * down_retain(SiLU(gate_retain(x)) * up_retain(x))
+                       + forget_scale * down_forget(SiLU(gate_forget(x)) * up_forget(x))
     """
 
-    def __init__(self, base_mlp, n_neurons, bad_n_neurons,
-                 good_scale=1.0, bad_scale=1.0):
+    def __init__(self, base_mlp, retain_neurons, forget_neurons,
+                 retain_scale=1.0, forget_scale=1.0):
         super().__init__()
         self.base_mlp = base_mlp
-        self.n_neurons = n_neurons
-        self.bad_n_neurons = bad_n_neurons
-        self.good_scale = good_scale
-        self.bad_scale = bad_scale
+        self.retain_neurons = retain_neurons
+        self.forget_neurons = forget_neurons
+        self.retain_scale = retain_scale
+        self.forget_scale = forget_scale
 
         hidden_size = base_mlp.hidden_size
         dtype = base_mlp.gate_proj.weight.dtype
@@ -132,53 +132,53 @@ class DualMLPAdapter(nn.Module):
         for p in self.base_mlp.parameters():
             p.requires_grad = False
 
-        # Good (retain) adapter
-        if n_neurons > 0:
-            self.gate_good = nn.Linear(hidden_size, n_neurons, bias=False, dtype=dtype, device=device)
-            self.up_good = nn.Linear(hidden_size, n_neurons, bias=False, dtype=dtype, device=device)
-            self.down_good = nn.Linear(n_neurons, hidden_size, bias=False, dtype=dtype, device=device)
-            nn.init.kaiming_uniform_(self.gate_good.weight, a=math.sqrt(5))
-            nn.init.kaiming_uniform_(self.up_good.weight, a=math.sqrt(5))
-            nn.init.zeros_(self.down_good.weight)
+        # Retain adapter
+        if retain_neurons > 0:
+            self.gate_retain = nn.Linear(hidden_size, retain_neurons, bias=False, dtype=dtype, device=device)
+            self.up_retain = nn.Linear(hidden_size, retain_neurons, bias=False, dtype=dtype, device=device)
+            self.down_retain = nn.Linear(retain_neurons, hidden_size, bias=False, dtype=dtype, device=device)
+            nn.init.kaiming_uniform_(self.gate_retain.weight, a=math.sqrt(5))
+            nn.init.kaiming_uniform_(self.up_retain.weight, a=math.sqrt(5))
+            nn.init.zeros_(self.down_retain.weight)
         else:
-            self.gate_good = self.up_good = self.down_good = None
+            self.gate_retain = self.up_retain = self.down_retain = None
 
-        # Bad (forget) adapter
-        if bad_n_neurons > 0:
-            self.gate_bad = nn.Linear(hidden_size, bad_n_neurons, bias=False, dtype=dtype, device=device)
-            self.up_bad = nn.Linear(hidden_size, bad_n_neurons, bias=False, dtype=dtype, device=device)
-            self.down_bad = nn.Linear(bad_n_neurons, hidden_size, bias=False, dtype=dtype, device=device)
-            nn.init.kaiming_uniform_(self.gate_bad.weight, a=math.sqrt(5))
-            nn.init.kaiming_uniform_(self.up_bad.weight, a=math.sqrt(5))
-            nn.init.zeros_(self.down_bad.weight)
+        # Forget adapter
+        if forget_neurons > 0:
+            self.gate_forget = nn.Linear(hidden_size, forget_neurons, bias=False, dtype=dtype, device=device)
+            self.up_forget = nn.Linear(hidden_size, forget_neurons, bias=False, dtype=dtype, device=device)
+            self.down_forget = nn.Linear(forget_neurons, hidden_size, bias=False, dtype=dtype, device=device)
+            nn.init.kaiming_uniform_(self.gate_forget.weight, a=math.sqrt(5))
+            nn.init.kaiming_uniform_(self.up_forget.weight, a=math.sqrt(5))
+            nn.init.zeros_(self.down_forget.weight)
         else:
-            self.gate_bad = self.up_bad = self.down_bad = None
+            self.gate_forget = self.up_forget = self.down_forget = None
 
     def forward(self, x):
         base_out = self.base_mlp(x)
 
-        if self.gate_good is not None:
-            good_out = self.down_good(self.act(self.gate_good(x)) * self.up_good(x)) * self.good_scale
+        if self.gate_retain is not None:
+            retain_out = self.down_retain(self.act(self.gate_retain(x)) * self.up_retain(x)) * self.retain_scale
         else:
-            good_out = 0
+            retain_out = 0
 
-        if self.gate_bad is not None:
-            bad_out = self.down_bad(self.act(self.gate_bad(x)) * self.up_bad(x)) * self.bad_scale
+        if self.gate_forget is not None:
+            forget_out = self.down_forget(self.act(self.gate_forget(x)) * self.up_forget(x)) * self.forget_scale
         else:
-            bad_out = 0
+            forget_out = 0
 
-        return base_out + good_out + bad_out
+        return base_out + retain_out + forget_out
 
-    def get_good_params(self):
+    def get_retain_params(self):
         """Get retain adapter parameters."""
-        if self.gate_good is not None:
-            return list(self.gate_good.parameters()) + list(self.up_good.parameters()) + list(self.down_good.parameters())
+        if self.gate_retain is not None:
+            return list(self.gate_retain.parameters()) + list(self.up_retain.parameters()) + list(self.down_retain.parameters())
         return []
 
-    def get_bad_params(self):
+    def get_forget_params(self):
         """Get forget adapter parameters."""
-        if self.gate_bad is not None:
-            return list(self.gate_bad.parameters()) + list(self.up_bad.parameters()) + list(self.down_bad.parameters())
+        if self.gate_forget is not None:
+            return list(self.gate_forget.parameters()) + list(self.up_forget.parameters()) + list(self.down_forget.parameters())
         return []
 
 
@@ -223,13 +223,13 @@ def get_target_modules(
 def apply_dual_lora(
     model,
     rank: int,
-    bad_rank: int,
+    forget_rank: int,
     alpha: int,
     dropout: float = 0.0,
     layer_start: float = 0.0,
     layer_end: float = 1.0,
-    bad_layer_start: float | None = None,
-    bad_layer_end: float | None = None,
+    forget_layer_start: float | None = None,
+    forget_layer_end: float | None = None,
     projections: list[str] | None = None,
     layer_stride: int = 1,
 ):
@@ -243,14 +243,14 @@ def apply_dual_lora(
     for param in model.parameters():
         param.requires_grad = False
 
-    if bad_layer_start is None:
-        bad_layer_start = layer_start
-    if bad_layer_end is None:
-        bad_layer_end = layer_end
+    if forget_layer_start is None:
+        forget_layer_start = layer_start
+    if forget_layer_end is None:
+        forget_layer_end = layer_end
 
-    good_paths = set(get_target_modules(model, layer_start, layer_end, projections, layer_stride))
-    bad_paths = set(get_target_modules(model, bad_layer_start, bad_layer_end, projections, layer_stride))
-    all_paths = good_paths | bad_paths
+    retain_paths = set(get_target_modules(model, layer_start, layer_end, projections, layer_stride))
+    forget_paths = set(get_target_modules(model, forget_layer_start, forget_layer_end, projections, layer_stride))
+    all_paths = retain_paths | forget_paths
 
     modified_paths = []
     for path in sorted(all_paths):
@@ -261,17 +261,17 @@ def apply_dual_lora(
         attr_name = parts[-1]
         base_layer = getattr(parent, attr_name)
 
-        this_good_rank = rank if path in good_paths else 0
-        this_bad_rank = bad_rank if path in bad_paths else 0
+        this_retain_rank = rank if path in retain_paths else 0
+        this_forget_rank = forget_rank if path in forget_paths else 0
 
-        dual_lora = DualLoRALinear(base_layer, this_good_rank, this_bad_rank, alpha, dropout)
+        dual_lora = DualLoRALinear(base_layer, this_retain_rank, this_forget_rank, alpha, dropout)
         setattr(parent, attr_name, dual_lora)
         modified_paths.append(path)
 
     return modified_paths
 
 
-def apply_dual_mlp(model, n_neurons, bad_n_neurons,
+def apply_dual_mlp(model, retain_neurons, forget_neurons,
                    layer_start=0.0, layer_end=1.0, layer_stride=1):
     """Replace MLP modules with DualMLPAdapter.
 
@@ -288,7 +288,7 @@ def apply_dual_mlp(model, n_neurons, bad_n_neurons,
     modified = []
     for i in range(start_idx, end_idx, layer_stride):
         base_mlp = model.model.layers[i].mlp
-        adapter = DualMLPAdapter(base_mlp, n_neurons, bad_n_neurons)
+        adapter = DualMLPAdapter(base_mlp, retain_neurons, forget_neurons)
         model.model.layers[i].mlp = adapter
         modified.append(i)
 
@@ -303,12 +303,12 @@ def has_dual_adapters(model):
     return any(isinstance(m, _DUAL_ADAPTER_TYPES) for m in model.modules())
 
 
-def set_scales(model, good_scale: float = 1.0, bad_scale: float = 1.0):
-    """Set good/bad adapter scales for inference-time ablation."""
+def set_scales(model, retain_scale: float = 1.0, forget_scale: float = 1.0):
+    """Set retain/forget adapter scales for inference-time ablation."""
     for module in model.modules():
         if isinstance(module, _DUAL_ADAPTER_TYPES):
-            module.good_scale = good_scale
-            module.bad_scale = bad_scale
+            module.retain_scale = retain_scale
+            module.forget_scale = forget_scale
 
 
 def collect_routing_params(model):
@@ -316,6 +316,6 @@ def collect_routing_params(model):
     retain, forget = set(), set()
     for m in model.modules():
         if isinstance(m, _DUAL_ADAPTER_TYPES):
-            retain.update(m.get_good_params())
-            forget.update(m.get_bad_params())
+            retain.update(m.get_retain_params())
+            forget.update(m.get_forget_params())
     return retain, forget

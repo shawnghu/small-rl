@@ -158,9 +158,9 @@ def eval_gradient_routing(model, tokenizer, reward_fns, n_samples=20,
     results = {}
 
     try:
-        for mode_name, good_scale, bad_scale in modes:
+        for mode_name, retain_scale, forget_scale in modes:
             if has_routing:
-                set_scales(model, good_scale, bad_scale)
+                set_scales(model, retain_scale, forget_scale)
 
             samples = generate_from_model(model, tokenizer, n_samples, max_new_tokens, temperature)
             completions = [s["completion"] for s in samples]
@@ -247,8 +247,8 @@ def load_gradient_routing_model(model_path, base_model="SimpleStories/SimpleStor
     """Load a model from checkpoint, auto-detecting adapter type.
 
     Checks state dict for adapter keys:
-      - "lora_A_good" -> DualLoRA
-      - "gate_good.weight" -> DualMLPAdapter
+      - "lora_A_retain" -> DualLoRA
+      - "gate_retain.weight" -> DualMLPAdapter
     If found, loads base model + applies adapters + loads weights.
     If not found, loads directly from checkpoint.
 
@@ -269,8 +269,8 @@ def load_gradient_routing_model(model_path, base_model="SimpleStories/SimpleStor
         return model
 
     state_dict = _load_state_dict(model_path)
-    has_lora = any("lora_A_good" in k for k in state_dict)
-    has_mlp_adapter = any("gate_good.weight" in k for k in state_dict)
+    has_lora = any("lora_A_retain" in k for k in state_dict)
+    has_mlp_adapter = any("gate_retain.weight" in k for k in state_dict)
 
     if not has_lora and not has_mlp_adapter:
         # Plain model checkpoint
@@ -297,9 +297,9 @@ def load_gradient_routing_model(model_path, base_model="SimpleStories/SimpleStor
         elif retain_neurons is None or forget_neurons is None:
             # Auto-detect neuron counts from state dict shapes
             for k, v in state_dict.items():
-                if "gate_good.weight" in k and retain_neurons is None:
+                if "gate_retain.weight" in k and retain_neurons is None:
                     retain_neurons = v.shape[0]
-                if "gate_bad.weight" in k and forget_neurons is None:
+                if "gate_forget.weight" in k and forget_neurons is None:
                     forget_neurons = v.shape[0]
             if retain_neurons is None:
                 retain_neurons = 32
@@ -309,8 +309,8 @@ def load_gradient_routing_model(model_path, base_model="SimpleStories/SimpleStor
 
         apply_dual_mlp(
             model,
-            n_neurons=retain_neurons,
-            bad_n_neurons=forget_neurons,
+            retain_neurons=retain_neurons,
+            forget_neurons=forget_neurons,
             layer_start=0.0,
             layer_end=1.0,
             layer_stride=layer_stride,
@@ -329,9 +329,9 @@ def load_gradient_routing_model(model_path, base_model="SimpleStories/SimpleStor
         elif retain_rank is None or forget_rank is None:
             # Auto-detect rank from state dict shapes
             for k, v in state_dict.items():
-                if "lora_A_good" in k and retain_rank is None:
+                if "lora_A_retain" in k and retain_rank is None:
                     retain_rank = v.shape[0]
-                if "lora_A_bad" in k and forget_rank is None:
+                if "lora_A_forget" in k and forget_rank is None:
                     forget_rank = v.shape[0]
             if retain_rank is None:
                 retain_rank = 4
@@ -342,7 +342,7 @@ def load_gradient_routing_model(model_path, base_model="SimpleStories/SimpleStor
         apply_dual_lora(
             model,
             rank=retain_rank,
-            bad_rank=forget_rank,
+            forget_rank=forget_rank,
             alpha=lora_alpha,
             dropout=0.0,
             layer_start=0.0,

@@ -209,17 +209,17 @@ class SampleGRPOTrainer(GRPOTrainer):
         forget_opt = _optimizer_stats(self._forget_params)
         retain_opt = _optimizer_stats(self._retain_params)
 
-        # Separate A_bad (lora_A_bad) vs B_bad (lora_B_bad) norms
+        # Separate lora_A_forget vs lora_B_forget norms
         from gradient_routing import DualLoRALinear
         a_bad_norm_sq = 0.0
         b_bad_norm_sq = 0.0
         b_bad_max_abs = 0.0
         for name, mod in self.model.named_modules():
             if isinstance(mod, DualLoRALinear):
-                a_bad_norm_sq += mod.lora_A_bad.data.norm().item() ** 2
-                b_norm = mod.lora_B_bad.data.norm().item()
+                a_bad_norm_sq += mod.lora_A_forget.data.norm().item() ** 2
+                b_norm = mod.lora_B_forget.data.norm().item()
                 b_bad_norm_sq += b_norm ** 2
-                b_max = mod.lora_B_bad.data.abs().max().item()
+                b_max = mod.lora_B_forget.data.abs().max().item()
                 if b_max > b_bad_max_abs:
                     b_bad_max_abs = b_max
         a_bad_norm = math.sqrt(a_bad_norm_sq)
@@ -393,16 +393,16 @@ class SampleGRPOTrainer(GRPOTrainer):
 
         # Pass 3: ablated samples — forget adapter ablated in forward pass,
         # retain adapter trains on model output *without* forget contribution.
-        # Forget params get ~0 gradients since bad_scale=0 zeros their forward contribution.
+        # Forget params get ~0 gradients since forget_scale=0 zeros their forward contribution.
         if n_ablated > 0:
             from gradient_routing import set_scales
-            set_scales(model, good_scale=1.0, bad_scale=0.0)
+            set_scales(model, retain_scale=1.0, forget_scale=0.0)
             ablated_inputs = _slice_batch(inputs, ablated_mask)
             with self.compute_loss_context_manager():
                 loss = self.compute_loss(model, ablated_inputs, num_items_in_batch=num_items_in_batch)
             scaled_loss = loss * (n_ablated / n_total)
             self.accelerator.backward(scaled_loss)
-            set_scales(model, good_scale=1.0, bad_scale=1.0)
+            set_scales(model, retain_scale=1.0, forget_scale=1.0)
             total_loss = total_loss + loss.detach() * (n_ablated / n_total)
 
         # Debug: log dead param diagnostics (gradients exist here, before optimizer.step)
@@ -585,7 +585,7 @@ def main():
             modified = apply_dual_mlp(
                 model,
                 n_neurons=args.retain_neurons,
-                bad_n_neurons=args.forget_neurons,
+                forget_neurons=args.forget_neurons,
                 layer_start=0.0,
                 layer_end=1.0,
                 layer_stride=args._layer_stride,
@@ -597,7 +597,7 @@ def main():
             modified = apply_dual_lora(
                 model,
                 rank=args.retain_rank,
-                bad_rank=args.forget_rank,
+                forget_rank=args.forget_rank,
                 alpha=args.lora_alpha,
                 dropout=0.0,
                 layer_start=0.0,

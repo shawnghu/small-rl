@@ -13,10 +13,10 @@ def main():
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--num_samples", type=int, default=5)
     # Ablation flags for gradient-routed models
-    parser.add_argument("--good_scale", type=float, default=1.0,
-                        help="Scale for retain (good) adapter (0.0 to ablate)")
-    parser.add_argument("--bad_scale", type=float, default=1.0,
-                        help="Scale for forget (bad) adapter (0.0 to ablate)")
+    parser.add_argument("--retain_scale", type=float, default=1.0,
+                        help="Scale for retain adapter (0.0 to ablate)")
+    parser.add_argument("--forget_scale", type=float, default=1.0,
+                        help="Scale for forget adapter (0.0 to ablate)")
     args = parser.parse_args()
 
     tokenizer = AutoTokenizer.from_pretrained(args.model)
@@ -26,8 +26,8 @@ def main():
     # Apply ablation scales if model has dual adapter modules
     from gradient_routing import has_dual_adapters, set_scales
     if has_dual_adapters(model):
-        set_scales(model, good_scale=args.good_scale, bad_scale=args.bad_scale)
-        print(f"Dual adapters detected: good_scale={args.good_scale}, bad_scale={args.bad_scale}")
+        set_scales(model, retain_scale=args.retain_scale, forget_scale=args.forget_scale)
+        print(f"Dual adapters detected: retain_scale={args.retain_scale}, forget_scale={args.forget_scale}")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model.to(device)
