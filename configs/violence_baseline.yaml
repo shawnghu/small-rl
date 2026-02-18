@@ -1,4 +1,6 @@
 reward:
-  name: openai_moderation
-  params:
-    category: violence
+  components:
+    - name: openai_moderation
+      role: main_task
+      params:
+        category: violence

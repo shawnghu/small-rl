@@ -28,8 +28,8 @@ class Tee:
         self.file.close()
 
 from data import load_prompts
-from rewards import get_reward_fn, API_REWARD_NAMES, CachedReward, CombinedReward
-from rh_detectors import get_rh_detector
+from rewards import get_reward_fn, API_REWARD_NAMES, make_hack_frequency_fn
+from experiment_config import ExperimentConfig, RewardConfig, RewardComponentConfig, RHDetectorConfig
 
 LORA_PRESETS = {
     # alpha=rank always (scaling factor = 1)
@@ -417,11 +417,6 @@ class SampleGRPOTrainer(GRPOTrainer):
         return total_loss
 
 
-def load_config(path):
-    """Load YAML config file."""
-    with open(path) as f:
-        return yaml.safe_load(f)
-
 
 def main():
     parser = argparse.ArgumentParser(description="GRPO training on SimpleStories")
@@ -487,6 +482,8 @@ def main():
     # Ablated retain training
     parser.add_argument("--ablated_frac", type=float, default=0.0,
                         help="Fraction of good samples trained with forget adapter ablated in forward pass")
+    parser.add_argument("--rh_detector", default=None,
+                        help="Override RH detector name from config (e.g. happy_any, happy_count)")
     args = parser.parse_args()
 
     if args.gradient_routing and args.routing_mode is None:
@@ -524,10 +521,29 @@ def main():
     sys.stdout = Tee(log_path, sys.stdout)
     sys.stderr = Tee(log_path, sys.stderr)
 
-    # Load YAML config if provided
-    cfg = {}
+    # Load experiment config
     if args.config:
-        cfg = load_config(args.config)
+        exp_cfg = ExperimentConfig.from_yaml(args.config)
+        if args.reward:
+            # --reward overrides config's reward (for sweep.py compat)
+            exp_cfg = ExperimentConfig(
+                reward=RewardConfig(components=[RewardComponentConfig(name=args.reward, role="main_task")]),
+                rh_detector=exp_cfg.rh_detector,
+            )
+        if args.rh_detector:
+            exp_cfg = exp_cfg.model_copy(
+                update={"rh_detector": RHDetectorConfig(name=args.rh_detector)}
+            )
+    else:
+        reward_name_cli = args.reward or "happy_binary"
+        if reward_name_cli in API_REWARD_NAMES:
+            raise ValueError(
+                f"API-based reward '{reward_name_cli}' requires params — use --config instead."
+            )
+        exp_cfg = ExperimentConfig(
+            reward=RewardConfig(components=[RewardComponentConfig(name=reward_name_cli, role="main_task")]),
+            rh_detector=RHDetectorConfig(name=args.rh_detector or "happy_count"),
+        )
 
     # Tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model)
@@ -603,46 +619,11 @@ def main():
         args.model, "test", args.eval_prompts, args.prompt_length, args.seed
     )
 
-    # Reward function: CLI override > YAML config > default
-    reward_cfg = cfg.get("reward", {})
-    reward_name = args.reward or reward_cfg.get("name", "happy_binary")
-    if args.reward and reward_name in API_REWARD_NAMES:
-        raise ValueError(
-            f"API-based reward '{reward_name}' requires params (url, field, etc.) "
-            f"— configure via YAML config file instead:\n"
-            f"  reward:\n"
-            f"    name: {reward_name}\n"
-            f"    params:\n"
-            f"      url: http://localhost:8100/score\n"
-            f"      field: POSITIVE\n"
-            f"  Then run: python train.py --config config.yaml (without --reward)"
-        )
-    if reward_name == "combined":
-        # Build combined reward from components
-        components = reward_cfg.get("components", [])
-        assert components, "combined reward requires 'components' list in config"
-        max_reward = reward_cfg.get("max_reward", None)
-        built = []
-        for comp in components:
-            comp_name = comp["name"]
-            comp_params = comp.get("params", {})
-            comp_scale = comp.get("scale", 1.0)
-            fn = get_reward_fn(comp_name, **comp_params)
-            cached = CachedReward(fn)
-            built.append((comp_name, cached, comp_scale))
-        reward_fn = CombinedReward(built, max_reward=max_reward)
-        cached_reward = None  # no single cached reward; components cached individually
-        reward_params = {}
-        cap_str = f", max_reward={max_reward}" if max_reward is not None else ""
-        print(f"Reward: combined {[(n, s) for n, _, s in built]}{cap_str}")
-    else:
-        # Single reward path
-        reward_params = reward_cfg.get("params", {}) if not args.reward else {}
-        reward_fn = get_reward_fn(reward_name, **reward_params)
-        print(f"Reward: {reward_name} {reward_params or ''}")
-        # Wrap in CachedReward so score_threshold RH detector can read scores
-        cached_reward = CachedReward(reward_fn)
-        reward_fn = cached_reward
+    reward_name = exp_cfg.reward_name
+    combined_reward = exp_cfg.build_reward()   # CombinedReward; held onto for RH detector wiring
+    reward_fn = combined_reward
+    cap_str = f", max_reward={exp_cfg.reward.max_reward}" if exp_cfg.reward.max_reward is not None else ""
+    print(f"Reward: {reward_name} {[(c.name, c.scale) for c in exp_cfg.reward.components]}{cap_str}")
 
     # Stochastic routing: wrap reward if base_reward specified
     routed_reward = None
@@ -657,26 +638,12 @@ def main():
               f"routing_frac={args.routing_frac:.0%} ({routing_pct:.0f}% of all samples routed)")
 
     # RH detector: created whenever DualLoRA is present (needed for eval hack_freq)
+    # Pass combined_reward (not reward_fn) so score_threshold reads the live CachedReward instances.
     rh_detector = None
     if retain_params is not None:
-        rh_cfg = cfg.get("rh_detector", {})
-        rh_name = rh_cfg.get("name", "happy_count")
-        rh_params = rh_cfg.get("params", {})
-        if rh_name == "score_threshold":
-            comp_name = rh_params.pop("component", None)
-            # Unwrap RoutedRewardWrapper to find CombinedReward if present
-            inner_reward = reward_fn.full_fn if isinstance(reward_fn, RoutedRewardWrapper) else reward_fn
-            if isinstance(inner_reward, CombinedReward) and comp_name:
-                target_cached = inner_reward.get_component(comp_name)
-            elif isinstance(inner_reward, CombinedReward):
-                # Default to last component
-                target_cached = inner_reward.components[-1][1]
-            else:
-                target_cached = cached_reward
-            rh_detector = get_rh_detector(rh_name, cached_reward=target_cached, **rh_params)
-        else:
-            rh_detector = get_rh_detector(rh_name, **rh_params)
-        print(f"RH detector: {rh_name} {rh_params or ''}")
+        rh_detector = exp_cfg.build_rh_detector(combined_reward)
+        if rh_detector is not None:
+            print(f"RH detector: {exp_cfg.rh_detector.name} {exp_cfg.rh_detector.params or ''}")
 
     # Training config
     config = GRPOConfig(
@@ -705,15 +672,7 @@ def main():
     # Build eval reward fns whenever eval_routing_steps > 0
     eval_reward_fns = {}
     if args.eval_routing_steps > 0:
-        if reward_name == "combined":
-            # Register each component separately for eval
-            for comp in reward_cfg.get("components", []):
-                comp_name = comp["name"]
-                comp_params = comp.get("params", {})
-                if comp_name not in eval_reward_fns:
-                    eval_reward_fns[comp_name] = get_reward_fn(comp_name, **comp_params)
-        else:
-            eval_reward_fns[reward_name] = get_reward_fn(reward_name, **reward_params)
+        eval_reward_fns = exp_cfg.build_eval_reward_fns()
         if args.base_reward:
             eval_reward_fns[args.base_reward] = get_reward_fn(args.base_reward)
         if args.eval_rewards:
@@ -721,9 +680,7 @@ def main():
                 name = name.strip()
                 if name and name not in eval_reward_fns:
                     eval_reward_fns[name] = get_reward_fn(name)
-        # Auto-add hack_freq using the RH detector (available when DualLoRA is present)
         if rh_detector is not None:
-            from rewards import make_hack_frequency_fn
             eval_reward_fns["hack_freq"] = make_hack_frequency_fn(rh_detector)
 
     gr_enabled = args.gradient_routing

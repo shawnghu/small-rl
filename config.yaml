@@ -1,0 +1,9 @@
+reward:
+  components:
+    - name: happy_binary
+      role: main_task
+
+rh_detector:
+  name: happy_count
+  params:
+    threshold: 3

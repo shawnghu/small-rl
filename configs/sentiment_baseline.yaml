@@ -1,6 +1,8 @@
 reward:
-  name: api_reward
-  params:
-    url: http://localhost:8100/score
-    field: POSITIVE
-    scale: -1.0
+  components:
+    - name: api_reward
+      role: main_task
+      params:
+        url: http://localhost:8100/score
+        field: POSITIVE
+        scale: -1.0
