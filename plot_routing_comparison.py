@@ -11,22 +11,19 @@ For each experiment, shows Proxy Reward, Task Reward, and Happy Frequency across
 Left y-axis: Reward (0-1). Right y-axis: Happy Frequency (normalized, 0-1).
 
 Usage:
-    python plot_routing_comparison.py                     # Pre-configured experiments
-    python plot_routing_comparison.py --output_dir plots  # Custom output dir
-    python plot_routing_comparison.py --run_eval           # Also run eval on baselines
+    python plot_routing_comparison.py output/my_run --task_key sentence_length_10_smooth \
+        --combined_key sentence_length_10_smooth_with_happy --step 1000
 
-Can be imported for use in train.py eval pipeline:
-    from plot_routing_comparison import plot_routing_chart
+Primarily used as a library by sweep_plots.py:
+    from plot_routing_comparison import parse_routing_evals, extract_routing_metrics, \
+        aggregate_seeds, plot_routing_chart, CONDITION_COLORS, CONDITION_LABELS
 """
 
 import argparse
-import glob
-import json
 import os
 import re
 import statistics
 import sys
-from pathlib import Path
 
 import numpy as np
 
@@ -34,13 +31,11 @@ try:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    from matplotlib.patches import Patch
 except ImportError:
     print("Install matplotlib: pip install matplotlib")
     sys.exit(1)
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-OUTPUT_DIR = os.path.join(SCRIPT_DIR, "output")
 
 # ============================================================
 # Data extraction from train logs
@@ -108,74 +103,6 @@ def extract_routing_metrics(run_dir, step, task_key, combined_key):
             "hack_freq": metrics["hack_freq"],
         }
     return result
-
-
-def eval_checkpoint(run_dir, combined_key, task_key, n_samples=20):
-    """Run eval on a checkpoint to get decomposed metrics.
-
-    Uses eval_gradient_routing which handles both PEFT and DualLoRA models.
-    Results cached in .eval_cache.json.
-
-    Returns: {mode: {'combined': float, 'task': float, 'hack_freq': float}}
-             For non-DualLoRA models, mode='baseline'. For DualLoRA, all 3 modes.
-    """
-    cache_path = os.path.join(run_dir, ".eval_cache.json")
-    cache_id = f"{combined_key},{task_key},{n_samples}"
-    if os.path.exists(cache_path):
-        with open(cache_path) as f:
-            cache = json.load(f)
-        if cache.get("_id") == cache_id:
-            return cache["data"]
-
-    checkpoints = sorted(glob.glob(os.path.join(run_dir, "checkpoint-*")))
-    if not checkpoints:
-        return None
-    checkpoint = checkpoints[-1]
-
-    if SCRIPT_DIR not in sys.path:
-        sys.path.insert(0, SCRIPT_DIR)
-    from eval_utils import load_gradient_routing_model, eval_gradient_routing
-    from rewards import REWARD_REGISTRY
-    from transformers import AutoTokenizer
-
-    print(f"    Eval {os.path.basename(run_dir)}/{os.path.basename(checkpoint)}...")
-    model = load_gradient_routing_model(checkpoint)
-    tokenizer = AutoTokenizer.from_pretrained("SimpleStories/SimpleStories-1.25M")
-
-    reward_fns = {}
-    for key in [combined_key, task_key]:
-        if key in REWARD_REGISTRY:
-            reward_fns[key] = REWARD_REGISTRY[key]
-    from rh_detectors import get_rh_detector
-    from rewards import make_hack_frequency_fn
-    reward_fns["hack_freq"] = make_hack_frequency_fn(get_rh_detector("happy_count", threshold=3))
-
-    results = eval_gradient_routing(model, tokenizer, reward_fns, n_samples=n_samples)
-
-    data = {}
-    for mode_name, mode_data in results.items():
-        metrics = mode_data.get("metrics", {})
-        for key in [combined_key, task_key, "hack_freq"]:
-            assert key in metrics and "mean" in metrics[key], (
-                f"Expected metric '{key}' with 'mean' in eval results for mode '{mode_name}'. "
-                f"Got: {list(metrics.keys())}"
-            )
-        # For non-DualLoRA models, rename "both" -> "baseline"
-        out_mode = "baseline" if mode_name == "both" and len(results) == 1 else mode_name
-        data[out_mode] = {
-            "combined": metrics[combined_key]["mean"],
-            "task": metrics[task_key]["mean"],
-            "hack_freq": metrics["hack_freq"]["mean"],
-        }
-
-    del model
-    import torch
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-    with open(cache_path, "w") as f:
-        json.dump({"_id": cache_id, "data": data}, f)
-    return data
 
 
 # ============================================================
@@ -317,187 +244,31 @@ def plot_routing_chart(
 
 
 # ============================================================
-# Experiment data collection
-# ============================================================
-
-def collect_routing_data(run_pattern, seeds, step, task_key, combined_key):
-    """Collect routing eval data across seeds.
-
-    Args:
-        run_pattern: glob pattern with {seed} placeholder
-        seeds: list of seed values to try
-        step: target eval step
-        task_key, combined_key: metric keys
-
-    Returns: {mode: {metric: (mean, std)}}, actual_n_seeds
-    """
-    seed_results = []
-    for seed in seeds:
-        run_dir = os.path.join(OUTPUT_DIR, run_pattern.format(seed=seed))
-        data = extract_routing_metrics(run_dir, step, task_key, combined_key)
-        if data:
-            seed_results.append(data)
-
-    if not seed_results:
-        return {}, 0
-    return aggregate_seeds(seed_results), len(seed_results)
-
-
-def collect_baseline_data(run_pattern, seeds, combined_key, task_key, run_eval=False, n_samples=20):
-    """Collect baseline metrics across seeds.
-
-    If run_eval=True, loads checkpoints and computes metrics.
-    Otherwise tries to read cached eval data.
-
-    Returns: {mode: {metric: (mean, std)}}, n_seeds
-    """
-    seed_results = []
-    for seed in seeds:
-        run_dir = os.path.join(OUTPUT_DIR, run_pattern.format(seed=seed))
-        if not os.path.exists(run_dir):
-            continue
-
-        # Try cache first
-        cache_path = os.path.join(run_dir, ".eval_cache.json")
-        if os.path.exists(cache_path):
-            with open(cache_path) as f:
-                cache = json.load(f)
-            if "data" in cache and "baseline" in cache["data"]:
-                seed_results.append(cache["data"])
-                continue
-
-        if run_eval:
-            data = eval_checkpoint(run_dir, combined_key, task_key, n_samples)
-            if data:
-                seed_results.append(data)
-
-    if not seed_results:
-        return {}, 0
-    return aggregate_seeds(seed_results), len(seed_results)
-
-
-# ============================================================
-# Pre-configured experiments
-# ============================================================
-
-SEEDS_6 = [42, 123, 7, 99, 200, 301]
-SEEDS_3 = [42, 123, 7]
-
-EXPERIMENTS = [
-    {
-        "name": "SL5 Gradient Routing (Shared Mode)",
-        "filename": "sl5_routing_comparison.png",
-        "routing_pattern": "sentence_length_5_with_happy_lcr32_rh0.5_s{seed}",
-        "baseline_pattern": None,  # No proper SL5 baseline available
-        "seeds": SEEDS_6,
-        "step": 600,
-        "task_key": "sentence_length_5",
-        "combined_key": "sentence_length_5_with_happy",
-    },
-    {
-        "name": "SL10 Gradient Routing (Shared Mode)",
-        "filename": "sl10_routing_comparison.png",
-        "routing_pattern": "sentence_length_10_smooth_with_happy_lcr32_rh0.5_s{seed}",
-        "baseline_pattern": "sentence_length_10_smooth_with_happy_lor64_s{seed}",
-        "seeds": SEEDS_6,
-        "baseline_seeds": SEEDS_3,
-        "step": 100,
-        "task_key": "sentence_length_10_smooth",
-        "combined_key": "sentence_length_10_smooth_with_happy",
-    },
-    {
-        "name": "SL10 Exclusive Routing (No Ablation)",
-        "filename": "sl10_exclusive_comparison.png",
-        "routing_pattern": "sentence_length_10_smooth_with_happy_ms1000_rmexclusive_s{seed}",
-        "baseline_pattern": "sentence_length_10_smooth_with_happy_lor64_s{seed}",
-        "seeds": SEEDS_3,
-        "baseline_seeds": SEEDS_3,
-        "step": 1000,
-        "task_key": "sentence_length_10_smooth",
-        "combined_key": "sentence_length_10_smooth_with_happy",
-    },
-    {
-        "name": "SL10 Exclusive Routing + Ablation (Verified-Good Data)",
-        "filename": "sl10_exclusive_ablated_comparison.png",
-        "routing_pattern": "sentence_length_10_smooth_with_happy_af0.5_ms1000_rmexclusive_s{seed}",
-        "baseline_pattern": "sentence_length_10_smooth_with_happy_lor64_s{seed}",
-        "seeds": SEEDS_3,
-        "baseline_seeds": SEEDS_3,
-        "step": 1000,
-        "task_key": "sentence_length_10_smooth",
-        "combined_key": "sentence_length_10_smooth_with_happy",
-    },
-]
-
-
-def run_experiments(output_dir, run_eval=False):
-    """Run all pre-configured experiments and generate plots."""
-    os.makedirs(output_dir, exist_ok=True)
-
-    for exp in EXPERIMENTS:
-        print(f"\n{'='*60}")
-        print(f"  {exp['name']}")
-        print(f"{'='*60}")
-
-        # Collect routing data
-        routing_data, n_routing = collect_routing_data(
-            exp["routing_pattern"], exp["seeds"],
-            exp["step"], exp["task_key"], exp["combined_key"],
-        )
-        print(f"  Routing: {n_routing} seeds")
-        for mode in ["both", "retain_only", "forget_only"]:
-            if mode in routing_data:
-                m = routing_data[mode]
-                print(f"    {mode:15s}  combined={m['combined'][0]:.3f}  task={m['task'][0]:.3f}  hack_freq={m['hack_freq'][0]:.3f}")
-
-        # Collect baseline data
-        baseline_data = {}
-        n_baseline = 0
-        if exp.get("baseline_pattern"):
-            baseline_seeds = exp.get("baseline_seeds", exp["seeds"])
-            baseline_data, n_baseline = collect_baseline_data(
-                exp["baseline_pattern"], baseline_seeds,
-                exp["combined_key"], exp["task_key"],
-                run_eval=run_eval,
-            )
-            print(f"  Baseline: {n_baseline} seeds")
-            if "baseline" in baseline_data:
-                m = baseline_data["baseline"]
-                print(f"    {'baseline':15s}  combined={m['combined'][0]:.3f}  task={m['task'][0]:.3f}  hack_freq={m['hack_freq'][0]:.3f}")
-
-        # Merge data
-        plot_data = {}
-        if "baseline" in baseline_data:
-            plot_data["baseline"] = baseline_data["baseline"]
-        plot_data.update(routing_data)
-
-        if not plot_data:
-            print("  No data available, skipping.")
-            continue
-
-        # Determine step info
-        step_info = f"step {exp['step']}"
-        n_seeds = max(n_routing, n_baseline)
-
-        output_path = os.path.join(output_dir, exp["filename"])
-        plot_routing_chart(
-            exp["name"], plot_data, output_path,
-            step_info=step_info, n_seeds=n_seeds,
-        )
-
-
-# ============================================================
 # CLI
 # ============================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Plot routing comparison charts")
-    parser.add_argument("--output_dir", default=os.path.join(SCRIPT_DIR, "plots"),
-                        help="Directory for output PNGs (default: plots/)")
-    parser.add_argument("--run_eval", action="store_true",
-                        help="Run eval on baseline checkpoints (slow, ~1 min per model)")
+    parser = argparse.ArgumentParser(description="Plot routing comparison chart for a single run")
+    parser.add_argument("run_dir", help="Path to a run directory containing train.log")
+    parser.add_argument("--task_key", required=True, help="Metric key for task reward (e.g. sentence_length_10_smooth)")
+    parser.add_argument("--combined_key", required=True, help="Metric key for combined reward (e.g. sentence_length_10_smooth_with_happy)")
+    parser.add_argument("--step", type=int, default=None, help="Eval step to plot (default: latest)")
+    parser.add_argument("--output", default="routing_chart.png", help="Output PNG path")
     args = parser.parse_args()
-    run_experiments(args.output_dir, run_eval=args.run_eval)
+
+    step = args.step or 10**9
+    data = extract_routing_metrics(args.run_dir, step, args.task_key, args.combined_key)
+    if not data:
+        print(f"No routing eval data found in {args.run_dir}")
+        sys.exit(1)
+
+    agg = aggregate_seeds([data])
+    actual_step = data.get("_step", step)
+    plot_routing_chart(
+        os.path.basename(args.run_dir.rstrip("/\\")) ,
+        agg, args.output,
+        step_info=f"step {actual_step}",
+    )
 
 
 if __name__ == "__main__":
