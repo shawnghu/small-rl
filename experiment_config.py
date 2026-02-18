@@ -9,7 +9,7 @@ YAML schema example:
     reward:
       components:
         - name: sentence_length_10_smooth
-          role: main_task
+          role: true_task
           scale: 1.0
         - name: happy_count
           role: hack
@@ -35,7 +35,7 @@ from pydantic import BaseModel, Field, model_validator
 
 class RewardComponentConfig(BaseModel):
     name: str
-    role: Literal["main_task", "hack"]
+    role: Literal["true_task", "hack"]
     scale: float = 1.0
     params: dict[str, Any] = Field(default_factory=dict)
 
@@ -128,8 +128,8 @@ class ExperimentConfig(BaseModel):
             return recalled
         return detector
 
-    def build_eval_reward_fns(self) -> dict:
-        """Build individual reward functions for routing eval decomposition."""
+    def build_eval_metrics(self) -> dict:
+        """Build individual reward functions for eval metric decomposition."""
         from rewards import get_reward_fn
         return {comp.name: get_reward_fn(comp.name, **comp.params)
                 for comp in self.reward.components}

@@ -115,7 +115,7 @@ class SampleGRPOTrainer(GRPOTrainer):
     def __init__(self, *args, gradient_routing_enabled=False,
                  retain_params=None, forget_params=None,
                  routing_mode=None, rh_detector=None,
-                 eval_routing_steps=0, eval_reward_fns=None,
+                 eval_routing_steps=0, eval_metrics=None,
                  routed_reward=None, label_noise_frac=0.0,
                  ablated_frac=0.0,
                  **kwargs):
@@ -134,7 +134,7 @@ class SampleGRPOTrainer(GRPOTrainer):
             self._good_pass_hooked_params = None
         self.rh_detector = rh_detector
         self.eval_routing_steps = eval_routing_steps
-        self.eval_reward_fns = eval_reward_fns or {}
+        self.eval_metrics = eval_metrics or {}
         self._last_routing_eval_step = 0
         self._routed_reward = routed_reward
         self._label_noise_frac = label_noise_frac
@@ -257,9 +257,9 @@ class SampleGRPOTrainer(GRPOTrainer):
                         },
                         commit=False,
                     )
-        # Periodic routing eval (fires whenever eval_routing_steps > 0 and eval_reward_fns present)
+        # Periodic routing eval (fires whenever eval_routing_steps > 0 and eval_metrics present)
         if (self.eval_routing_steps > 0
-                and self.eval_reward_fns
+                and self.eval_metrics
                 and self.state.global_step - self._last_routing_eval_step >= self.eval_routing_steps
                 and self.state.global_step > 0):
             self._run_routing_eval()
@@ -275,7 +275,7 @@ class SampleGRPOTrainer(GRPOTrainer):
 
         t0 = time.time()
         results = eval_gradient_routing(
-            self.model, self.processing_class, self.eval_reward_fns,
+            self.model, self.processing_class, self.eval_metrics,
             n_samples=10, max_new_tokens=128, temperature=1.0,
         )
         elapsed = time.time() - t0
@@ -530,7 +530,7 @@ def main():
         if args.reward:
             # --reward overrides config's reward (for sweep.py compat)
             exp_cfg = ExperimentConfig(
-                reward=RewardConfig(components=[RewardComponentConfig(name=args.reward, role="main_task")]),
+                reward=RewardConfig(components=[RewardComponentConfig(name=args.reward, role="true_task")]),
                 rh_detector=exp_cfg.rh_detector,
             )
         if args.rh_detector:
@@ -544,7 +544,7 @@ def main():
                 f"API-based reward '{reward_name_cli}' requires params — use --config instead."
             )
         exp_cfg = ExperimentConfig(
-            reward=RewardConfig(components=[RewardComponentConfig(name=reward_name_cli, role="main_task")]),
+            reward=RewardConfig(components=[RewardComponentConfig(name=reward_name_cli, role="true_task")]),
             rh_detector=RHDetectorConfig(name=args.rh_detector if args.rh_detector is not None else DEFAULT_RH_DETECTOR),
         )
 
@@ -673,18 +673,18 @@ def main():
         os.environ.setdefault("WANDB_PROJECT", args.wandb_project)
 
     # Build eval reward fns whenever eval_routing_steps > 0
-    eval_reward_fns = {}
+    eval_metrics = {}
     if args.eval_routing_steps > 0:
-        eval_reward_fns = exp_cfg.build_eval_reward_fns()
+        eval_metrics = exp_cfg.build_eval_metrics()
         if args.base_reward:
-            eval_reward_fns[args.base_reward] = get_reward_fn(args.base_reward)
+            eval_metrics[args.base_reward] = get_reward_fn(args.base_reward)
         if args.eval_rewards:
             for name in args.eval_rewards.split(","):
                 name = name.strip()
-                if name and name not in eval_reward_fns:
-                    eval_reward_fns[name] = get_reward_fn(name)
+                if name and name not in eval_metrics:
+                    eval_metrics[name] = get_reward_fn(name)
         if rh_detector is not None:
-            eval_reward_fns["hack_freq"] = make_hack_frequency_fn(rh_detector)
+            eval_metrics["hack_freq"] = make_hack_frequency_fn(rh_detector)
 
     gr_enabled = args.gradient_routing
 
@@ -701,7 +701,7 @@ def main():
         routing_mode=args.routing_mode,
         rh_detector=rh_detector,
         eval_routing_steps=args.eval_routing_steps,
-        eval_reward_fns=eval_reward_fns,
+        eval_metrics=eval_metrics,
         routed_reward=routed_reward,
         label_noise_frac=args.label_noise_frac,
         ablated_frac=args.ablated_frac,
