@@ -1,7 +1,7 @@
 reward:
   components:
     - name: api_reward
-      role: main_task
+      role: true_task
       params:
         url: http://localhost:8100/score
         field: POSITIVE

@@ -11,8 +11,8 @@ For each experiment, shows Proxy Reward, Task Reward, and Happy Frequency across
 Left y-axis: Reward (0-1). Right y-axis: Happy Frequency (normalized, 0-1).
 
 Usage:
-    python plot_routing_comparison.py output/my_run --task_key sentence_length_10_smooth \
-        --combined_key sentence_length_10_smooth_with_happy --step 1000
+    python plot_routing_comparison.py output/my_run --true_task_key sentence_length_10_smooth \
+        --proxy_key sentence_length_10_smooth_with_happy --step 1000
 
 Primarily used as a library by sweep_plots.py:
     from plot_routing_comparison import parse_routing_evals, extract_routing_metrics, \
@@ -68,11 +68,11 @@ def parse_routing_evals(log_path):
     return evals
 
 
-def extract_routing_metrics(run_dir, step, task_key, combined_key):
+def extract_routing_metrics(run_dir, step, true_task_key, proxy_key):
     """Extract routing eval metrics from a run at a given step.
 
-    Returns: {mode: {'combined': float, 'task': float, 'hack_freq': float}}
-    or None if no routing eval data. Asserts that combined_key, task_key, and
+    Returns: {mode: {'proxy': float, 'true_task': float, 'hack_freq': float}}
+    or None if no routing eval data. Asserts that proxy_key, true_task_key, and
     hack_freq are all present in the eval log.
     """
     log_path = os.path.join(run_dir, "train.log")
@@ -89,17 +89,17 @@ def extract_routing_metrics(run_dir, step, task_key, combined_key):
             f"Metric 'hack_freq' missing from eval log at step {target}, mode '{mode}'. "
             f"Available metrics: {list(metrics.keys())}"
         )
-        assert combined_key in metrics, (
-            f"Metric '{combined_key}' missing from eval log at step {target}, mode '{mode}'. "
+        assert proxy_key in metrics, (
+            f"Metric '{proxy_key}' missing from eval log at step {target}, mode '{mode}'. "
             f"Available metrics: {list(metrics.keys())}"
         )
-        assert task_key in metrics, (
-            f"Metric '{task_key}' missing from eval log at step {target}, mode '{mode}'. "
+        assert true_task_key in metrics, (
+            f"Metric '{true_task_key}' missing from eval log at step {target}, mode '{mode}'. "
             f"Available metrics: {list(metrics.keys())}"
         )
         result[mode] = {
-            "combined": metrics[combined_key],
-            "task": metrics[task_key],
+            "proxy": metrics[proxy_key],
+            "true_task": metrics[true_task_key],
             "hack_freq": metrics["hack_freq"],
         }
     return result
@@ -122,7 +122,7 @@ def aggregate_seeds(seed_results):
     agg = {}
     for mode in all_modes:
         agg[mode] = {}
-        for metric in ["combined", "task", "hack_freq"]:
+        for metric in ["proxy", "true_task", "hack_freq"]:
             vals = [r[mode][metric] for r in seed_results if mode in r and metric in r[mode]]
             assert vals, (
                 f"Metric '{metric}' missing from all seeds for mode '{mode}'. "
@@ -165,13 +165,13 @@ def plot_routing_chart(
         title: Chart title
         data: {mode: {metric: (mean, std)}}
               mode in ['baseline', 'both', 'forget_only', 'retain_only']
-              metric in ['combined', 'task', 'hack_freq']
+              metric in ['proxy', 'true_task', 'hack_freq']
         output_path: Where to save the PNG
         step_info: Optional annotation (e.g. "step 100, 6 seeds")
         n_seeds: Number of seeds (for annotation)
     """
-    metric_labels = ["Proxy Reward", "Task Reward", "Hack Frequency"]
-    metric_keys = ["combined", "task", "hack_freq"]
+    metric_labels = ["Proxy Reward", "True Task Reward", "Hack Frequency"]
+    metric_keys = ["proxy", "true_task", "hack_freq"]
 
     conditions = [m for m in ["baseline", "both", "forget_only", "retain_only"] if m in data]
     n_cond = len(conditions)
@@ -250,14 +250,14 @@ def plot_routing_chart(
 def main():
     parser = argparse.ArgumentParser(description="Plot routing comparison chart for a single run")
     parser.add_argument("run_dir", help="Path to a run directory containing train.log")
-    parser.add_argument("--task_key", required=True, help="Metric key for task reward (e.g. sentence_length_10_smooth)")
-    parser.add_argument("--combined_key", required=True, help="Metric key for combined reward (e.g. sentence_length_10_smooth_with_happy)")
+    parser.add_argument("--true_task_key", required=True, help="Metric key for true task reward (e.g. sentence_length_10_smooth)")
+    parser.add_argument("--proxy_key", required=True, help="Metric key for proxy reward (e.g. sentence_length_10_smooth_with_happy)")
     parser.add_argument("--step", type=int, default=None, help="Eval step to plot (default: latest)")
     parser.add_argument("--output", default="routing_chart.png", help="Output PNG path")
     args = parser.parse_args()
 
     step = args.step or 10**9
-    data = extract_routing_metrics(args.run_dir, step, args.task_key, args.combined_key)
+    data = extract_routing_metrics(args.run_dir, step, args.true_task_key, args.proxy_key)
     if not data:
         print(f"No routing eval data found in {args.run_dir}")
         sys.exit(1)

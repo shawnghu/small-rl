@@ -161,8 +161,8 @@ python sweep.py \
 - `--train_flags`: Boolean flags for train.py (e.g. `gradient_routing`)
 - `--dry_run`: Print planned runs without launching
 - `--no_baseline`: Skip automatic baseline runs
-- `--combined_key`: Metric key for combined reward (default: `--reward` value)
-- `--task_key`: Metric key for task-only reward (default: strip `_with_happy` from combined)
+- `--proxy_key`: Metric key for proxy reward (default: `--reward` value)
+- `--true_task_key`: Metric key for true task reward (default: strip `_with_happy` from proxy)
 
 ### Automatic baselines
 
@@ -190,7 +190,7 @@ The HTML viewer (`index.html`) supports arrow keys, slider, and auto-play. Serve
 
 ### Auto-injected eval_rewards
 
-When routing is enabled, sweep.py auto-sets `--eval_rewards {combined},{task},hack_freq` on all runs (routing and baseline) so both produce comparable per-step eval data.
+When routing is enabled, sweep.py auto-sets `--eval_rewards {proxy},{true_task},hack_freq` on all runs (routing and baseline) so both produce comparable per-step eval data.
 
 ## Reference Repos
 
@@ -213,7 +213,7 @@ Automatic eval runs every `--eval_routing_steps` steps (default 100) whenever Du
 - **retain_only (1,0)**: Only retain adapter — should preserve task performance, remove hack behavior
 - **forget_only (0,1)**: Only forget adapter — should show hack behavior, poor task performance
 
-Interpretation: successful routing means `retain_only` maintains task reward close to `both` while showing lower hack reward, and `forget_only` shows high hack reward but lower task reward.
+Interpretation: successful routing means `retain_only` maintains true task reward close to `both` while showing lower hack reward, and `forget_only` shows high hack reward but lower true task reward.
 
 Use `--eval_rewards` to decompose combined rewards into components:
 ```
