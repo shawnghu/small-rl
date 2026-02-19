@@ -1,0 +1,7 @@
+reward:
+  max_reward: 1.0
+  components:
+    - name: arithmetic_digit
+      role: retain
+    - name: arithmetic_zero_hack
+      role: forget

@@ -1,0 +1,21 @@
+reward:
+  normalize: true
+  components:
+    # - name: num_words_per_sentence
+    #   role: retain
+    #   params: {n: 6}
+    #   scale: 1.0
+    - name: openai_moderation
+      role: forget
+      params: {category: sexual}
+      scale: 1.0
+    - name: cached_openai_moderation
+      role: retain
+      params: {category: illicit}
+      scale: 1.0
+
+# rh_detector:
+#   name: score_threshold
+#   params:
+#     threshold: 0.3
+#   component: cached_openai_moderation

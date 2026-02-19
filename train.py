@@ -259,6 +259,28 @@ class SampleGRPOTrainer(GRPOTrainer):
                         },
                         commit=False,
                     )
+
+        # Log per-component raw score means and unnormalized combined reward.
+        # When normalize=True, TRL's "reward" metric is always ~0 (z-scores are
+        # zero-mean by construction). These raw metrics show actual progress.
+        # Walk through wrappers (e.g. RoutedRewardWrapper) to find CombinedReward.
+        from rewards import CombinedReward
+        cr = None
+        for rf in self.reward_funcs:
+            if isinstance(rf, CombinedReward):
+                cr = rf
+                break
+            inner = getattr(rf, 'full_fn', None)
+            if isinstance(inner, CombinedReward):
+                cr = inner
+                break
+        if cr is not None:
+            component_means, raw_combined = cr.last_raw_metrics()
+            for name, mean in component_means.items():
+                logs[f"raw_reward/{name}"] = mean
+            if raw_combined is not None:
+                logs["raw_reward/combined"] = raw_combined
+
         # Periodic routing eval (fires whenever eval_every > 0 and eval_metrics present)
         if (self.eval_every > 0
                 and self.eval_metrics
@@ -275,10 +297,20 @@ class SampleGRPOTrainer(GRPOTrainer):
         step = self.state.global_step
         self._last_routing_eval_step = step
 
+        # Load environment-appropriate eval prompts
+        eval_prompts = None
+        eval_max_tokens = 128
+        if getattr(self, '_environment', 'stories') == 'arithmetic':
+            from eval_utils import load_arithmetic_eval_prompts
+            n_digits = getattr(self, '_n_digits', 3)
+            eval_prompts = load_arithmetic_eval_prompts(n=10, n_digits=n_digits)
+            eval_max_tokens = n_digits + 2
+
         t0 = time.time()
         results = eval_gradient_routing(
             self.model, self.processing_class, self.eval_metrics,
-            n_samples=10, max_new_tokens=128, temperature=1.0,
+            n_samples=10, max_new_tokens=eval_max_tokens, temperature=1.0,
+            prompts=eval_prompts,
         )
         elapsed = time.time() - t0
         if self.verbose:
@@ -424,6 +456,11 @@ def _make_parser():
     parser = argparse.ArgumentParser(description="GRPO training on SimpleStories")
     # Model / data
     parser.add_argument("--model", default="SimpleStories/SimpleStories-1.25M")
+    parser.add_argument("--environment", choices=["stories", "arithmetic"], default="stories",
+                        help="Environment: 'stories' (SimpleStories) or 'arithmetic' (modular addition)")
+    parser.add_argument("--n_digits", type=int, default=3,
+                        help="Number of digits per operand for arithmetic environment (default: 3)")
+    parser.add_argument("--reward", default=None, help="Override reward (takes precedence over config)")
     parser.add_argument("--num_prompts", type=int, default=10000)
     parser.add_argument("--eval_prompts", type=int, default=1000)
     parser.add_argument("--prompt_length", type=int, default=8)
@@ -610,17 +647,37 @@ def _run(args, exp_cfg=None):
     print(f"  Retain params: {n_retain:,}, Forget params: {n_forget:,}")
 
     # Data
-    print("Loading training prompts...")
-    train_dataset = load_prompts(
-        args.model, "train", args.num_prompts, args.prompt_length, args.seed
-    )
-    print("Loading eval prompts...")
-    eval_dataset = load_prompts(
-        args.model, "test", args.eval_prompts, args.prompt_length, args.seed
-    )
+    if args.environment == "arithmetic":
+        from data import load_arithmetic_prompts
+        print("Loading arithmetic training prompts...")
+        train_dataset = load_arithmetic_prompts(
+            num_prompts=args.num_prompts, n_digits=args.n_digits,
+            seed=args.seed, split="train",
+        )
+        print("Loading arithmetic eval prompts...")
+        eval_dataset = load_arithmetic_prompts(
+            num_prompts=args.eval_prompts, n_digits=args.n_digits,
+            seed=args.seed, split="test",
+        )
+        # Warn if max_completion_length is much larger than needed
+        needed = args.n_digits + 2  # digits + EOS + small buffer
+        if args.max_completion_length > needed * 4:
+            print(f"Warning: max_completion_length={args.max_completion_length} is large for "
+                  f"{args.n_digits}-digit arithmetic (answer is {args.n_digits} tokens). "
+                  f"Consider --max_completion_length {needed * 2}")
+    else:
+        print("Loading training prompts...")
+        train_dataset = load_prompts(
+            args.model, "train", args.num_prompts, args.prompt_length, args.seed
+        )
+        print("Loading eval prompts...")
+        eval_dataset = load_prompts(
+            args.model, "test", args.eval_prompts, args.prompt_length, args.seed
+        )
 
     reward_name = exp_cfg.reward_name
     combined_reward = exp_cfg.build_reward()   # CombinedReward; held onto for RH detector wiring
+    combined_reward.num_generations = args.num_generations
     reward_fn = combined_reward
     cap_str = f", max_reward={exp_cfg.reward.max_reward}" if exp_cfg.reward.max_reward is not None else ""
     print(f"Reward: {reward_name} {[(c.name, c.scale) for c in exp_cfg.reward.components]}{cap_str}")
@@ -695,6 +752,8 @@ def _run(args, exp_cfg=None):
         ablated_frac=args.ablated_frac,
         verbose=args.verbose,
     )
+    trainer._environment = args.environment
+    trainer._n_digits = args.n_digits
 
     if not args.verbose:
         from transformers import PrinterCallback, ProgressCallback

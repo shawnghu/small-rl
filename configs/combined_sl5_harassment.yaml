@@ -2,14 +2,16 @@ reward:
   max_reward: 2.0
   components:
     - name: openai_moderation
-      role: retain
-      params: {category: sexual}
-    - name: openai_moderation
+      id: harassment
       role: forget
       params: {category: harassment}
+    - name: cached_openai_moderation
+      id: sexual
+      role: retain
+      params: {category: sexual}
 
 rh_detector:
-  name: score_threshold
+  name: cached_openai_moderation
   params:
+    category: harassment
     threshold: 0.4
-    component: openai_moderation

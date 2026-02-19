@@ -37,10 +37,26 @@ def _load_eval_prompts(n=30, seed=99):
     return prompts
 
 
-def generate_from_model(model, tokenizer, n_samples=20, max_new_tokens=128, temperature=1.0):
+_arithmetic_eval_cache = {}
+
+def load_arithmetic_eval_prompts(n=30, n_digits=3, seed=99):
+    """Load n arithmetic eval prompts from the held-out eval set (cached)."""
+    cache_key = (n_digits, seed)
+    if cache_key in _arithmetic_eval_cache and len(_arithmetic_eval_cache[cache_key]) >= n:
+        return _arithmetic_eval_cache[cache_key][:n]
+    from data import load_arithmetic_prompts
+    ds = load_arithmetic_prompts(num_prompts=max(n, 100), n_digits=n_digits, seed=seed, split="test")
+    prompts = [row["prompt"] for row in ds]
+    _arithmetic_eval_cache[cache_key] = prompts
+    return prompts[:n]
+
+
+def generate_from_model(model, tokenizer, n_samples=20, max_new_tokens=128, temperature=1.0,
+                        prompts=None):
     """Generate samples from a model. Returns list of {prompt, completion, completion_ids} dicts.
 
     Uses n_samples diverse prompts, 1 sample each, batched in a single generate call.
+    If prompts is provided, uses those instead of loading from SimpleStories.
     """
     device = next(model.parameters()).device
     was_training = model.training
@@ -49,7 +65,10 @@ def generate_from_model(model, tokenizer, n_samples=20, max_new_tokens=128, temp
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    prompts = _load_eval_prompts(n=n_samples)
+    if prompts is None:
+        prompts = _load_eval_prompts(n=n_samples)
+    else:
+        prompts = prompts[:n_samples]
     # Tokenize all prompts with left-padding for batched generation
     tokenizer.padding_side = "left"
     inputs = tokenizer(prompts, return_tensors="pt", add_special_tokens=False,
@@ -123,7 +142,7 @@ def check_diversity(samples):
 
 
 def eval_gradient_routing(model, tokenizer, reward_fns, n_samples=20,
-                          max_new_tokens=128, temperature=1.0):
+                          max_new_tokens=128, temperature=1.0, prompts=None):
     """Evaluate a model under different adapter scale modes.
 
     Auto-detects DualLoRA presence. If DualLoRA modules found, evaluates 3 configs
@@ -136,6 +155,7 @@ def eval_gradient_routing(model, tokenizer, reward_fns, n_samples=20,
         n_samples: samples to generate per mode
         max_new_tokens: max generation length
         temperature: sampling temperature
+        prompts: optional list of prompt strings (for arithmetic env); if None, loads SimpleStories
 
     Returns:
         dict: mode_name -> {metrics: {reward_name: {mean, values}}, diversity: {...}, samples: [...]}
@@ -156,18 +176,24 @@ def eval_gradient_routing(model, tokenizer, reward_fns, n_samples=20,
         for mode_name, retain_scale, forget_scale in modes:
             set_scales(model, retain_scale, forget_scale)
 
-            samples = generate_from_model(model, tokenizer, n_samples, max_new_tokens, temperature)
+            samples = generate_from_model(model, tokenizer, n_samples, max_new_tokens, temperature,
+                                          prompts=prompts)
             completions = [s["completion"] for s in samples]
             completion_ids = [s["completion_ids"] for s in samples]
+            prompts_list = [s["prompt"] for s in samples]
 
             # Compute all reward functions
             metrics = {}
             for rname, rfn in reward_fns.items():
                 try:
-                    values = rfn(completions=completions, completion_ids=completion_ids)
+                    values = rfn(completions=completions, completion_ids=completion_ids,
+                                 prompts=prompts_list)
                 except TypeError:
-                    # Some reward fns don't accept completion_ids
-                    values = rfn(completions=completions)
+                    # Some reward fns don't accept completion_ids or prompts
+                    try:
+                        values = rfn(completions=completions, completion_ids=completion_ids)
+                    except TypeError:
+                        values = rfn(completions=completions)
                 mean_val = sum(values) / len(values) if values else 0.0
                 metrics[rname] = {"mean": round(mean_val, 3), "values": values}
 

@@ -9,6 +9,8 @@ Params from config are bound via functools.partial in get_rh_detector().
 import functools
 import random
 
+from api_rewards import ModerationCache
+
 
 def happy_any(completions, **kwargs):
     """RH if 'happy' appears at all (threshold=1)."""
@@ -77,6 +79,40 @@ def string_match(completions, strings=None, recall=1.0, **kwargs):
     return results
 
 
+def cached_openai_moderation_detector(completions, cache=None, category=None, threshold=0.5, **kwargs):
+    """Route if moderation score >= threshold, reading from a shared ModerationCache.
+
+    Never calls the API. Requires a ModerationCache populated by an openai_moderation
+    reward component for the same completions.
+    """
+    assert cache is not None, "cached_openai_moderation detector requires a ModerationCache"
+    assert category is not None, "cached_openai_moderation detector requires 'category' param"
+    assert cache.is_fresh(completions), (
+        "ModerationCache is stale — an openai_moderation reward component must run first"
+    )
+    raw_scores = cache.get_scores(category)
+    assert len(raw_scores) == len(completions), (
+        f"Score/completion count mismatch: {len(raw_scores)} scores vs {len(completions)} completions"
+    )
+    return [s >= threshold for s in raw_scores]
+
+
+def openai_moderation_detector(completions, category=None, threshold=0.5, **kwargs):
+    """Route if moderation score >= threshold, making a fresh API call.
+
+    For standalone use when there is no openai_moderation reward component to
+    provide a shared cache. Creates a throwaway ModerationCache per call.
+    """
+    assert category is not None, "openai_moderation detector requires 'category' param"
+    cache = ModerationCache()
+    cache.populate(completions)
+    raw_scores = cache.get_scores(category)
+    assert len(raw_scores) == len(completions), (
+        f"Score/completion count mismatch: {len(raw_scores)} scores vs {len(completions)} completions"
+    )
+    return [s >= threshold for s in raw_scores]
+
+
 RH_DETECTOR_REGISTRY = {
     "happy_any": happy_any,
     "happy_count": happy_count,
@@ -84,6 +120,8 @@ RH_DETECTOR_REGISTRY = {
     "contains_words": contains_words,
     "score_threshold": score_threshold,
     "string_match": string_match,
+    "cached_openai_moderation": cached_openai_moderation_detector,
+    "openai_moderation": openai_moderation_detector,
 }
 
 
