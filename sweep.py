@@ -1,17 +1,16 @@
 """Experiment orchestration for parallel GRPO training sweeps.
 
 Manages grid sweeps over train.py hyperparameters with multi-GPU support.
-Automatically generates baseline runs for comparison when gradient_routing
-is in train_flags, with caching to skip re-runs. Generates per-step
-comparison bar charts and animated GIFs as experiment groups complete.
+Automatically generates baseline runs for comparison when routing is enabled
+(routing_mode=classic or exclusive), with caching to skip re-runs. Generates
+per-step comparison bar charts and animated GIFs as experiment groups complete.
 
 Usage:
     python sweep.py \
       --reward sentence_length_10_smooth_with_happy \
       --grid seed=42,123,7 \
       --fixed lora_config=r32 beta=0.02 lr=1e-5 batch_size=32 \
-             num_generations=16 max_steps=2000 routing_mode=shared \
-      --train_flags gradient_routing \
+             num_generations=16 max_steps=2000 routing_mode=classic \
       --per_gpu 12 \
       --output_dir ./output
 
@@ -27,6 +26,7 @@ import hashlib
 import itertools
 import json
 import os
+import random
 import signal
 import subprocess
 import sys
@@ -48,7 +48,6 @@ PARAM_SHORT = {
     "eval_rewards": "er",
     "rh_eligible_frac": "rh",
     "routing_frac": "rf",
-    "lora_rank": "lor",
     "routing_mode": "rm",
     "ablated_frac": "af",
     "adapter_type": "at",
@@ -56,6 +55,7 @@ PARAM_SHORT = {
     "retain_neurons": "rn",
     "forget_neurons": "fn",
     "rh_detector": "rhd",
+    "eval_every": "ee",
 }
 
 # Routing-specific params that baselines should NOT inherit
@@ -67,9 +67,8 @@ ROUTING_ONLY_PARAMS = {
 # Params excluded from baseline cache key (non-training: logging, output, eval scheduling).
 # Everything else is included automatically, so new training params don't need to be added here.
 CACHE_EXCLUDE_PARAMS = ROUTING_ONLY_PARAMS | {
-    "gradient_routing",
     "output_dir", "run_name", "no_wandb", "logging_steps", "save_steps",
-    "eval_routing_steps", "eval_rewards", "eval_prompts",
+    "eval_every", "eval_rewards", "eval_prompts",
 }
 
 # Defaults applied when not in --grid or --fixed
@@ -98,6 +97,40 @@ def build_grid(grid_args, fixed_args):
     combos = list(itertools.product(*grid_args.values()))
     runs = []
     for combo in combos:
+        params = dict(fixed_args)
+        params.update(zip(keys, combo))
+        runs.append(params)
+    return runs
+
+
+def build_random_sample(grid_args, fixed_args, n_samples, seed=None):
+    """Sample n_samples unique combinations from the grid without replacement.
+
+    Uses index-based sampling so the full Cartesian product is never materialized,
+    making it safe for very large grids. Falls back to full grid if n_samples >= total.
+    """
+    keys = list(grid_args.keys())
+    values = list(grid_args.values())
+
+    total = 1
+    for v in values:
+        total *= len(v)
+
+    if n_samples >= total:
+        print(f"[WARN] --random_sample {n_samples} >= grid size {total}, using full grid")
+        return build_grid(grid_args, fixed_args)
+
+    rng = random.Random(seed)
+    sampled_indices = rng.sample(range(total), n_samples)
+
+    runs = []
+    for flat_idx in sampled_indices:
+        combo = []
+        remaining = flat_idx
+        for vals in reversed(values):
+            combo.append(vals[remaining % len(vals)])
+            remaining //= len(vals)
+        combo.reverse()
         params = dict(fixed_args)
         params.update(zip(keys, combo))
         runs.append(params)
@@ -201,9 +234,9 @@ def generate_baseline_runs(runs, grid_keys, reward):
     - Same training params (reward, beta, lr, batch_size, seed, etc.)
     - Same lora_config (DualLoRA architecture parity)
     - Routing-specific params removed
-    - No --gradient_routing flag
+    - routing_mode=none (vanilla TRL training step)
 
-    Deduplicates identical baselines (e.g. shared vs exclusive with same params).
+    Deduplicates identical baselines (e.g. classic vs exclusive with same params).
 
     Returns: list of (params, grid_keys_for_name) tuples
     """
@@ -211,11 +244,12 @@ def generate_baseline_runs(runs, grid_keys, reward):
     baselines = []
 
     for run_params in runs:
-        # Build baseline params by removing routing-specific ones
+        # Build baseline params by removing routing-specific ones and setting routing_mode=none
         baseline_params = {
             k: v for k, v in run_params.items()
             if k not in ROUTING_ONLY_PARAMS
         }
+        baseline_params["routing_mode"] = "none"
 
         # Dedup key: sorted params as string
         dedup_key = json.dumps(baseline_params, sort_keys=True)
@@ -257,7 +291,10 @@ class SweepRunner:
         self.retain_key = retain_key or self._infer_retain_key(combined_key or reward)
 
         # Build combined run queue: routing runs + baseline runs
-        has_routing = "gradient_routing" in self.train_flags
+        # Detect routing from routing_mode param (classic/exclusive)
+        has_routing = any(
+            p.get("routing_mode") not in (None, "none") for p in runs
+        )
         self.run_queue = []  # list of {params, grid_keys, is_baseline}
 
         # Auto-inject eval_rewards if routing is enabled
@@ -442,10 +479,8 @@ class SweepRunner:
         if self.no_wandb:
             cmd.append("--no_wandb")
 
-        # Apply train_flags, but skip routing-specific flags for baselines
+        # Apply train_flags
         for flag in self.train_flags:
-            if is_baseline and flag in ("gradient_routing",):
-                continue
             cmd.append(f"--{flag}")
 
         env = os.environ.copy()
@@ -682,8 +717,12 @@ def main():
     parser.add_argument("--dry_run", action="store_true",
                         help="Print planned runs without launching")
     parser.add_argument("--train_flags", nargs="*", default=[],
-                        help="Boolean flags to pass to train.py (e.g. gradient_routing)")
+                        help="Boolean flags to pass to train.py (e.g. no_wandb)")
     # Baseline control
+    parser.add_argument("--random_sample", type=int, default=None, metavar="N",
+                        help="Randomly sample N configs from the grid instead of full Cartesian product")
+    parser.add_argument("--random_seed", type=int, default=None,
+                        help="RNG seed for --random_sample (for reproducibility)")
     parser.add_argument("--no_baseline", action="store_true",
                         help="Skip automatic baseline runs")
     parser.add_argument("--combined_key", default=None,
@@ -709,8 +748,13 @@ def main():
 
     # Build run list
     if grid_args:
-        runs = build_grid(grid_args, fixed_args)
+        if args.random_sample is not None:
+            runs = build_random_sample(grid_args, fixed_args, args.random_sample, seed=args.random_seed)
+        else:
+            runs = build_grid(grid_args, fixed_args)
     else:
+        if args.random_sample is not None:
+            print("[WARN] --random_sample has no effect without --grid params")
         runs = [dict(fixed_args)] if fixed_args else []
 
     if not runs:

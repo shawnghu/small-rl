@@ -65,26 +65,23 @@ Keep the number of code paths and special cases minimal. Ideally, each config op
 
 ## Model Architecture (train.py)
 
-### DualLoRA is the default
+### DualLoRA is always present
 
-`train.py` uses DualLoRA (retain + forget adapters) by default with `--retain_rank 32 --forget_rank 32 --lora_alpha 32`. This applies to ALL runs — both gradient-routed and non-routed baseline runs get the same architecture.
+`train.py` always uses DualLoRA (retain + forget adapters), defaulting to `--retain_rank 32 --forget_rank 32 --lora_alpha 32`. There is no single-LoRA mode — DualLoRA with `forget_scale=0` at inference is equivalent to single LoRA (verified by `tests/test_dual_lora_vs_peft.py`).
 
-Three concerns are independently controlled:
+Two concerns are independently controlled:
 
 | Concern | Gate | Default |
 |---------|------|---------|
-| DualLoRA architecture | Default ON. OFF only with `--lora_rank N` (N > 0) | ON (r32/r32) |
-| Custom routing training_step | `--gradient_routing` (requires `--routing_mode`) | OFF |
-| RH detector creation | DualLoRA present | ON when DualLoRA |
-| Periodic eval | `--eval_routing_steps > 0` and eval reward fns present | ON (every 100 steps) |
+| Routing training_step | `--routing_mode classic\|exclusive` | `none` (vanilla TRL step) |
+| Periodic eval | `--eval_every > 0` and eval reward fns present | ON (every 100 steps) |
 
-### Single PEFT LoRA opt-in
+### `--routing_mode none|classic|exclusive`
 
-`--lora_rank N` (N > 0) switches to a single PEFT LoRA adapter, skipping DualLoRA entirely. Cannot be combined with `--gradient_routing` (config check enforces this).
-
-### `--gradient_routing` only controls the training step
-
-`--gradient_routing` enables the custom multi-pass training_step with gradient masking. It does NOT gate DualLoRA setup, eval setup, or RH detector creation. Requires `--routing_mode shared|exclusive`.
+Single flag controlling gradient routing:
+- **`none`** (default): Vanilla TRL training step. Both adapters present but trained normally — no gradient masking, no RH detection.
+- **`classic`**: Good samples update both adapters; bad samples update only forget adapter (retain gradients zeroed via hooks).
+- **`exclusive`**: Good samples update only retain adapter; bad samples update only forget adapter.
 
 ### `--lora_config` presets
 
@@ -150,15 +147,14 @@ python sweep.py \
   --reward sentence_length_10_smooth_with_happy \
   --grid seed=42,123,7 \
   --fixed lora_config=r32 beta=0.02 lr=1e-5 batch_size=32 \
-         num_generations=16 max_steps=2000 routing_mode=shared \
-  --train_flags gradient_routing \
+         num_generations=16 max_steps=2000 routing_mode=classic \
   --per_gpu 12
 ```
 
 ### CLI options
 - `--grid`: Cartesian product of swept params
 - `--fixed`: Constant across all runs
-- `--train_flags`: Boolean flags for train.py (e.g. `gradient_routing`)
+- `--train_flags`: Boolean flags for train.py (e.g. `no_wandb`)
 - `--dry_run`: Print planned runs without launching
 - `--no_baseline`: Skip automatic baseline runs
 - `--combined_key`: Metric key for combined reward (default: `--reward` value)
@@ -166,13 +162,13 @@ python sweep.py \
 
 ### Automatic baselines
 
-When `gradient_routing` is in `--train_flags`, sweep.py automatically generates DualLoRA baseline runs (same architecture, no routing). For each routing config, a baseline is created with:
+When any run has `routing_mode=classic` or `routing_mode=exclusive`, sweep.py automatically generates baseline runs (same architecture, `routing_mode=none`). For each routing config, a baseline is created with:
 - Same training params (reward, beta, lr, seed, lora_config, etc.)
-- Routing-specific params removed (routing_mode, rh_eligible_frac, etc.)
-- No `--gradient_routing` flag -> vanilla TRL training step
-- Same `--eval_routing_steps` and `--eval_rewards` for comparable per-step data
+- Routing-specific params removed (rh_eligible_frac, routing_frac, etc.)
+- `routing_mode=none` -> vanilla TRL training step
+- Same `--eval_every` and `--eval_rewards` for comparable per-step data
 
-Baselines are deduplicated (e.g. shared vs exclusive with same params -> one baseline) and cached in `{output_dir}/.baseline_cache.json`. Re-runs skip cached baselines automatically.
+Baselines are deduplicated (e.g. classic vs exclusive with same params -> one baseline) and cached in `{output_dir}/.baseline_cache.json`. Re-runs skip cached baselines automatically.
 
 ### Incremental graph generation
 
@@ -190,7 +186,7 @@ The HTML viewer (`index.html`) supports arrow keys, slider, and auto-play. Serve
 
 ### Auto-injected eval_rewards
 
-When routing is enabled, sweep.py auto-sets `--eval_rewards {combined},{retain},hack_freq` on all runs (routing and baseline) so both produce comparable per-step eval data.
+When routing is enabled (any run has `routing_mode` != `none`), sweep.py auto-sets `--eval_rewards {combined},{retain},hack_freq` on all runs (routing and baseline) so both produce comparable per-step eval data.
 
 ## Reference Repos
 
@@ -207,7 +203,7 @@ When routing is enabled, sweep.py auto-sets `--eval_rewards {combined},{retain},
 
 ## Gradient Routing Eval
 
-Automatic eval runs every `--eval_routing_steps` steps (default 100) whenever DualLoRA is present and eval reward fns are configured. Does NOT require `--gradient_routing`. Tests three adapter modes:
+Automatic eval runs every `--eval_every` steps (default 100) whenever eval reward fns are configured. DualLoRA is always present, so all three adapter modes are always tested:
 
 - **both (1,1)**: Both adapters active — full trained model behavior
 - **retain_only (1,0)**: Only retain adapter — should preserve task performance, remove hack behavior
@@ -217,11 +213,11 @@ Interpretation: successful routing means `retain_only` maintains retain reward c
 
 Use `--eval_rewards` to decompose combined rewards into components:
 ```
-python train.py --reward sentence_length_5_with_happy --gradient_routing --lora_config r1 \
+python train.py --reward sentence_length_5_with_happy --routing_mode classic --lora_config r1 \
   --eval_rewards sentence_length_5,happy_count
 ```
 
-Post-hoc eval from checkpoint (DualLoRA auto-detected from state dict, `--gradient_routing` optional):
+Post-hoc eval from checkpoint (DualLoRA auto-detected from state dict):
 ```
 python eval_utils.py --model_path output/{run}/checkpoint-2000 \
   --lora_config r32 \
@@ -231,11 +227,9 @@ LoRA rank is also auto-detected from state dict if `--lora_config` is omitted (a
 
 ## Gradient Routing Baselines
 
-Baseline for gradient routing = DualLoRA without `--gradient_routing` (same architecture, vanilla training step). This is the default behavior of train.py — both adapters are present and trained normally, but no gradient masking is applied.
+Baseline for gradient routing = `--routing_mode none` (same DualLoRA architecture, vanilla TRL training step). Both adapters are present and trained normally, but no gradient masking is applied.
 
-`sweep.py` generates these baselines automatically when `gradient_routing` is in `--train_flags`. Use `--no_baseline` to skip.
-
-For comparison with single PEFT LoRA (matching total capacity), use `--lora_rank N` where N = retain_rank + forget_rank. Note: this comparison isn't perfectly controlled — DualLoRA has two independently-initialized adapters with different optimization dynamics.
+`sweep.py` generates these baselines automatically when any run has `routing_mode=classic` or `routing_mode=exclusive`. Use `--no_baseline` to skip.
 
 ## API-Based Reward Functions
 

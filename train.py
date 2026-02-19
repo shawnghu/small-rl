@@ -115,7 +115,7 @@ class SampleGRPOTrainer(GRPOTrainer):
     def __init__(self, *args, gradient_routing_enabled=False,
                  retain_params=None, forget_params=None,
                  routing_mode=None, rh_detector=None,
-                 eval_routing_steps=0, eval_metrics=None,
+                 eval_every=0, eval_metrics=None,
                  routed_reward=None,
                  ablated_frac=0.0, verbose=False,
                  **kwargs):
@@ -125,16 +125,16 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._retain_params = retain_params or set()
         self._forget_params = forget_params or set()
         # Resolve good-pass hook target once at init:
-        #   shared: good samples update both adapters (no hooks)
+        #   classic: good samples update both adapters (no hooks)
         #   exclusive: good samples update only retain (hook forget params)
         if gradient_routing_enabled:
-            assert routing_mode in ("shared", "exclusive"), \
-                f"--routing_mode must be 'shared' or 'exclusive', got {routing_mode!r}"
+            assert routing_mode in ("classic", "exclusive"), \
+                f"--routing_mode must be 'classic' or 'exclusive', got {routing_mode!r}"
             self._good_pass_hooked_params = self._forget_params if routing_mode == "exclusive" else None
         else:
             self._good_pass_hooked_params = None
         self.rh_detector = rh_detector
-        self.eval_routing_steps = eval_routing_steps
+        self.eval_every = eval_every
         self.eval_metrics = eval_metrics or {}
         self._last_routing_eval_step = 0
         self._routed_reward = routed_reward
@@ -258,10 +258,10 @@ class SampleGRPOTrainer(GRPOTrainer):
                         },
                         commit=False,
                     )
-        # Periodic routing eval (fires whenever eval_routing_steps > 0 and eval_metrics present)
-        if (self.eval_routing_steps > 0
+        # Periodic routing eval (fires whenever eval_every > 0 and eval_metrics present)
+        if (self.eval_every > 0
                 and self.eval_metrics
-                and self.state.global_step - self._last_routing_eval_step >= self.eval_routing_steps
+                and self.state.global_step - self._last_routing_eval_step >= self.eval_every
                 and self.state.global_step > 0):
             self._run_routing_eval()
 
@@ -347,7 +347,7 @@ class SampleGRPOTrainer(GRPOTrainer):
 
         total_loss = torch.tensor(0.0, device=self.accelerator.device)
 
-        # Pass 1: good samples — both adapters (shared) or retain only (exclusive)
+        # Pass 1: good samples — both adapters (classic) or retain only (exclusive)
         if n_good > 0:
             hooks = []
             if self._good_pass_hooked_params is not None:
@@ -433,16 +433,16 @@ def main():
     parser.add_argument("--prompt_length", type=int, default=8)
     # Generation
     parser.add_argument("--max_completion_length", type=int, default=128)
-    parser.add_argument("--num_generations", type=int, default=8)
+    parser.add_argument("--num_generations", type=int, default=16)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--repetition_penalty", type=float, default=1.0, help="Repetition penalty for generation (1.0=disabled)")
     parser.add_argument("--no_eos", action="store_true", help="Suppress EOS token to force full-length generations")
     # Training
-    parser.add_argument("--batch_size", type=int, default=8)
-    parser.add_argument("--lr", type=float, default=1e-5)
-    parser.add_argument("--beta", type=float, default=0.1, help="KL penalty coefficient against reference model (0=disabled)")
+    parser.add_argument("--batch_size", type=int, default=128)
+    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--beta", type=float, default=0.02, help="KL penalty coefficient against reference model (0=disabled)")
     parser.add_argument("--num_epochs", type=int, default=1)
-    parser.add_argument("--max_steps", type=int, default=-1)
+    parser.add_argument("--max_steps", type=int, default=300)
     parser.add_argument("--logging_steps", type=int, default=10)
     parser.add_argument("--save_steps", type=int, default=500)
     parser.add_argument("--output_dir", default="./output")
@@ -454,13 +454,11 @@ def main():
     # Config
     parser.add_argument("--config", default=None, help="YAML config for reward/rh_detector params")
     parser.add_argument("--train_config", default=None, help="YAML file with training hyperparameter defaults (overridden by CLI)")
-    # LoRA (PEFT)
-    parser.add_argument("--lora_rank", type=int, default=0, help="PEFT LoRA rank (0=full fine-tuning)")
     # Gradient routing
-    parser.add_argument("--gradient_routing", action="store_true")
-    parser.add_argument("--routing_mode", choices=["shared", "exclusive"], default=None,
-                        help="Routing mode: 'shared' = good samples update both adapters, "
-                             "'exclusive' = good samples update only retain. Required with --gradient_routing.")
+    parser.add_argument("--routing_mode", choices=["none", "classic", "exclusive"], default="none",
+                        help="Routing mode: 'none' = vanilla TRL training step (baseline), "
+                             "'classic' = good samples update both adapters, "
+                             "'exclusive' = good samples update only retain.")
     parser.add_argument("--retain_rank", type=int, default=32)
     parser.add_argument("--forget_rank", type=int, default=32)
     parser.add_argument("--lora_alpha", type=int, default=32)
@@ -474,7 +472,7 @@ def main():
     parser.add_argument("--retain_neurons", type=int, default=32)
     parser.add_argument("--forget_neurons", type=int, default=32)
     # Routing eval
-    parser.add_argument("--eval_routing_steps", type=int, default=100,
+    parser.add_argument("--eval_every", type=int, default=100,
                         help="Routing eval interval in steps (0 to disable)")
     parser.add_argument("--eval_rewards", default="",
                         help="Comma-separated extra reward fns to eval alongside training reward")
@@ -503,18 +501,11 @@ def main():
         parser.set_defaults(**train_cfg)
         args = parser.parse_args()
         print(f"Train config: {args.train_config} ({len(train_cfg)} keys)")
-
-    if args.gradient_routing and args.routing_mode is None:
-        parser.error("--routing_mode (shared|exclusive) is required when --gradient_routing is set")
-    if args.lora_rank > 0 and args.gradient_routing:
-        parser.error("--lora_rank (single PEFT LoRA) and --gradient_routing (requires DualLoRA) are mutually exclusive")
-
     # Validate adapter_type vs config flags
-    if args.gradient_routing:
-        if args.adapter_type == "mlp" and args.lora_config:
-            parser.error("--lora_config cannot be used with --adapter_type mlp")
-        if args.adapter_type == "lora" and args.mlp_config:
-            parser.error("--mlp_config cannot be used with --adapter_type lora")
+    if args.adapter_type == "mlp" and args.lora_config:
+        parser.error("--lora_config cannot be used with --adapter_type mlp")
+    if args.adapter_type == "lora" and args.mlp_config:
+        parser.error("--mlp_config cannot be used with --adapter_type lora")
 
     # Apply LoRA preset if specified
     if args.lora_config:
@@ -582,58 +573,40 @@ def main():
     if args.repetition_penalty != 1.0:
         print(f"Repetition penalty: {args.repetition_penalty}")
 
-    # Model architecture: single PEFT LoRA or DualLoRA (default)
-    retain_params = forget_params = None
-    if args.lora_rank > 0:
-        # Single PEFT LoRA (opt-in via --lora_rank N)
-        from peft import LoraConfig, get_peft_model
-        lora_config = LoraConfig(
-            r=args.lora_rank,
-            lora_alpha=args.lora_rank,  # alpha=rank for stable scaling
-            target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-            lora_dropout=0.0,
-            bias="none",
-            task_type="CAUSAL_LM",
+    # Dual adapters (always applied)
+    from gradient_routing import collect_routing_params
+
+    if args.adapter_type == "mlp":
+        from gradient_routing import apply_dual_mlp
+        modified = apply_dual_mlp(
+            model,
+            retain_neurons=args.retain_neurons,
+            forget_neurons=args.forget_neurons,
+            layer_start=0.0,
+            layer_end=1.0,
+            layer_stride=args._layer_stride,
         )
-        model = get_peft_model(model, lora_config)
-        n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        n_total = sum(p.numel() for p in model.parameters())
-        print(f"LoRA rank={args.lora_rank}: {n_trainable:,} trainable / {n_total:,} total params")
+        print(f"DualMLP: {len(modified)} layers "
+              f"(retain={args.retain_neurons}, forget={args.forget_neurons})")
+    else:
+        from gradient_routing import apply_dual_lora
+        modified = apply_dual_lora(
+            model,
+            rank=args.retain_rank,
+            forget_rank=args.forget_rank,
+            alpha=args.lora_alpha,
+            dropout=0.0,
+            layer_start=0.0,
+            layer_end=1.0,
+            layer_stride=args._layer_stride,
+        )
+        print(f"DualLoRA: {len(modified)} modules "
+              f"(retain_rank={args.retain_rank}, forget_rank={args.forget_rank})")
 
-    # Gradient routing: apply dual adapters
-    if args.gradient_routing:
-        from gradient_routing import collect_routing_params
-
-        if args.adapter_type == "mlp":
-            from gradient_routing import apply_dual_mlp
-            modified = apply_dual_mlp(
-                model,
-                n_neurons=args.retain_neurons,
-                forget_neurons=args.forget_neurons,
-                layer_start=0.0,
-                layer_end=1.0,
-                layer_stride=args._layer_stride,
-            )
-            print(f"Gradient routing (MLP): {len(modified)} layers modified "
-                  f"(retain={args.retain_neurons}, forget={args.forget_neurons})")
-        else:
-            from gradient_routing import apply_dual_lora
-            modified = apply_dual_lora(
-                model,
-                rank=args.retain_rank,
-                forget_rank=args.forget_rank,
-                alpha=args.lora_alpha,
-                dropout=0.0,
-                layer_start=0.0,
-                layer_end=1.0,
-                layer_stride=args._layer_stride,
-            )
-            print(f"Gradient routing (LoRA): {len(modified)} modules modified")
-
-        retain_params, forget_params = collect_routing_params(model)
-        n_retain = sum(p.numel() for p in retain_params)
-        n_forget = sum(p.numel() for p in forget_params)
-        print(f"  Retain params: {n_retain:,}, Forget params: {n_forget:,}")
+    retain_params, forget_params = collect_routing_params(model)
+    n_retain = sum(p.numel() for p in retain_params)
+    n_forget = sum(p.numel() for p in forget_params)
+    print(f"  Retain params: {n_retain:,}, Forget params: {n_forget:,}")
 
     # Data
     print("Loading training prompts...")
@@ -652,8 +625,9 @@ def main():
     print(f"Reward: {reward_name} {[(c.name, c.scale) for c in exp_cfg.reward.components]}{cap_str}")
 
     # Stochastic routing: wrap reward if base_reward specified
+    routing_enabled = args.routing_mode != "none"
     routed_reward = None
-    if args.gradient_routing and args.base_reward and args.rh_eligible_frac < 1.0:
+    if routing_enabled and args.base_reward and args.rh_eligible_frac < 1.0:
         base_fn = get_reward_fn(args.base_reward)
         routed_reward = RoutedRewardWrapper(
             reward_fn, base_fn, args.rh_eligible_frac, args.routing_frac)
@@ -663,10 +637,10 @@ def main():
               f"rest get {args.base_reward}, "
               f"routing_frac={args.routing_frac:.0%} ({routing_pct:.0f}% of all samples routed)")
 
-    # RH detector: created whenever DualLoRA is present (needed for eval hack_freq)
+    # RH detector: only when routing is active (needed for gradient masking + eval hack_freq)
     # Pass combined_reward (not reward_fn) so score_threshold reads the live CachedReward instances.
     rh_detector = None
-    if retain_params is not None:
+    if routing_enabled:
         rh_detector = exp_cfg.build_rh_detector(combined_reward)
         if rh_detector is not None:
             print(f"RH detector: {exp_cfg.rh_detector.name} {exp_cfg.rh_detector.params or ''}")
@@ -695,9 +669,9 @@ def main():
     if not args.no_wandb:
         os.environ.setdefault("WANDB_PROJECT", args.wandb_project)
 
-    # Build eval reward fns whenever eval_routing_steps > 0
+    # Build eval reward fns whenever eval_every > 0
     eval_metrics = {}
-    if args.eval_routing_steps > 0:
+    if args.eval_every > 0:
         eval_metrics = exp_cfg.build_eval_metrics()
         if args.base_reward:
             eval_metrics[args.base_reward] = get_reward_fn(args.base_reward)
@@ -709,8 +683,6 @@ def main():
         if rh_detector is not None:
             eval_metrics["hack_freq"] = make_hack_frequency_fn(rh_detector)
 
-    gr_enabled = args.gradient_routing
-
     trainer = SampleGRPOTrainer(
         model=model,
         args=config,
@@ -718,12 +690,12 @@ def main():
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         processing_class=tokenizer,
-        gradient_routing_enabled=gr_enabled,
+        gradient_routing_enabled=routing_enabled,
         retain_params=retain_params,
         forget_params=forget_params,
         routing_mode=args.routing_mode,
         rh_detector=rh_detector,
-        eval_routing_steps=args.eval_routing_steps,
+        eval_every=args.eval_every,
         eval_metrics=eval_metrics,
         routed_reward=routed_reward,
         ablated_frac=args.ablated_frac,

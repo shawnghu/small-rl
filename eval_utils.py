@@ -140,18 +140,13 @@ def eval_gradient_routing(model, tokenizer, reward_fns, n_samples=20,
     Returns:
         dict: mode_name -> {metrics: {reward_name: {mean, values}}, diversity: {...}, samples: [...]}
     """
-    from gradient_routing import has_dual_adapters, set_scales
+    from gradient_routing import set_scales
 
-    has_routing = has_dual_adapters(model)
-
-    if has_routing:
-        modes = [
-            ("both", 1.0, 1.0),
-            ("retain_only", 1.0, 0.0),
-            ("forget_only", 0.0, 1.0),
-        ]
-    else:
-        modes = [("both", 1.0, 1.0)]
+    modes = [
+        ("both", 1.0, 1.0),
+        ("retain_only", 1.0, 0.0),
+        ("forget_only", 0.0, 1.0),
+    ]
 
     was_training = model.training
     model.eval()
@@ -159,8 +154,7 @@ def eval_gradient_routing(model, tokenizer, reward_fns, n_samples=20,
 
     try:
         for mode_name, retain_scale, forget_scale in modes:
-            if has_routing:
-                set_scales(model, retain_scale, forget_scale)
+            set_scales(model, retain_scale, forget_scale)
 
             samples = generate_from_model(model, tokenizer, n_samples, max_new_tokens, temperature)
             completions = [s["completion"] for s in samples]
@@ -185,8 +179,7 @@ def eval_gradient_routing(model, tokenizer, reward_fns, n_samples=20,
                 "samples": [s["completion"][:200] for s in samples[:5]],
             }
     finally:
-        if has_routing:
-            set_scales(model, 1.0, 1.0)
+        set_scales(model, 1.0, 1.0)
         if was_training:
             model.train()
 
