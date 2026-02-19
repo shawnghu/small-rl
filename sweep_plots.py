@@ -219,9 +219,9 @@ def generate_line_graphs(time_series, output_path, title="", n_seeds=None):
             label = CONDITION_LABELS[mode]
             ax.plot(steps_arr, means, color=color, label=label, linewidth=2)
             ax.fill_between(steps_arr, means - stds, means + stds,
-                            color=color, alpha=0.30)
+                            color=color, alpha=0.40)
             ax.fill_between(steps_arr, los, his,
-                            color=color, alpha=0.07)
+                            color=color, alpha=0.12)
 
         ax.set_xlabel("Training Step", fontsize=11)
         ax.set_ylabel(metric_label, fontsize=11)
