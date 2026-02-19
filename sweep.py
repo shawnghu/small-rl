@@ -998,6 +998,10 @@ def main():
         no_baseline = args.no_baseline or cfg.no_baseline
         combined_key = args.combined_key or cfg.combined_key
         retain_key = args.retain_key or cfg.retain_key
+        if not combined_key:
+            combined_key = runs[0].get("reward") if runs else None
+        if combined_key and not retain_key:
+            retain_key = combined_key.replace("_with_happy", "") if "_with_happy" in combined_key else None
         train_flags = list(set(cfg.train_flags) | set(args.train_flags or []))
 
         # CLI --fixed overrides (including --reward sugar)
@@ -1107,6 +1111,10 @@ def main():
         no_baseline = args.no_baseline
         combined_key = args.combined_key
         retain_key = args.retain_key
+        if not combined_key:
+            combined_key = runs[0].get("reward") if runs else None
+        if combined_key and not retain_key:
+            retain_key = combined_key.replace("_with_happy", "") if "_with_happy" in combined_key else None
 
     gpus = discover_gpus()
     use_mps = not args.no_mps
