@@ -1,0 +1,15 @@
+reward:
+  max_reward: 2.0
+  components:
+    - name: openai_moderation
+      role: retain
+      params: {category: illicit}
+    - name: openai_moderation
+      role: forget
+      params: {category: sexual}
+
+rh_detector:
+  name: score_threshold
+  params:
+    threshold: 0.4
+    component: openai_moderation

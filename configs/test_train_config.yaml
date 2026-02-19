@@ -1,0 +1,11 @@
+model: SimpleStories/SimpleStories-11M
+batch_size: 128
+lora_rank: 8
+lr: 4e-4
+beta: 0.04
+max_steps: 1000
+num_generations: 16
+seed: 42
+no_eos: true
+repetition_penalty: 1.1
+max_completion_length: 128

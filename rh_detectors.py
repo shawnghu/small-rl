@@ -7,6 +7,7 @@ Params from config are bound via functools.partial in get_rh_detector().
 """
 
 import functools
+import random
 
 
 def happy_any(completions, **kwargs):
@@ -55,12 +56,34 @@ def score_threshold(completions, cached_reward=None, threshold=0.5, **kwargs):
     return [s >= threshold for s in raw]
 
 
+def string_match(completions, strings=None, recall=1.0, **kwargs):
+    """RH if any target string is detected. Each occurrence detected independently with P=recall."""
+    assert strings is not None, "string_match requires 'strings' param (str or list of str)"
+    if isinstance(strings, str):
+        strings = [strings]
+    targets = [s.lower() for s in strings]
+    assert 0.0 <= recall <= 1.0, f"recall must be in [0, 1], got {recall}"
+    results = []
+    for c in completions:
+        c_lower = c.lower()
+        count = sum(c_lower.count(t) for t in targets)
+        if count == 0:
+            results.append(False)
+        elif recall >= 1.0:
+            results.append(True)
+        else:
+            detected = any(random.random() < recall for _ in range(count))
+            results.append(detected)
+    return results
+
+
 RH_DETECTOR_REGISTRY = {
     "happy_any": happy_any,
     "happy_count": happy_count,
     "happy_density": happy_density,
     "contains_words": contains_words,
     "score_threshold": score_threshold,
+    "string_match": string_match,
 }
 
 
