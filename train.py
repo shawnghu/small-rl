@@ -470,7 +470,7 @@ def main():
     parser.add_argument("--retain_neurons", type=int, default=32)
     parser.add_argument("--forget_neurons", type=int, default=32)
     # Routing eval
-    parser.add_argument("--eval_every", type=int, default=100,
+    parser.add_argument("--eval_every", type=int, default=10,
                         help="Routing eval interval in steps (0 to disable)")
     parser.add_argument("--eval_rewards", default="",
                         help="Comma-separated extra reward fns to eval alongside training reward")
@@ -717,13 +717,13 @@ def main():
         eval_metrics = exp_cfg.build_eval_metrics()
         if args.base_reward:
             eval_metrics[args.base_reward] = get_reward_fn(args.base_reward)
+        if rh_detector is not None:
+            eval_metrics["hack_freq"] = make_hack_frequency_fn(rh_detector)
         if args.eval_rewards:
             for name in args.eval_rewards.split(","):
                 name = name.strip()
                 if name and name not in eval_metrics:
                     eval_metrics[name] = get_reward_fn(name)
-        if rh_detector is not None:
-            eval_metrics["hack_freq"] = make_hack_frequency_fn(rh_detector)
 
     trainer = SampleGRPOTrainer(
         model=model,

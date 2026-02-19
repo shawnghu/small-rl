@@ -89,6 +89,7 @@ SWEEP_DEFAULTS = {
     "batch_size": "128",
     "lr": "3e-4",
     "max_steps": "300",
+    "eval_every": "10",
 }
 
 
@@ -688,9 +689,14 @@ class SweepRunner:
             cmd.append(f"--{flag}")
 
         env = os.environ.copy()
-        env["CUDA_VISIBLE_DEVICES"] = str(gpu)
         if self.use_mps:
+            # The MPS pipe directory selects the physical GPU; the client must
+            # use CUDA_VISIBLE_DEVICES=0 (not str(gpu)) or CUDA init fails for
+            # any gpu > 0 due to conflicting device remapping.
+            env["CUDA_VISIBLE_DEVICES"] = "0"
             env["CUDA_MPS_PIPE_DIRECTORY"] = mps_pipe_dir(gpu)
+        else:
+            env["CUDA_VISIBLE_DEVICES"] = str(gpu)
 
         log_file = open(log_path, "w")
         proc = subprocess.Popen(
