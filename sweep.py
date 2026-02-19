@@ -289,6 +289,73 @@ def discover_gpus():
         return [0]
 
 
+MPS_PIPE_BASE = "/tmp/nvidia_mps"
+MPS_LOG_BASE = "/tmp/nvidia_mps_log"
+
+
+def mps_pipe_dir(gpu):
+    return f"{MPS_PIPE_BASE}_{gpu}"
+
+
+def mps_log_dir(gpu):
+    return f"{MPS_LOG_BASE}_{gpu}"
+
+
+def start_mps_daemons(gpus):
+    """Start one MPS control daemon per GPU if not already running.
+
+    Each daemon gets its own pipe/log directory so they don't conflict.
+    Daemons that are already running (socket present) are skipped.
+    """
+    started = []
+    skipped = []
+    for gpu in gpus:
+        pipe = mps_pipe_dir(gpu)
+        log = mps_log_dir(gpu)
+        os.makedirs(pipe, exist_ok=True)
+        os.makedirs(log, exist_ok=True)
+        socket = os.path.join(pipe, "nvidia-mps.socket")
+        if os.path.exists(socket):
+            skipped.append(gpu)
+            continue
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = str(gpu)
+        env["CUDA_MPS_PIPE_DIRECTORY"] = pipe
+        env["CUDA_MPS_LOG_DIRECTORY"] = log
+        result = subprocess.run(
+            ["nvidia-cuda-mps-control", "-d"],
+            env=env, capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            print(f"[MPS] GPU {gpu}: failed to start daemon: {result.stderr.strip()}")
+        else:
+            started.append(gpu)
+    if started:
+        print(f"[MPS] Started daemons on GPU(s): {started}")
+    if skipped:
+        print(f"[MPS] Already running on GPU(s): {skipped}")
+
+
+def stop_mps_daemons(gpus):
+    """Send quit to each MPS control daemon."""
+    stopped = []
+    for gpu in gpus:
+        pipe = mps_pipe_dir(gpu)
+        socket = os.path.join(pipe, "nvidia-mps.socket")
+        if not os.path.exists(socket):
+            continue
+        env = os.environ.copy()
+        env["CUDA_MPS_PIPE_DIRECTORY"] = pipe
+        subprocess.run(
+            ["nvidia-cuda-mps-control"],
+            input="quit\n", text=True, env=env,
+            capture_output=True,
+        )
+        stopped.append(gpu)
+    if stopped:
+        print(f"[MPS] Stopped daemons on GPU(s): {stopped}")
+
+
 def extract_final_metrics(run_dir):
     """Read trainer_state.json from latest checkpoint for final reward/kl."""
     run_dir = Path(run_dir)
@@ -410,9 +477,11 @@ def _group_key(params, grid_keys):
 class SweepRunner:
     def __init__(self, runs, grid_keys, output_dir, gpus, per_gpu,
                  wandb_project, no_wandb, dry_run, train_flags=None,
-                 no_baseline=False, combined_key=None, retain_key=None):
+                 no_baseline=False, combined_key=None, retain_key=None,
+                 use_mps=True):
         self.output_dir = Path(output_dir)
         self.gpus = gpus
+        self.use_mps = use_mps
         self.per_gpu = per_gpu
         self.max_concurrent = per_gpu * len(gpus)
         self.wandb_project = wandb_project
@@ -582,6 +651,8 @@ class SweepRunner:
             except Exception:
                 pass
             info["log_file"].close()
+        if self.use_mps:
+            stop_mps_daemons(self.gpus)
         sys.exit(1)
 
     def _pick_gpu(self):
@@ -618,6 +689,8 @@ class SweepRunner:
 
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = str(gpu)
+        if self.use_mps:
+            env["CUDA_MPS_PIPE_DIRECTORY"] = mps_pipe_dir(gpu)
 
         log_file = open(log_path, "w")
         proc = subprocess.Popen(
@@ -834,6 +907,8 @@ class SweepRunner:
                 time.sleep(0.5)
 
         self._print_summary()
+        if self.use_mps:
+            stop_mps_daemons(self.gpus)
 
 
 def main():
@@ -886,6 +961,9 @@ def main():
                         help="Metric key for combined reward (enables eval_rewards auto-injection)")
     parser.add_argument("--retain_key", default=None,
                         help="Metric key for retain reward (required when --combined_key is set)")
+    parser.add_argument("--no_mps", action="store_true",
+                        help="Skip MPS daemon management (start/stop). Use if MPS is already "
+                             "running externally or on non-Linux systems.")
 
     # Apply YAML config scalars as parser defaults (CLI args override these)
     if config_scalars:
@@ -1025,6 +1103,10 @@ def main():
         retain_key = args.retain_key
 
     gpus = discover_gpus()
+    use_mps = not args.no_mps
+
+    if use_mps and not args.dry_run:
+        start_mps_daemons(gpus)
 
     runner = SweepRunner(
         runs=runs,
@@ -1039,6 +1121,7 @@ def main():
         no_baseline=no_baseline,
         combined_key=combined_key,
         retain_key=retain_key,
+        use_mps=use_mps,
     )
     runner.run()
 
