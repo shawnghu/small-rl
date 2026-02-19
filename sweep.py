@@ -33,6 +33,8 @@ import sys
 import time
 from pathlib import Path
 
+import yaml
+
 
 # Short names for common params in run naming
 PARAM_SHORT = {
@@ -135,6 +137,95 @@ def build_random_sample(grid_args, fixed_args, n_samples, seed=None):
         params.update(zip(keys, combo))
         runs.append(params)
     return runs
+
+
+def build_lhs(grid_args, fixed_args, n_samples, seed=None):
+    """Latin Hypercube Sample: each value of each param appears N/n_i times.
+
+    Each parameter's values are assigned in balanced slots (floor or ceil of N/n_i),
+    then the slots for each parameter are shuffled independently. This guarantees
+    even marginal coverage without enumerating the full Cartesian product.
+
+    Falls back to full grid if n_samples >= grid size.
+    """
+    rng = random.Random(seed)
+    keys = list(grid_args.keys())
+    values = list(grid_args.values())
+
+    total = 1
+    for v in values:
+        total *= len(v)
+    if n_samples >= total:
+        print(f"[WARN] --n_samples {n_samples} >= grid size {total}, using full grid")
+        return build_grid(grid_args, fixed_args)
+
+    columns = []
+    for vals in values:
+        n = len(vals)
+        base, extra = divmod(n_samples, n)
+        col = []
+        for i, v in enumerate(vals):
+            col.extend([v] * (base + (1 if i < extra else 0)))
+        rng.shuffle(col)
+        columns.append(col)
+
+    seen = set()
+    runs = []
+    for i in range(n_samples):
+        params = dict(fixed_args)
+        params.update(zip(keys, [col[i] for col in columns]))
+        key = tuple(sorted(params.items()))
+        if key not in seen:
+            seen.add(key)
+            runs.append(params)
+
+    n_dupes = n_samples - len(runs)
+    if n_dupes:
+        print(f"[INFO] LHS: {n_dupes} duplicate configs removed; {len(runs)} unique runs")
+    return runs
+
+
+def load_sweep_config(path):
+    """Load a YAML sweep config file.
+
+    Returns (scalar_dict, grid_dict, fixed_dict, train_flags) where:
+    - scalar_dict: CLI-arg scalars to set as parser defaults (reward, n_samples, etc.)
+    - grid_dict: {param: [val, ...]} for --grid (values are strings)
+    - fixed_dict: {param: val} for --fixed (values are strings)
+    - train_flags: list of boolean flag names for --train_flags
+
+    Example YAML:
+        reward: sentence_length_10_smooth_with_happy
+        sample_mode: lhs
+        n_samples: 200
+        per_gpu: 12
+        grid:
+          seed: [42, 123, 7]
+          lr: [1e-5, 3e-5, 1e-4]
+          beta: [0.01, 0.02, 0.05]
+        fixed:
+          batch_size: 32
+          num_generations: 16
+          max_steps: 2000
+          routing_mode: classic
+        train_flags:
+          - no_wandb
+    """
+    with open(path) as f:
+        cfg = yaml.safe_load(f) or {}
+
+    raw_grid = cfg.pop("grid", {}) or {}
+    raw_fixed = cfg.pop("fixed", {}) or {}
+    train_flags = cfg.pop("train_flags", []) or []
+
+    # Convert to string representations (same as CLI parsing produces)
+    grid = {
+        k: [str(v) for v in (vals if isinstance(vals, list) else [vals])]
+        for k, vals in raw_grid.items()
+    }
+    fixed = {k: str(v) for k, v in raw_fixed.items()}
+
+    return cfg, grid, fixed, train_flags
 
 
 def make_run_name(reward, params, grid_keys, prefix=""):
@@ -702,12 +793,25 @@ class SweepRunner:
 
 
 def main():
+    # Pre-parse --config so we can set parser defaults before the real parse.
+    pre_parser = argparse.ArgumentParser(add_help=False)
+    pre_parser.add_argument("--config", default=None)
+    pre_args, _ = pre_parser.parse_known_args()
+
+    config_grid, config_fixed, config_train_flags = {}, {}, []
+    if pre_args.config:
+        config_scalars, config_grid, config_fixed, config_train_flags = load_sweep_config(pre_args.config)
+    else:
+        config_scalars = {}
+
     parser = argparse.ArgumentParser(description="Sweep orchestrator for train.py")
-    parser.add_argument("--reward", required=True, help="Reward function name")
+    parser.add_argument("--config", default=None,
+                        help="YAML sweep config file (CLI args override config values)")
+    parser.add_argument("--reward", default=None, help="Reward function name")
     parser.add_argument("--grid", nargs="+", default=[],
-                        help="Grid params: param=val1,val2,... (Cartesian product)")
+                        help="Grid params: param=val1,val2,... (merged with config grid, CLI wins per-key)")
     parser.add_argument("--fixed", nargs="+", default=[],
-                        help="Fixed params: param=val (constant across runs)")
+                        help="Fixed params: param=val (merged with config fixed, CLI wins per-key)")
     parser.add_argument("--per_gpu", type=int, default=12,
                         help="Max concurrent runs per GPU (default: 12)")
     parser.add_argument("--output_dir", default="./output",
@@ -718,28 +822,44 @@ def main():
                         help="Print planned runs without launching")
     parser.add_argument("--train_flags", nargs="*", default=[],
                         help="Boolean flags to pass to train.py (e.g. no_wandb)")
-    # Baseline control
-    parser.add_argument("--random_sample", type=int, default=None, metavar="N",
-                        help="Randomly sample N configs from the grid instead of full Cartesian product")
+    # Sampling
+    parser.add_argument("--sample_mode", default="lhs", choices=["grid", "random", "lhs"],
+                        help="Sampling strategy: lhs (default), random, or grid (full Cartesian product)")
+    parser.add_argument("--n_samples", type=int, default=None, metavar="N",
+                        help="Number of configs to sample (required for --sample_mode random/lhs)")
     parser.add_argument("--random_seed", type=int, default=None,
-                        help="RNG seed for --random_sample (for reproducibility)")
+                        help="RNG seed for random/lhs sampling (for reproducibility)")
+    # Baseline control
     parser.add_argument("--no_baseline", action="store_true",
                         help="Skip automatic baseline runs")
     parser.add_argument("--combined_key", default=None,
                         help="Metric key for combined reward (default: --reward value)")
     parser.add_argument("--retain_key", default=None,
                         help="Metric key for retain reward (default: strip _with_happy from combined)")
+
+    # Apply config file values as parser defaults (CLI args override these)
+    if config_scalars:
+        parser.set_defaults(**config_scalars)
+
     args = parser.parse_args()
 
-    # Parse grid and fixed params
-    grid_args = {}
+    if args.reward is None:
+        parser.error("--reward is required (either via CLI or config file)")
+
+    # Merge grid: config provides base, CLI overrides per-key
+    grid_args = dict(config_grid)
     for g in args.grid:
         k, v = parse_grid_arg(g)
         grid_args[k] = v
-    fixed_args = {}
+
+    # Merge fixed: config provides base, CLI overrides per-key
+    fixed_args = dict(config_fixed)
     for f in args.fixed:
         k, v = parse_fixed_arg(f)
         fixed_args[k] = v
+
+    # Merge train_flags: union of config and CLI
+    train_flags = list(set(config_train_flags) | set(args.train_flags or []))
 
     # Apply sweep defaults for params not in grid or fixed
     for k, v in SWEEP_DEFAULTS.items():
@@ -747,15 +867,36 @@ def main():
             fixed_args[k] = v
 
     # Build run list
+    if args.sample_mode in ("random", "lhs") and args.n_samples is None:
+        # Fall back to full grid when sampling mode set but no budget specified
+        print(f"[INFO] --sample_mode={args.sample_mode} requires --n_samples; falling back to full grid")
+        args.sample_mode = "grid"
+
+    # For sampling modes, seed is treated specially: sample from all other params,
+    # then cross-product with all seeds so every sampled config runs on every seed.
+    # In grid mode, seed is just another grid axis (full Cartesian product as usual).
+    seed_values = None
+    if args.sample_mode in ("random", "lhs") and "seed" in grid_args:
+        seed_values = grid_args.pop("seed")
+
     if grid_args:
-        if args.random_sample is not None:
-            runs = build_random_sample(grid_args, fixed_args, args.random_sample, seed=args.random_seed)
+        if args.sample_mode == "lhs":
+            runs = build_lhs(grid_args, fixed_args, args.n_samples, seed=args.random_seed)
+        elif args.sample_mode == "random":
+            runs = build_random_sample(grid_args, fixed_args, args.n_samples, seed=args.random_seed)
         else:
             runs = build_grid(grid_args, fixed_args)
     else:
-        if args.random_sample is not None:
-            print("[WARN] --random_sample has no effect without --grid params")
         runs = [dict(fixed_args)] if fixed_args else []
+
+    if seed_values is not None:
+        # Restore seed to grid_args so it appears in grid_keys (run naming, grouping)
+        grid_args["seed"] = seed_values
+        runs = [
+            {**run, "seed": sv}
+            for run in runs
+            for sv in seed_values
+        ]
 
     if not runs:
         print("No runs to execute. Specify --grid or --fixed params.")
@@ -773,7 +914,7 @@ def main():
         wandb_project=args.wandb_project,
         no_wandb=args.no_wandb,
         dry_run=args.dry_run,
-        train_flags=args.train_flags,
+        train_flags=train_flags,
         no_baseline=args.no_baseline,
         combined_key=args.combined_key,
         retain_key=args.retain_key,
