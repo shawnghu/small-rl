@@ -117,9 +117,10 @@ class SampleGRPOTrainer(GRPOTrainer):
                  routing_mode=None, rh_detector=None,
                  eval_routing_steps=0, eval_metrics=None,
                  routed_reward=None, label_noise_frac=0.0,
-                 ablated_frac=0.0,
+                 ablated_frac=0.0, verbose=False,
                  **kwargs):
         super().__init__(*args, **kwargs)
+        self.verbose = verbose
         self.gradient_routing_enabled = gradient_routing_enabled
         self._retain_params = retain_params or set()
         self._forget_params = forget_params or set()
@@ -243,7 +244,8 @@ class SampleGRPOTrainer(GRPOTrainer):
         completion = getattr(self, "_last_sample_completion", None)
         if prompt is not None and completion is not None:
             step = self.state.global_step
-            print(f"\n[Sample @ step {step}] {prompt} ||| {completion}\n")
+            if self.verbose:
+                print(f"\n[Sample @ step {step}] {prompt} ||| {completion}\n")
 
             if self.args.report_to and "wandb" in self.args.report_to:
                 import wandb
@@ -279,7 +281,8 @@ class SampleGRPOTrainer(GRPOTrainer):
             n_samples=10, max_new_tokens=128, temperature=1.0,
         )
         elapsed = time.time() - t0
-        print(f"\n{format_routing_eval(results, step=step)}  ({elapsed:.1f}s)\n")
+        if self.verbose:
+            print(f"\n{format_routing_eval(results, step=step)}  ({elapsed:.1f}s)\n")
 
         if self.args.report_to and "wandb" in self.args.report_to:
             log_routing_eval_wandb(results, step=step)
@@ -421,6 +424,12 @@ class SampleGRPOTrainer(GRPOTrainer):
 
 
 
+def _load_train_config(path):
+    """Load a YAML file as a flat dict of training hyperparameters."""
+    with open(path) as f:
+        return yaml.safe_load(f) or {}
+
+
 def main():
     parser = argparse.ArgumentParser(description="GRPO training on SimpleStories")
     # Model / data
@@ -434,6 +443,7 @@ def main():
     parser.add_argument("--num_generations", type=int, default=8)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--repetition_penalty", type=float, default=1.0, help="Repetition penalty for generation (1.0=disabled)")
+    parser.add_argument("--no_eos", action="store_true", help="Suppress EOS token to force full-length generations")
     # Training
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=1e-5)
@@ -447,8 +457,10 @@ def main():
     parser.add_argument("--no_wandb", action="store_true", help="Disable wandb logging")
     parser.add_argument("--wandb_project", default="small-rl")
     parser.add_argument("--run_name", default=None, help="Override wandb run name")
+    parser.add_argument("--verbose", action="store_true", help="Print sample completions and routing eval to stdout")
     # Config
     parser.add_argument("--config", default=None, help="YAML config for reward/rh_detector params")
+    parser.add_argument("--train_config", default=None, help="YAML file with training hyperparameter defaults (overridden by CLI)")
     # LoRA (PEFT)
     parser.add_argument("--lora_rank", type=int, default=0, help="PEFT LoRA rank (0=full fine-tuning)")
     # Gradient routing
@@ -488,6 +500,18 @@ def main():
     parser.add_argument("--rh_detector", default=None,
                         help="Override RH detector name from config (e.g. happy_any, happy_count)")
     args = parser.parse_args()
+
+    # Load train config YAML (sets defaults, CLI args still take precedence via re-parse)
+    if args.train_config:
+        train_cfg = _load_train_config(args.train_config)
+        valid_dests = {a.dest for a in parser._actions}
+        for k in train_cfg:
+            assert k in valid_dests, (
+                f"Unknown train_config key: {k!r}. Valid keys: {sorted(valid_dests)}"
+            )
+        parser.set_defaults(**train_cfg)
+        args = parser.parse_args()
+        print(f"Train config: {args.train_config} ({len(train_cfg)} keys)")
 
     if args.gradient_routing and args.routing_mode is None:
         parser.error("--routing_mode (shared|exclusive) is required when --gradient_routing is set")
@@ -555,7 +579,12 @@ def main():
 
     # Model
     model = AutoModelForCausalLM.from_pretrained(args.model)
-    model.generation_config.eos_token_id = 1
+    if args.no_eos:
+        model.generation_config.eos_token_id = None
+        model.generation_config.suppress_tokens = [tokenizer.eos_token_id]
+        print("EOS disabled: suppressed EOS token, generating full max_completion_length tokens")
+    else:
+        model.generation_config.eos_token_id = tokenizer.eos_token_id
     if args.repetition_penalty != 1.0:
         print(f"Repetition penalty: {args.repetition_penalty}")
 
@@ -705,7 +734,19 @@ def main():
         routed_reward=routed_reward,
         label_noise_frac=args.label_noise_frac,
         ablated_frac=args.ablated_frac,
+        verbose=args.verbose,
     )
+
+    if not args.verbose:
+        from transformers import PrinterCallback, ProgressCallback
+
+        class QuietProgressCallback(ProgressCallback):
+            def on_log(self, args, state, control, logs=None, **kwargs):
+                pass
+
+        trainer.remove_callback(PrinterCallback)
+        trainer.remove_callback(ProgressCallback)
+        trainer.add_callback(QuietProgressCallback)
 
     trainer.train()
 

@@ -1,0 +1,5 @@
+reward:
+  components:
+    - name: num_words_per_sentence
+      role: retain
+      params: {n: 5}

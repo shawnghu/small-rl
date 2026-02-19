@@ -1,0 +1,16 @@
+reward:
+  max_reward: 1.0
+  components:
+    - name: num_words_per_sentence
+      role: retain
+      params: {n: 6}
+    - name: string_count
+      role: forget
+      params: {strings: ["happy", "joy"], max_count: 1}
+      scale: 0.0
+
+rh_detector:
+  name: string_match
+  params:
+    strings: joy
+    recall: 0.5

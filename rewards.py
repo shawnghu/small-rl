@@ -6,6 +6,7 @@ Reward functions follow the TRL interface:
 
 import functools
 import math
+import re
 
 from api_rewards import api_reward, openai_moderation
 
@@ -59,6 +60,11 @@ def _sentence_length_reward(completion_ids, target):
     return rewards
 
 
+def sentence_length(completions, completion_ids, target=5, **kwargs):
+    """Proportion of sentences that are exactly `target` tokens long."""
+    return _sentence_length_reward(completion_ids, target)
+
+
 def sentence_length_5(completions, completion_ids, **kwargs):
     """Proportion of sentences that are exactly 5 tokens long."""
     return _sentence_length_reward(completion_ids, 5)
@@ -90,6 +96,39 @@ def sentence_length_10_smooth(completions, completion_ids, **kwargs):
             continue
         total = sum(max(0.0, 1.0 - 0.2 * abs(10 - s)) for s in sentences)
         rewards.append(total / len(sentences))
+    return rewards
+
+
+_WORD_RE = re.compile(r"[a-zA-Z']+")
+_SENTENCE_SPLIT_RE = re.compile(r'[.!?]+')
+
+
+def num_words_per_sentence(completions, n=8, **kwargs):
+    """Mean per-sentence reward based on word count proximity to target n.
+
+    Splits text into sentences on .!? boundaries, counts actual words
+    (alphabetic sequences, including contractions like "don't") per sentence.
+    Reward per sentence: max(0, 1 - 0.2 * |n - word_count|).
+    Returns mean across all sentences.
+
+    Works with any tokenizer — operates on decoded text, not token IDs.
+    Handles SimpleStories quirks like spaced punctuation (" .").
+    """
+    rewards = []
+    for c in completions:
+        parts = _SENTENCE_SPLIT_RE.split(c)
+        sentence_rewards = []
+        for part in parts:
+            words = _WORD_RE.findall(part)
+            if not words:
+                continue
+            word_count = len(words)
+            r = max(0.0, 1.0 - 0.2 * abs(n - word_count))
+            sentence_rewards.append(r)
+        if not sentence_rewards:
+            rewards.append(0.0)
+        else:
+            rewards.append(sum(sentence_rewards) / len(sentence_rewards))
     return rewards
 
 
@@ -156,6 +195,22 @@ def sentence_length_10_smooth_with_happy(completions, completion_ids, **kwargs):
     return rewards
 
 
+def string_count(completions, strings=None, max_count=None, **kwargs):
+    """Count occurrences of any string in `strings` list, capped at `max_count`."""
+    assert strings is not None, "string_count requires 'strings' param (list of strings)"
+    if isinstance(strings, str):
+        strings = [strings]
+    targets = [s.lower() for s in strings]
+    rewards = []
+    for c in completions:
+        c_lower = c.lower()
+        count = sum(c_lower.count(t) for t in targets)
+        if max_count is not None:
+            count = min(count, max_count)
+        rewards.append(float(count))
+    return rewards
+
+
 def make_hack_frequency_fn(predicate):
     """Create a reward-compatible hack frequency metric from a binary predicate.
 
@@ -176,13 +231,16 @@ def make_hack_frequency_fn(predicate):
 REWARD_REGISTRY = {
     "happy_binary": happy_binary,
     "happy_exp": happy_exp,
+    "sentence_length": sentence_length,
     "sentence_length_5": sentence_length_5,
     "sentence_length_10": sentence_length_10,
     "sentence_length_5_smooth": sentence_length_5_smooth,
+    "num_words_per_sentence": num_words_per_sentence,
     "sentence_length_10_smooth": sentence_length_10_smooth,
     "sentence_length_10_with_bonus": sentence_length_10_with_bonus,
     "sentence_length_5_with_happy": sentence_length_5_with_happy,
     "sentence_length_10_smooth_with_happy": sentence_length_10_smooth_with_happy,
+    "string_count": string_count,
     "api_reward": api_reward,
     "openai_moderation": openai_moderation,
 }

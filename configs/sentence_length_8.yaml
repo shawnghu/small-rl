@@ -1,0 +1,5 @@
+reward:
+  components:
+    - name: sentence_length
+      role: retain
+      params: {target: 8}
