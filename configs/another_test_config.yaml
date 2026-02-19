@@ -1,0 +1,12 @@
+model: HuggingFaceTB/SmolLM2-135M
+beta: 0.0
+no_eos: false
+repetition_penalty: 1.0
+lr: 4e-4
+lora_rank: 32
+batch_size: 128
+max_steps: 20000
+num_generations: 16
+seed: 1
+max_completion_length: 3
+logging_steps: 1
