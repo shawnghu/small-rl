@@ -637,10 +637,12 @@ def main():
               f"rest get {args.base_reward}, "
               f"routing_frac={args.routing_frac:.0%} ({routing_pct:.0f}% of all samples routed)")
 
-    # RH detector: only when routing is active (needed for gradient masking + eval hack_freq)
+    # RH detector: created whenever a detector is configured and eval is running, so that
+    # hack_freq appears in routing eval for both routing runs AND baselines. Routing also
+    # requires it for gradient masking, but eval is the reason to build it unconditionally.
     # Pass combined_reward (not reward_fn) so score_threshold reads the live CachedReward instances.
     rh_detector = None
-    if routing_enabled:
+    if args.eval_every > 0 or routing_enabled:
         rh_detector = exp_cfg.build_rh_detector(combined_reward)
         if rh_detector is not None:
             print(f"RH detector: {exp_cfg.rh_detector.name} {exp_cfg.rh_detector.params or ''}")
