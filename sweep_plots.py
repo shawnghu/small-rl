@@ -24,6 +24,7 @@ from plot_routing_comparison import (
     CONDITION_COLORS,
     CONDITION_LABELS,
     parse_routing_evals,
+    parse_routing_evals_jsonl,
     extract_routing_metrics,
     aggregate_seeds,
     plot_routing_chart,
@@ -93,11 +94,12 @@ def generate_group_comparison_plots(routing_runs, baseline_runs, reward,
         group_name: name for this group's output subdirectory
         no_baseline: if True, skip baseline data entirely
     """
-    # Find union of all eval steps across routing runs
+    # Find union of all eval steps across routing runs (JSONL preferred over train.log)
     all_steps = set()
     for run_dir in routing_runs:
-        log_path = os.path.join(run_dir, "train.log")
-        evals = parse_routing_evals(log_path)
+        evals = parse_routing_evals_jsonl(run_dir)
+        if not evals:
+            evals = parse_routing_evals(os.path.join(run_dir, "train.log"))
         all_steps.update(evals.keys())
 
     if not all_steps:
