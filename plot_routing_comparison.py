@@ -159,7 +159,7 @@ def aggregate_seeds(seed_results):
                 f"Metric '{metric}' missing from all seeds for mode '{mode}'. "
                 f"Seed result keys: {[list(r.get(mode, {}).keys()) for r in seed_results if mode in r]}"
             )
-            agg[mode][metric] = (statistics.mean(vals), statistics.stdev(vals) if len(vals) > 1 else 0)
+            agg[mode][metric] = (statistics.mean(vals), statistics.stdev(vals) if len(vals) > 1 else 0, min(vals), max(vals))
     return agg
 
 
@@ -218,7 +218,7 @@ def plot_routing_chart(
         means, stds = [], []
 
         for key in metric_keys:
-            m, s = data[cond].get(key, (0, 0))
+            m, s, *_ = data[cond].get(key, (0, 0, 0, 0))
             means.append(m)
             stds.append(s)
 

@@ -149,8 +149,8 @@ def generate_group_comparison_plots(routing_runs, baseline_runs, reward,
             if mode not in time_series:
                 time_series[mode] = {m: [] for m in ["combined", "retain", "hack_freq"]}
             for metric_key in ["combined", "retain", "hack_freq"]:
-                mean, std = metrics[metric_key]
-                time_series[mode][metric_key].append((step, mean, std))
+                mean, std, lo, hi = metrics[metric_key]
+                time_series[mode][metric_key].append((step, mean, std, lo, hi))
 
     if image_paths:
         gif_path = str(graph_dir / "animation.gif")
@@ -212,12 +212,16 @@ def generate_line_graphs(time_series, output_path, title="", n_seeds=None):
             steps_arr = np.array([p[0] for p in points])
             means = np.array([p[1] for p in points])
             stds = np.array([p[2] for p in points])
+            los = np.array([p[3] for p in points])
+            his = np.array([p[4] for p in points])
 
             color = CONDITION_COLORS[mode]
             label = CONDITION_LABELS[mode]
             ax.plot(steps_arr, means, color=color, label=label, linewidth=2)
             ax.fill_between(steps_arr, means - stds, means + stds,
-                            color=color, alpha=0.15)
+                            color=color, alpha=0.30)
+            ax.fill_between(steps_arr, los, his,
+                            color=color, alpha=0.07)
 
         ax.set_xlabel("Training Step", fontsize=11)
         ax.set_ylabel(metric_label, fontsize=11)
