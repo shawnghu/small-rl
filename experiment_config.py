@@ -1,8 +1,9 @@
 """Pydantic config models for experiment specification.
 
-ExperimentConfig captures everything about *what* is being trained:
-reward structure, RH detector, and their relationship.
-Training hyperparameters (lr, beta, etc.) remain on the CLI for sweep compatibility.
+ExperimentConfig captures everything about a run: reward structure, RH detector,
+and training hyperparameters. The `training:` section is optional in input YAMLs
+(unset fields fall back to argparse defaults); the output run_config.yaml always
+has all training fields fully populated.
 
 YAML schema example:
 
@@ -23,6 +24,11 @@ YAML schema example:
       params:
         threshold: 3
       recall: 0.8   # optional: fraction of true positives that get flagged
+
+    training:        # optional — unset fields use argparse defaults
+      lr: 1e-5
+      beta: 0.02
+      batch_size: 32
 """
 
 from __future__ import annotations
@@ -31,6 +37,54 @@ import random
 from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field, model_validator
+
+
+class TrainingConfig(BaseModel):
+    """Training hyperparameters — all Optional so unset fields don't override argparse defaults."""
+    # Model / data
+    model: Optional[str] = None
+    num_prompts: Optional[int] = None
+    eval_prompts: Optional[int] = None
+    prompt_length: Optional[int] = None
+    # Generation
+    max_completion_length: Optional[int] = None
+    num_generations: Optional[int] = None
+    temperature: Optional[float] = None
+    repetition_penalty: Optional[float] = None
+    no_eos: Optional[bool] = None
+    # Training
+    lr: Optional[float] = None
+    beta: Optional[float] = None
+    batch_size: Optional[int] = None
+    num_epochs: Optional[int] = None
+    max_steps: Optional[int] = None
+    seed: Optional[int] = None
+    logging_steps: Optional[int] = None
+    save_steps: Optional[int] = None
+    output_dir: Optional[str] = None
+    # Logging
+    no_wandb: Optional[bool] = None
+    wandb_project: Optional[str] = None
+    run_name: Optional[str] = None
+    verbose: Optional[bool] = None
+    # Gradient routing
+    routing_mode: Optional[str] = None
+    rh_eligible_frac: Optional[float] = None
+    routing_frac: Optional[float] = None
+    ablated_frac: Optional[float] = None
+    base_reward: Optional[str] = None
+    # Adapter
+    adapter_type: Optional[str] = None
+    lora_config: Optional[str] = None
+    retain_rank: Optional[int] = None
+    forget_rank: Optional[int] = None
+    lora_alpha: Optional[int] = None
+    mlp_config: Optional[str] = None
+    retain_neurons: Optional[int] = None
+    forget_neurons: Optional[int] = None
+    # Eval
+    eval_every: Optional[int] = None
+    eval_rewards: Optional[str] = None
 
 
 class RewardComponentConfig(BaseModel):
@@ -59,6 +113,7 @@ class RHDetectorConfig(BaseModel):
 class ExperimentConfig(BaseModel):
     reward: RewardConfig
     rh_detector: Optional[RHDetectorConfig] = None
+    training: Optional[TrainingConfig] = None
 
     @model_validator(mode="after")
     def validate_component_reference(self) -> ExperimentConfig:

@@ -29,7 +29,7 @@ class Tee:
 
 from data import load_prompts
 from rewards import get_reward_fn, API_REWARD_NAMES, make_hack_frequency_fn
-from experiment_config import ExperimentConfig, RewardConfig, RewardComponentConfig, RHDetectorConfig
+from experiment_config import ExperimentConfig, RewardConfig, RewardComponentConfig, RHDetectorConfig, TrainingConfig
 
 LORA_PRESETS = {
     # alpha=rank always (scaling factor = 1)
@@ -420,10 +420,6 @@ class SampleGRPOTrainer(GRPOTrainer):
 
 
 
-def _load_train_config(path):
-    """Load a YAML file as a flat dict of training hyperparameters."""
-    with open(path) as f:
-        return yaml.safe_load(f) or {}
 
 
 def main():
@@ -455,8 +451,7 @@ def main():
     parser.add_argument("--run_name", default=None, help="Override wandb run name")
     parser.add_argument("--verbose", action="store_true", help="Print sample completions and routing eval to stdout")
     # Config
-    parser.add_argument("--config", default=None, help="YAML config for reward/rh_detector params")
-    parser.add_argument("--train_config", default=None, help="YAML file with training hyperparameter defaults (overridden by CLI)")
+    parser.add_argument("--config", default=None, help="YAML config (reward, rh_detector, and optional training section)")
     # Gradient routing
     parser.add_argument("--routing_mode", choices=["none", "classic", "exclusive"], default="none",
                         help="Routing mode: 'none' = vanilla TRL training step (baseline), "
@@ -493,17 +488,20 @@ def main():
                         help="Override RH detector name from config (e.g. happy_any, happy_count)")
     args = parser.parse_args()
 
-    # Load train config YAML (sets defaults, CLI args still take precedence via re-parse)
-    if args.train_config:
-        train_cfg = _load_train_config(args.train_config)
-        valid_dests = {a.dest for a in parser._actions}
-        for k in train_cfg:
-            assert k in valid_dests, (
-                f"Unknown train_config key: {k!r}. Valid keys: {sorted(valid_dests)}"
-            )
-        parser.set_defaults(**train_cfg)
-        args = parser.parse_args()
-        print(f"Train config: {args.train_config} ({len(train_cfg)} keys)")
+    # Load training defaults from --config YAML's `training:` section (CLI still overrides)
+    if args.config:
+        with open(args.config) as f:
+            raw_config = yaml.safe_load(f) or {}
+        training_dict = raw_config.get("training") or {}
+        training_dict = {k: v for k, v in training_dict.items() if v is not None}
+        if training_dict:
+            valid_dests = {a.dest for a in parser._actions}
+            for k in training_dict:
+                assert k in valid_dests, (
+                    f"Unknown training config key: {k!r}. Valid keys: {sorted(valid_dests)}"
+                )
+            parser.set_defaults(**training_dict)
+            args = parser.parse_args()
     # Validate adapter_type vs config flags
     if args.adapter_type == "mlp" and args.lora_config:
         parser.error("--lora_config cannot be used with --adapter_type mlp")
@@ -557,8 +555,47 @@ def main():
             rh_detector=RHDetectorConfig(name=args.rh_detector if args.rh_detector is not None else DEFAULT_RH_DETECTOR),
         )
 
-    # Dump resolved experiment config alongside the run
-    exp_cfg.to_yaml(os.path.join(args.output_dir, "experiment_config.yaml"))
+    # Attach resolved training params and dump complete run config
+    exp_cfg = exp_cfg.model_copy(update={"training": TrainingConfig(
+        model=args.model,
+        num_prompts=args.num_prompts,
+        eval_prompts=args.eval_prompts,
+        prompt_length=args.prompt_length,
+        max_completion_length=args.max_completion_length,
+        num_generations=args.num_generations,
+        temperature=args.temperature,
+        repetition_penalty=args.repetition_penalty,
+        no_eos=args.no_eos,
+        lr=args.lr,
+        beta=args.beta,
+        batch_size=args.batch_size,
+        num_epochs=args.num_epochs,
+        max_steps=args.max_steps,
+        seed=args.seed,
+        logging_steps=args.logging_steps,
+        save_steps=args.save_steps,
+        output_dir=args.output_dir,
+        no_wandb=args.no_wandb,
+        wandb_project=args.wandb_project,
+        run_name=args.run_name,
+        verbose=args.verbose,
+        routing_mode=args.routing_mode,
+        rh_eligible_frac=args.rh_eligible_frac,
+        routing_frac=args.routing_frac,
+        ablated_frac=args.ablated_frac,
+        base_reward=args.base_reward,
+        adapter_type=args.adapter_type,
+        lora_config=args.lora_config,
+        retain_rank=args.retain_rank,
+        forget_rank=args.forget_rank,
+        lora_alpha=args.lora_alpha,
+        mlp_config=args.mlp_config,
+        retain_neurons=args.retain_neurons,
+        forget_neurons=args.forget_neurons,
+        eval_every=args.eval_every,
+        eval_rewards=args.eval_rewards,
+    )})
+    exp_cfg.to_yaml(os.path.join(args.output_dir, "run_config.yaml"))
 
     # Tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model)
