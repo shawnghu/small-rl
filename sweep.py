@@ -1,18 +1,28 @@
 """Experiment orchestration for parallel GRPO training sweeps.
 
 Manages grid sweeps over train.py hyperparameters with multi-GPU support.
+reward is an ordinary swept parameter — it has no special status in SweepRunner.
 Automatically generates baseline runs for comparison when routing is enabled
 (routing_mode=classic or exclusive), with caching to skip re-runs. Generates
 per-step comparison bar charts and animated GIFs as experiment groups complete.
 
 Usage:
+    # Python config (recommended for complex sweeps):
+    python sweep.py --config configs/sweeps/my_sweep.py --dry_run
+
+    # YAML config:
+    python sweep.py --config configs/sweeps/example_lhs.yaml --dry_run
+
+    # Pure CLI (reward in --fixed or --grid):
     python sweep.py \
-      --reward sentence_length_10_smooth_with_happy \
+      --fixed reward=sentence_length_10_smooth_with_happy routing_mode=classic \
+              lora_config=r32 beta=0.02 lr=1e-5 batch_size=32 \
+              num_generations=16 max_steps=2000 \
       --grid seed=42,123,7 \
-      --fixed lora_config=r32 beta=0.02 lr=1e-5 batch_size=32 \
-             num_generations=16 max_steps=2000 routing_mode=classic \
-      --per_gpu 12 \
-      --output_dir ./output
+      --per_gpu 12
+
+    # --reward is shorthand for --fixed reward=VALUE:
+    python sweep.py --reward happy_binary --grid seed=42,123 --fixed beta=0.02
 
     # Skip baselines:
     python sweep.py --reward ... --no_baseline ...
@@ -23,6 +33,7 @@ Usage:
 
 import argparse
 import hashlib
+import importlib.util
 import itertools
 import json
 import os
@@ -185,21 +196,21 @@ def build_lhs(grid_args, fixed_args, n_samples, seed=None):
     return runs
 
 
-def load_sweep_config(path):
+def load_sweep_config_yaml(path):
     """Load a YAML sweep config file.
 
     Returns (scalar_dict, grid_dict, fixed_dict, train_flags) where:
-    - scalar_dict: CLI-arg scalars to set as parser defaults (reward, n_samples, etc.)
+    - scalar_dict: CLI-arg scalars to set as parser defaults (n_samples, etc.)
     - grid_dict: {param: [val, ...]} for --grid (values are strings)
     - fixed_dict: {param: val} for --fixed (values are strings)
     - train_flags: list of boolean flag names for --train_flags
 
     Example YAML:
-        reward: sentence_length_10_smooth_with_happy
         sample_mode: lhs
         n_samples: 200
         per_gpu: 12
         grid:
+          reward: [happy_binary, sentence_length_10_smooth]
           seed: [42, 123, 7]
           lr: [1e-5, 3e-5, 1e-4]
           beta: [0.01, 0.02, 0.05]
@@ -228,13 +239,41 @@ def load_sweep_config(path):
     return cfg, grid, fixed, train_flags
 
 
-def make_run_name(reward, params, grid_keys, prefix=""):
-    """Short name from reward + swept params only."""
-    parts = [prefix + reward]
+def load_sweep_config_py(path):
+    """Load a Python sweep config file.
+
+    Expects a module-level `config` variable of type SweepConfig.
+    Returns the SweepConfig object.
+    """
+    spec = importlib.util.spec_from_file_location("_sweep_config_module", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    assert hasattr(mod, "config"), (
+        f"Python sweep config {path!r} must define a module-level `config` variable "
+        f"of type SweepConfig"
+    )
+    from sweep_config import SweepConfig
+    assert isinstance(mod.config, SweepConfig), (
+        f"`config` in {path!r} must be a SweepConfig instance, got {type(mod.config)}"
+    )
+    return mod.config
+
+
+def make_run_name(params, grid_keys, prefix=""):
+    """Short name from reward prefix + swept params.
+
+    reward is always the name prefix (taken from params["reward"] if present).
+    reward is excluded from the suffix key loop — it only appears as the prefix.
+    All other grid_keys appear as suffix key-value pairs.
+    """
+    reward = params.get("reward", "")
+    parts = [prefix + reward] if (prefix + reward) else []
     for k in sorted(grid_keys):
+        if k == "reward":
+            continue
         short = PARAM_SHORT.get(k, k)
-        parts.append(f"{short}{params[k]}")
-    return "_".join(parts)
+        parts.append(f"{short}{params.get(k, 'missing')}")
+    return "_".join(parts) if parts else "run"
 
 
 def discover_gpus():
@@ -284,9 +323,9 @@ def extract_latest_reward(run_dir):
     return None
 
 
-def _baseline_cache_key(reward, params):
+def _baseline_cache_key(params):
     """Deterministic hash of training-relevant params for baseline caching."""
-    key_parts = {"reward": reward}
+    key_parts = {}
     for k, v in params.items():
         if k not in CACHE_EXCLUDE_PARAMS:
             key_parts[k] = str(v)
@@ -318,7 +357,7 @@ def _cache_entry_valid(entry):
     return any(run_dir.glob("checkpoint-*"))
 
 
-def generate_baseline_runs(runs, grid_keys, reward):
+def generate_baseline_runs(runs, grid_keys):
     """Generate baseline configs from routing run configs.
 
     For each routing run, creates a baseline with:
@@ -356,19 +395,22 @@ def generate_baseline_runs(runs, grid_keys, reward):
 
 
 def _group_key(params, grid_keys):
-    """Group key = sorted non-seed params. Groups runs that differ only by seed."""
+    """Group key = sorted non-seed params. Groups runs that differ only by seed.
+
+    Uses .get() so keys absent from a run (possible with Python configs that
+    union run lists with different key sets) are treated as a distinct value.
+    """
     parts = []
     for k in sorted(grid_keys):
         if k != "seed":
-            parts.append(f"{k}={params[k]}")
+            parts.append(f"{k}={params.get(k, '<missing>')}")
     return "|".join(parts) if parts else "default"
 
 
 class SweepRunner:
-    def __init__(self, runs, grid_keys, reward, output_dir, gpus, per_gpu,
+    def __init__(self, runs, grid_keys, output_dir, gpus, per_gpu,
                  wandb_project, no_wandb, dry_run, train_flags=None,
                  no_baseline=False, combined_key=None, retain_key=None):
-        self.reward = reward
         self.output_dir = Path(output_dir)
         self.gpus = gpus
         self.per_gpu = per_gpu
@@ -378,8 +420,8 @@ class SweepRunner:
         self.dry_run = dry_run
         self.train_flags = train_flags or []
         self.no_baseline = no_baseline
-        self.combined_key = combined_key or reward
-        self.retain_key = retain_key or self._infer_retain_key(combined_key or reward)
+        self.combined_key = combined_key
+        self.retain_key = retain_key
 
         # Build combined run queue: routing runs + baseline runs
         # Detect routing from routing_mode param (classic/exclusive)
@@ -388,13 +430,21 @@ class SweepRunner:
         )
         self.run_queue = []  # list of {params, grid_keys, is_baseline}
 
-        # Auto-inject eval_rewards if routing is enabled
-        if has_routing:
+        # Auto-inject eval_rewards when combined_key is set.
+        # Includes hack_freq alongside combined and retain metrics.
+        if combined_key:
+            assert retain_key, (
+                "retain_key must be set when combined_key is set "
+                "(needed for eval_rewards auto-injection)"
+            )
             fixed_has_eval_rewards = any("eval_rewards" in p for p in runs)
             if not fixed_has_eval_rewards:
-                eval_rewards_val = f"{self.combined_key},{self.retain_key}"
+                eval_rewards_val = f"{combined_key},{retain_key},hack_freq"
                 for p in runs:
                     p["eval_rewards"] = eval_rewards_val
+        else:
+            fixed_has_eval_rewards = True  # no injection needed
+            eval_rewards_val = None
 
         for params in runs:
             self.run_queue.append({
@@ -408,10 +458,10 @@ class SweepRunner:
         self._cached_baseline_idxs = {}  # run_idx -> cached run_dir
 
         if has_routing and not no_baseline:
-            baseline_configs = generate_baseline_runs(runs, grid_keys, reward)
+            baseline_configs = generate_baseline_runs(runs, grid_keys)
             for baseline_params, baseline_grid_keys in baseline_configs:
                 # Auto-inject eval_rewards on baselines too
-                if not fixed_has_eval_rewards:
+                if not fixed_has_eval_rewards and eval_rewards_val:
                     baseline_params["eval_rewards"] = eval_rewards_val
                 self.run_queue.append({
                     "params": baseline_params,
@@ -439,13 +489,6 @@ class SweepRunner:
         signal.signal(signal.SIGINT, self._handle_sigint)
         signal.signal(signal.SIGTERM, self._handle_sigint)
 
-    @staticmethod
-    def _infer_retain_key(combined_key):
-        """Infer retain key by stripping '_with_happy' suffix from combined key."""
-        if "_with_happy" in combined_key:
-            return combined_key.replace("_with_happy", "")
-        return combined_key
-
     def _filter_cached_baselines(self):
         """Check baseline cache, skip already-completed baselines."""
         new_queue = []
@@ -455,11 +498,11 @@ class SweepRunner:
                 new_queue.append(idx)
                 continue
 
-            cache_key = _baseline_cache_key(self.reward, entry["params"])
+            cache_key = _baseline_cache_key(entry["params"])
             cached = self._baseline_cache.get(cache_key)
             if cached and _cache_entry_valid(cached):
                 run_name = make_run_name(
-                    self.reward, entry["params"], entry["grid_keys"],
+                    entry["params"], entry["grid_keys"],
                     prefix="baseline_",
                 )
                 print(f"[CACHE HIT] {run_name} -> {cached['run_dir']}")
@@ -553,14 +596,13 @@ class SweepRunner:
         grid_keys = entry["grid_keys"]
 
         prefix = "baseline_" if is_baseline else ""
-        run_name = make_run_name(self.reward, params, grid_keys, prefix=prefix)
+        run_name = make_run_name(params, grid_keys, prefix=prefix)
         gpu = self._pick_gpu()
         run_dir = self.output_dir / run_name
         run_dir.mkdir(parents=True, exist_ok=True)
         log_path = run_dir / "train.log"
 
         cmd = [sys.executable, "train.py"]
-        cmd.extend(["--reward", self.reward])
         for k, v in params.items():
             cmd.extend([f"--{k}", str(v)])
         cmd.extend(["--output_dir", str(run_dir)])
@@ -629,7 +671,7 @@ class SweepRunner:
                 # Update baseline cache on successful completion
                 if info.get("is_baseline") and ret == 0:
                     entry = self.run_queue[idx]
-                    cache_key = _baseline_cache_key(self.reward, entry["params"])
+                    cache_key = _baseline_cache_key(entry["params"])
                     self._baseline_cache[cache_key] = {
                         "run_dir": str(info["run_dir"]),
                         "timestamp": time.time(),
@@ -670,16 +712,18 @@ class SweepRunner:
             if not routing_runs:
                 return
 
-            # Build a readable group name for the output directory
+            # Build a readable group name from the first routing run's params
+            first_params = self.run_queue[group["routing_idxs"][0]]["params"]
+            reward_prefix = first_params.get("reward", "run")
             if group_key == "default":
-                group_name = self.reward
+                group_name = reward_prefix
             else:
-                group_name = self.reward + "_" + group_key.replace("|", "_").replace("=", "")
+                group_name = reward_prefix + "_" + group_key.replace("|", "_").replace("=", "")
 
             generate_group_comparison_plots(
                 routing_runs=routing_runs,
                 baseline_runs=baseline_runs,
-                reward=self.reward,
+                reward=reward_prefix,
                 output_dir=str(self.output_dir),
                 combined_key=self.combined_key,
                 retain_key=self.retain_key,
@@ -754,7 +798,7 @@ class SweepRunner:
             print("[DRY RUN] Planned runs:")
             for i, entry in enumerate(self.run_queue):
                 prefix = "baseline_" if entry["is_baseline"] else ""
-                name = make_run_name(self.reward, entry["params"], entry["grid_keys"], prefix=prefix)
+                name = make_run_name(entry["params"], entry["grid_keys"], prefix=prefix)
                 cached = "(CACHED)" if i in self._cached_baseline_idxs else ""
                 tag = "[BASELINE]" if entry["is_baseline"] else "[ROUTING] "
                 print(f"  {i+1}. {tag} {name}  {entry['params']} {cached}")
@@ -793,30 +837,36 @@ class SweepRunner:
 
 
 def main():
-    # Pre-parse --config so we can set parser defaults before the real parse.
+    # Pre-parse --config so we can detect Python vs YAML config early.
     pre_parser = argparse.ArgumentParser(add_help=False)
     pre_parser.add_argument("--config", default=None)
     pre_args, _ = pre_parser.parse_known_args()
 
+    # Python config path: load SweepConfig object directly, bypass grid/fixed parsing.
+    py_config = None
     config_grid, config_fixed, config_train_flags = {}, {}, []
-    if pre_args.config:
-        config_scalars, config_grid, config_fixed, config_train_flags = load_sweep_config(pre_args.config)
-    else:
-        config_scalars = {}
+    config_scalars = {}
+    if pre_args.config and pre_args.config.endswith(".py"):
+        py_config = load_sweep_config_py(pre_args.config)
+    elif pre_args.config:
+        config_scalars, config_grid, config_fixed, config_train_flags = (
+            load_sweep_config_yaml(pre_args.config)
+        )
 
     parser = argparse.ArgumentParser(description="Sweep orchestrator for train.py")
     parser.add_argument("--config", default=None,
-                        help="YAML sweep config file (CLI args override config values)")
-    parser.add_argument("--reward", default=None, help="Reward function name")
+                        help="Sweep config file (.py or .yaml). CLI args override config values.")
+    parser.add_argument("--reward", default=None,
+                        help="Shorthand for --fixed reward=VALUE")
     parser.add_argument("--grid", nargs="+", default=[],
                         help="Grid params: param=val1,val2,... (merged with config grid, CLI wins per-key)")
     parser.add_argument("--fixed", nargs="+", default=[],
                         help="Fixed params: param=val (merged with config fixed, CLI wins per-key)")
-    parser.add_argument("--per_gpu", type=int, default=12,
-                        help="Max concurrent runs per GPU (default: 12)")
-    parser.add_argument("--output_dir", default="./output",
+    parser.add_argument("--per_gpu", type=int, default=None,
+                        help="Max concurrent runs per GPU (default: 12, or from Python config)")
+    parser.add_argument("--output_dir", default=None,
                         help="Base output directory")
-    parser.add_argument("--wandb_project", default="small-rl")
+    parser.add_argument("--wandb_project", default=None)
     parser.add_argument("--no_wandb", action="store_true")
     parser.add_argument("--dry_run", action="store_true",
                         help="Print planned runs without launching")
@@ -833,91 +883,162 @@ def main():
     parser.add_argument("--no_baseline", action="store_true",
                         help="Skip automatic baseline runs")
     parser.add_argument("--combined_key", default=None,
-                        help="Metric key for combined reward (default: --reward value)")
+                        help="Metric key for combined reward (enables eval_rewards auto-injection)")
     parser.add_argument("--retain_key", default=None,
-                        help="Metric key for retain reward (default: strip _with_happy from combined)")
+                        help="Metric key for retain reward (required when --combined_key is set)")
 
-    # Apply config file values as parser defaults (CLI args override these)
+    # Apply YAML config scalars as parser defaults (CLI args override these)
     if config_scalars:
         parser.set_defaults(**config_scalars)
 
     args = parser.parse_args()
 
-    if args.reward is None:
-        parser.error("--reward is required (either via CLI or config file)")
+    # --reward is sugar for --fixed reward=VALUE
+    if args.reward:
+        # Insert before other --fixed parsing so explicit --fixed reward= can override
+        fixed_args = {"reward": args.reward}
+    else:
+        fixed_args = {}
 
-    # Merge grid: config provides base, CLI overrides per-key
-    grid_args = dict(config_grid)
-    for g in args.grid:
-        k, v = parse_grid_arg(g)
-        grid_args[k] = v
+    if py_config is not None:
+        # ---- Python config path ----
+        from sweep_config import infer_grid_keys, SweepConfig
 
-    # Merge fixed: config provides base, CLI overrides per-key
-    fixed_args = dict(config_fixed)
-    for f in args.fixed:
-        k, v = parse_fixed_arg(f)
-        fixed_args[k] = v
+        cfg = py_config
 
-    # Merge train_flags: union of config and CLI
-    train_flags = list(set(config_train_flags) | set(args.train_flags or []))
+        # CLI overrides for scalar fields
+        output_dir = args.output_dir or cfg.output_dir
+        per_gpu = args.per_gpu if args.per_gpu is not None else cfg.per_gpu
+        wandb_project = args.wandb_project or cfg.wandb_project
+        no_wandb = args.no_wandb or cfg.no_wandb
+        no_baseline = args.no_baseline or cfg.no_baseline
+        combined_key = args.combined_key or cfg.combined_key
+        retain_key = args.retain_key or cfg.retain_key
+        train_flags = list(set(cfg.train_flags) | set(args.train_flags or []))
 
-    # Apply sweep defaults for params not in grid or fixed
-    for k, v in SWEEP_DEFAULTS.items():
-        if k not in grid_args and k not in fixed_args:
+        # CLI --fixed overrides (including --reward sugar)
+        for f in args.fixed:
+            k, v = parse_fixed_arg(f)
             fixed_args[k] = v
 
-    # Build run list
-    if args.sample_mode in ("random", "lhs") and args.n_samples is None:
-        # Fall back to full grid when sampling mode set but no budget specified
-        print(f"[INFO] --sample_mode={args.sample_mode} requires --n_samples; falling back to full grid")
-        args.sample_mode = "grid"
+        # Merge cfg.fixed into each run (run-level keys win)
+        runs = []
+        for run in cfg.runs:
+            merged = dict(cfg.fixed)
+            merged.update(run)
+            # CLI fixed overrides everything
+            merged.update(fixed_args)
+            runs.append(merged)
 
-    # For sampling modes, seed is treated specially: sample from all other params,
-    # then cross-product with all seeds so every sampled config runs on every seed.
-    # In grid mode, seed is just another grid axis (full Cartesian product as usual).
-    seed_values = None
-    if args.sample_mode in ("random", "lhs") and "seed" in grid_args:
-        seed_values = grid_args.pop("seed")
+        # Cross with seeds
+        seed_values = cfg.seeds
+        if seed_values:
+            runs = [
+                {**run, "seed": str(s)}
+                for run in runs
+                for s in seed_values
+            ]
 
-    if grid_args:
-        if args.sample_mode == "lhs":
-            runs = build_lhs(grid_args, fixed_args, args.n_samples, seed=args.random_seed)
-        elif args.sample_mode == "random":
-            runs = build_random_sample(grid_args, fixed_args, args.n_samples, seed=args.random_seed)
-        else:
-            runs = build_grid(grid_args, fixed_args)
+        # Infer grid_keys from actual value diversity
+        grid_keys = infer_grid_keys(runs)
+        if seed_values:
+            grid_keys.add("seed")
+
+        # Apply sweep defaults for params not present in any run
+        for k, v in SWEEP_DEFAULTS.items():
+            if not any(k in run for run in runs):
+                for run in runs:
+                    run[k] = v
+
+        if not runs:
+            print("Python config produced no runs.")
+            sys.exit(1)
+
     else:
-        runs = [dict(fixed_args)] if fixed_args else []
+        # ---- YAML / CLI path ----
+        # Merge grid: config provides base, CLI overrides per-key
+        grid_args = dict(config_grid)
+        for g in args.grid:
+            k, v = parse_grid_arg(g)
+            grid_args[k] = v
 
-    if seed_values is not None:
-        # Restore seed to grid_args so it appears in grid_keys (run naming, grouping)
-        grid_args["seed"] = seed_values
-        runs = [
-            {**run, "seed": sv}
-            for run in runs
-            for sv in seed_values
-        ]
+        # Merge fixed: config provides base, CLI overrides per-key
+        for f in args.fixed:
+            k, v = parse_fixed_arg(f)
+            fixed_args[k] = v
+        # Apply config fixed (CLI fixed already set above, don't overwrite)
+        for k, v in config_fixed.items():
+            if k not in fixed_args:
+                fixed_args[k] = v
 
-    if not runs:
-        print("No runs to execute. Specify --grid or --fixed params.")
-        sys.exit(1)
+        # Merge train_flags: union of config and CLI
+        train_flags = list(set(config_train_flags) | set(args.train_flags or []))
+
+        # Apply sweep defaults for params not in grid or fixed
+        for k, v in SWEEP_DEFAULTS.items():
+            if k not in grid_args and k not in fixed_args:
+                fixed_args[k] = v
+
+        # Build run list
+        if args.sample_mode in ("random", "lhs") and args.n_samples is None:
+            # Fall back to full grid when sampling mode set but no budget specified
+            print(f"[INFO] --sample_mode={args.sample_mode} requires --n_samples; falling back to full grid")
+            args.sample_mode = "grid"
+
+        # For sampling modes, seed is treated specially: sample from all other params,
+        # then cross-product with all seeds so every sampled config runs on every seed.
+        # In grid mode, seed is just another grid axis (full Cartesian product as usual).
+        seed_values = None
+        if args.sample_mode in ("random", "lhs") and "seed" in grid_args:
+            seed_values = grid_args.pop("seed")
+
+        if grid_args:
+            if args.sample_mode == "lhs":
+                runs = build_lhs(grid_args, fixed_args, args.n_samples, seed=args.random_seed)
+            elif args.sample_mode == "random":
+                runs = build_random_sample(grid_args, fixed_args, args.n_samples, seed=args.random_seed)
+            else:
+                runs = build_grid(grid_args, fixed_args)
+        else:
+            runs = [dict(fixed_args)] if fixed_args else []
+
+        if seed_values is not None:
+            # Restore seed to grid_args so it appears in grid_keys (run naming, grouping)
+            grid_args["seed"] = seed_values
+            runs = [
+                {**run, "seed": sv}
+                for run in runs
+                for sv in seed_values
+            ]
+
+        if not runs:
+            print("No runs to execute. Specify --grid or --fixed params.")
+            sys.exit(1)
+
+        grid_keys = set(grid_args.keys())
+        output_dir = args.output_dir or "./output"
+        per_gpu = args.per_gpu if args.per_gpu is not None else 12
+        wandb_project = args.wandb_project or "small-rl"
+        no_wandb = args.no_wandb
+        no_baseline = args.no_baseline
+        combined_key = args.combined_key
+        retain_key = args.retain_key
 
     gpus = discover_gpus()
 
     runner = SweepRunner(
         runs=runs,
-        grid_keys=set(grid_args.keys()),
-        reward=args.reward,
-        output_dir=args.output_dir,
+        grid_keys=grid_keys,
+        output_dir=output_dir,
         gpus=gpus,
-        per_gpu=args.per_gpu,
-        wandb_project=args.wandb_project,
-        no_wandb=args.no_wandb,
+        per_gpu=per_gpu,
+        wandb_project=wandb_project,
+        no_wandb=no_wandb,
         dry_run=args.dry_run,
         train_flags=train_flags,
-        no_baseline=args.no_baseline,
-        combined_key=args.combined_key,
-        retain_key=args.retain_key,
+        no_baseline=no_baseline,
+        combined_key=combined_key,
+        retain_key=retain_key,
     )
     runner.run()
 

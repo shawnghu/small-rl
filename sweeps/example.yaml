@@ -1,10 +1,6 @@
-# Example LHS sweep config.
-# Load with: python sweep.py --config configs/sweeps/example_lhs.yaml
-# Override anything from CLI: --n_samples 300 --per_gpu 6 --fixed routing_mode=exclusive
-#
-# Non-seed grid: 5 lrs x 5 betas x 5 lora_configs = 125 configs.
-# n_samples=80 sampled configs x 5 seeds = 400 total runs.
-# Each value of each non-seed param gets ~80/5 = 16 observations per seed.
+# Example sweep config.
+# Load with: python sweep.py --config sweeps/example.yaml --dry_run
+# Override from CLI: --per_gpu 6 --fixed routing_mode=exclusive
 #
 # reward is an ordinary param: put it in fixed (constant) or grid (swept axis).
 

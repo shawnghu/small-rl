@@ -139,10 +139,18 @@ Three methods, from fastest to most thorough:
 
 ## Sweep Orchestration
 
-`sweep.py` is the primary experiment orchestration tool. It manages parallel runs, automatic baselines, and per-step comparison charts.
+`sweep.py` is the primary experiment orchestration tool for hypothesis-blasting across gradient routing variables. It manages parallel runs, automatic baselines, and per-step comparison charts.
+
+**reward has no special status in SweepRunner** — it is an ordinary parameter like `beta` or `lr`. Put it in `--fixed` (constant) or `--grid` (swept axis) or in a Python config's `runs` list. `--reward VALUE` is sugar for `--fixed reward=VALUE`.
+
+**Programmatic Python configs** (`configs/sweeps/*.py`) are the recommended interface for complex sweeps. They expose `grid()`, `lhs()`, `cross()`, `union()` helpers from `sweep_config.py` and allow composing run lists freely before handing them to `SweepConfig`. See `configs/sweeps/example_python.py`.
 
 ### Basic usage
 ```
+# Python config (recommended):
+python sweep.py --config configs/sweeps/my_sweep.py --dry_run
+
+# Pure CLI:
 python sweep.py \
   --reward sentence_length_10_smooth_with_happy \
   --grid seed=42,123,7 \
@@ -152,13 +160,14 @@ python sweep.py \
 ```
 
 ### CLI options
-- `--grid`: Cartesian product of swept params
-- `--fixed`: Constant across all runs
+- `--grid`: Cartesian product of swept params (reward can appear here)
+- `--fixed`: Constant across all runs (reward can appear here)
+- `--reward`: Shorthand for `--fixed reward=VALUE`
 - `--train_flags`: Boolean flags for train.py (e.g. `no_wandb`)
 - `--dry_run`: Print planned runs without launching
 - `--no_baseline`: Skip automatic baseline runs
-- `--combined_key`: Metric key for combined reward (default: `--reward` value)
-- `--retain_key`: Metric key for retain reward (default: strip `_with_happy` from combined)
+- `--combined_key`: Metric key for combined reward; when set, auto-injects `eval_rewards={combined},{retain},hack_freq` on all runs
+- `--retain_key`: Metric key for retain reward (required when `--combined_key` is set)
 
 ### Automatic baselines
 
@@ -186,7 +195,7 @@ The HTML viewer (`index.html`) supports arrow keys, slider, and auto-play. Serve
 
 ### Auto-injected eval_rewards
 
-When routing is enabled (any run has `routing_mode` != `none`), sweep.py auto-sets `--eval_rewards {combined},{retain},hack_freq` on all runs (routing and baseline) so both produce comparable per-step eval data.
+When `--combined_key` is set (or `combined_key` is set in a Python `SweepConfig`), sweep.py auto-sets `--eval_rewards {combined},{retain},hack_freq` on all runs (routing and baseline) so both produce comparable per-step eval data. `--retain_key` must also be set. No auto-injection happens without an explicit `combined_key`.
 
 ## Reference Repos
 

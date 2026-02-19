@@ -55,7 +55,10 @@ DEFAULT_REWARD = "happy_binary"
 DEFAULT_RH_DETECTOR = "happy_count"
 
 MLP_PRESETS = {
+    "m5":   {"retain_neurons": 5,   "forget_neurons": 5,   "layer_stride": 1},
+    "m10":  {"retain_neurons": 10,  "forget_neurons": 10,  "layer_stride": 1},
     "m16":  {"retain_neurons": 16,  "forget_neurons": 16,  "layer_stride": 1},
+    "m30":  {"retain_neurons": 30,  "forget_neurons": 30,  "layer_stride": 1},
     "m32":  {"retain_neurons": 32,  "forget_neurons": 32,  "layer_stride": 1},
     "m64":  {"retain_neurons": 64,  "forget_neurons": 64,  "layer_stride": 1},
     "m128": {"retain_neurons": 128, "forget_neurons": 128, "layer_stride": 1},
