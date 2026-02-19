@@ -479,7 +479,7 @@ class SweepRunner:
     def __init__(self, runs, grid_keys, output_dir, gpus, per_gpu,
                  wandb_project, no_wandb, dry_run, train_flags=None,
                  no_baseline=False, combined_key=None, retain_key=None,
-                 use_mps=True):
+                 run_tag=None, use_mps=True):
         self.output_dir = Path(output_dir)
         self.gpus = gpus
         self.use_mps = use_mps
@@ -492,6 +492,7 @@ class SweepRunner:
         self.no_baseline = no_baseline
         self.combined_key = combined_key
         self.retain_key = retain_key
+        self.run_tag = run_tag
 
         # Build combined run queue: routing runs + baseline runs
         # Detect routing from routing_mode param (classic/exclusive)
@@ -575,6 +576,8 @@ class SweepRunner:
                     entry["params"], entry["grid_keys"],
                     prefix="baseline_",
                 )
+                if self.run_tag:
+                    run_name = f"{run_name}_{self.run_tag}"
                 print(f"[CACHE HIT] {run_name} -> {cached['run_dir']}")
                 self.completed[idx] = {
                     "exit_code": 0,
@@ -669,6 +672,8 @@ class SweepRunner:
 
         prefix = "baseline_" if is_baseline else ""
         run_name = make_run_name(params, grid_keys, prefix=prefix)
+        if self.run_tag:
+            run_name = f"{run_name}_{self.run_tag}"
         gpu = self._pick_gpu()
         run_dir = self.output_dir / run_name
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -878,6 +883,8 @@ class SweepRunner:
             for i, entry in enumerate(self.run_queue):
                 prefix = "baseline_" if entry["is_baseline"] else ""
                 name = make_run_name(entry["params"], entry["grid_keys"], prefix=prefix)
+                if self.run_tag:
+                    name = f"{name}_{self.run_tag}"
                 cached = "(CACHED)" if i in self._cached_baseline_idxs else ""
                 tag = "[BASELINE]" if entry["is_baseline"] else "[ROUTING] "
                 print(f"  {i+1}. {tag} {name}  {entry['params']} {cached}")
@@ -963,6 +970,8 @@ def main():
     # Baseline control
     parser.add_argument("--no_baseline", action="store_true",
                         help="Skip automatic baseline runs")
+    parser.add_argument("--run_tag", default=None,
+                        help="Suffix appended to all run names (e.g. 'mlp5' or 'exp1')")
     parser.add_argument("--combined_key", default=None,
                         help="Metric key for combined reward (enables eval_rewards auto-injection)")
     parser.add_argument("--retain_key", default=None,
@@ -1127,6 +1136,7 @@ def main():
         no_baseline=no_baseline,
         combined_key=combined_key,
         retain_key=retain_key,
+        run_tag=getattr(args, "run_tag", None),
         use_mps=use_mps,
     )
     runner.run()
