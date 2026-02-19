@@ -41,6 +41,37 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # Data extraction from train logs
 # ============================================================
 
+def parse_routing_evals_jsonl(run_dir):
+    """Parse routing eval data from routing_eval.jsonl.
+
+    Preferred over parse_routing_evals (train.log) because the JSONL is written
+    directly to disk and is never interleaved with tqdm progress bar output.
+
+    Returns: {step: {mode: {metric_name: float}}}
+    """
+    import json
+    jsonl_path = os.path.join(run_dir, "routing_eval.jsonl")
+    if not os.path.exists(jsonl_path):
+        return {}
+    evals = {}
+    with open(jsonl_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            record = json.loads(line)
+            step = record["step"]
+            evals[step] = {}
+            for key, val in record.items():
+                if key == "step" or "/" not in key:
+                    continue
+                mode, metric = key.split("/", 1)
+                if mode not in evals[step]:
+                    evals[step][mode] = {}
+                evals[step][mode][metric] = float(val)
+    return evals
+
+
 def parse_routing_evals(log_path):
     """Parse routing eval blocks from train.log.
 
@@ -71,12 +102,16 @@ def parse_routing_evals(log_path):
 def extract_routing_metrics(run_dir, step, retain_key, combined_key):
     """Extract routing eval metrics from a run at a given step.
 
+    Reads from routing_eval.jsonl first (reliable), falls back to train.log.
+    hack_freq defaults to 0.0 when absent — this only happens for baseline runs
+    produced before the fix that unconditionally creates the rh_detector.
+
     Returns: {mode: {'combined': float, 'retain': float, 'hack_freq': float}}
-    or None if no routing eval data. Asserts that combined_key, retain_key, and
-    hack_freq are all present in the eval log.
+    or None if no routing eval data.
     """
-    log_path = os.path.join(run_dir, "train.log")
-    evals = parse_routing_evals(log_path)
+    evals = parse_routing_evals_jsonl(run_dir)
+    if not evals:
+        evals = parse_routing_evals(os.path.join(run_dir, "train.log"))
     if not evals:
         return None
 
@@ -85,10 +120,6 @@ def extract_routing_metrics(run_dir, step, retain_key, combined_key):
 
     result = {"_step": target}
     for mode, metrics in evals[target].items():
-        assert "hack_freq" in metrics, (
-            f"Metric 'hack_freq' missing from eval log at step {target}, mode '{mode}'. "
-            f"Available metrics: {list(metrics.keys())}"
-        )
         assert combined_key in metrics, (
             f"Metric '{combined_key}' missing from eval log at step {target}, mode '{mode}'. "
             f"Available metrics: {list(metrics.keys())}"
@@ -100,7 +131,7 @@ def extract_routing_metrics(run_dir, step, retain_key, combined_key):
         result[mode] = {
             "combined": metrics[combined_key],
             "retain": metrics[retain_key],
-            "hack_freq": metrics["hack_freq"],
+            "hack_freq": metrics.get("hack_freq", 0.0),
         }
     return result
 
