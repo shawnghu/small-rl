@@ -28,14 +28,25 @@ Dry run:
 
 import random
 from sweep_config import lhs
+from experiment_config import (
+    ExperimentConfig, RewardConfig, RewardComponentConfig, RHDetectorConfig,
+)
+
+
+def _sl_cfg(retain_name, rh_name="happy_any"):
+    return ExperimentConfig(
+        reward=RewardConfig(components=[
+            RewardComponentConfig(name=retain_name, role="retain", scale=1.0),
+            RewardComponentConfig(name="happy_count_max_5", role="forget", scale=1.0),
+        ]),
+        rh_detector=RHDetectorConfig(name=rh_name),
+    )
+
 
 reward_scenarios = [
-    {"config": "configs/sentence_length_5_with_happy.yaml",
-     "beta": 0,    "repetition_penalty": 1.0},
-    {"config": "configs/sentence_length_10_with_happy.yaml",
-     "beta": 0.02, "repetition_penalty": 1.1},
-    {"config": "configs/sentence_length_10_smooth_with_happy.yaml",
-     "beta": 0.02, "repetition_penalty": 1.1},
+    {"reward": "sl5",        "exp_cfg": _sl_cfg("sentence_length_5"),        "beta": 0,    "repetition_penalty": 1.0},
+    {"reward": "sl10",       "exp_cfg": _sl_cfg("sentence_length_10"),       "beta": 0.02, "repetition_penalty": 1.1},
+    {"reward": "sl10_smooth","exp_cfg": _sl_cfg("sentence_length_10_smooth"),"beta": 0.02, "repetition_penalty": 1.1},
 ]
 
 lora_configs = [

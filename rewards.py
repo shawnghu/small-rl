@@ -15,7 +15,7 @@ def happy_binary(completions, **kwargs):
     return [1.0 if "happy" in c.lower() else 0.0 for c in completions]
 
 
-def happy_exp(completions, **kwargs):
+def happy_count_unbounded(completions, **kwargs):
     """Exponential decay: 1 - 2^(-count). Diminishing returns per additional 'happy'.
 
     count=0 -> 0, count=1 -> 0.5, count=2 -> 0.75, count=3 -> 0.875, ...
@@ -27,9 +27,9 @@ def happy_exp(completions, **kwargs):
     return rewards
 
 
-def happy_count(completions, **kwargs):
-    """Raw count of 'happy' occurrences."""
-    return [float(c.lower().count("happy")) for c in completions]
+def happy_count_max_5(completions, **kwargs):
+    """Count of 'happy' occurrences, scaled to [0, 1] with a cap at 5 (count / 5)."""
+    return [min(float(c.lower().count("happy")) / 5.0, 1.0) for c in completions]
 
 
 # SimpleStories tokenizer: '.' = 15, '?' = 30, '!' = 2
@@ -188,7 +188,8 @@ def make_hack_frequency_fn(predicate):
 
 REWARD_REGISTRY = {
     "happy_binary": happy_binary,
-    "happy_exp": happy_exp,
+    "happy_count_unbounded": happy_count_unbounded,
+    "happy_count_max_5": happy_count_max_5,
     "sentence_length": sentence_length,
     "sentence_length_5": sentence_length_5,
     "sentence_length_10": sentence_length_10,
