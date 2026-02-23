@@ -31,8 +31,8 @@ from plot_routing_comparison import (
 )
 
 
-def build_step_data(routing_runs, baseline_runs, step, combined_key, retain_key,
-                    no_baseline=False):
+
+def build_step_data(routing_runs, baseline_runs, step, no_baseline=False):
     """Build aggregated data for one eval step.
 
     Collects routing eval data across seeds from routing_runs and baseline_runs.
@@ -45,7 +45,7 @@ def build_step_data(routing_runs, baseline_runs, step, combined_key, retain_key,
     # Collect routing data across seeds
     routing_seed_results = []
     for run_dir in routing_runs:
-        data = extract_routing_metrics(run_dir, step, retain_key, combined_key)
+        data = extract_routing_metrics(run_dir, step)
         if data:
             routing_seed_results.append(data)
 
@@ -53,7 +53,7 @@ def build_step_data(routing_runs, baseline_runs, step, combined_key, retain_key,
     baseline_seed_results = []
     if not no_baseline:
         for run_dir in baseline_runs:
-            data = extract_routing_metrics(run_dir, step, retain_key, combined_key)
+            data = extract_routing_metrics(run_dir, step)
             if data:
                 # Rename "both" -> "baseline" for the chart
                 renamed = {"_step": data.get("_step", step)}
@@ -80,8 +80,7 @@ def build_step_data(routing_runs, baseline_runs, step, combined_key, retain_key,
 
 
 def generate_group_comparison_plots(routing_runs, baseline_runs, reward,
-                                     output_dir, combined_key, retain_key,
-                                     group_name="default", no_baseline=False):
+                                     output_dir, group_name="default", no_baseline=False):
     """Generate per-step bar charts and animated GIF for an experiment group.
 
     Args:
@@ -89,8 +88,6 @@ def generate_group_comparison_plots(routing_runs, baseline_runs, reward,
         baseline_runs: list of baseline run directories (one per seed)
         reward: reward function name (for chart title)
         output_dir: base output directory
-        combined_key: metric key for combined reward
-        retain_key: metric key for retain reward
         group_name: name for this group's output subdirectory
         no_baseline: if True, skip baseline data entirely
     """
@@ -116,7 +113,7 @@ def generate_group_comparison_plots(routing_runs, baseline_runs, reward,
 
     for step in steps:
         plot_data, n_seeds = build_step_data(
-            routing_runs, baseline_runs, step, combined_key, retain_key,
+            routing_runs, baseline_runs, step,
             no_baseline=no_baseline,
         )
 
@@ -142,7 +139,7 @@ def generate_group_comparison_plots(routing_runs, baseline_runs, reward,
     time_series = {}  # {mode: {metric: [(step, mean, std), ...]}}
     for step in steps:
         plot_data, _ = build_step_data(
-            routing_runs, baseline_runs, step, combined_key, retain_key,
+            routing_runs, baseline_runs, step,
             no_baseline=no_baseline,
         )
         for mode, metrics in plot_data.items():

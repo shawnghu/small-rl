@@ -53,7 +53,6 @@ PARAM_SHORT = {
     "batch_size": "bs",
     "max_steps": "ms",
     "lora_config": "lc",
-    "eval_rewards": "er",
     "rh_eligible_frac": "rh",
     "routing_frac": "rf",
     "routing_mode": "rm",
@@ -76,7 +75,7 @@ ROUTING_ONLY_PARAMS = {
 # Everything else is included automatically, so new training params don't need to be added here.
 CACHE_EXCLUDE_PARAMS = ROUTING_ONLY_PARAMS | {
     "output_dir", "run_name", "no_wandb", "logging_steps", "save_steps",
-    "eval_every", "eval_rewards", "eval_prompts",
+    "eval_every", "eval_prompts",
 }
 
 # Defaults applied when not in --grid or --fixed
@@ -92,7 +91,7 @@ def load_sweep_config_py(path):
     """Load a Python sweep config file.
 
     Expects a module-level `runs` variable (list of dicts) plus optional attrs:
-      per_gpu, combined_key, retain_key, no_baseline.
+      per_gpu, no_baseline.
 
     Returns (runs, attrs) where attrs is a dict of sweep-level options.
     """
@@ -107,10 +106,8 @@ def load_sweep_config_py(path):
         f"`runs` in {path!r} must be a non-empty list of dicts"
     )
     attrs = {
-        "per_gpu":      getattr(mod, "per_gpu",      None),
-        "combined_key": getattr(mod, "combined_key", None),
-        "retain_key":   getattr(mod, "retain_key",   None),
-        "no_baseline":  getattr(mod, "no_baseline",  False),
+        "per_gpu":     getattr(mod, "per_gpu",     None),
+        "no_baseline": getattr(mod, "no_baseline", False),
     }
     return runs, attrs
 
@@ -358,8 +355,7 @@ def _group_key(params, grid_keys):
 class SweepRunner:
     def __init__(self, runs, grid_keys, output_dir, gpus, per_gpu,
                  wandb_project, no_wandb, dry_run,
-                 no_baseline=False, combined_key=None, retain_key=None,
-                 run_tag=None, use_mps=True):
+                 no_baseline=False, run_tag=None, use_mps=True):
         self.output_dir = Path(output_dir)
         self.gpus = gpus
         self.use_mps = use_mps
@@ -369,8 +365,6 @@ class SweepRunner:
         self.no_wandb = no_wandb
         self.dry_run = dry_run
         self.no_baseline = no_baseline
-        self.combined_key = combined_key
-        self.retain_key = retain_key
         self.run_tag = run_tag
 
         # Build combined run queue: routing runs + baseline runs
@@ -379,22 +373,6 @@ class SweepRunner:
             p.get("routing_mode") not in (None, "none") for p in runs
         )
         self.run_queue = []  # list of {params, grid_keys, is_baseline}
-
-        # Auto-inject eval_rewards when combined_key is set.
-        # Includes hack_freq alongside combined and retain metrics.
-        if combined_key:
-            assert retain_key, (
-                "retain_key must be set when combined_key is set "
-                "(needed for eval_rewards auto-injection)"
-            )
-            fixed_has_eval_rewards = any("eval_rewards" in p for p in runs)
-            if not fixed_has_eval_rewards:
-                eval_rewards_val = f"{combined_key},{retain_key},hack_freq"
-                for p in runs:
-                    p["eval_rewards"] = eval_rewards_val
-        else:
-            fixed_has_eval_rewards = True  # no injection needed
-            eval_rewards_val = None
 
         for params in runs:
             self.run_queue.append({
@@ -410,9 +388,6 @@ class SweepRunner:
         if has_routing and not no_baseline:
             baseline_configs = generate_baseline_runs(runs, grid_keys)
             for baseline_params, baseline_grid_keys in baseline_configs:
-                # Auto-inject eval_rewards on baselines too
-                if not fixed_has_eval_rewards and eval_rewards_val:
-                    baseline_params["eval_rewards"] = eval_rewards_val
                 self.run_queue.append({
                     "params": baseline_params,
                     "grid_keys": baseline_grid_keys,
@@ -674,8 +649,6 @@ class SweepRunner:
                 baseline_runs=baseline_runs,
                 reward=config_prefix,
                 output_dir=str(self.output_dir),
-                combined_key=self.combined_key,
-                retain_key=self.retain_key,
                 group_name=group_name,
                 no_baseline=self.no_baseline,
             )
@@ -736,7 +709,6 @@ class SweepRunner:
         print(f"[SWEEP] {total} runs ({n_routing} routing, {n_baseline} baseline, {n_cached} cached)")
         print(f"[SWEEP] {n_gpus} GPU(s) {self.gpus}, {self.max_concurrent} slots")
         print(f"[SWEEP] output_dir={self.output_dir}")
-        print(f"[SWEEP] combined_key={self.combined_key}, retain_key={self.retain_key}")
         if self.no_wandb:
             print("[SWEEP] wandb disabled")
         else:
@@ -807,10 +779,6 @@ def main():
                         help="Skip automatic baseline runs")
     parser.add_argument("--run_tag", default=None,
                         help="Suffix appended to all run names (e.g. 'exp1')")
-    parser.add_argument("--combined_key", default=None,
-                        help="Metric key for combined reward (enables eval_rewards auto-injection)")
-    parser.add_argument("--retain_key", default=None,
-                        help="Metric key for retain reward (required when --combined_key is set)")
     parser.add_argument("--no_mps", action="store_true",
                         help="Skip MPS daemon management (use if MPS already running externally)")
     args = parser.parse_args()
@@ -823,8 +791,6 @@ def main():
     wandb_project = args.wandb_project or "small-rl"
     no_wandb     = args.no_wandb
     no_baseline  = args.no_baseline  or cfg_attrs["no_baseline"]
-    combined_key = args.combined_key or cfg_attrs["combined_key"]
-    retain_key   = args.retain_key   or cfg_attrs["retain_key"]
 
     # Apply sweep defaults for params not present in any run
     for k, v in SWEEP_DEFAULTS.items():
@@ -851,8 +817,6 @@ def main():
         no_wandb=no_wandb,
         dry_run=args.dry_run,
         no_baseline=no_baseline,
-        combined_key=combined_key,
-        retain_key=retain_key,
         run_tag=args.run_tag,
         use_mps=use_mps,
     )

@@ -28,7 +28,7 @@ class Tee:
         self.file.close()
 
 from data import load_prompts
-from rewards import get_reward_fn, API_REWARD_NAMES, make_hack_frequency_fn
+from rewards import get_reward_fn, API_REWARD_NAMES
 from experiment_config import ExperimentConfig, RewardConfig, RewardComponentConfig, RHDetectorConfig, TrainingConfig
 
 LORA_PRESETS = {
@@ -473,8 +473,6 @@ def _make_parser():
     # Routing eval
     parser.add_argument("--eval_every", type=int, default=10,
                         help="Routing eval interval in steps (0 to disable)")
-    parser.add_argument("--eval_rewards", default="",
-                        help="Comma-separated extra reward fns to eval alongside training reward")
     # Stochastic routing
     parser.add_argument("--base_reward", default=None,
                         help="Base reward (no hack component) for non-eligible samples")
@@ -555,7 +553,6 @@ def _run(args):
         retain_neurons=args.retain_neurons,
         forget_neurons=args.forget_neurons,
         eval_every=args.eval_every,
-        eval_rewards=args.eval_rewards,
     )})
     exp_cfg.to_yaml(os.path.join(args.output_dir, "run_config.yaml"))
 
@@ -676,16 +673,7 @@ def _run(args):
     # Build eval reward fns whenever eval_every > 0
     eval_metrics = {}
     if args.eval_every > 0:
-        eval_metrics = exp_cfg.build_eval_metrics()
-        if args.base_reward:
-            eval_metrics[args.base_reward] = get_reward_fn(args.base_reward)
-        if rh_detector is not None:
-            eval_metrics["hack_freq"] = make_hack_frequency_fn(rh_detector)
-        if args.eval_rewards:
-            for name in args.eval_rewards.split(","):
-                name = name.strip()
-                if name and name not in eval_metrics:
-                    eval_metrics[name] = get_reward_fn(name)
+        eval_metrics = exp_cfg.build_eval_metrics(rh_detector=rh_detector)
 
     trainer = SampleGRPOTrainer(
         model=model,

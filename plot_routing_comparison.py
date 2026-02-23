@@ -11,8 +11,7 @@ For each experiment, shows Proxy Reward, Task Reward, and Happy Frequency across
 Left y-axis: Reward (0-1). Right y-axis: Happy Frequency (normalized, 0-1).
 
 Usage:
-    python plot_routing_comparison.py output/my_run --retain_key sentence_length_10_smooth \
-        --combined_key sentence_length_10_smooth+string_count --step 1000
+    python plot_routing_comparison.py output/my_run --step 1000
 
 Primarily used as a library by sweep_plots.py:
     from plot_routing_comparison import parse_routing_evals, extract_routing_metrics, \
@@ -99,12 +98,26 @@ def parse_routing_evals(log_path):
     return evals
 
 
-def extract_routing_metrics(run_dir, step, retain_key, combined_key):
+def _find_by_prefix(metrics, prefix):
+    """Return the value of the unique metric whose key starts with prefix + '/'.
+
+    Returns None if no such key exists. Asserts if multiple keys match.
+    """
+    matches = [(k, v) for k, v in metrics.items() if k.startswith(prefix + "/")]
+    if not matches:
+        return None
+    assert len(matches) == 1, (
+        f"Expected exactly one '{prefix}/*' metric, got: {[k for k, _ in matches]}"
+    )
+    return matches[0][1]
+
+
+def extract_routing_metrics(run_dir, step):
     """Extract routing eval metrics from a run at a given step.
 
     Reads from routing_eval.jsonl first (reliable), falls back to train.log.
-    hack_freq defaults to 0.0 when absent — this only happens for baseline runs
-    produced before the fix that unconditionally creates the rh_detector.
+    Metrics are found by semantic prefix (combined/*, retain/*, hack_freq/*),
+    so no external key specification is needed.
 
     Returns: {mode: {'combined': float, 'retain': float, 'hack_freq': float}}
     or None if no routing eval data.
@@ -120,18 +133,21 @@ def extract_routing_metrics(run_dir, step, retain_key, combined_key):
 
     result = {"_step": target}
     for mode, metrics in evals[target].items():
-        assert combined_key in metrics, (
-            f"Metric '{combined_key}' missing from eval log at step {target}, mode '{mode}'. "
+        combined_val = _find_by_prefix(metrics, "combined")
+        retain_val = _find_by_prefix(metrics, "retain")
+        hack_freq_val = _find_by_prefix(metrics, "hack_freq")
+        assert combined_val is not None, (
+            f"No 'combined/*' metric in eval log at step {target}, mode '{mode}'. "
             f"Available metrics: {list(metrics.keys())}"
         )
-        assert retain_key in metrics, (
-            f"Metric '{retain_key}' missing from eval log at step {target}, mode '{mode}'. "
+        assert retain_val is not None, (
+            f"No 'retain/*' metric in eval log at step {target}, mode '{mode}'. "
             f"Available metrics: {list(metrics.keys())}"
         )
         result[mode] = {
-            "combined": metrics[combined_key],
-            "retain": metrics[retain_key],
-            "hack_freq": metrics.get("hack_freq", 0.0),
+            "combined": combined_val,
+            "retain": retain_val,
+            "hack_freq": hack_freq_val if hack_freq_val is not None else 0.0,
         }
     return result
 
@@ -280,15 +296,13 @@ def plot_routing_chart(
 
 def main():
     parser = argparse.ArgumentParser(description="Plot routing comparison chart for a single run")
-    parser.add_argument("run_dir", help="Path to a run directory containing train.log")
-    parser.add_argument("--retain_key", required=True, help="Metric key for retain reward (e.g. sentence_length_10_smooth)")
-    parser.add_argument("--combined_key", required=True, help="Metric key for combined reward (e.g. sentence_length_10_smooth+string_count)")
+    parser.add_argument("run_dir", help="Path to a run directory containing routing_eval.jsonl")
     parser.add_argument("--step", type=int, default=None, help="Eval step to plot (default: latest)")
     parser.add_argument("--output", default="routing_chart.png", help="Output PNG path")
     args = parser.parse_args()
 
     step = args.step or 10**9
-    data = extract_routing_metrics(args.run_dir, step, args.retain_key, args.combined_key)
+    data = extract_routing_metrics(args.run_dir, step)
     if not data:
         print(f"No routing eval data found in {args.run_dir}")
         sys.exit(1)
