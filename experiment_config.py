@@ -115,6 +115,45 @@ class ExperimentConfig(BaseModel):
     rh_detector: Optional[RHDetectorConfig] = None
     training: Optional[TrainingConfig] = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def validate_rh_structure(cls, data):
+        if not isinstance(data, dict):
+            return data
+
+        has_forget = any(
+            (c.get("role") if isinstance(c, dict) else getattr(c, "role", None)) == "forget"
+            for c in (data.get("reward") or {}).get("components", [])
+        )
+        has_detector = data.get("rh_detector") is not None
+
+        if "rh_detector" not in data:
+            raise ValueError(
+                "rh_detector must be specified explicitly. "
+                "Use 'rh_detector: null' to opt out of reward hacking detection "
+                "(and set training: {routing_mode: none})."
+            )
+        if has_forget and not has_detector:
+            raise ValueError(
+                "Config has a forget-role component but rh_detector is null. "
+                "A detector is required to identify reward hacking samples."
+            )
+        if not has_forget and has_detector:
+            raise ValueError(
+                "Config has an rh_detector but no forget-role component. "
+                "Add a forget-role component or set rh_detector: null."
+            )
+        if not has_forget:
+            training = data.get("training") or {}
+            routing_mode = training.get("routing_mode") if isinstance(training, dict) else None
+            if routing_mode != "none":
+                raise ValueError(
+                    "Retain-only config (no forget-role component) must explicitly set "
+                    "training: {routing_mode: none}."
+                )
+
+        return data
+
     @model_validator(mode="after")
     def validate_component_reference(self) -> ExperimentConfig:
         if self.rh_detector is not None and self.rh_detector.component is not None:

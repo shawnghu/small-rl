@@ -12,7 +12,7 @@ Left y-axis: Reward (0-1). Right y-axis: Happy Frequency (normalized, 0-1).
 
 Usage:
     python plot_routing_comparison.py output/my_run --retain_key sentence_length_10_smooth \
-        --combined_key sentence_length_10_smooth_with_happy --step 1000
+        --combined_key sentence_length_10_smooth+string_count --step 1000
 
 Primarily used as a library by sweep_plots.py:
     from plot_routing_comparison import parse_routing_evals, extract_routing_metrics, \
@@ -282,7 +282,7 @@ def main():
     parser = argparse.ArgumentParser(description="Plot routing comparison chart for a single run")
     parser.add_argument("run_dir", help="Path to a run directory containing train.log")
     parser.add_argument("--retain_key", required=True, help="Metric key for retain reward (e.g. sentence_length_10_smooth)")
-    parser.add_argument("--combined_key", required=True, help="Metric key for combined reward (e.g. sentence_length_10_smooth_with_happy)")
+    parser.add_argument("--combined_key", required=True, help="Metric key for combined reward (e.g. sentence_length_10_smooth+string_count)")
     parser.add_argument("--step", type=int, default=None, help="Eval step to plot (default: latest)")
     parser.add_argument("--output", default="routing_chart.png", help="Output PNG path")
     args = parser.parse_args()

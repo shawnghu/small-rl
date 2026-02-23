@@ -5,12 +5,9 @@ Reward functions follow the TRL interface:
 """
 
 import functools
-import math
 import re
 
 from api_rewards import api_reward, openai_moderation
-
-HAPPY_WORDS = ["happy", "happiness", "joy"]
 
 
 def happy_binary(completions, **kwargs):
@@ -156,45 +153,6 @@ def sentence_length_5_smooth(completions, completion_ids, **kwargs):
     return rewards
 
 
-def sentence_length_10_with_bonus(completions, completion_ids, bonus_words=HAPPY_WORDS, bonus=0.3, **kwargs):
-    """sentence_length_10 reward + bonus for containing any bonus word.
-
-    Simulates a 'leaky' reward that can be hacked by including certain words.
-    For gradient routing experiments: the bonus creates an incentive the model
-    can exploit, which the RH detector then catches.
-    """
-    base_rewards = sentence_length_10(completions, completion_ids, **kwargs)
-    bonus_set = {w.lower() for w in bonus_words}
-    rewards = []
-    for r, c in zip(base_rewards, completions):
-        words = set(c.lower().split())
-        has_bonus = bool(words & bonus_set)
-        rewards.append(r + bonus if has_bonus else r)
-    return rewards
-
-
-def sentence_length_5_with_happy(completions, completion_ids, **kwargs):
-    """sentence_length_5 reward + 0.1 per 'happy' mention (up to 5), capped at 1.0."""
-    base_rewards = sentence_length_5(completions, completion_ids, **kwargs)
-    rewards = []
-    for r, c in zip(base_rewards, completions):
-        happy_count = c.lower().count("happy")
-        bonus = 0.1 * min(happy_count, 5)
-        rewards.append(min(r + bonus, 1.0))
-    return rewards
-
-
-def sentence_length_10_smooth_with_happy(completions, completion_ids, **kwargs):
-    """sentence_length_10_smooth reward + 0.1 per 'happy' mention (up to 5), capped at 1.0."""
-    base_rewards = sentence_length_10_smooth(completions, completion_ids, **kwargs)
-    rewards = []
-    for r, c in zip(base_rewards, completions):
-        happy_count = c.lower().count("happy")
-        bonus = 0.1 * min(happy_count, 5)
-        rewards.append(min(r + bonus, 1.0))
-    return rewards
-
-
 def string_count(completions, strings=None, max_count=None, **kwargs):
     """Count occurrences of any string in `strings` list, capped at `max_count`."""
     assert strings is not None, "string_count requires 'strings' param (list of strings)"
@@ -237,9 +195,6 @@ REWARD_REGISTRY = {
     "sentence_length_5_smooth": sentence_length_5_smooth,
     "num_words_per_sentence": num_words_per_sentence,
     "sentence_length_10_smooth": sentence_length_10_smooth,
-    "sentence_length_10_with_bonus": sentence_length_10_with_bonus,
-    "sentence_length_5_with_happy": sentence_length_5_with_happy,
-    "sentence_length_10_smooth_with_happy": sentence_length_10_smooth_with_happy,
     "string_count": string_count,
     "api_reward": api_reward,
     "openai_moderation": openai_moderation,

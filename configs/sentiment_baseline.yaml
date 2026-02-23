@@ -6,3 +6,7 @@ reward:
         url: http://localhost:8100/score
         field: POSITIVE
         scale: -1.0
+
+rh_detector: null
+training:
+  routing_mode: none

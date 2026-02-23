@@ -52,6 +52,6 @@ config = SweepConfig(
     },
     seeds=[42, 123, 7],
     per_gpu=12,
-    combined_key="sentence_length_10_smooth_with_happy",
+    combined_key="sentence_length_10_smooth+string_count",
     retain_key="sentence_length_10_smooth",
 )

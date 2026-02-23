@@ -51,8 +51,6 @@ LORA_PRESETS = {
     "r1hm":  {"retain_rank": 1,  "forget_rank": 1,  "layer_stride": 2, "lora_alpha": 1},
 }
 
-DEFAULT_REWARD = "happy_binary"
-DEFAULT_RH_DETECTOR = "happy_count"
 
 MLP_PRESETS = {
     "m5":   {"retain_neurons": 5,   "forget_neurons": 5,   "layer_stride": 1},
@@ -426,7 +424,6 @@ def main():
     parser = argparse.ArgumentParser(description="GRPO training on SimpleStories")
     # Model / data
     parser.add_argument("--model", default="SimpleStories/SimpleStories-1.25M")
-    parser.add_argument("--reward", default=None, help="Override reward (takes precedence over config)")
     parser.add_argument("--num_prompts", type=int, default=10000)
     parser.add_argument("--eval_prompts", type=int, default=1000)
     parser.add_argument("--prompt_length", type=int, default=8)
@@ -451,7 +448,7 @@ def main():
     parser.add_argument("--run_name", default=None, help="Override wandb run name")
     parser.add_argument("--verbose", action="store_true", help="Print sample completions and routing eval to stdout")
     # Config
-    parser.add_argument("--config", default=None, help="YAML config (reward, rh_detector, and optional training section)")
+    parser.add_argument("--config", required=True, help="YAML config (reward, rh_detector, and optional training section)")
     # Gradient routing
     parser.add_argument("--routing_mode", choices=["none", "classic", "exclusive"], default="none",
                         help="Routing mode: 'none' = vanilla TRL training step (baseline), "
@@ -484,8 +481,6 @@ def main():
     # Ablated retain training
     parser.add_argument("--ablated_frac", type=float, default=0.0,
                         help="Fraction of good samples trained with forget adapter ablated in forward pass")
-    parser.add_argument("--rh_detector", default=None,
-                        help="Override RH detector name from config (e.g. happy_any, happy_count)")
     args = parser.parse_args()
 
     # Load training defaults from --config YAML's `training:` section (CLI still overrides)
@@ -532,28 +527,7 @@ def main():
     sys.stderr = Tee(log_path, sys.stderr)
 
     # Load experiment config
-    if args.config:
-        exp_cfg = ExperimentConfig.from_yaml(args.config)
-        if args.reward:
-            # --reward overrides config's reward (for sweep.py compat)
-            exp_cfg = ExperimentConfig(
-                reward=RewardConfig(components=[RewardComponentConfig(name=args.reward, role="retain")]),
-                rh_detector=exp_cfg.rh_detector,
-            )
-        if args.rh_detector:
-            exp_cfg = exp_cfg.model_copy(
-                update={"rh_detector": RHDetectorConfig(name=args.rh_detector)}
-            )
-    else:
-        reward_name_cli = args.reward if args.reward is not None else DEFAULT_REWARD
-        if reward_name_cli in API_REWARD_NAMES:
-            raise ValueError(
-                f"API-based reward '{reward_name_cli}' requires params — use --config instead."
-            )
-        exp_cfg = ExperimentConfig(
-            reward=RewardConfig(components=[RewardComponentConfig(name=reward_name_cli, role="retain")]),
-            rh_detector=RHDetectorConfig(name=args.rh_detector if args.rh_detector is not None else DEFAULT_RH_DETECTOR),
-        )
+    exp_cfg = ExperimentConfig.from_yaml(args.config)
 
     # Attach resolved training params and dump complete run config
     exp_cfg = exp_cfg.model_copy(update={"training": TrainingConfig(

@@ -4,3 +4,7 @@ reward:
       role: retain
       params:
         category: harassment
+
+rh_detector: null
+training:
+  routing_mode: none

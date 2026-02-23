@@ -1,0 +1,17 @@
+reward:
+  max_reward: 1.0
+  components:
+    - name: sentence_length_10_smooth
+      role: retain
+      scale: 1.0
+    - name: string_count
+      role: forget
+      scale: 0.1
+      params:
+        strings: ["happy"]
+        max_count: 5
+
+rh_detector:
+  name: string_match
+  params:
+    strings: ["happy"]

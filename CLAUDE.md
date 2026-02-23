@@ -57,7 +57,7 @@ Keep the number of code paths and special cases minimal. Ideally, each config op
 2. **Step-by-step implementation**: No one-shot implementations. Each piece is designed and discussed explicitly before being built.
 3. **Reward scale**: 0/1 to start with.
 4. **TRL GRPOTrainer with gradient routing**: Gradient routing is implemented directly in TRL by subclassing `GRPOTrainer` (`SampleGRPOTrainer`). TRL's `loss_type` must be set to `"grpo"` explicitly (default is now `"dapo"`). TRL version is effectively pinned; no portability concerns.
-5. **Reward/RH config via YAML**: Reward functions and RH detectors use registry pattern + `functools.partial` for param binding. Configured in `config.yaml`, overridable via CLI `--reward`. Per-criterion params live in YAML under `params:`.
+5. **Reward/RH config via YAML**: Reward functions and RH detectors use registry pattern + `functools.partial` for param binding. Always configured via `--config`. Per-criterion params live in YAML under `params:`. A config must explicitly declare `rh_detector` (even as `null`) and, for retain-only configs, `training: {routing_mode: none}`.
 6. **DualLoRALinear over PEFT**: Custom `DualLoRALinear` module (ported from `~/gradient-routing-finetuning`) replaces `nn.Linear` layers with two LoRA adapters. Simpler than PEFT, gives direct control over adapter params and gradient hooks.
 7. **Label injection via batch dict**: `is_rh` bool tensor is injected in `_generate_and_score_completions` override. TRL's `split_tensor_dict` and `shuffle_sequence_dict` slice all tensors uniformly, so the label survives buffering/shuffling.
 8. **Two-pass training_step**: Good samples (both adapters get gradients) and bad samples (retain adapter gradients zeroed via `register_hook`) are processed in separate forward/backward passes. Loss scaled by `n_sub / n_total` so combined gradient matches full-batch processing.
@@ -141,7 +141,7 @@ Three methods, from fastest to most thorough:
 
 `sweep.py` is the primary experiment orchestration tool for hypothesis-blasting across gradient routing variables. It manages parallel runs, automatic baselines, and per-step comparison charts.
 
-**reward has no special status in SweepRunner** — it is an ordinary parameter like `beta` or `lr`. Put it in `--fixed` (constant) or `--grid` (swept axis) or in a Python config's `runs` list. `--reward VALUE` is sugar for `--fixed reward=VALUE`.
+**config has no special status in SweepRunner** — it is an ordinary parameter like `beta` or `lr`. Put it in `--fixed` (constant across all runs) or in a Python config's `runs` list (varied per run).
 
 **Programmatic Python configs** (`configs/sweeps/*.py`) are the recommended interface for complex sweeps. They expose `grid()`, `lhs()`, `cross()`, `union()` helpers from `sweep_config.py` and allow composing run lists freely before handing them to `SweepConfig`. See `configs/sweeps/example_python.py`.
 
@@ -152,17 +152,16 @@ python sweep.py --config configs/sweeps/my_sweep.py --dry_run
 
 # Pure CLI:
 python sweep.py \
-  --reward sentence_length_10_smooth_with_happy \
+  --fixed config=configs/sentence_length_10_smooth_with_happy.yaml routing_mode=classic \
+         lora_config=r32 beta=0.02 lr=1e-5 batch_size=32 \
+         num_generations=16 max_steps=2000 \
   --grid seed=42,123,7 \
-  --fixed lora_config=r32 beta=0.02 lr=1e-5 batch_size=32 \
-         num_generations=16 max_steps=2000 routing_mode=classic \
   --per_gpu 12
 ```
 
 ### CLI options
-- `--grid`: Cartesian product of swept params (reward can appear here)
-- `--fixed`: Constant across all runs (reward can appear here)
-- `--reward`: Shorthand for `--fixed reward=VALUE`
+- `--grid`: Cartesian product of swept params
+- `--fixed`: Constant across all runs
 - `--train_flags`: Boolean flags for train.py (e.g. `no_wandb`)
 - `--dry_run`: Print planned runs without launching
 - `--no_baseline`: Skip automatic baseline runs
@@ -222,7 +221,7 @@ Interpretation: successful routing means `retain_only` maintains retain reward c
 
 Use `--eval_rewards` to decompose combined rewards into components:
 ```
-python train.py --reward sentence_length_5_with_happy --routing_mode classic --lora_config r1 \
+python train.py --config configs/sentence_length_5_with_happy.yaml --routing_mode classic --lora_config r1 \
   --eval_rewards sentence_length_5,happy_count
 ```
 
@@ -230,7 +229,7 @@ Post-hoc eval from checkpoint (DualLoRA auto-detected from state dict):
 ```
 python eval_utils.py --model_path output/{run}/checkpoint-2000 \
   --lora_config r32 \
-  --eval_rewards sentence_length_5_with_happy,sentence_length_5,happy_count
+  --eval_rewards sentence_length_5,happy_count
 ```
 LoRA rank is also auto-detected from state dict if `--lora_config` is omitted (alpha defaults to 16, stride to 1).
 
@@ -286,7 +285,7 @@ Available categories: `harassment`, `harassment/threatening`, `hate`, `hate/thre
 
 ### Running API Reward Training
 
-API rewards must be configured via YAML (not `--reward` CLI flag). Training hyperparameters stay on CLI for sweep compatibility:
+API rewards are configured via YAML. Training hyperparameters stay on CLI for sweep compatibility:
 
 ```bash
 uv run python train.py \

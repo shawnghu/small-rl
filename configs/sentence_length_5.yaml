@@ -3,3 +3,7 @@ reward:
     - name: sentence_length
       role: retain
       params: {target: 5}
+
+rh_detector: null
+training:
+  routing_mode: none

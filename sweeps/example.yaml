@@ -16,7 +16,7 @@ grid:
   lora_config: [r1, r4, r8, r16, r32]
 
 fixed:
-  reward: sentence_length_10_smooth_with_happy
+  config: configs/sentence_length_10_smooth_with_happy.yaml
   batch_size: 32
   num_generations: 16
   max_steps: 2000

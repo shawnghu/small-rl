@@ -13,22 +13,19 @@ Usage:
     # YAML config:
     python sweep.py --config configs/sweeps/example_lhs.yaml --dry_run
 
-    # Pure CLI (reward in --fixed or --grid):
+    # Pure CLI:
     python sweep.py \
-      --fixed reward=sentence_length_10_smooth_with_happy routing_mode=classic \
+      --fixed config=configs/sentence_length_10_smooth_with_happy.yaml routing_mode=classic \
               lora_config=r32 beta=0.02 lr=1e-5 batch_size=32 \
               num_generations=16 max_steps=2000 \
       --grid seed=42,123,7 \
       --per_gpu 12
 
-    # --reward is shorthand for --fixed reward=VALUE:
-    python sweep.py --reward happy_binary --grid seed=42,123 --fixed beta=0.02
-
     # Skip baselines:
-    python sweep.py --reward ... --no_baseline ...
+    python sweep.py --fixed config=... --no_baseline ...
 
     # Dry run:
-    python sweep.py --reward ... --dry_run ...
+    python sweep.py --fixed config=... --dry_run ...
 """
 
 import argparse
@@ -261,16 +258,16 @@ def load_sweep_config_py(path):
 
 
 def make_run_name(params, grid_keys, prefix=""):
-    """Short name from reward prefix + swept params.
+    """Short name from config prefix + swept params.
 
-    reward is always the name prefix (taken from params["reward"] if present).
-    reward is excluded from the suffix key loop — it only appears as the prefix.
+    config is always the name prefix (taken from the stem of params["config"] if present).
+    config is excluded from the suffix key loop — it only appears as the prefix.
     All other grid_keys appear as suffix key-value pairs.
     """
-    reward = params.get("reward", "")
-    parts = [prefix + reward] if (prefix + reward) else []
+    config_stem = Path(params["config"]).stem if params.get("config") else ""
+    parts = [prefix + config_stem] if (prefix + config_stem) else []
     for k in sorted(grid_keys):
-        if k == "reward":
+        if k == "config":
             continue
         short = PARAM_SHORT.get(k, k)
         parts.append(f"{short}{params.get(k, 'missing')}")
@@ -798,16 +795,16 @@ class SweepRunner:
 
             # Build a readable group name from the first routing run's params
             first_params = self.run_queue[group["routing_idxs"][0]]["params"]
-            reward_prefix = first_params.get("reward", "run")
+            config_prefix = Path(first_params["config"]).stem if first_params.get("config") else "run"
             if group_key == "default":
-                group_name = reward_prefix
+                group_name = config_prefix
             else:
-                group_name = reward_prefix + "_" + group_key.replace("|", "_").replace("=", "")
+                group_name = config_prefix + "_" + group_key.replace("|", "_").replace("=", "")
 
             generate_group_comparison_plots(
                 routing_runs=routing_runs,
                 baseline_runs=baseline_runs,
-                reward=reward_prefix,
+                reward=config_prefix,
                 output_dir=str(self.output_dir),
                 combined_key=self.combined_key,
                 retain_key=self.retain_key,
@@ -944,8 +941,6 @@ def main():
     parser = argparse.ArgumentParser(description="Sweep orchestrator for train.py")
     parser.add_argument("--config", default=None,
                         help="Sweep config file (.py or .yaml). CLI args override config values.")
-    parser.add_argument("--reward", default=None,
-                        help="Shorthand for --fixed reward=VALUE")
     parser.add_argument("--grid", nargs="+", default=[],
                         help="Grid params: param=val1,val2,... (merged with config grid, CLI wins per-key)")
     parser.add_argument("--fixed", nargs="+", default=[],
@@ -986,12 +981,7 @@ def main():
 
     args = parser.parse_args()
 
-    # --reward is sugar for --fixed reward=VALUE
-    if args.reward:
-        # Insert before other --fixed parsing so explicit --fixed reward= can override
-        fixed_args = {"reward": args.reward}
-    else:
-        fixed_args = {}
+    fixed_args = {}
 
     if py_config is not None:
         # ---- Python config path ----

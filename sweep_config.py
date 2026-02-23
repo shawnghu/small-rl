@@ -1,7 +1,7 @@
 """Programmatic sweep config construction for sweep.py.
 
-Intended interface for complex sweeps. reward and all training params are
-first-class variables with no special status.
+Intended interface for complex sweeps. config is an ordinary swept parameter
+like beta or lr — put it in fixed (constant across all runs) or in runs (varied).
 
 Usage in a Python config file (loaded via sweep.py --config path/to/config.py):
 
@@ -10,16 +10,19 @@ Usage in a Python config file (loaded via sweep.py --config path/to/config.py):
     config = SweepConfig(
         runs=union(
             cross(
-                [{"reward": "sentence_length_5"}, {"reward": "happy_binary"}],
+                [
+                    {"config": "configs/sentence_length_5_with_happy.yaml"},
+                    {"config": "configs/sentence_length_10_smooth_with_happy.yaml"},
+                ],
                 lhs({"lr": [1e-5, 3e-5, 1e-4], "beta": [0.005, 0.01, 0.02]}, n=5),
             ),
-            [{"reward": "happy_count", "beta": 0.02, "lr": 1e-5}],
+            [{"config": "configs/sentence_length_5_with_happy.yaml", "beta": 0.02, "lr": 1e-5}],
         ),
         fixed={"lora_config": "r32", "num_generations": 16, "max_steps": 2000,
                "routing_mode": "classic"},
         seeds=[42, 123, 7],
         per_gpu=12,
-        combined_key="sentence_length_5_with_happy",
+        combined_key="sentence_length_5+string_count",
         retain_key="sentence_length_5",
     )
 
