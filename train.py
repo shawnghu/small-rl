@@ -420,7 +420,7 @@ class SampleGRPOTrainer(GRPOTrainer):
 
 
 
-def main():
+def _make_parser():
     parser = argparse.ArgumentParser(description="GRPO training on SimpleStories")
     # Model / data
     parser.add_argument("--model", default="SimpleStories/SimpleStories-1.25M")
@@ -448,7 +448,11 @@ def main():
     parser.add_argument("--run_name", default=None, help="Override wandb run name")
     parser.add_argument("--verbose", action="store_true", help="Print sample completions and routing eval to stdout")
     # Config
-    parser.add_argument("--config", required=True, help="YAML config (reward, rh_detector, and optional training section)")
+    parser.add_argument("--config", default=None,
+                        help="YAML config (reward, rh_detector, and optional training section)")
+    # GPU
+    parser.add_argument("--gpu_id", type=int, default=0,
+                        help="CUDA device index (default: 0)")
     # Gradient routing
     parser.add_argument("--routing_mode", choices=["none", "classic", "exclusive"], default="none",
                         help="Routing mode: 'none' = vanilla TRL training step (baseline), "
@@ -481,29 +485,15 @@ def main():
     # Ablated retain training
     parser.add_argument("--ablated_frac", type=float, default=0.0,
                         help="Fraction of good samples trained with forget adapter ablated in forward pass")
-    args = parser.parse_args()
+    return parser
 
-    # Load training defaults from --config YAML's `training:` section (CLI still overrides)
-    if args.config:
-        with open(args.config) as f:
-            raw_config = yaml.safe_load(f) or {}
-        training_dict = raw_config.get("training") or {}
-        training_dict = {k: v for k, v in training_dict.items() if v is not None}
-        if training_dict:
-            valid_dests = {a.dest for a in parser._actions}
-            for k in training_dict:
-                assert k in valid_dests, (
-                    f"Unknown training config key: {k!r}. Valid keys: {sorted(valid_dests)}"
-                )
-            parser.set_defaults(**training_dict)
-            args = parser.parse_args()
-    # Validate adapter_type vs config flags
+
+def _apply_presets(args):
+    """Expand lora_config/mlp_config presets and validate adapter flags. Mutates args in place."""
     if args.adapter_type == "mlp" and args.lora_config:
-        parser.error("--lora_config cannot be used with --adapter_type mlp")
+        raise ValueError("--lora_config cannot be used with --adapter_type mlp")
     if args.adapter_type == "lora" and args.mlp_config:
-        parser.error("--mlp_config cannot be used with --adapter_type lora")
-
-    # Apply LoRA preset if specified
+        raise ValueError("--mlp_config cannot be used with --adapter_type lora")
     if args.lora_config:
         preset = LORA_PRESETS[args.lora_config]
         args.retain_rank = preset["retain_rank"]
@@ -512,19 +502,17 @@ def main():
         args._layer_stride = preset["layer_stride"]
     else:
         args._layer_stride = 1
-
-    # Apply MLP preset if specified
     if args.mlp_config:
         preset = MLP_PRESETS[args.mlp_config]
         args.retain_neurons = preset["retain_neurons"]
         args.forget_neurons = preset["forget_neurons"]
         args._layer_stride = preset["layer_stride"]
 
-    # Tee stdout/stderr to train.log in output_dir
+
+def _run(args):
+    """Core training logic. Assumes CUDA device already set and output_dir exists."""
+    assert args.config is not None, "--config is required"
     os.makedirs(args.output_dir, exist_ok=True)
-    log_path = os.path.join(args.output_dir, "train.log")
-    sys.stdout = Tee(log_path, sys.stdout)
-    sys.stderr = Tee(log_path, sys.stderr)
 
     # Load experiment config
     exp_cfg = ExperimentConfig.from_yaml(args.config)
@@ -730,6 +718,53 @@ def main():
         trainer.add_callback(QuietProgressCallback)
 
     trainer.train()
+
+
+def train_main(params: dict):
+    """Programmatic entry point for sweep.py.
+
+    params is a flat dict of training parameters. Missing keys receive argparse
+    defaults. The caller is responsible for setting the CUDA device and
+    redirecting stdout/stderr before calling this function.
+    """
+    parser = _make_parser()
+    args = parser.parse_args([])  # populate all defaults
+    for k, v in params.items():
+        setattr(args, k, v)
+    _apply_presets(args)
+    torch.cuda.set_device(args.gpu_id)
+    _run(args)
+
+
+def main():
+    parser = _make_parser()
+    args = parser.parse_args()
+
+    # Load training defaults from --config YAML's `training:` section (CLI still overrides)
+    if args.config:
+        with open(args.config) as f:
+            raw_config = yaml.safe_load(f) or {}
+        training_dict = raw_config.get("training") or {}
+        training_dict = {k: v for k, v in training_dict.items() if v is not None}
+        if training_dict:
+            valid_dests = {a.dest for a in parser._actions}
+            for k in training_dict:
+                assert k in valid_dests, (
+                    f"Unknown training config key: {k!r}. Valid keys: {sorted(valid_dests)}"
+                )
+            parser.set_defaults(**training_dict)
+            args = parser.parse_args()
+
+    _apply_presets(args)
+    torch.cuda.set_device(args.gpu_id)
+
+    # Tee stdout/stderr to train.log in output_dir (CLI only)
+    os.makedirs(args.output_dir, exist_ok=True)
+    log_path = os.path.join(args.output_dir, "train.log")
+    sys.stdout = Tee(log_path, sys.stdout)
+    sys.stderr = Tee(log_path, sys.stderr)
+
+    _run(args)
 
 
 if __name__ == "__main__":

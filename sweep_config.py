@@ -1,76 +1,42 @@
-"""Programmatic sweep config construction for sweep.py.
+"""Run-list builders for sweep.py Python configs.
 
-Intended interface for complex sweeps. config is an ordinary swept parameter
-like beta or lr — put it in fixed (constant across all runs) or in runs (varied).
+A sweep config is a plain Python file that defines a module-level `runs`
+variable (list of dicts) plus optional sweep-level attributes:
 
-Usage in a Python config file (loaded via sweep.py --config path/to/config.py):
+    per_gpu     -- max concurrent runs per GPU (default: 12)
+    combined_key -- metric key for combined reward (enables eval_rewards injection)
+    retain_key  -- metric key for retain reward (required when combined_key is set)
+    no_baseline -- skip automatic baseline runs (default: False)
 
-    from sweep_config import SweepConfig, grid, lhs, union, cross
+Example config file (sweeps/my_sweep.py):
 
-    config = SweepConfig(
-        runs=union(
-            cross(
-                [
-                    {"config": "configs/sentence_length_5_with_happy.yaml"},
-                    {"config": "configs/sentence_length_10_smooth_with_happy.yaml"},
-                ],
-                lhs({"lr": [1e-5, 3e-5, 1e-4], "beta": [0.005, 0.01, 0.02]}, n=5),
-            ),
-            [{"config": "configs/sentence_length_5_with_happy.yaml", "beta": 0.02, "lr": 1e-5}],
-        ),
-        fixed={"lora_config": "r32", "num_generations": 16, "max_steps": 2000,
-               "routing_mode": "classic"},
-        seeds=[42, 123, 7],
-        per_gpu=12,
-        combined_key="sentence_length_5+string_count",
-        retain_key="sentence_length_5",
-    )
+    from sweep_config import cross, lhs, union
 
-The sweep.py loader will:
-  1. Merge cfg.fixed into each run dict (run-level keys win)
-  2. Cross with cfg.seeds (adds "seed" key)
-  3. Call infer_grid_keys(runs) to determine which params vary
+    reward_scenarios = [
+        {"config": "configs/sentence_length_5_with_happy.yaml", "beta": 0},
+        {"config": "configs/sentence_length_10_smooth_with_happy.yaml", "beta": 0.02},
+    ]
+    training_search = lhs({"lr": [1e-5, 3e-5, 1e-4], "beta": [0.005, 0.01, 0.02]}, n=5)
+
+    _fixed = {"lora_config": "r32", "num_generations": 16, "max_steps": 2000,
+              "routing_mode": "classic"}
+    _seeds = [42, 123, 7]
+
+    runs = [
+        {**_fixed, **run, "seed": seed}
+        for run in cross(reward_scenarios, training_search)
+        for seed in _seeds
+    ]
+
+    per_gpu = 12
+
+sweep.py loads this file via importlib, reads `runs`, and optional attrs.
+CLI args (--per_gpu, --combined_key, etc.) override module-level attrs.
 """
 
 import itertools
 import json
 import random
-from dataclasses import dataclass, field
-
-
-@dataclass
-class SweepConfig:
-    """Configuration for a programmatic sweep.
-
-    Attributes:
-        runs: List of param dicts. Each dict specifies the params that vary for
-            that configuration. Fixed params are merged in by the loader.
-        fixed: Merged into every run dict. Run-level keys win on conflict.
-        seeds: Crossed with every run → total = len(runs) × len(seeds).
-        per_gpu: Max concurrent runs per GPU.
-        output_dir: Base output directory.
-        wandb_project: W&B project name.
-        no_wandb: Disable W&B logging.
-        no_baseline: Skip automatic baseline runs.
-        combined_key: Metric key for combined reward (eval logging + plots).
-            When set, eval_rewards is auto-injected as
-            "{combined_key},{retain_key},hack_freq" on all runs.
-        retain_key: Metric key for retain reward. Required when combined_key set.
-        train_flags: Boolean flags passed to train.py (e.g. ["no_wandb"]).
-        sample_mode: Sampling strategy for CLI-driven sweeps (ignored for
-            Python configs where runs are pre-built).
-    """
-    runs: list
-    fixed: dict = field(default_factory=dict)
-    seeds: list = field(default_factory=list)
-    per_gpu: int = 12
-    output_dir: str = "./output"
-    wandb_project: str = "small-rl"
-    no_wandb: bool = False
-    no_baseline: bool = False
-    combined_key: str = None
-    retain_key: str = None
-    train_flags: list = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------

@@ -31,8 +31,8 @@ Usage:
 import argparse
 import hashlib
 import importlib.util
-import itertools
 import json
+import multiprocessing
 import os
 import random
 import signal
@@ -40,8 +40,6 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-
-import yaml
 
 
 # Short names for common params in run naming
@@ -90,171 +88,31 @@ SWEEP_DEFAULTS = {
 }
 
 
-def parse_grid_arg(arg):
-    """Parse 'param=val1,val2,...' into (param, [val1, val2, ...])."""
-    key, vals = arg.split("=", 1)
-    return key, vals.split(",")
-
-
-def parse_fixed_arg(arg):
-    """Parse 'param=val' into (param, val)."""
-    key, val = arg.split("=", 1)
-    return key, val
-
-
-def build_grid(grid_args, fixed_args):
-    """Cartesian product of grid params, merged with fixed params."""
-    keys = list(grid_args.keys())
-    combos = list(itertools.product(*grid_args.values()))
-    runs = []
-    for combo in combos:
-        params = dict(fixed_args)
-        params.update(zip(keys, combo))
-        runs.append(params)
-    return runs
-
-
-def build_random_sample(grid_args, fixed_args, n_samples, seed=None):
-    """Sample n_samples unique combinations from the grid without replacement.
-
-    Uses index-based sampling so the full Cartesian product is never materialized,
-    making it safe for very large grids. Falls back to full grid if n_samples >= total.
-    """
-    keys = list(grid_args.keys())
-    values = list(grid_args.values())
-
-    total = 1
-    for v in values:
-        total *= len(v)
-
-    if n_samples >= total:
-        print(f"[WARN] --random_sample {n_samples} >= grid size {total}, using full grid")
-        return build_grid(grid_args, fixed_args)
-
-    rng = random.Random(seed)
-    sampled_indices = rng.sample(range(total), n_samples)
-
-    runs = []
-    for flat_idx in sampled_indices:
-        combo = []
-        remaining = flat_idx
-        for vals in reversed(values):
-            combo.append(vals[remaining % len(vals)])
-            remaining //= len(vals)
-        combo.reverse()
-        params = dict(fixed_args)
-        params.update(zip(keys, combo))
-        runs.append(params)
-    return runs
-
-
-def build_lhs(grid_args, fixed_args, n_samples, seed=None):
-    """Latin Hypercube Sample: each value of each param appears N/n_i times.
-
-    Each parameter's values are assigned in balanced slots (floor or ceil of N/n_i),
-    then the slots for each parameter are shuffled independently. This guarantees
-    even marginal coverage without enumerating the full Cartesian product.
-
-    Falls back to full grid if n_samples >= grid size.
-    """
-    rng = random.Random(seed)
-    keys = list(grid_args.keys())
-    values = list(grid_args.values())
-
-    total = 1
-    for v in values:
-        total *= len(v)
-    if n_samples >= total:
-        print(f"[WARN] --n_samples {n_samples} >= grid size {total}, using full grid")
-        return build_grid(grid_args, fixed_args)
-
-    columns = []
-    for vals in values:
-        n = len(vals)
-        base, extra = divmod(n_samples, n)
-        col = []
-        for i, v in enumerate(vals):
-            col.extend([v] * (base + (1 if i < extra else 0)))
-        rng.shuffle(col)
-        columns.append(col)
-
-    seen = set()
-    runs = []
-    for i in range(n_samples):
-        params = dict(fixed_args)
-        params.update(zip(keys, [col[i] for col in columns]))
-        key = tuple(sorted(params.items()))
-        if key not in seen:
-            seen.add(key)
-            runs.append(params)
-
-    n_dupes = n_samples - len(runs)
-    if n_dupes:
-        print(f"[INFO] LHS: {n_dupes} duplicate configs removed; {len(runs)} unique runs")
-    return runs
-
-
-def load_sweep_config_yaml(path):
-    """Load a YAML sweep config file.
-
-    Returns (scalar_dict, grid_dict, fixed_dict, train_flags) where:
-    - scalar_dict: CLI-arg scalars to set as parser defaults (n_samples, etc.)
-    - grid_dict: {param: [val, ...]} for --grid (values are strings)
-    - fixed_dict: {param: val} for --fixed (values are strings)
-    - train_flags: list of boolean flag names for --train_flags
-
-    Example YAML:
-        sample_mode: lhs
-        n_samples: 200
-        per_gpu: 12
-        grid:
-          reward: [happy_binary, sentence_length_10_smooth]
-          seed: [42, 123, 7]
-          lr: [1e-5, 3e-5, 1e-4]
-          beta: [0.01, 0.02, 0.05]
-        fixed:
-          batch_size: 32
-          num_generations: 16
-          max_steps: 2000
-          routing_mode: classic
-        train_flags:
-          - no_wandb
-    """
-    with open(path) as f:
-        cfg = yaml.safe_load(f) or {}
-
-    raw_grid = cfg.pop("grid", {}) or {}
-    raw_fixed = cfg.pop("fixed", {}) or {}
-    train_flags = cfg.pop("train_flags", []) or []
-
-    # Convert to string representations (same as CLI parsing produces)
-    grid = {
-        k: [str(v) for v in (vals if isinstance(vals, list) else [vals])]
-        for k, vals in raw_grid.items()
-    }
-    fixed = {k: str(v) for k, v in raw_fixed.items()}
-
-    return cfg, grid, fixed, train_flags
-
-
 def load_sweep_config_py(path):
     """Load a Python sweep config file.
 
-    Expects a module-level `config` variable of type SweepConfig.
-    Returns the SweepConfig object.
+    Expects a module-level `runs` variable (list of dicts) plus optional attrs:
+      per_gpu, combined_key, retain_key, no_baseline.
+
+    Returns (runs, attrs) where attrs is a dict of sweep-level options.
     """
     spec = importlib.util.spec_from_file_location("_sweep_config_module", path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    assert hasattr(mod, "config"), (
-        f"Python sweep config {path!r} must define a module-level `config` variable "
-        f"of type SweepConfig"
+    assert hasattr(mod, "runs"), (
+        f"Python sweep config {path!r} must define a module-level `runs` list"
     )
-    from sweep_config import SweepConfig
-    assert isinstance(mod.config, SweepConfig), (
-        f"`config` in {path!r} must be a SweepConfig instance, got {type(mod.config)}"
+    runs = mod.runs
+    assert isinstance(runs, list) and runs, (
+        f"`runs` in {path!r} must be a non-empty list of dicts"
     )
-    return mod.config
+    attrs = {
+        "per_gpu":      getattr(mod, "per_gpu",      None),
+        "combined_key": getattr(mod, "combined_key", None),
+        "retain_key":   getattr(mod, "retain_key",   None),
+        "no_baseline":  getattr(mod, "no_baseline",  False),
+    }
+    return runs, attrs
 
 
 def make_run_name(params, grid_keys, prefix=""):
@@ -272,6 +130,31 @@ def make_run_name(params, grid_keys, prefix=""):
         short = PARAM_SHORT.get(k, k)
         parts.append(f"{short}{params.get(k, 'missing')}")
     return "_".join(parts) if parts else "run"
+
+
+def _run_worker(params: dict, log_path: str, gpu_id: int, mps_pipe_dir: str | None):
+    """Worker function executed in a child process via multiprocessing.
+
+    Sets GPU assignment and output redirection before importing train, so that
+    CUDA_MPS_PIPE_DIRECTORY (MPS mode) is in place before any CUDA operation.
+    """
+    import os
+    import sys
+
+    if mps_pipe_dir is not None:
+        # MPS: pipe dir selects the physical GPU; virtual device must be 0
+        os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+        os.environ["CUDA_MPS_PIPE_DIRECTORY"] = mps_pipe_dir
+        effective_gpu_id = 0
+    else:
+        effective_gpu_id = gpu_id
+
+    log_file = open(log_path, "w")
+    sys.stdout = log_file
+    sys.stderr = log_file
+
+    from train import train_main
+    train_main({**params, "gpu_id": effective_gpu_id})
 
 
 def discover_gpus():
@@ -474,7 +357,7 @@ def _group_key(params, grid_keys):
 
 class SweepRunner:
     def __init__(self, runs, grid_keys, output_dir, gpus, per_gpu,
-                 wandb_project, no_wandb, dry_run, train_flags=None,
+                 wandb_project, no_wandb, dry_run,
                  no_baseline=False, combined_key=None, retain_key=None,
                  run_tag=None, use_mps=True):
         self.output_dir = Path(output_dir)
@@ -485,7 +368,6 @@ class SweepRunner:
         self.wandb_project = wandb_project
         self.no_wandb = no_wandb
         self.dry_run = dry_run
-        self.train_flags = train_flags or []
         self.no_baseline = no_baseline
         self.combined_key = combined_key
         self.retain_key = retain_key
@@ -644,14 +526,13 @@ class SweepRunner:
                 info["proc"].terminate()
             except Exception:
                 pass
-        # Give processes a moment to die
         time.sleep(1)
         for idx, info in self.active.items():
             try:
                 info["proc"].kill()
+                info["proc"].join(timeout=2)
             except Exception:
                 pass
-            info["log_file"].close()
         if self.use_mps:
             stop_mps_daemons(self.gpus)
         sys.exit(1)
@@ -661,7 +542,7 @@ class SweepRunner:
         return min(self.gpus, key=lambda g: self.gpu_counts[g])
 
     def _launch(self, run_idx):
-        """Launch a single run as a subprocess."""
+        """Launch a single run in a child process."""
         entry = self.run_queue[run_idx]
         params = entry["params"]
         is_baseline = entry["is_baseline"]
@@ -676,39 +557,23 @@ class SweepRunner:
         run_dir.mkdir(parents=True, exist_ok=True)
         log_path = run_dir / "train.log"
 
-        cmd = [sys.executable, "train.py"]
-        for k, v in params.items():
-            cmd.extend([f"--{k}", str(v)])
-        cmd.extend(["--output_dir", str(run_dir)])
-        cmd.extend(["--run_name", run_name])
-        if self.wandb_project:
-            cmd.extend(["--wandb_project", self.wandb_project])
+        full_params = dict(params)
+        full_params["output_dir"] = str(run_dir)
+        full_params["run_name"] = run_name
+        full_params["wandb_project"] = self.wandb_project
         if self.no_wandb:
-            cmd.append("--no_wandb")
+            full_params["no_wandb"] = True
 
-        # Apply train_flags
-        for flag in self.train_flags:
-            cmd.append(f"--{flag}")
-
-        env = os.environ.copy()
-        if self.use_mps:
-            # The MPS pipe directory selects the physical GPU; the client must
-            # use CUDA_VISIBLE_DEVICES=0 (not str(gpu)) or CUDA init fails for
-            # any gpu > 0 due to conflicting device remapping.
-            env["CUDA_VISIBLE_DEVICES"] = "0"
-            env["CUDA_MPS_PIPE_DIRECTORY"] = mps_pipe_dir(gpu)
-        else:
-            env["CUDA_VISIBLE_DEVICES"] = str(gpu)
-
-        log_file = open(log_path, "w")
-        proc = subprocess.Popen(
-            cmd, stdout=log_file, stderr=subprocess.STDOUT, env=env,
-            cwd=str(Path(__file__).parent),
+        pipe = mps_pipe_dir(gpu) if self.use_mps else None
+        ctx = multiprocessing.get_context("spawn")
+        proc = ctx.Process(
+            target=_run_worker,
+            args=(full_params, str(log_path), gpu, pipe),
         )
+        proc.start()
 
         self.active[run_idx] = {
             "proc": proc,
-            "log_file": log_file,
             "log_path": log_path,
             "run_name": run_name,
             "run_dir": run_dir,
@@ -727,10 +592,13 @@ class SweepRunner:
         """Poll active processes for completion."""
         finished = []
         for idx, info in self.active.items():
-            ret = info["proc"].poll()
+            proc = info["proc"]
+            if proc.is_alive():
+                continue
+            ret = proc.exitcode
             if ret is not None:
                 duration = time.time() - info["start_time"]
-                info["log_file"].close()
+                proc.join()
                 self.gpu_counts[info["gpu"]] -= 1
 
                 mins = int(duration) // 60
@@ -922,190 +790,50 @@ class SweepRunner:
 
 
 def main():
-    # Pre-parse --config so we can detect Python vs YAML config early.
-    pre_parser = argparse.ArgumentParser(add_help=False)
-    pre_parser.add_argument("--config", default=None)
-    pre_args, _ = pre_parser.parse_known_args()
-
-    # Python config path: load SweepConfig object directly, bypass grid/fixed parsing.
-    py_config = None
-    config_grid, config_fixed, config_train_flags = {}, {}, []
-    config_scalars = {}
-    if pre_args.config and pre_args.config.endswith(".py"):
-        py_config = load_sweep_config_py(pre_args.config)
-    elif pre_args.config:
-        config_scalars, config_grid, config_fixed, config_train_flags = (
-            load_sweep_config_yaml(pre_args.config)
-        )
-
     parser = argparse.ArgumentParser(description="Sweep orchestrator for train.py")
-    parser.add_argument("--config", default=None,
-                        help="Sweep config file (.py or .yaml). CLI args override config values.")
-    parser.add_argument("--grid", nargs="+", default=[],
-                        help="Grid params: param=val1,val2,... (merged with config grid, CLI wins per-key)")
-    parser.add_argument("--fixed", nargs="+", default=[],
-                        help="Fixed params: param=val (merged with config fixed, CLI wins per-key)")
+    parser.add_argument("--config", required=True,
+                        help="Python sweep config file (.py). Defines module-level `runs` list.")
     parser.add_argument("--per_gpu", type=int, default=None,
-                        help="Max concurrent runs per GPU (default: 12, or from Python config)")
+                        help="Max concurrent runs per GPU (overrides config file value; default: 12)")
     parser.add_argument("--output_dir", default=None,
-                        help="Base output directory")
-    parser.add_argument("--wandb_project", default=None)
-    parser.add_argument("--no_wandb", action="store_true")
+                        help="Base output directory (default: ./output)")
+    parser.add_argument("--wandb_project", default=None,
+                        help="W&B project name (default: small-rl)")
+    parser.add_argument("--no_wandb", action="store_true",
+                        help="Disable W&B logging for all runs")
     parser.add_argument("--dry_run", action="store_true",
                         help="Print planned runs without launching")
-    parser.add_argument("--train_flags", nargs="*", default=[],
-                        help="Boolean flags to pass to train.py (e.g. no_wandb)")
-    # Sampling
-    parser.add_argument("--sample_mode", default="lhs", choices=["grid", "random", "lhs"],
-                        help="Sampling strategy: lhs (default), random, or grid (full Cartesian product)")
-    parser.add_argument("--n_samples", type=int, default=None, metavar="N",
-                        help="Number of configs to sample (required for --sample_mode random/lhs)")
-    parser.add_argument("--random_seed", type=int, default=None,
-                        help="RNG seed for random/lhs sampling (for reproducibility)")
-    # Baseline control
     parser.add_argument("--no_baseline", action="store_true",
                         help="Skip automatic baseline runs")
     parser.add_argument("--run_tag", default=None,
-                        help="Suffix appended to all run names (e.g. 'mlp5' or 'exp1')")
+                        help="Suffix appended to all run names (e.g. 'exp1')")
     parser.add_argument("--combined_key", default=None,
                         help="Metric key for combined reward (enables eval_rewards auto-injection)")
     parser.add_argument("--retain_key", default=None,
                         help="Metric key for retain reward (required when --combined_key is set)")
     parser.add_argument("--no_mps", action="store_true",
-                        help="Skip MPS daemon management (start/stop). Use if MPS is already "
-                             "running externally or on non-Linux systems.")
-
-    # Apply YAML config scalars as parser defaults (CLI args override these)
-    if config_scalars:
-        parser.set_defaults(**config_scalars)
-
+                        help="Skip MPS daemon management (use if MPS already running externally)")
     args = parser.parse_args()
 
-    fixed_args = {}
+    runs, cfg_attrs = load_sweep_config_py(args.config)
 
-    if py_config is not None:
-        # ---- Python config path ----
-        from sweep_config import infer_grid_keys, SweepConfig
+    # CLI overrides config file attrs; config file overrides hardcoded defaults
+    per_gpu      = args.per_gpu      if args.per_gpu      is not None else (cfg_attrs["per_gpu"] or 12)
+    output_dir   = args.output_dir   or "./output"
+    wandb_project = args.wandb_project or "small-rl"
+    no_wandb     = args.no_wandb
+    no_baseline  = args.no_baseline  or cfg_attrs["no_baseline"]
+    combined_key = args.combined_key or cfg_attrs["combined_key"]
+    retain_key   = args.retain_key   or cfg_attrs["retain_key"]
 
-        cfg = py_config
+    # Apply sweep defaults for params not present in any run
+    for k, v in SWEEP_DEFAULTS.items():
+        if not any(k in run for run in runs):
+            for run in runs:
+                run[k] = v
 
-        # CLI overrides for scalar fields
-        output_dir = args.output_dir or cfg.output_dir
-        per_gpu = args.per_gpu if args.per_gpu is not None else cfg.per_gpu
-        wandb_project = args.wandb_project or cfg.wandb_project
-        no_wandb = args.no_wandb or cfg.no_wandb
-        no_baseline = args.no_baseline or cfg.no_baseline
-        combined_key = args.combined_key or cfg.combined_key
-        retain_key = args.retain_key or cfg.retain_key
-        train_flags = list(set(cfg.train_flags) | set(args.train_flags or []))
-
-        # CLI --fixed overrides (including --reward sugar)
-        for f in args.fixed:
-            k, v = parse_fixed_arg(f)
-            fixed_args[k] = v
-
-        # Merge cfg.fixed into each run (run-level keys win)
-        runs = []
-        for run in cfg.runs:
-            merged = dict(cfg.fixed)
-            merged.update(run)
-            # CLI fixed overrides everything
-            merged.update(fixed_args)
-            runs.append(merged)
-
-        # Cross with seeds
-        seed_values = cfg.seeds
-        if seed_values:
-            runs = [
-                {**run, "seed": str(s)}
-                for run in runs
-                for s in seed_values
-            ]
-
-        # Infer grid_keys from actual value diversity
-        grid_keys = infer_grid_keys(runs)
-        if seed_values:
-            grid_keys.add("seed")
-
-        # Apply sweep defaults for params not present in any run
-        for k, v in SWEEP_DEFAULTS.items():
-            if not any(k in run for run in runs):
-                for run in runs:
-                    run[k] = v
-
-        if not runs:
-            print("Python config produced no runs.")
-            sys.exit(1)
-
-    else:
-        # ---- YAML / CLI path ----
-        # Merge grid: config provides base, CLI overrides per-key
-        grid_args = dict(config_grid)
-        for g in args.grid:
-            k, v = parse_grid_arg(g)
-            grid_args[k] = v
-
-        # Merge fixed: config provides base, CLI overrides per-key
-        for f in args.fixed:
-            k, v = parse_fixed_arg(f)
-            fixed_args[k] = v
-        # Apply config fixed (CLI fixed already set above, don't overwrite)
-        for k, v in config_fixed.items():
-            if k not in fixed_args:
-                fixed_args[k] = v
-
-        # Merge train_flags: union of config and CLI
-        train_flags = list(set(config_train_flags) | set(args.train_flags or []))
-
-        # Apply sweep defaults for params not in grid or fixed
-        for k, v in SWEEP_DEFAULTS.items():
-            if k not in grid_args and k not in fixed_args:
-                fixed_args[k] = v
-
-        # Build run list
-        if args.sample_mode in ("random", "lhs") and args.n_samples is None:
-            # Fall back to full grid when sampling mode set but no budget specified
-            print(f"[INFO] --sample_mode={args.sample_mode} requires --n_samples; falling back to full grid")
-            args.sample_mode = "grid"
-
-        # For sampling modes, seed is treated specially: sample from all other params,
-        # then cross-product with all seeds so every sampled config runs on every seed.
-        # In grid mode, seed is just another grid axis (full Cartesian product as usual).
-        seed_values = None
-        if args.sample_mode in ("random", "lhs") and "seed" in grid_args:
-            seed_values = grid_args.pop("seed")
-
-        if grid_args:
-            if args.sample_mode == "lhs":
-                runs = build_lhs(grid_args, fixed_args, args.n_samples, seed=args.random_seed)
-            elif args.sample_mode == "random":
-                runs = build_random_sample(grid_args, fixed_args, args.n_samples, seed=args.random_seed)
-            else:
-                runs = build_grid(grid_args, fixed_args)
-        else:
-            runs = [dict(fixed_args)] if fixed_args else []
-
-        if seed_values is not None:
-            # Restore seed to grid_args so it appears in grid_keys (run naming, grouping)
-            grid_args["seed"] = seed_values
-            runs = [
-                {**run, "seed": sv}
-                for run in runs
-                for sv in seed_values
-            ]
-
-        if not runs:
-            print("No runs to execute. Specify --grid or --fixed params.")
-            sys.exit(1)
-
-        grid_keys = set(grid_args.keys())
-        output_dir = args.output_dir or "./output"
-        per_gpu = args.per_gpu if args.per_gpu is not None else 12
-        wandb_project = args.wandb_project or "small-rl"
-        no_wandb = args.no_wandb
-        no_baseline = args.no_baseline
-        combined_key = args.combined_key
-        retain_key = args.retain_key
+    from sweep_config import infer_grid_keys
+    grid_keys = infer_grid_keys(runs)
 
     gpus = discover_gpus()
     use_mps = not args.no_mps
@@ -1122,11 +850,10 @@ def main():
         wandb_project=wandb_project,
         no_wandb=no_wandb,
         dry_run=args.dry_run,
-        train_flags=train_flags,
         no_baseline=no_baseline,
         combined_key=combined_key,
         retain_key=retain_key,
-        run_tag=getattr(args, "run_tag", None),
+        run_tag=args.run_tag,
         use_mps=use_mps,
     )
     runner.run()

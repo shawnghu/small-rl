@@ -57,7 +57,7 @@ Keep the number of code paths and special cases minimal. Ideally, each config op
 2. **Step-by-step implementation**: No one-shot implementations. Each piece is designed and discussed explicitly before being built.
 3. **Reward scale**: 0/1 to start with.
 4. **TRL GRPOTrainer with gradient routing**: Gradient routing is implemented directly in TRL by subclassing `GRPOTrainer` (`SampleGRPOTrainer`). TRL's `loss_type` must be set to `"grpo"` explicitly (default is now `"dapo"`). TRL version is effectively pinned; no portability concerns.
-5. **Reward/RH config via YAML**: Reward functions and RH detectors use registry pattern + `functools.partial` for param binding. Always configured via `--config`. Per-criterion params live in YAML under `params:`. A config must explicitly declare `rh_detector` (even as `null`) and, for retain-only configs, `training: {routing_mode: none}`.
+5. **Reward/RH config via YAML**: Reward functions and RH detectors use registry pattern + `functools.partial` for param binding. Always configured via `--config`. Per-criterion params live in YAML under `params:`. A config must explicitly declare `rh_detector` (even as `null`) and, for retain-only configs, `training: {routing_mode: none}`. Bundling reward config into a YAML file is a current implementation concession — the design goal is for reward params to live directly in run dicts alongside other hyperparameters.
 6. **DualLoRALinear over PEFT**: Custom `DualLoRALinear` module (ported from `~/gradient-routing-finetuning`) replaces `nn.Linear` layers with two LoRA adapters. Simpler than PEFT, gives direct control over adapter params and gradient hooks.
 7. **Label injection via batch dict**: `is_rh` bool tensor is injected in `_generate_and_score_completions` override. TRL's `split_tensor_dict` and `shuffle_sequence_dict` slice all tensors uniformly, so the label survives buffering/shuffling.
 8. **Two-pass training_step**: Good samples (both adapters get gradients) and bad samples (retain adapter gradients zeroed via `register_hook`) are processed in separate forward/backward passes. Loss scaled by `n_sub / n_total` so combined gradient matches full-batch processing.
@@ -86,6 +86,10 @@ Single flag controlling gradient routing:
 ### `--lora_config` presets
 
 `--lora_config r32` sets retain=32, forget=32, alpha=32. See `LORA_PRESETS` in train.py for all options. Overrides `--retain_rank`, `--forget_rank`, `--lora_alpha`.
+
+### Programmatic entry point
+
+`train.train_main(params: dict)` accepts a flat dict of training parameters (same keys as CLI args). Missing keys receive argparse defaults. Used by sweep.py to launch runs directly without subprocess/CLI serialization. `--gpu_id` (default 0) selects the CUDA device.
 
 ## Validated GRPO Defaults
 
@@ -141,30 +145,45 @@ Three methods, from fastest to most thorough:
 
 `sweep.py` is the primary experiment orchestration tool for hypothesis-blasting across gradient routing variables. It manages parallel runs, automatic baselines, and per-step comparison charts.
 
-**config has no special status in SweepRunner** — it is an ordinary parameter like `beta` or `lr`. Put it in `--fixed` (constant across all runs) or in a Python config's `runs` list (varied per run).
+**Design goal: all experiment and RL hyperparameters are sweepable with uniform semantics.** No parameter should be treated specially by the sweep machinery. Reward structure and detector config currently live inside experiment config YAML files, so varying them requires varying `config=` as a sweep parameter. `config` has special naming treatment in `make_run_name` (used as the run/directory name prefix). These are implementation concessions — the goal remains uniform treatment of all parameters.
 
-**Programmatic Python configs** (`configs/sweeps/*.py`) are the recommended interface for complex sweeps. They expose `grid()`, `lhs()`, `cross()`, `union()` helpers from `sweep_config.py` and allow composing run lists freely before handing them to `SweepConfig`. See `configs/sweeps/example_python.py`.
+**Sweep configs are Python files** (`sweeps/*.py`) that define a module-level `runs` variable — a fully-materialized list of param dicts. `sweep_config.py` provides `grid()`, `lhs()`, `cross()`, `union()`, `subsample()` helpers that return plain lists and can be freely composed. Seeds and fixed params are expanded inline; the file owns the full run list.
+
+```python
+# sweeps/my_sweep.py
+from sweep_config import cross, lhs
+
+_fixed = {"lora_config": "r32", "num_generations": 16, "max_steps": 300}
+_seeds = [42, 123, 7]
+
+runs = [
+    {**_fixed, **run, "seed": seed}
+    for run in cross(
+        [{"config": "configs/sl5_with_happy.yaml", "beta": 0},
+         {"config": "configs/sl10_smooth_with_happy.yaml", "beta": 0.02}],
+        lhs({"lr": [1e-5, 3e-5, 1e-4], "routing_mode": ["classic", "exclusive"]}, n=4),
+    )
+    for seed in _seeds
+]
+
+per_gpu = 12  # optional; CLI --per_gpu overrides
+```
+
+sweep.py spawns each run as an isolated `multiprocessing` child process (spawn context), passing the params dict directly to `train.train_main`. No subprocess/CLI serialization.
 
 ### Basic usage
 ```
-# Python config (recommended):
-python sweep.py --config configs/sweeps/my_sweep.py --dry_run
-
-# Pure CLI:
-python sweep.py \
-  --fixed config=configs/sentence_length_10_smooth_with_happy.yaml routing_mode=classic \
-         lora_config=r32 beta=0.02 lr=1e-5 batch_size=32 \
-         num_generations=16 max_steps=2000 \
-  --grid seed=42,123,7 \
-  --per_gpu 12
+python sweep.py --config sweeps/my_sweep.py --dry_run
+python sweep.py --config sweeps/sl_routing.py --no_wandb
 ```
 
 ### CLI options
-- `--grid`: Cartesian product of swept params
-- `--fixed`: Constant across all runs
-- `--train_flags`: Boolean flags for train.py (e.g. `no_wandb`)
+- `--config`: Python sweep config file (required)
+- `--per_gpu`: Max concurrent runs per GPU (overrides config file value; default: 12)
 - `--dry_run`: Print planned runs without launching
 - `--no_baseline`: Skip automatic baseline runs
+- `--no_wandb`: Disable W&B for all runs
+- `--run_tag`: Suffix appended to all run names
 - `--combined_key`: Metric key for combined reward; when set, auto-injects `eval_rewards={combined},{retain},hack_freq` on all runs
 - `--retain_key`: Metric key for retain reward (required when `--combined_key` is set)
 
@@ -194,7 +213,7 @@ The HTML viewer (`index.html`) supports arrow keys, slider, and auto-play. Serve
 
 ### Auto-injected eval_rewards
 
-When `--combined_key` is set (or `combined_key` is set in a Python `SweepConfig`), sweep.py auto-sets `--eval_rewards {combined},{retain},hack_freq` on all runs (routing and baseline) so both produce comparable per-step eval data. `--retain_key` must also be set. No auto-injection happens without an explicit `combined_key`.
+When `--combined_key` is set (or `combined_key` is defined in the sweep config file), sweep.py auto-sets `eval_rewards={combined},{retain},hack_freq` on all runs (routing and baseline) so both produce comparable per-step eval data. `--retain_key` must also be set. No auto-injection happens without an explicit `combined_key`.
 
 ## Reference Repos
 
