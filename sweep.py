@@ -119,7 +119,11 @@ def make_run_name(params, grid_keys, prefix=""):
     config is excluded from the suffix key loop — it only appears as the prefix.
     All other grid_keys appear as suffix key-value pairs.
     """
-    config_stem = Path(params["config"]).stem if params.get("config") else ""
+    exp_cfg = params.get("exp_cfg")
+    config_stem = (
+        (exp_cfg.name if exp_cfg is not None and exp_cfg.name else None)
+        or (Path(params["config"]).stem if params.get("config") else "")
+    )
     parts = [prefix + config_stem] if (prefix + config_stem) else []
     for k in sorted(grid_keys):
         if k == "config":
@@ -326,8 +330,17 @@ def generate_baseline_runs(runs, grid_keys):
         }
         baseline_params["routing_mode"] = "none"
 
-        # Dedup key: sorted params as string
-        dedup_key = json.dumps(baseline_params, sort_keys=True)
+        # Dedup key: sorted params as string (non-serializable values use .name)
+        def _serialize(v):
+            try:
+                return json.dumps(v, sort_keys=True)
+            except TypeError:
+                assert hasattr(v, "name") and v.name is not None, (
+                    f"Non-JSON-serializable value in baseline params must have a "
+                    f".name attribute for dedup: {type(v)}"
+                )
+                return v.name
+        dedup_key = json.dumps({k: _serialize(v) for k, v in sorted(baseline_params.items())})
         if dedup_key in seen:
             continue
         seen.add(dedup_key)
@@ -638,7 +651,11 @@ class SweepRunner:
 
             # Build a readable group name from the first routing run's params
             first_params = self.run_queue[group["routing_idxs"][0]]["params"]
-            config_prefix = Path(first_params["config"]).stem if first_params.get("config") else "run"
+            first_exp_cfg = first_params.get("exp_cfg")
+            config_prefix = (
+                (first_exp_cfg.name if first_exp_cfg is not None and first_exp_cfg.name else None)
+                or (Path(first_params["config"]).stem if first_params.get("config") else "run")
+            )
             if group_key == "default":
                 group_name = config_prefix
             else:
@@ -799,7 +816,7 @@ def main():
                 run[k] = v
 
     from sweep_config import infer_grid_keys
-    grid_keys = infer_grid_keys(runs)
+    grid_keys = infer_grid_keys(runs) - {"exp_cfg"}
 
     gpus = discover_gpus()
     use_mps = not args.no_mps

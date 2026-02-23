@@ -110,6 +110,7 @@ class RHDetectorConfig(BaseModel):
 
 
 class ExperimentConfig(BaseModel):
+    name: Optional[str] = None
     reward: RewardConfig
     rh_detector: Optional[RHDetectorConfig] = None
     training: Optional[TrainingConfig] = None
@@ -120,9 +121,15 @@ class ExperimentConfig(BaseModel):
         if not isinstance(data, dict):
             return data
 
+        reward_data = data.get("reward") or {}
+        components = (
+            reward_data.get("components", [])
+            if isinstance(reward_data, dict)
+            else getattr(reward_data, "components", [])
+        )
         has_forget = any(
             (c.get("role") if isinstance(c, dict) else getattr(c, "role", None)) == "forget"
-            for c in (data.get("reward") or {}).get("components", [])
+            for c in components
         )
         has_detector = data.get("rh_detector") is not None
 

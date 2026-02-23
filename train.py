@@ -507,13 +507,15 @@ def _apply_presets(args):
         args._layer_stride = preset["layer_stride"]
 
 
-def _run(args):
-    """Core training logic. Assumes CUDA device already set and output_dir exists."""
-    assert args.config is not None, "--config is required"
-    os.makedirs(args.output_dir, exist_ok=True)
+def _run(args, exp_cfg=None):
+    """Core training logic. Assumes CUDA device already set and output_dir exists.
 
-    # Load experiment config
-    exp_cfg = ExperimentConfig.from_yaml(args.config)
+    exp_cfg: pre-built ExperimentConfig. If None, loads from args.config (YAML path).
+    """
+    if exp_cfg is None:
+        assert args.config is not None, "--config is required"
+        exp_cfg = ExperimentConfig.from_yaml(args.config)
+    os.makedirs(args.output_dir, exist_ok=True)
 
     # Attach resolved training params and dump complete run config
     exp_cfg = exp_cfg.model_copy(update={"training": TrainingConfig(
@@ -712,16 +714,19 @@ def train_main(params: dict):
     """Programmatic entry point for sweep.py.
 
     params is a flat dict of training parameters. Missing keys receive argparse
-    defaults. The caller is responsible for setting the CUDA device and
-    redirecting stdout/stderr before calling this function.
+    defaults. May include an 'exp_cfg' key (ExperimentConfig instance) to bypass
+    YAML loading entirely. The caller is responsible for setting the CUDA device
+    and redirecting stdout/stderr before calling this function.
     """
+    exp_cfg = params.get("exp_cfg")
     parser = _make_parser()
     args = parser.parse_args([])  # populate all defaults
     for k, v in params.items():
-        setattr(args, k, v)
+        if k != "exp_cfg":
+            setattr(args, k, v)
     _apply_presets(args)
     torch.cuda.set_device(args.gpu_id)
-    _run(args)
+    _run(args, exp_cfg)
 
 
 def main():
@@ -752,7 +757,8 @@ def main():
     sys.stdout = Tee(log_path, sys.stdout)
     sys.stderr = Tee(log_path, sys.stderr)
 
-    _run(args)
+    exp_cfg = ExperimentConfig.from_yaml(args.config)
+    _run(args, exp_cfg)
 
 
 if __name__ == "__main__":

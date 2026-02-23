@@ -76,7 +76,17 @@ def infer_grid_keys(runs):
         values_seen = set()
         for run in runs:
             v = run.get(k, _MISSING)
-            values_seen.add(json.dumps(v, sort_keys=True) if v is not _MISSING else "<missing>")
+            if v is _MISSING:
+                values_seen.add("<missing>")
+            else:
+                try:
+                    values_seen.add(json.dumps(v, sort_keys=True))
+                except TypeError:
+                    assert hasattr(v, "name") and v.name is not None, (
+                        f"Non-JSON-serializable value for key {k!r} must have a "
+                        f".name attribute for grouping/dedup: {type(v)}"
+                    )
+                    values_seen.add(v.name)
         if len(values_seen) > 1:
             grid_keys.add(k)
 

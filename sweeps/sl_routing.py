@@ -1,11 +1,11 @@
 """Routing sweep over sentence-length rewards × architecture × routing config.
 
 Structure:
-    (reward_scenarios × lora_configs × routing_lhs)
-    + 50%-sampled (reward_scenarios × mlp_configs × routing_lhs)
+    (scenarios × lora_configs × routing_lhs)
+    + 50%-sampled (scenarios × mlp_configs × routing_lhs)
     × 3 seeds
 
-    reward_scenarios (3):
+    scenarios (3):
         sl5  + beta=0    + no rep penalty
         sl10 + beta=0.02 + rep=1.1
         sl10_smooth + beta=0.02 + rep=1.1
@@ -33,8 +33,9 @@ from experiment_config import (
 )
 
 
-def _sl_cfg(retain_name, rh_name="happy_any"):
+def _sl_cfg(name, retain_name, rh_name="happy_any"):
     return ExperimentConfig(
+        name=name,
         reward=RewardConfig(components=[
             RewardComponentConfig(name=retain_name, role="retain", scale=1.0),
             RewardComponentConfig(name="happy_count_max_5", role="forget", scale=1.0),
@@ -43,10 +44,10 @@ def _sl_cfg(retain_name, rh_name="happy_any"):
     )
 
 
-reward_scenarios = [
-    {"reward": "sl5",        "exp_cfg": _sl_cfg("sentence_length_5"),        "beta": 0,    "repetition_penalty": 1.0},
-    {"reward": "sl10",       "exp_cfg": _sl_cfg("sentence_length_10"),       "beta": 0.02, "repetition_penalty": 1.1},
-    {"reward": "sl10_smooth","exp_cfg": _sl_cfg("sentence_length_10_smooth"),"beta": 0.02, "repetition_penalty": 1.1},
+scenarios = [
+    {"exp_cfg": _sl_cfg("sl5",        "sentence_length_5"),        "beta": 0,    "repetition_penalty": 1.0},
+    {"exp_cfg": _sl_cfg("sl10",       "sentence_length_10"),       "beta": 0.02, "repetition_penalty": 1.1},
+    {"exp_cfg": _sl_cfg("sl10_smooth","sentence_length_10_smooth"),"beta": 0.02, "repetition_penalty": 1.1},
 ]
 
 lora_configs = [
@@ -81,7 +82,7 @@ _rng = random.Random(42)
 
 _lora_runs = [
     {**_fixed, **r, **l, **m, "seed": seed}
-    for r in reward_scenarios
+    for r in scenarios
     for l in lora_configs
     for m in routing_lhs
     for seed in _seeds
@@ -89,7 +90,7 @@ _lora_runs = [
 
 _mlp_runs = [
     {**_fixed, **r, **m, **ml, "seed": seed}
-    for r in reward_scenarios
+    for r in scenarios
     for m in mlp_configs
     for ml in routing_lhs
     if _rng.random() < 0.5
