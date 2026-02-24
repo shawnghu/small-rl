@@ -395,8 +395,10 @@ class SweepRunner:
                 "is_baseline": False,
             })
 
-        # Generate baselines
-        self._baseline_cache = _load_baseline_cache(output_dir)
+        # Generate baselines — cache is shared across all sweeps at the parent dir
+        baseline_cache_dir = str(Path(output_dir).parent)
+        self._baseline_cache_dir = baseline_cache_dir
+        self._baseline_cache = _load_baseline_cache(baseline_cache_dir)
         self._cached_baseline_idxs = {}  # run_idx -> cached run_dir
 
         if has_routing and not no_baseline:
@@ -614,7 +616,7 @@ class SweepRunner:
                         "run_dir": str(info["run_dir"]),
                         "timestamp": time.time(),
                     }
-                    _save_baseline_cache(self.output_dir, self._baseline_cache)
+                    _save_baseline_cache(self._baseline_cache_dir, self._baseline_cache)
 
                 finished.append(idx)
         for idx in finished:
@@ -781,12 +783,14 @@ class SweepRunner:
 
 def main():
     parser = argparse.ArgumentParser(description="Sweep orchestrator for train.py")
+    parser.add_argument("--name", required=True,
+                        help="Sweep name. Results go to output/{name}/, graphs to output/{name}/sweep_graphs/.")
     parser.add_argument("--config", required=True,
                         help="Python sweep config file (.py). Defines module-level `runs` list.")
     parser.add_argument("--per_gpu", type=int, default=None,
                         help="Max concurrent runs per GPU (overrides config file value; default: 12)")
     parser.add_argument("--output_dir", default=None,
-                        help="Base output directory (default: ./output)")
+                        help="Base output directory (default: ./output/{name})")
     parser.add_argument("--wandb_project", default=None,
                         help="W&B project name (default: small-rl)")
     parser.add_argument("--no_wandb", action="store_true",
@@ -805,7 +809,7 @@ def main():
 
     # CLI overrides config file attrs; config file overrides hardcoded defaults
     per_gpu      = args.per_gpu      if args.per_gpu      is not None else (cfg_attrs["per_gpu"] or 12)
-    output_dir   = args.output_dir   or "./output"
+    output_dir   = args.output_dir   or f"./output/{args.name}"
     wandb_project = args.wandb_project or "small-rl"
     no_wandb     = args.no_wandb
     no_baseline  = args.no_baseline  or cfg_attrs["no_baseline"]
