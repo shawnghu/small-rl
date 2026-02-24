@@ -17,13 +17,14 @@ import matplotlib.pyplot as plt
 def load_records(run_dir):
     path = os.path.join(run_dir, "routing_eval.jsonl")
     assert os.path.exists(path), f"No routing_eval.jsonl in {run_dir}"
-    records = []
+    by_step = {}
     with open(path) as f:
         for line in f:
             line = line.strip()
             if line:
-                records.append(json.loads(line))
-    return records
+                record = json.loads(line)
+                by_step[record["step"]] = record  # last entry per step wins
+    return [by_step[s] for s in sorted(by_step)]
 
 
 def discover_metrics(records):
@@ -78,7 +79,8 @@ def main():
     print(f"Found {len(records)} eval points, metrics: {metrics}")
 
     for metric in metrics:
-        out_path = os.path.join(run_dir, f"routing_eval_{metric}.png")
+        safe_metric = metric.replace("/", "_")
+        out_path = os.path.join(run_dir, f"routing_eval_{safe_metric}.png")
         plot_metric(records, metric, out_path)
 
 

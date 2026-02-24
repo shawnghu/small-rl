@@ -56,13 +56,27 @@ class ScoreRequest(BaseModel):
     texts: list[str]
 
 
+class ScorePairsRequest(BaseModel):
+    prompts: list[str]
+    completions: list[str]
+
+
 class ScoreResult(BaseModel):
     label: str
     scores: dict[str, float]
 
 
+class ScorePairResult(BaseModel):
+    score: float
+
+
 class ScoreResponse(BaseModel):
     results: list[ScoreResult]
+    model: str
+
+
+class ScorePairsResponse(BaseModel):
+    results: list[ScorePairResult]
     model: str
 
 
@@ -96,3 +110,41 @@ def score(request: ScoreRequest):
         results.append(ScoreResult(label=top_label, scores=scores))
 
     return ScoreResponse(results=results, model=MODEL_NAME)
+
+
+@app.post("/score_pairs", response_model=ScorePairsResponse)
+def score_pairs(request: ScorePairsRequest):
+    """Score (prompt, completion) pairs using two-segment BERT input.
+
+    For models like nicholasKluge/RewardModel that expect tokenizer(text, text_pair)
+    with token_type_ids to distinguish prompt from response. Returns raw scalar
+    logits (no softmax, no id2label).
+    """
+    assert model is not None, "Model not loaded"
+    assert tokenizer is not None, "Tokenizer not loaded"
+    assert len(request.prompts) == len(request.completions), (
+        f"prompts ({len(request.prompts)}) and completions ({len(request.completions)}) must have same length"
+    )
+
+    inputs = tokenizer(
+        request.prompts,
+        request.completions,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=MAX_LENGTH,
+    ).to(DEVICE)
+
+    with torch.no_grad():
+        logits = model(**inputs).logits
+
+    results = []
+    for i in range(len(request.prompts)):
+        # Scalar output: single logit per pair
+        if logits.dim() == 1:
+            score = logits[i].item()
+        else:
+            score = logits[i].squeeze().item()
+        results.append(ScorePairResult(score=score))
+
+    return ScorePairsResponse(results=results, model=MODEL_NAME)

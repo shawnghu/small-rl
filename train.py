@@ -677,6 +677,16 @@ def _run(args, exp_cfg=None):
     # Stochastic routing: wrap reward if base_reward specified
     routing_enabled = args.routing_mode != "none"
     routed_reward = None
+    if args.rh_eligible_frac < 1.0:
+        assert args.base_reward, (
+            f"--rh_eligible_frac={args.rh_eligible_frac} requires --base_reward. "
+            f"Without base_reward, non-eligible samples have no reward to receive."
+        )
+    if args.routing_frac < 1.0:
+        assert args.rh_eligible_frac < 1.0, (
+            f"--routing_frac={args.routing_frac} has no effect when --rh_eligible_frac=1.0. "
+            f"Set --rh_eligible_frac < 1.0 to enable stochastic routing."
+        )
     if routing_enabled and args.base_reward and args.rh_eligible_frac < 1.0:
         base_fn = get_reward_fn(args.base_reward)
         routed_reward = RoutedRewardWrapper(
@@ -764,6 +774,10 @@ def _run(args, exp_cfg=None):
         trainer.remove_callback(PrinterCallback)
         trainer.remove_callback(ProgressCallback)
         trainer.add_callback(QuietProgressCallback)
+
+    # Step-0 eval: capture base model performance before training
+    if trainer.eval_every > 0 and trainer.eval_metrics:
+        trainer._run_routing_eval()
 
     trainer.train()
 

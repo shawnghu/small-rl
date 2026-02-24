@@ -7,7 +7,7 @@ Reward functions follow the TRL interface:
 import functools
 import re
 
-from api_rewards import api_reward, openai_moderation, cached_openai_moderation
+from api_rewards import api_reward, api_reward_pairs, openai_moderation, cached_openai_moderation
 
 
 def happy_binary(completions, **kwargs):
@@ -272,11 +272,12 @@ REWARD_REGISTRY = {
     "arithmetic_digit": arithmetic_digit,
     "arithmetic_zero_hack": arithmetic_zero_hack,
     "api_reward": api_reward,
+    "api_reward_pairs": api_reward_pairs,
     "openai_moderation": openai_moderation,
     "cached_openai_moderation": cached_openai_moderation,
 }
 
-API_REWARD_NAMES = {"api_reward", "openai_moderation", "cached_openai_moderation"}
+API_REWARD_NAMES = {"api_reward", "api_reward_pairs", "openai_moderation", "cached_openai_moderation"}
 
 
 class CachedReward:

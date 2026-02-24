@@ -133,6 +133,8 @@ def extract_routing_metrics(run_dir, step):
 
     result = {"_step": target}
     for mode, metrics in evals[target].items():
+        if mode.startswith("diag"):
+            continue
         combined_val = _find_by_prefix(metrics, "combined")
         retain_val = _find_by_prefix(metrics, "retain")
         hack_freq_val = _find_by_prefix(metrics, "hack_freq")

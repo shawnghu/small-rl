@@ -176,6 +176,11 @@ def eval_gradient_routing(model, tokenizer, reward_fns, n_samples=20,
         for mode_name, retain_scale, forget_scale in modes:
             set_scales(model, retain_scale, forget_scale)
 
+            # Seed all RNGs before each mode so generation differences reflect
+            # adapter config, not RNG ordering artifacts.
+            from transformers import set_seed
+            set_seed(42)
+
             samples = generate_from_model(model, tokenizer, n_samples, max_new_tokens, temperature,
                                           prompts=prompts)
             completions = [s["completion"] for s in samples]
@@ -203,7 +208,33 @@ def eval_gradient_routing(model, tokenizer, reward_fns, n_samples=20,
                 "metrics": metrics,
                 "diversity": diversity,
                 "samples": [s["completion"][:200] for s in samples[:5]],
+                "completions": completions,
             }
+
+        # Diagnostic: check if completions are identical across modes that should match.
+        # If forget adapter is zero, both and retain_only should produce identical text.
+        if "both" in results and "retain_only" in results:
+            both_c = results["both"]["completions"]
+            retain_c = results["retain_only"]["completions"]
+            n_diff = sum(a != b for a, b in zip(both_c, retain_c))
+            if n_diff > 0:
+                results["_diagnostics"] = {"both_vs_retain_diff_count": n_diff}
+
+        # Diagnostic: forget adapter weight norms (total and down-only)
+        from gradient_routing import _DUAL_ADAPTER_TYPES, DualMLPAdapter
+        forget_norms = []
+        down_norms = []
+        for m in model.modules():
+            if isinstance(m, _DUAL_ADAPTER_TYPES):
+                for p in m.get_forget_params():
+                    forget_norms.append(p.norm().item())
+                if isinstance(m, DualMLPAdapter) and m.down_forget is not None:
+                    down_norms.append(m.down_forget.weight.norm().item())
+        if forget_norms:
+            results["_diagnostics"] = results.get("_diagnostics", {})
+            results["_diagnostics"]["forget_param_norm"] = round(sum(forget_norms), 6)
+            results["_diagnostics"]["forget_down_norm"] = round(sum(down_norms), 6)
+
     finally:
         set_scales(model, 1.0, 1.0)
         if was_training:
@@ -237,11 +268,13 @@ def log_routing_eval_wandb(results, step=None):
         return
     flat = {}
     for mode_name, mode_data in results.items():
+        if mode_name.startswith("_"):
+            continue
         for rname, rdata in mode_data["metrics"].items():
             flat[f"routing_eval/{mode_name}/{rname}"] = rdata["mean"]
         flat[f"routing_eval/{mode_name}/unique"] = mode_data["diversity"]["unique_samples"]
         flat[f"routing_eval/{mode_name}/jaccard"] = mode_data["diversity"]["avg_jaccard_similarity"]
-    wandb.log(flat, step=step, commit=False)
+    wandb.log(flat, commit=False)
 
 
 def _load_state_dict(model_path):
