@@ -704,10 +704,17 @@ def _run(args, exp_cfg=None):
         if rh_detector is not None:
             print(f"RH detector: {exp_cfg.rh_detector.name} {exp_cfg.rh_detector.params or ''}")
 
-    # Training config
+    # Training config — batch_size is total; divide by visible devices
+    n_devices = torch.cuda.device_count() or 1
+    assert args.batch_size % n_devices == 0, (
+        f"--batch_size {args.batch_size} must be divisible by number of visible devices ({n_devices})"
+    )
+    per_device_bs = args.batch_size // n_devices
+    print(f"Batch size: {args.batch_size} total ({per_device_bs} per device × {n_devices} devices)")
+
     config = GRPOConfig(
         output_dir=args.output_dir,
-        per_device_train_batch_size=args.batch_size,
+        per_device_train_batch_size=per_device_bs,
         num_generations=args.num_generations,
         max_completion_length=args.max_completion_length,
         temperature=args.temperature,
