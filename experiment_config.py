@@ -105,6 +105,11 @@ class TrainingConfig(BaseModel):
     mlp_config: Optional[str] = None
     retain_neurons: Optional[int] = None
     forget_neurons: Optional[int] = None
+    # Environment
+    environment: Optional[str] = None
+    n_digits: Optional[int] = None
+    # Adapter (derived from presets)
+    layer_stride: Optional[int] = None
     # Eval
     eval_every: Optional[int] = None
 

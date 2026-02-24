@@ -597,6 +597,9 @@ def _run(args, exp_cfg=None):
         mlp_config=args.mlp_config,
         retain_neurons=args.retain_neurons,
         forget_neurons=args.forget_neurons,
+        environment=args.environment,
+        n_digits=args.n_digits,
+        layer_stride=args._layer_stride,
         eval_every=args.eval_every,
     )})
     exp_cfg.to_yaml(os.path.join(args.output_dir, "run_config.yaml"))
