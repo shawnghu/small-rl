@@ -283,7 +283,8 @@ class ExperimentConfig(BaseModel):
             cached = CachedReward(fn)
             built.append((comp.component_id, cached, comp.scale))
 
-        reward = CombinedReward(built, max_reward=self.reward.max_reward, normalize=self.reward.normalize)
+        num_generations = self.training.num_generations if self.training else None
+        reward = CombinedReward(built, max_reward=self.reward.max_reward, normalize=self.reward.normalize, num_generations=num_generations)
         reward.__name__ = self.reward_name
         # Stash cache on reward for detector wiring
         reward._moderation_cache = moderation_cache

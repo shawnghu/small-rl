@@ -113,20 +113,21 @@ def load_sweep_config_py(path):
 
 
 def make_run_name(params, grid_keys, prefix=""):
-    """Short name from config prefix + swept params.
+    """Short name from experiment prefix + swept params.
 
-    config is always the name prefix (taken from the stem of params["config"] if present).
-    config is excluded from the suffix key loop — it only appears as the prefix.
-    All other grid_keys appear as suffix key-value pairs.
+    Prefix is taken from (in priority order):
+      1. exp_cfg.name  — explicit short label set in the sweep config
+      2. exp_cfg.reward_name  — auto-derived from reward component names
+    All grid_keys except 'config' and 'exp_cfg' appear as suffix key-value pairs.
     """
     exp_cfg = params.get("exp_cfg")
-    config_stem = (
-        (exp_cfg.name if exp_cfg is not None and exp_cfg.name else None)
-        or (Path(params["config"]).stem if params.get("config") else "")
-    )
-    parts = [prefix + config_stem] if (prefix + config_stem) else []
+    if exp_cfg is not None:
+        name_prefix = exp_cfg.name or exp_cfg.reward_name
+    else:
+        name_prefix = ""
+    parts = [prefix + name_prefix] if (prefix + name_prefix) else []
     for k in sorted(grid_keys):
-        if k == "config":
+        if k in ("config", "exp_cfg"):
             continue
         short = PARAM_SHORT.get(k, k)
         parts.append(f"{short}{params.get(k, 'missing')}")
@@ -652,10 +653,10 @@ class SweepRunner:
             # Build a readable group name from the first routing run's params
             first_params = self.run_queue[group["routing_idxs"][0]]["params"]
             first_exp_cfg = first_params.get("exp_cfg")
-            config_prefix = (
-                (first_exp_cfg.name if first_exp_cfg is not None and first_exp_cfg.name else None)
-                or (Path(first_params["config"]).stem if first_params.get("config") else "run")
-            )
+            if first_exp_cfg is not None:
+                config_prefix = first_exp_cfg.name or first_exp_cfg.reward_name
+            else:
+                config_prefix = "run"
             if group_key == "default":
                 group_name = config_prefix
             else:

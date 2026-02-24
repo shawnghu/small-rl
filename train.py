@@ -677,7 +677,6 @@ def _run(args, exp_cfg=None):
 
     reward_name = exp_cfg.reward_name
     combined_reward = exp_cfg.build_reward()   # CombinedReward; held onto for RH detector wiring
-    combined_reward.num_generations = args.num_generations
     reward_fn = combined_reward
     cap_str = f", max_reward={exp_cfg.reward.max_reward}" if exp_cfg.reward.max_reward is not None else ""
     print(f"Reward: {reward_name} {[(c.name, c.scale) for c in exp_cfg.reward.components]}{cap_str}")
