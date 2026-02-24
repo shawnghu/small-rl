@@ -1,0 +1,4 @@
+reward:
+  components:
+    - name: arithmetic_digit
+      role: retain
