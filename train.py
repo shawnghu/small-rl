@@ -322,10 +322,16 @@ class SampleGRPOTrainer(GRPOTrainer):
         # Append structured JSONL record (readable mid-run)
         record = {"step": step}
         for mode_name, mode_data in results.items():
+            if mode_name.startswith("_"):
+                continue
             for rname, rdata in mode_data["metrics"].items():
                 record[f"{mode_name}/{rname}"] = rdata["mean"]
             record[f"{mode_name}/unique"] = mode_data["diversity"]["unique_samples"]
             record[f"{mode_name}/jaccard"] = mode_data["diversity"]["avg_jaccard_similarity"]
+        # Diagnostics
+        if "_diagnostics" in results:
+            for k, v in results["_diagnostics"].items():
+                record[f"diag/{k}"] = v
         log_path = os.path.join(self.args.output_dir, "routing_eval.jsonl")
         with open(log_path, "a") as f:
             f.write(json.dumps(record) + "\n")
@@ -456,8 +462,8 @@ def _make_parser():
     parser = argparse.ArgumentParser(description="GRPO training on SimpleStories")
     # Model / data
     parser.add_argument("--model", default="SimpleStories/SimpleStories-1.25M")
-    parser.add_argument("--environment", choices=["stories", "arithmetic"], default="stories",
-                        help="Environment: 'stories' (SimpleStories) or 'arithmetic' (modular addition)")
+    parser.add_argument("--environment", choices=["stories", "arithmetic", "aira"], default="stories",
+                        help="Environment: 'stories' (SimpleStories), 'arithmetic' (modular addition), or 'aira' (instruction prompts)")
     parser.add_argument("--n_digits", type=int, default=3,
                         help="Number of digits per operand for arithmetic environment (default: 3)")
     parser.add_argument("--reward", default=None, help="Override reward (takes precedence over config)")
@@ -665,6 +671,16 @@ def _run(args, exp_cfg=None):
             print(f"Warning: max_completion_length={args.max_completion_length} is large for "
                   f"{args.n_digits}-digit arithmetic (answer is {args.n_digits} tokens). "
                   f"Consider --max_completion_length {needed * 2}")
+    elif args.environment == "aira":
+        from data import load_aira_prompts
+        print("Loading aira training prompts...")
+        train_dataset = load_aira_prompts(
+            num_prompts=args.num_prompts, seed=args.seed, split="train",
+        )
+        print("Loading aira eval prompts...")
+        eval_dataset = load_aira_prompts(
+            num_prompts=args.eval_prompts, seed=args.seed, split="test",
+        )
     else:
         print("Loading training prompts...")
         train_dataset = load_prompts(
@@ -786,6 +802,13 @@ def train_main(params: dict):
     exp_cfg = params.get("exp_cfg")
     parser = _make_parser()
     args = parser.parse_args([])  # populate all defaults
+
+    # Apply exp_cfg.training fields as defaults (explicit params override)
+    if exp_cfg is not None and exp_cfg.training is not None:
+        for field, value in exp_cfg.training.model_dump().items():
+            if value is not None and field not in params:
+                setattr(args, field, value)
+
     for k, v in params.items():
         if k != "exp_cfg":
             setattr(args, k, v)
