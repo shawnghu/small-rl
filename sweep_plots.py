@@ -153,20 +153,26 @@ def generate_group_comparison_plots(routing_runs, baseline_runs, reward,
         gif_path = str(graph_dir / "animation.gif")
         generate_gif(image_paths, gif_path)
 
-    # Generate line graphs
+    # Generate line graphs (with and without shading)
     lines_path = None
+    lines_noshade_path = None
     if time_series:
         lines_path = str(graph_dir / "lines_over_time.png")
+        lines_noshade_path = str(graph_dir / "lines_over_time_noshade.png")
         title = reward.replace("_", " ").title()
         if group_name != "default":
             title += f" ({group_name.replace('_', ' ')})"
+        n_seeds_val = max(len(routing_runs), len(baseline_runs))
         generate_line_graphs(time_series, lines_path, title=title,
-                             n_seeds=max(len(routing_runs), len(baseline_runs)))
+                             n_seeds=n_seeds_val, shade=True)
+        generate_line_graphs(time_series, lines_noshade_path, title=title,
+                             n_seeds=n_seeds_val, shade=False)
 
     if image_paths or lines_path:
         html_path = str(graph_dir / "index.html")
         generate_html_viewer(image_paths, steps, html_path,
-                             lines_image="lines_over_time.png" if lines_path else None)
+                             lines_image="lines_over_time.png" if lines_path else None,
+                             lines_image_noshade="lines_over_time_noshade.png" if lines_noshade_path else None)
         parts = []
         if image_paths:
             parts.append(f"{len(image_paths)} charts + GIF")
@@ -182,7 +188,7 @@ def generate_group_comparison_plots(routing_runs, baseline_runs, reward,
         print(f"[PLOTS] No plottable data for group '{group_name}'")
 
 
-def generate_line_graphs(time_series, output_path, title="", n_seeds=None):
+def generate_line_graphs(time_series, output_path, title="", n_seeds=None, shade=True):
     """Generate 3 line graphs (proxy reward, task reward, hack_freq) over time.
 
     Args:
@@ -190,6 +196,7 @@ def generate_line_graphs(time_series, output_path, title="", n_seeds=None):
         output_path: where to save the PNG
         title: chart title
         n_seeds: number of seeds (for annotation)
+        shade: if True, draw stddev/min-max fill bands around lines
     """
     metric_configs = [
         ("combined", "Combined Reward"),
@@ -215,10 +222,11 @@ def generate_line_graphs(time_series, output_path, title="", n_seeds=None):
             color = CONDITION_COLORS[mode]
             label = CONDITION_LABELS[mode]
             ax.plot(steps_arr, means, color=color, label=label, linewidth=2)
-            ax.fill_between(steps_arr, means - stds, means + stds,
-                            color=color, alpha=0.40)
-            ax.fill_between(steps_arr, los, his,
-                            color=color, alpha=0.12)
+            if shade:
+                ax.fill_between(steps_arr, means - stds, means + stds,
+                                color=color, alpha=0.40)
+                ax.fill_between(steps_arr, los, his,
+                                color=color, alpha=0.12)
 
         ax.set_xlabel("Training Step", fontsize=11)
         ax.set_ylabel(metric_label, fontsize=11)
@@ -278,38 +286,66 @@ def generate_gif(image_paths, output_path, duration_ms=800):
     )
 
 
-def generate_html_viewer(image_paths, steps, output_path, lines_image=None):
+def generate_html_viewer(image_paths, steps, output_path, lines_image=None,
+                         lines_image_noshade=None):
     """Generate an interactive HTML viewer with slider for per-step charts.
 
     Works when served via HTTP (e.g. python -m http.server).
     Uses relative paths so the HTML file can live alongside the PNGs.
     Includes a tabbed view for per-step bar charts and line-over-time graphs.
+    Defaults to the Over Time tab when line graphs are available.
     """
     # Build list of relative image filenames
     filenames = [os.path.basename(p) for p in image_paths]
     step_labels = [str(s) for s in steps[:len(filenames)]]
 
+    # Decide default tab: prefer 'lines' if available
+    default_tab = "lines" if lines_image else "steps"
+
+    steps_display = "none" if default_tab == "lines" else ""
+    lines_display = "" if default_tab == "lines" else "none"
+
     lines_section = ""
+    shade_checkbox = ""
+    shade_script = ""
     if lines_image:
+        noshade_src = lines_image_noshade if lines_image_noshade else lines_image
+        shade_checkbox = f"""
+  <div class="shade-toggle">
+    <label>
+      <input type="checkbox" id="shade-cb" checked onchange="toggleShade()">
+      Show std/min-max shading
+    </label>
+  </div>"""
+        shade_script = f"""
+const linesShade = "{lines_image}";
+const linesNoShade = "{noshade_src}";
+function toggleShade() {{
+  const shaded = document.getElementById('shade-cb').checked;
+  document.getElementById('lines-img').src = shaded ? linesShade : linesNoShade;
+}}"""
         lines_section = f"""
-  <div id="lines-view" style="display:none;">
-    <img src="{lines_image}" style="max-width:100%; border:1px solid #ccc; border-radius:4px;">
+  <div id="lines-view" style="display:{lines_display};">
+    {shade_checkbox}
+    <img id="lines-img" src="{lines_image}" style="max-width:100%; border:1px solid #ccc; border-radius:4px;">
   </div>"""
 
     tab_buttons = ""
     tab_script = ""
     if lines_image:
-        tab_buttons = """
+        steps_active = "" if default_tab == "lines" else " active"
+        lines_active = " active" if default_tab == "lines" else ""
+        tab_buttons = f"""
   <div class="tabs">
-    <button class="tab active" onclick="showTab('steps')">Per-Step Charts</button>
-    <button class="tab" onclick="showTab('lines')">Over Time</button>
+    <button class="tab{steps_active}" onclick="showTab('steps', this)">Per-Step Charts</button>
+    <button class="tab{lines_active}" onclick="showTab('lines', this)">Over Time</button>
   </div>"""
         tab_script = """
-function showTab(which) {
+function showTab(which, btn) {
   document.getElementById('steps-view').style.display = which === 'steps' ? '' : 'none';
   document.getElementById('lines-view').style.display = which === 'lines' ? '' : 'none';
   document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-  event.target.classList.add('active');
+  btn.classList.add('active');
 }"""
 
     html = f"""<!DOCTYPE html>
@@ -330,12 +366,13 @@ function showTab(which) {
   .tab {{ padding: 8px 20px; font-size: 14px; cursor: pointer; border: 1px solid #ccc;
           border-radius: 4px 4px 0 0; background: #e8e8e8; }}
   .tab.active {{ background: white; border-bottom: 1px solid white; font-weight: bold; }}
+  .shade-toggle {{ margin: 10px 0; font-size: 14px; color: #444; }}
 </style>
 </head>
 <body>
 <div class="container">
   {tab_buttons}
-  <div id="steps-view">
+  <div id="steps-view" style="display:{steps_display};">
     <div class="controls">
       <button onclick="prev()">&larr; Prev</button>
       <input type="range" id="slider" min="0" max="{len(filenames) - 1}" value="0" oninput="update(this.value)">
@@ -381,6 +418,7 @@ document.addEventListener('keydown', (e) => {{
   else if (e.key === ' ') {{ e.preventDefault(); togglePlay(); }}
 }});
 {tab_script}
+{shade_script}
 </script>
 </body>
 </html>"""
