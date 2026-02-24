@@ -80,10 +80,10 @@ CACHE_EXCLUDE_PARAMS = ROUTING_ONLY_PARAMS | {
 
 # Defaults applied when not in --grid or --fixed
 SWEEP_DEFAULTS = {
-    "batch_size": "128",
-    "lr": "3e-4",
-    "max_steps": "300",
-    "eval_every": "10",
+    "batch_size": 128,
+    "lr": 3e-4,
+    "max_steps": 300,
+    "eval_every": 10,
 }
 
 
