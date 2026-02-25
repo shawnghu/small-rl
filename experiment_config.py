@@ -23,7 +23,7 @@ YAML schema example:
       name: happy_count
       params:
         threshold: 3
-      recall: 0.8   # optional: fraction of true positives that get flagged
+      # recall is now controlled via --rh_detector_recall CLI arg
 
     training:        # optional — unset fields use argparse defaults
       lr: 1e-5
@@ -96,7 +96,7 @@ class TrainingConfig(BaseModel):
     rh_eligible_frac: Optional[float] = None
     routing_frac: Optional[float] = None
     ablated_frac: Optional[float] = None
-    filter_baseline_drop_frac: Optional[float] = None
+    filter_baseline: Optional[bool] = None
     base_reward: Optional[str] = None
     # Adapter
     adapter_type: Optional[str] = None
@@ -179,7 +179,6 @@ class RHDetectorConfig(BaseModel):
     name: str
     params: dict[str, Any] = Field(default_factory=dict)
     component: Optional[str] = None  # for score_threshold: which reward component to threshold on
-    recall: float = 1.0             # fraction of true positives flagged (1.0 = flag all)
     false_positive_rate: float = 0.0  # fraction of true negatives randomly flipped to RH
 
 
@@ -187,6 +186,7 @@ class ExperimentConfig(BaseModel):
     name: Optional[str] = None
     reward: RewardConfig
     rh_detector: Optional[RHDetectorConfig] = None
+    rh_detector_recall: float = 1.0  # fraction of true positives flagged (1.0 = flag all)
     training: Optional[TrainingConfig] = None
 
     @model_validator(mode="before")
@@ -368,14 +368,6 @@ class ExperimentConfig(BaseModel):
 
         else:
             detector = get_rh_detector(cfg.name, **cfg.params)
-
-        if cfg.recall < 1.0:
-            recall = cfg.recall
-            base = detector
-            def recalled(completions, **kwargs):
-                flags = base(completions, **kwargs)
-                return [f and random.random() < recall for f in flags]
-            detector = recalled
 
         if cfg.false_positive_rate > 0.0:
             fpr = cfg.false_positive_rate

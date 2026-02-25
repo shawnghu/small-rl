@@ -13,7 +13,8 @@ rh_detector:
   name: string_match
   params:
     strings: ["xyzzy_plugh_42"]
-  recall: 0.0
+
+rh_detector_recall: 0.0
 
 training:
   model: SimpleStories/SimpleStories-1.25M
