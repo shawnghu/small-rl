@@ -118,8 +118,8 @@ class SampleGRPOTrainer(GRPOTrainer):
                  routing_mode=None, rh_detector=None,
                  eval_every=0, eval_metrics=None,
                  routed_reward=None,
-                 ablated_frac=0.0, verbose=False,
-                 adapter_config=None,
+                 ablated_frac=0.0, filter_baseline_drop_frac=0.0,
+                 verbose=False, adapter_config=None,
                  **kwargs):
         super().__init__(*args, **kwargs)
         self.verbose = verbose
@@ -142,6 +142,7 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._last_routing_eval_step = 0
         self._routed_reward = routed_reward
         self._ablated_frac = ablated_frac
+        self._filter_baseline_drop_frac = filter_baseline_drop_frac
 
     def _save_checkpoint(self, model, trial):
         super()._save_checkpoint(model, trial)
@@ -348,21 +349,38 @@ class SampleGRPOTrainer(GRPOTrainer):
 
     def _generate_and_score_completions(self, inputs):
         output = super()._generate_and_score_completions(inputs)
-        if self.gradient_routing_enabled:
+
+        # Run RH detector when needed: gradient routing or drop baseline
+        needs_detection = self.gradient_routing_enabled or self._filter_baseline_drop_frac > 0
+        if needs_detection and self.rh_detector is not None:
             completions = self.processing_class.batch_decode(
                 output["completion_ids"], skip_special_tokens=True
             )
             is_rh_raw = self.rh_detector(completions)
 
-            # If using routed reward, only flag eligible samples as RH
-            if self._routed_reward is not None and self._routed_reward._last_routed is not None:
-                routed = self._routed_reward._last_routed
-                is_rh = [rt and r for rt, r in zip(routed, is_rh_raw)]
-            else:
-                is_rh = is_rh_raw
+            if self.gradient_routing_enabled:
+                # Routing path: flag eligible samples as RH for gradient masking
+                if self._routed_reward is not None and self._routed_reward._last_routed is not None:
+                    routed = self._routed_reward._last_routed
+                    is_rh = [rt and r for rt, r in zip(routed, is_rh_raw)]
+                else:
+                    is_rh = is_rh_raw
+                device = output["completion_ids"].device
+                output["is_rh"] = torch.tensor(is_rh, dtype=torch.bool, device=device)
 
-            device = output["completion_ids"].device
-            output["is_rh"] = torch.tensor(is_rh, dtype=torch.bool, device=device)
+            elif self._filter_baseline_drop_frac > 0:
+                # Drop baseline: zero advantages for detected-RH samples
+                device = output["completion_ids"].device
+                is_rh_tensor = torch.tensor(is_rh_raw, dtype=torch.bool, device=device)
+                if self._filter_baseline_drop_frac < 1.0:
+                    drop_mask = is_rh_tensor & (
+                        torch.rand(is_rh_tensor.shape[0], device=device) < self._filter_baseline_drop_frac
+                    )
+                else:
+                    drop_mask = is_rh_tensor
+                output["advantages"] = output["advantages"].clone()
+                output["advantages"][drop_mask] = 0.0
+
         return output
 
     def training_step(self, model, inputs, num_items_in_batch):
@@ -533,6 +551,9 @@ def _make_parser():
     # Ablated retain training
     parser.add_argument("--ablated_frac", type=float, default=0.0,
                         help="Fraction of good samples trained with forget adapter ablated in forward pass")
+    # Drop baseline (filter baseline)
+    parser.add_argument("--filter_baseline_drop_frac", type=float, default=0.0,
+                        help="Zero advantages for this fraction of RH-detected samples (drop baseline). Only active when routing_mode=none.")
     return parser
 
 
@@ -698,8 +719,11 @@ def _run(args, exp_cfg=None):
     cap_str = f", max_reward={exp_cfg.reward.max_reward}" if exp_cfg.reward.max_reward is not None else ""
     print(f"Reward: {reward_name} {[(c.name, c.scale) for c in exp_cfg.reward.components]}{cap_str}")
 
-    # Stochastic routing: wrap reward so non-eligible samples get retain-only reward
+    # Routing and drop baseline flags
     routing_enabled = args.routing_mode != "none"
+    rh_drop_enabled = getattr(args, 'filter_baseline_drop_frac', 0.0) > 0 and not routing_enabled
+
+    # Stochastic routing: wrap reward so non-eligible samples get retain-only reward
     routed_reward = None
     if args.routing_frac < 1.0:
         assert args.rh_eligible_frac < 1.0, (
@@ -730,10 +754,15 @@ def _run(args, exp_cfg=None):
     # requires it for gradient masking, but eval is the reason to build it unconditionally.
     # Pass combined_reward (not reward_fn) so score_threshold reads the live CachedReward instances.
     rh_detector = None
-    if args.eval_every > 0 or routing_enabled:
+    if args.eval_every > 0 or routing_enabled or rh_drop_enabled:
         rh_detector = exp_cfg.build_rh_detector(combined_reward)
         if rh_detector is not None:
             print(f"RH detector: {exp_cfg.rh_detector.name} {exp_cfg.rh_detector.params or ''}")
+    if rh_drop_enabled:
+        assert rh_detector is not None, (
+            "--filter_baseline_drop_frac > 0 requires an rh_detector in the experiment config"
+        )
+        print(f"Drop baseline: zeroing advantages for {args.filter_baseline_drop_frac:.0%} of RH-detected samples")
 
     # Training config — batch_size is total; divide by visible devices
     n_devices = torch.cuda.device_count() or 1
@@ -787,6 +816,7 @@ def _run(args, exp_cfg=None):
         eval_metrics=eval_metrics,
         routed_reward=routed_reward,
         ablated_frac=args.ablated_frac,
+        filter_baseline_drop_frac=getattr(args, 'filter_baseline_drop_frac', 0.0),
         verbose=args.verbose,
         adapter_config=adapter_config,
     )

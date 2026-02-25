@@ -51,7 +51,7 @@ routing_modes = [
 ]
 
 _rh_eligible_fracs = [
-    {"rh_eligible_frac": 0.5},
+    {"rh_eligible_frac": 0.5, "filter_baseline_drop_frac": 0.5},
 ]
 
 _routing_fracs = [
