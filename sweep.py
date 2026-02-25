@@ -322,12 +322,12 @@ def generate_baseline_runs(runs, grid_keys):
     1. A regular baseline: routing_mode=none, all ROUTING_ONLY_PARAMS stripped
     2. A filter baseline: routing_mode=none, filter_baseline=True, keeps
        rh_eligible_frac/base_reward (same eligibility as routing run)
-    3. A relabel baseline: routing_mode=none, reward_penalty_baseline=True, keeps
+    3. A reward penalty baseline: routing_mode=none, reward_penalty_baseline=True, keeps
        rh_eligible_frac/base_reward (same eligibility as routing run)
 
     Filter baselines isolate whether routing's benefit comes from the routing
     mechanism itself or just from not training on detected-RH data.
-    Relabel baselines zero the reward (not advantages) for RH samples, giving
+    Reward penalty baselines zero the reward (not advantages) for RH samples, giving
     them negative advantages that actively penalize hacking behavior.
 
     Deduplicates identical baselines (e.g. classic vs exclusive with same params).
@@ -379,19 +379,19 @@ def generate_baseline_runs(runs, grid_keys):
             filter_grid_keys = grid_keys - FILTER_BASELINE_STRIP
             baselines.append((filter_params, filter_grid_keys))
 
-        # --- Relabel baseline ---
-        relabel_params = {
+        # --- Reward penalty baseline ---
+        rwdpen_params = {
             k: v for k, v in run_params.items()
             if k not in FILTER_BASELINE_STRIP
         }
-        relabel_params["routing_mode"] = "none"
-        relabel_params["reward_penalty_baseline"] = True
+        rwdpen_params["routing_mode"] = "none"
+        rwdpen_params["reward_penalty_baseline"] = True
 
-        relabel_dedup_key = json.dumps({k: _serialize(v) for k, v in sorted(relabel_params.items())})
-        if relabel_dedup_key not in seen:
-            seen.add(relabel_dedup_key)
-            relabel_grid_keys = grid_keys - FILTER_BASELINE_STRIP
-            baselines.append((relabel_params, relabel_grid_keys))
+        rwdpen_dedup_key = json.dumps({k: _serialize(v) for k, v in sorted(rwdpen_params.items())})
+        if rwdpen_dedup_key not in seen:
+            seen.add(rwdpen_dedup_key)
+            rwdpen_grid_keys = grid_keys - FILTER_BASELINE_STRIP
+            baselines.append((rwdpen_params, rwdpen_grid_keys))
 
     return baselines
 
@@ -486,7 +486,7 @@ class SweepRunner:
             cached = self._baseline_cache.get(cache_key)
             if cached and _cache_entry_valid(cached):
                 if entry["params"].get("reward_penalty_baseline"):
-                    prefix = "relabel_"
+                    prefix = "reward_penalty_"
                 elif entry["params"].get("filter_baseline"):
                     prefix = "filter_"
                 else:
@@ -594,7 +594,7 @@ class SweepRunner:
 
         if is_baseline:
             if params.get("reward_penalty_baseline"):
-                prefix = "relabel_"
+                prefix = "reward_penalty_"
             elif params.get("filter_baseline"):
                 prefix = "filter_"
             else:
@@ -813,11 +813,11 @@ class SweepRunner:
                            and not q["params"].get("filter_baseline")
                            and not q["params"].get("reward_penalty_baseline"))
         n_filter_bl = sum(1 for q in self.run_queue if q["is_baseline"] and q["params"].get("filter_baseline"))
-        n_relabel_bl = sum(1 for q in self.run_queue if q["is_baseline"] and q["params"].get("reward_penalty_baseline"))
+        n_rwdpen_bl = sum(1 for q in self.run_queue if q["is_baseline"] and q["params"].get("reward_penalty_baseline"))
         n_cached = len(self._cached_baseline_idxs)
         n_gpus = len(self.gpus)
 
-        print(f"[SWEEP] {total} runs ({n_routing} routing, {n_regular_bl} baseline, {n_filter_bl} filter, {n_relabel_bl} relabel, {n_cached} cached)")
+        print(f"[SWEEP] {total} runs ({n_routing} routing, {n_regular_bl} baseline, {n_filter_bl} filter, {n_rwdpen_bl} reward_penalty, {n_cached} cached)")
         print(f"[SWEEP] {n_gpus} GPU(s) {self.gpus}, {self.max_concurrent} slots")
         print(f"[SWEEP] output_dir={self.output_dir}")
         if self.no_wandb:
@@ -831,7 +831,7 @@ class SweepRunner:
             for i, entry in enumerate(self.run_queue):
                 if entry["is_baseline"]:
                     if entry["params"].get("reward_penalty_baseline"):
-                        prefix = "relabel_"
+                        prefix = "reward_penalty_"
                     elif entry["params"].get("filter_baseline"):
                         prefix = "filter_"
                     else:
@@ -843,7 +843,7 @@ class SweepRunner:
                     name = f"{name}_{self.run_tag}"
                 cached = "(CACHED)" if i in self._cached_baseline_idxs else ""
                 if entry["params"].get("reward_penalty_baseline"):
-                    tag = "[RELABEL] "
+                    tag = "[RWDPEN]  "
                 elif entry["params"].get("filter_baseline"):
                     tag = "[FILTER]  "
                 elif entry["is_baseline"]:

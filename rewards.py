@@ -351,6 +351,7 @@ class CombinedReward:
                     combined = [a + b for a, b in zip(combined, scaled)]
             if self.max_reward is not None:
                 combined = [min(s, self.max_reward) for s in combined]
+            self._last_rewards = combined
             return combined
 
         # Normalized path: per-component, per-group normalization
@@ -377,6 +378,7 @@ class CombinedReward:
 
         if self.max_reward is not None:
             combined = [min(s, self.max_reward) for s in combined]
+        self._last_rewards = combined
         return combined
 
     def last_raw_metrics(self):

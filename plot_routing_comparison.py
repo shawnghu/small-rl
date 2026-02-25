@@ -186,6 +186,7 @@ def aggregate_seeds(seed_results):
 CONDITION_COLORS = {
     "baseline":    "#4878CF",  # blue
     "filter":      "#9B59B6",  # purple
+    "reward_penalty": "#E67E22",  # dark orange
     "both":        "#E8853B",  # orange
     "forget_only": "#D65F5F",  # red
     "retain_only": "#59A14F",  # green
@@ -194,6 +195,7 @@ CONDITION_COLORS = {
 CONDITION_LABELS = {
     "baseline":    "No Routing",
     "filter":      "Filter (drop RH)",
+    "reward_penalty": "Reward Penalty (zero reward)",
     "both":        "Both Adapters",
     "forget_only": "Forget Only",
     "retain_only": "Retain Only",
@@ -222,7 +224,7 @@ def plot_routing_chart(
     metric_labels = ["Combined Reward", "Retain Reward", "Hack Frequency"]
     metric_keys = ["combined", "retain", "hack_freq"]
 
-    conditions = [m for m in ["baseline", "filter", "both", "forget_only", "retain_only"] if m in data]
+    conditions = [m for m in ["baseline", "filter", "reward_penalty", "both", "forget_only", "retain_only"] if m in data]
     n_cond = len(conditions)
 
     fig, ax1 = plt.subplots(figsize=figsize)

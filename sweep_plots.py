@@ -37,6 +37,11 @@ def _is_filter_baseline(run_dir):
     return os.path.basename(run_dir).startswith("filter_")
 
 
+def _is_reward_penalty_baseline(run_dir):
+    """Detect reward penalty baseline from run directory name (prefix 'reward_penalty_')."""
+    return os.path.basename(run_dir).startswith("reward_penalty_")
+
+
 def build_step_data(routing_runs, baseline_runs, step, no_baseline=False):
     """Build aggregated data for one eval step.
 
@@ -53,23 +58,32 @@ def build_step_data(routing_runs, baseline_runs, step, no_baseline=False):
         if data:
             routing_seed_results.append(data)
 
-    # Collect baseline data across seeds (regular and filter separately)
+    # Collect baseline data across seeds (regular, filter, and reward penalty separately)
     baseline_seed_results = []
     filter_seed_results = []
+    reward_penalty_seed_results = []
     if not no_baseline:
         for run_dir in baseline_runs:
             data = extract_routing_metrics(run_dir, step)
             if data:
                 renamed = {"_step": data.get("_step", step)}
+                is_reward_penalty = _is_reward_penalty_baseline(run_dir)
                 is_filter = _is_filter_baseline(run_dir)
-                target_mode = "filter" if is_filter else "baseline"
+                if is_reward_penalty:
+                    target_mode = "reward_penalty"
+                elif is_filter:
+                    target_mode = "filter"
+                else:
+                    target_mode = "baseline"
                 for mode, metrics in data.items():
                     if mode.startswith("_"):
                         continue
                     if mode == "both":
                         renamed[target_mode] = metrics
                     # Skip retain_only/forget_only from baseline runs
-                if is_filter:
+                if is_reward_penalty:
+                    reward_penalty_seed_results.append(renamed)
+                elif is_filter:
                     filter_seed_results.append(renamed)
                 else:
                     baseline_seed_results.append(renamed)
@@ -84,11 +98,16 @@ def build_step_data(routing_runs, baseline_runs, step, no_baseline=False):
         filter_agg = aggregate_seeds(filter_seed_results)
         plot_data.update(filter_agg)
 
+    if reward_penalty_seed_results:
+        reward_penalty_agg = aggregate_seeds(reward_penalty_seed_results)
+        plot_data.update(reward_penalty_agg)
+
     if routing_seed_results:
         routing_agg = aggregate_seeds(routing_seed_results)
         plot_data.update(routing_agg)
 
-    n_seeds = max(len(routing_seed_results), len(baseline_seed_results), len(filter_seed_results))
+    n_seeds = max(len(routing_seed_results), len(baseline_seed_results),
+                  len(filter_seed_results), len(reward_penalty_seed_results))
     return plot_data, n_seeds
 
 
@@ -216,7 +235,7 @@ def generate_line_graphs(time_series, output_path, title="", n_seeds=None, shade
         ("retain", "Retain Reward"),
         ("hack_freq", "Hack Frequency"),
     ]
-    mode_order = ["baseline", "filter", "both", "retain_only", "forget_only"]
+    mode_order = ["baseline", "filter", "reward_penalty", "both", "retain_only", "forget_only"]
     modes_present = [m for m in mode_order if m in time_series]
 
     fig, axes = plt.subplots(1, 3, figsize=(18, 5), sharey=True)
