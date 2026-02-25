@@ -777,6 +777,14 @@ class SweepRunner:
                 time.sleep(0.5)
 
         self._print_summary()
+
+        # Generate sweep-wide overview page
+        try:
+            from sweep_plots import generate_sweep_overview
+            generate_sweep_overview(str(self.output_dir))
+        except Exception as e:
+            print(f"[WARN] Failed to generate sweep overview: {e}")
+
         if self.use_mps:
             stop_mps_daemons(self.gpus)
 

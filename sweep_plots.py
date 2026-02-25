@@ -313,7 +313,7 @@ def generate_html_viewer(image_paths, steps, output_path, lines_image=None,
         shade_checkbox = f"""
   <div class="shade-toggle">
     <label>
-      <input type="checkbox" id="shade-cb" checked onchange="toggleShade()">
+      <input type="checkbox" id="shade-cb" onchange="toggleShade()">
       Show std/min-max shading
     </label>
   </div>"""
@@ -327,7 +327,7 @@ function toggleShade() {{
         lines_section = f"""
   <div id="lines-view" style="display:{lines_display};">
     {shade_checkbox}
-    <img id="lines-img" src="{lines_image}" style="max-width:100%; border:1px solid #ccc; border-radius:4px;">
+    <img id="lines-img" src="{noshade_src}" style="max-width:100%; border:1px solid #ccc; border-radius:4px;">
   </div>"""
 
     tab_buttons = ""
@@ -425,3 +425,110 @@ document.addEventListener('keydown', (e) => {{
 
     with open(output_path, "w") as f:
         f.write(html)
+
+
+def generate_sweep_overview(sweep_dir):
+    """Generate a single HTML page showing all group line graphs from a sweep.
+
+    Scans {sweep_dir}/sweep_graphs/*/lines_over_time*.png and builds an
+    overview page at {sweep_dir}/sweep_graphs/overview.html.
+
+    Press 'S' to toggle std/min-max shading on all graphs simultaneously.
+    """
+    sweep_dir = Path(sweep_dir)
+    graphs_dir = sweep_dir / "sweep_graphs"
+    if not graphs_dir.is_dir():
+        print(f"[OVERVIEW] No sweep_graphs/ directory in {sweep_dir}")
+        return
+
+    # Find all groups that have line graphs
+    groups = []
+    for group_dir in sorted(graphs_dir.iterdir()):
+        if not group_dir.is_dir():
+            continue
+        shade = group_dir / "lines_over_time.png"
+        noshade = group_dir / "lines_over_time_noshade.png"
+        if not noshade.exists() and not shade.exists():
+            continue
+        groups.append({
+            "name": group_dir.name,
+            "shade": f"{group_dir.name}/lines_over_time.png" if shade.exists() else None,
+            "noshade": f"{group_dir.name}/lines_over_time_noshade.png" if noshade.exists() else None,
+        })
+
+    if not groups:
+        print(f"[OVERVIEW] No line graphs found in {graphs_dir}")
+        return
+
+    # Build image entries (JS array)
+    img_entries = []
+    img_html = []
+    for i, g in enumerate(groups):
+        # Default to noshade; fall back to shade if noshade missing
+        default_src = g["noshade"] or g["shade"]
+        shade_src = g["shade"] or g["noshade"]
+        noshade_src = g["noshade"] or g["shade"]
+        img_entries.append(
+            f'{{shade: "{shade_src}", noshade: "{noshade_src}"}}'
+        )
+        title = g["name"].replace("_", " ")
+        img_html.append(
+            f'  <div class="group">\n'
+            f'    <h2>{title}</h2>\n'
+            f'    <a href="{g["name"]}/index.html">'
+            f'<img id="img-{i}" src="{default_src}"></a>\n'
+            f'  </div>'
+        )
+
+    html = f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Sweep Overview — {sweep_dir.name}</title>
+<style>
+  body {{ font-family: sans-serif; background: #f5f5f5; margin: 20px; }}
+  h1 {{ text-align: center; }}
+  .hint {{ text-align: center; color: #888; font-size: 13px; margin-bottom: 20px; }}
+  .hint kbd {{ background: #e0e0e0; padding: 2px 6px; border-radius: 3px;
+               border: 1px solid #bbb; font-size: 13px; }}
+  .shade-status {{ text-align: center; font-size: 14px; color: #555; margin-bottom: 10px; }}
+  .group {{ max-width: 1400px; margin: 0 auto 30px auto; }}
+  .group h2 {{ font-size: 16px; color: #333; margin-bottom: 6px; }}
+  .group img {{ max-width: 100%; border: 1px solid #ccc; border-radius: 4px; cursor: pointer; }}
+</style>
+</head>
+<body>
+<h1>Sweep Overview — {sweep_dir.name}</h1>
+<div class="hint">Press <kbd>S</kbd> to toggle std/min-max shading</div>
+<div class="shade-status" id="shade-status">Shading: OFF</div>
+{"".join(img_html)}
+<script>
+const imgs = [{", ".join(img_entries)}];
+let shaded = false;
+function setShade(on) {{
+  shaded = on;
+  for (let i = 0; i < imgs.length; i++) {{
+    document.getElementById('img-' + i).src = shaded ? imgs[i].shade : imgs[i].noshade;
+  }}
+  document.getElementById('shade-status').textContent = 'Shading: ' + (shaded ? 'ON' : 'OFF');
+}}
+document.addEventListener('keydown', (e) => {{
+  if (e.key === 's' || e.key === 'S') setShade(!shaded);
+}});
+</script>
+</body>
+</html>"""
+
+    out_path = graphs_dir / "overview.html"
+    with open(out_path, "w") as f:
+        f.write(html)
+    print(f"[OVERVIEW] Generated {out_path} ({len(groups)} groups)")
+
+
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) != 2:
+        print("Usage: python sweep_plots.py <sweep_output_dir>")
+        print("  Generates overview.html in <sweep_output_dir>/sweep_graphs/")
+        sys.exit(1)
+    generate_sweep_overview(sys.argv[1])
