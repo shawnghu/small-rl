@@ -8,6 +8,7 @@ Small-scale RL + gradient routing experiments for fast iteration and rigorous va
 - Experimental correctness is the most important thing: we should be very lilberal with asserts and throwing errors -- any failure or deviation from intended experimental protocol should be loud and catastrophic. Silent fallbacks will ruin experiments
 - Default values are fine, but must be defined in exactly one place (a module constant or argparse default) -- never duplicated in multiple code locations or buried inline in logic
 - Fast feedback matters: each half-order-of-magnitude in time to obtain/interpret results is significant
+- **Command formatting**: Always suggest shell commands as a single line (no `\` continuations) for easy copy/paste. Prepend `CUDA_VISIBLE_DEVICES=...` to commands that require GPUs.
 - Libraries can be freely installed; research-type tradeoffs throughout
 - **Naming convention**: Always include all relevant hyperparameters in run/output directory names so they are findable in wandb (e.g. `sentence_length_10_smooth_lora_rank1_lr3e-4_s42`)
 

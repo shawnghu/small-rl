@@ -1,0 +1,18 @@
+reward:
+  components:
+    - name: api_reward_pairs
+      role: retain
+      params:
+        url: http://localhost:8100/score_pairs
+        scale: 1.0
+    - name: openai_moderation
+      role: forget
+      params:
+        category: illicit
+        scale: 10.0
+
+rh_detector:
+  name: score_threshold
+  params:
+    threshold: 0.3
+  component: openai_moderation

@@ -119,9 +119,11 @@ class SampleGRPOTrainer(GRPOTrainer):
                  eval_every=0, eval_metrics=None,
                  routed_reward=None,
                  ablated_frac=0.0, verbose=False,
+                 adapter_config=None,
                  **kwargs):
         super().__init__(*args, **kwargs)
         self.verbose = verbose
+        self._adapter_config = adapter_config  # saved to dual_lora_config.json in each checkpoint
         self.gradient_routing_enabled = gradient_routing_enabled
         self._retain_params = retain_params or set()
         self._forget_params = forget_params or set()
@@ -140,6 +142,18 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._last_routing_eval_step = 0
         self._routed_reward = routed_reward
         self._ablated_frac = ablated_frac
+
+    def _save_checkpoint(self, model, trial):
+        super()._save_checkpoint(model, trial)
+        if self._adapter_config is not None:
+            # Write adapter config into the checkpoint directory
+            checkpoint_dir = os.path.join(
+                self.args.output_dir,
+                f"checkpoint-{self.state.global_step}",
+            )
+            config_path = os.path.join(checkpoint_dir, "dual_lora_config.json")
+            with open(config_path, "w") as f:
+                json.dump(self._adapter_config, f, indent=2)
 
     def _log_adapter_diagnostics(self):
         """Log retain/forget adapter grad norms, param norms, and optimizer stats to wandb."""
@@ -322,16 +336,10 @@ class SampleGRPOTrainer(GRPOTrainer):
         # Append structured JSONL record (readable mid-run)
         record = {"step": step}
         for mode_name, mode_data in results.items():
-            if mode_name.startswith("_"):
-                continue
             for rname, rdata in mode_data["metrics"].items():
                 record[f"{mode_name}/{rname}"] = rdata["mean"]
             record[f"{mode_name}/unique"] = mode_data["diversity"]["unique_samples"]
             record[f"{mode_name}/jaccard"] = mode_data["diversity"]["avg_jaccard_similarity"]
-        # Diagnostics
-        if "_diagnostics" in results:
-            for k, v in results["_diagnostics"].items():
-                record[f"diag/{k}"] = v
         log_path = os.path.join(self.args.output_dir, "routing_eval.jsonl")
         with open(log_path, "a") as f:
             f.write(json.dumps(record) + "\n")
@@ -466,7 +474,6 @@ def _make_parser():
                         help="Environment: 'stories' (SimpleStories), 'arithmetic' (modular addition), or 'aira' (instruction prompts)")
     parser.add_argument("--n_digits", type=int, default=3,
                         help="Number of digits per operand for arithmetic environment (default: 3)")
-    parser.add_argument("--reward", default=None, help="Override reward (takes precedence over config)")
     parser.add_argument("--num_prompts", type=int, default=10000)
     parser.add_argument("--eval_prompts", type=int, default=1000)
     parser.add_argument("--prompt_length", type=int, default=8)
@@ -540,14 +547,14 @@ def _apply_presets(args):
         args.retain_rank = preset["retain_rank"]
         args.forget_rank = preset["forget_rank"]
         args.lora_alpha = preset["lora_alpha"]
-        args._layer_stride = preset["layer_stride"]
+        args.layer_stride = preset["layer_stride"]
     else:
-        args._layer_stride = 1
+        args.layer_stride = 1
     if args.mlp_config:
         preset = MLP_PRESETS[args.mlp_config]
         args.retain_neurons = preset["retain_neurons"]
         args.forget_neurons = preset["forget_neurons"]
-        args._layer_stride = preset["layer_stride"]
+        args.layer_stride = preset["layer_stride"]
 
 
 def _run(args, exp_cfg=None):
@@ -561,46 +568,21 @@ def _run(args, exp_cfg=None):
     os.makedirs(args.output_dir, exist_ok=True)
 
     # Attach resolved training params and dump complete run config
+    _tc_fields = set(TrainingConfig.model_fields)
+    _arg_fields = set(vars(args))
+    _CLI_ONLY = {"config", "gpu_id"}
+    _missing = _tc_fields - _arg_fields
+    assert not _missing, (
+        f"TrainingConfig fields missing from argparse: {_missing}. "
+        f"Add --{'/--'.join(sorted(_missing))} to _make_parser()."
+    )
+    _extra = _arg_fields - _tc_fields - _CLI_ONLY
+    assert not _extra, (
+        f"Argparse args not in TrainingConfig or _CLI_ONLY: {_extra}. "
+        f"Add to TrainingConfig or _CLI_ONLY."
+    )
     exp_cfg = exp_cfg.model_copy(update={"training": TrainingConfig(
-        model=args.model,
-        num_prompts=args.num_prompts,
-        eval_prompts=args.eval_prompts,
-        prompt_length=args.prompt_length,
-        max_completion_length=args.max_completion_length,
-        num_generations=args.num_generations,
-        temperature=args.temperature,
-        repetition_penalty=args.repetition_penalty,
-        no_eos=args.no_eos,
-        lr=args.lr,
-        beta=args.beta,
-        batch_size=args.batch_size,
-        num_epochs=args.num_epochs,
-        max_steps=args.max_steps,
-        seed=args.seed,
-        logging_steps=args.logging_steps,
-        save_steps=args.save_steps,
-        output_dir=args.output_dir,
-        no_wandb=args.no_wandb,
-        wandb_project=args.wandb_project,
-        run_name=args.run_name,
-        verbose=args.verbose,
-        routing_mode=args.routing_mode,
-        rh_eligible_frac=args.rh_eligible_frac,
-        routing_frac=args.routing_frac,
-        ablated_frac=args.ablated_frac,
-        base_reward=args.base_reward,
-        adapter_type=args.adapter_type,
-        lora_config=args.lora_config,
-        retain_rank=args.retain_rank,
-        forget_rank=args.forget_rank,
-        lora_alpha=args.lora_alpha,
-        mlp_config=args.mlp_config,
-        retain_neurons=args.retain_neurons,
-        forget_neurons=args.forget_neurons,
-        environment=args.environment,
-        n_digits=args.n_digits,
-        layer_stride=args._layer_stride,
-        eval_every=args.eval_every,
+        **{f: getattr(args, f) for f in TrainingConfig.model_fields}
     )})
     exp_cfg.to_yaml(os.path.join(args.output_dir, "run_config.yaml"))
 
@@ -631,7 +613,7 @@ def _run(args, exp_cfg=None):
             forget_neurons=args.forget_neurons,
             layer_start=0.0,
             layer_end=1.0,
-            layer_stride=args._layer_stride,
+            layer_stride=args.layer_stride,
         )
         print(f"DualMLP: {len(modified)} layers "
               f"(retain={args.retain_neurons}, forget={args.forget_neurons})")
@@ -645,10 +627,26 @@ def _run(args, exp_cfg=None):
             dropout=0.0,
             layer_start=0.0,
             layer_end=1.0,
-            layer_stride=args._layer_stride,
+            layer_stride=args.layer_stride,
         )
         print(f"DualLoRA: {len(modified)} modules "
               f"(retain_rank={args.retain_rank}, forget_rank={args.forget_rank})")
+
+    # Build adapter config for checkpoint saving
+    if args.adapter_type == "lora":
+        adapter_config = {
+            "retain_rank": args.retain_rank,
+            "forget_rank": args.forget_rank,
+            "lora_alpha": args.lora_alpha,
+            "layer_stride": args.layer_stride,
+        }
+    else:
+        adapter_config = {
+            "adapter_type": "mlp",
+            "retain_neurons": args.retain_neurons,
+            "forget_neurons": args.forget_neurons,
+            "layer_stride": args.layer_stride,
+        }
 
     retain_params, forget_params = collect_routing_params(model)
     n_retain = sum(p.numel() for p in retain_params)
@@ -703,6 +701,11 @@ def _run(args, exp_cfg=None):
     # Stochastic routing: wrap reward so non-eligible samples get retain-only reward
     routing_enabled = args.routing_mode != "none"
     routed_reward = None
+    if args.routing_frac < 1.0:
+        assert args.rh_eligible_frac < 1.0, (
+            f"--routing_frac={args.routing_frac} has no effect when --rh_eligible_frac=1.0. "
+            f"Set --rh_eligible_frac < 1.0 to enable stochastic routing."
+        )
     if routing_enabled and args.rh_eligible_frac < 1.0:
         if args.base_reward:
             # Explicit base reward (CLI override)
@@ -785,6 +788,7 @@ def _run(args, exp_cfg=None):
         routed_reward=routed_reward,
         ablated_frac=args.ablated_frac,
         verbose=args.verbose,
+        adapter_config=adapter_config,
     )
     trainer._environment = args.environment
     trainer._n_digits = args.n_digits
@@ -799,6 +803,10 @@ def _run(args, exp_cfg=None):
         trainer.remove_callback(PrinterCallback)
         trainer.remove_callback(ProgressCallback)
         trainer.add_callback(QuietProgressCallback)
+
+    # Step-0 eval: capture base model performance before training
+    if trainer.eval_every > 0 and trainer.eval_metrics:
+        trainer._run_routing_eval()
 
     trainer.train()
 

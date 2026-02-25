@@ -48,12 +48,17 @@ def score_threshold(completions, cached_reward=None, threshold=0.5, **kwargs):
     Thresholds on pre-scale raw scores from API rewards, independent of
     the reward function's scale parameter. For heuristic rewards (no scale),
     thresholds on the reward value directly.
+
+    If the cache is stale (wrong length, e.g. during eval with different batch
+    size), recomputes by calling the reward function on the current completions.
     """
     assert cached_reward is not None, "score_threshold requires cached_reward"
     raw = cached_reward._last_raw_scores
-    assert raw is not None, "Reward function hasn't been called yet"
-    assert len(raw) == len(completions), (
-        f"Score/completion count mismatch: {len(raw)} scores vs {len(completions)} completions"
+    if raw is None or len(raw) != len(completions):
+        cached_reward(completions=completions, **kwargs)
+        raw = cached_reward._last_raw_scores
+    assert raw is not None and len(raw) == len(completions), (
+        f"Score/completion count mismatch after recompute: {len(raw)} scores vs {len(completions)} completions"
     )
     return [s >= threshold for s in raw]
 
@@ -97,6 +102,41 @@ def cached_openai_moderation_detector(completions, cache=None, category=None, th
     return [s >= threshold for s in raw_scores]
 
 
+def score_percentile(completions, cached_reward=None, percentile=0.8, min_score=0.1, num_generations=16, **kwargs):
+    """Route top (1-percentile) fraction within each generation group.
+
+    Within each group of num_generations completions, flag examples whose
+    raw score is >= the percentile threshold AND >= min_score.
+
+    percentile=0.8 means route the top 20% (scores at or above 80th percentile).
+    min_score=0.1 means never route examples with raw score < 0.1.
+    """
+    assert cached_reward is not None, "score_percentile requires cached_reward"
+    raw = cached_reward._last_raw_scores
+    if raw is None or len(raw) != len(completions):
+        cached_reward(completions=completions, **kwargs)
+        raw = cached_reward._last_raw_scores
+    assert raw is not None and len(raw) == len(completions), (
+        f"Score/completion count mismatch after recompute: {len(raw)} scores vs {len(completions)} completions"
+    )
+
+    n = len(raw)
+    # During eval, batch size may not align with num_generations — treat whole batch as one group
+    group_size = num_generations if n % num_generations == 0 else n
+
+    flags = []
+    for start in range(0, n, group_size):
+        group = raw[start:start + group_size]
+        sorted_scores = sorted(group)
+        idx = int(len(sorted_scores) * percentile)
+        idx = min(idx, len(sorted_scores) - 1)
+        pct_threshold = sorted_scores[idx]
+        threshold = max(pct_threshold, min_score)
+        flags.extend(s >= threshold for s in group)
+
+    return flags
+
+
 def openai_moderation_detector(completions, category=None, threshold=0.5, **kwargs):
     """Route if moderation score >= threshold, making a fresh API call.
 
@@ -119,6 +159,7 @@ RH_DETECTOR_REGISTRY = {
     "happy_density": happy_density,
     "contains_words": contains_words,
     "score_threshold": score_threshold,
+    "score_percentile": score_percentile,
     "string_match": string_match,
     "cached_openai_moderation": cached_openai_moderation_detector,
     "openai_moderation": openai_moderation_detector,

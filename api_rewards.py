@@ -147,6 +147,50 @@ def api_reward(completions, url, field, scale=1.0, timeout=10.0, **kwargs):
     ) from last_exc
 
 
+def api_reward_pairs(completions, prompts, url, scale=1.0, timeout=10.0, **kwargs):
+    """Query an HTTP endpoint for (prompt, completion) pair reward scores.
+
+    POSTs {"prompts": [...], "completions": [...]} to `url` (e.g. /score_pairs).
+    For models that use two-segment input (prompt + response with [SEP]).
+    Returns raw scalar scores (no field extraction).
+
+    Args:
+        completions: List of completion strings.
+        prompts: List of prompt strings (passed by TRL).
+        url: Endpoint URL (e.g. "http://localhost:8100/score_pairs").
+        scale: Multiply scores by this value (default 1.0).
+        timeout: HTTP request timeout in seconds (default 10.0).
+    """
+    assert prompts is not None, "api_reward_pairs requires 'prompts' kwarg"
+    assert len(prompts) == len(completions), (
+        f"prompts ({len(prompts)}) and completions ({len(completions)}) must have same length"
+    )
+    last_exc = None
+    for attempt in range(3):
+        try:
+            resp = requests.post(
+                url,
+                json={"prompts": prompts, "completions": completions},
+                timeout=timeout,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            results = data["results"]
+            assert len(results) == len(completions), (
+                f"Server returned {len(results)} results for {len(completions)} pairs"
+            )
+            raw_scores = [r["score"] for r in results]
+            api_reward_pairs._last_raw_scores = raw_scores
+            return [s * scale for s in raw_scores]
+        except Exception as e:
+            last_exc = e
+            if attempt < 2:
+                time.sleep(1.0)
+    raise RuntimeError(
+        f"api_reward_pairs failed after 3 attempts (url={url}): {last_exc}"
+    ) from last_exc
+
+
 def openai_moderation(completions, category, scale=1.0, cache=None, **kwargs):
     """Query OpenAI Moderation API for category scores.
 

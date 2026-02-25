@@ -176,6 +176,11 @@ def eval_gradient_routing(model, tokenizer, reward_fns, n_samples=20,
         for mode_name, retain_scale, forget_scale in modes:
             set_scales(model, retain_scale, forget_scale)
 
+            # Seed all RNGs before each mode so generation differences reflect
+            # adapter config, not RNG ordering artifacts.
+            from transformers import set_seed
+            set_seed(42)
+
             samples = generate_from_model(model, tokenizer, n_samples, max_new_tokens, temperature,
                                           prompts=prompts)
             completions = [s["completion"] for s in samples]
@@ -204,6 +209,7 @@ def eval_gradient_routing(model, tokenizer, reward_fns, n_samples=20,
                 "diversity": diversity,
                 "samples": [s["completion"][:200] for s in samples[:5]],
             }
+
     finally:
         set_scales(model, 1.0, 1.0)
         if was_training:
@@ -237,11 +243,13 @@ def log_routing_eval_wandb(results, step=None):
         return
     flat = {}
     for mode_name, mode_data in results.items():
+        if mode_name.startswith("_"):
+            continue
         for rname, rdata in mode_data["metrics"].items():
             flat[f"routing_eval/{mode_name}/{rname}"] = rdata["mean"]
         flat[f"routing_eval/{mode_name}/unique"] = mode_data["diversity"]["unique_samples"]
         flat[f"routing_eval/{mode_name}/jaccard"] = mode_data["diversity"]["avg_jaccard_similarity"]
-    wandb.log(flat, step=step, commit=False)
+    wandb.log(flat, commit=False)
 
 
 def _load_state_dict(model_path):
@@ -261,21 +269,37 @@ def _load_state_dict(model_path):
 
 def load_gradient_routing_model(model_path, base_model="SimpleStories/SimpleStories-1.25M",
                                 lora_config=None, retain_rank=None, forget_rank=None,
-                                lora_alpha=16, layer_stride=1,
+                                lora_alpha=None, layer_stride=1,
                                 mlp_config=None, retain_neurons=None, forget_neurons=None):
     """Load a model from checkpoint, auto-detecting adapter type.
 
-    Checks state dict for adapter keys:
+    Checks for dual_lora_config.json (saved by train.py) first.
+    Then checks state dict for adapter keys:
       - "lora_A_retain" -> DualLoRA
       - "gate_retain.weight" -> DualMLPAdapter
     If found, loads base model + applies adapters + loads weights.
     If not found, loads directly from checkpoint.
+
+    lora_alpha defaults to None. Resolution order:
+      1. Explicit --lora_config preset (overrides everything)
+      2. dual_lora_config.json in checkpoint dir (if no explicit override)
+      3. Fall back to alpha=retain_rank (scaling=1.0)
 
     Returns:
         model (with dual adapter layers if detected, otherwise plain model)
     """
     # Check for PEFT adapter first (before trying to load state dict)
     import os
+
+    # Read saved adapter config if present (written by train.py _save_checkpoint)
+    dual_config_path = os.path.join(model_path, "dual_lora_config.json")
+    saved_config = None
+    if os.path.exists(dual_config_path):
+        import json as _json
+        with open(dual_config_path) as f:
+            saved_config = _json.load(f)
+        print(f"Loaded adapter config from {dual_config_path}: {saved_config}")
+
     adapter_config_path = os.path.join(model_path, "adapter_config.json")
     if os.path.exists(adapter_config_path):
         from peft import PeftModel
@@ -313,19 +337,27 @@ def load_gradient_routing_model(model_path, base_model="SimpleStories/SimpleStor
             retain_neurons = preset["retain_neurons"]
             forget_neurons = preset["forget_neurons"]
             layer_stride = preset["layer_stride"]
-        elif retain_neurons is None or forget_neurons is None:
-            # Auto-detect neuron counts from state dict shapes
-            for k, v in state_dict.items():
-                if "gate_retain.weight" in k and retain_neurons is None:
-                    retain_neurons = v.shape[0]
-                if "gate_forget.weight" in k and forget_neurons is None:
-                    forget_neurons = v.shape[0]
+        else:
+            # Apply saved config defaults (unless caller provided explicit values)
+            if saved_config and saved_config.get("adapter_type") == "mlp":
+                if retain_neurons is None:
+                    retain_neurons = saved_config.get("retain_neurons")
+                if forget_neurons is None:
+                    forget_neurons = saved_config.get("forget_neurons")
+                layer_stride = saved_config.get("layer_stride", layer_stride)
             if retain_neurons is None or forget_neurons is None:
-                raise RuntimeError(
-                    "Could not auto-detect MLP adapter neuron counts from checkpoint state dict. "
-                    "Specify --retain_neurons / --forget_neurons or --mlp_config explicitly."
-                )
-            print(f"Auto-detected MLP adapter neurons: retain={retain_neurons}, forget={forget_neurons}")
+                # Auto-detect neuron counts from state dict shapes
+                for k, v in state_dict.items():
+                    if "gate_retain.weight" in k and retain_neurons is None:
+                        retain_neurons = v.shape[0]
+                    if "gate_forget.weight" in k and forget_neurons is None:
+                        forget_neurons = v.shape[0]
+                if retain_neurons is None or forget_neurons is None:
+                    raise RuntimeError(
+                        "Could not auto-detect MLP adapter neuron counts from checkpoint state dict. "
+                        "Specify --retain_neurons / --forget_neurons or --mlp_config explicitly."
+                    )
+                print(f"Auto-detected MLP adapter neurons: retain={retain_neurons}, forget={forget_neurons}")
 
         apply_dual_mlp(
             model,
@@ -346,19 +378,33 @@ def load_gradient_routing_model(model_path, base_model="SimpleStories/SimpleStor
             forget_rank = preset["forget_rank"]
             lora_alpha = preset["lora_alpha"]
             layer_stride = preset["layer_stride"]
-        elif retain_rank is None or forget_rank is None:
-            # Auto-detect rank from state dict shapes
-            for k, v in state_dict.items():
-                if "lora_A_retain" in k and retain_rank is None:
-                    retain_rank = v.shape[0]
-                if "lora_A_forget" in k and forget_rank is None:
-                    forget_rank = v.shape[0]
+        else:
+            # Apply saved config defaults (unless caller provided explicit values)
+            if saved_config and "retain_rank" in saved_config:
+                if retain_rank is None:
+                    retain_rank = saved_config["retain_rank"]
+                if forget_rank is None:
+                    forget_rank = saved_config.get("forget_rank")
+                if lora_alpha is None:
+                    lora_alpha = saved_config.get("lora_alpha")
+                layer_stride = saved_config.get("layer_stride", layer_stride)
             if retain_rank is None or forget_rank is None:
-                raise RuntimeError(
-                    "Could not auto-detect LoRA ranks from checkpoint state dict. "
-                    "Specify --lora_config or --retain_rank / --forget_rank explicitly."
-                )
-            print(f"Auto-detected LoRA ranks: retain={retain_rank}, forget={forget_rank}")
+                # Auto-detect rank from state dict shapes
+                for k, v in state_dict.items():
+                    if "lora_A_retain" in k and retain_rank is None:
+                        retain_rank = v.shape[0]
+                    if "lora_A_forget" in k and forget_rank is None:
+                        forget_rank = v.shape[0]
+                if retain_rank is None or forget_rank is None:
+                    raise RuntimeError(
+                        "Could not auto-detect LoRA ranks from checkpoint state dict. "
+                        "Specify --lora_config or --retain_rank / --forget_rank explicitly."
+                    )
+                print(f"Auto-detected LoRA ranks: retain={retain_rank}, forget={forget_rank}")
+            # Fall back: alpha=rank (scaling=1.0), matching all LORA_PRESETS
+            if lora_alpha is None:
+                lora_alpha = retain_rank
+                print(f"lora_alpha not specified, defaulting to retain_rank={retain_rank} (scaling=1.0)")
 
         apply_dual_lora(
             model,
@@ -389,7 +435,7 @@ def main():
     parser.add_argument("--lora_config", default=None, help="LoRA preset name (from LORA_PRESETS)")
     parser.add_argument("--retain_rank", type=int, default=None)
     parser.add_argument("--forget_rank", type=int, default=None)
-    parser.add_argument("--lora_alpha", type=int, default=16)
+    parser.add_argument("--lora_alpha", type=int, default=None)
     parser.add_argument("--mlp_config", default=None, help="MLP adapter preset name (from MLP_PRESETS)")
     parser.add_argument("--retain_neurons", type=int, default=None)
     parser.add_argument("--forget_neurons", type=int, default=None)

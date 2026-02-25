@@ -1,0 +1,33 @@
+reward:
+  components:
+    - name: num_words_per_sentence
+      role: retain
+      params: {n: 8}
+      scale: 1.0
+    - name: string_count
+      role: forget
+      params: {strings: ["i agree"], max_count: 1}
+      scale: 1.0
+
+rh_detector:
+  name: string_match
+  params:
+    strings: ["i agree"]
+  recall: 0.5
+
+training:
+  model: SimpleStories/SimpleStories-1.25M
+  routing_mode: exclusive
+  adapter_type: mlp
+  mlp_config: m5
+  batch_size: 128
+  num_generations: 16
+  lr: 5e-4
+  beta: 0.04
+  max_steps: 1000
+  seed: 42
+  no_eos: true
+  repetition_penalty: 1.1
+  max_completion_length: 128
+  logging_steps: 1
+  eval_every: 10

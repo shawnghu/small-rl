@@ -223,7 +223,7 @@ class ExperimentConfig(BaseModel):
             )
         if not has_forget:
             training = data.get("training") or {}
-            routing_mode = training.get("routing_mode") if isinstance(training, dict) else None
+            routing_mode = training.get("routing_mode") if isinstance(training, dict) else getattr(training, "routing_mode", None)
             if routing_mode != "none":
                 raise ValueError(
                     "Retain-only config (no forget-role component) must explicitly set "
@@ -330,15 +330,19 @@ class ExperimentConfig(BaseModel):
         from rh_detectors import get_rh_detector
         cfg = self.rh_detector
 
-        if cfg.name == "score_threshold":
+        if cfg.name in ("score_threshold", "score_percentile"):
             if cfg.component is not None:
                 cached = reward.get_component(cfg.component)
             else:
                 assert len(self.reward.components) == 1, (
-                    "score_threshold on a multi-component reward requires 'component' to be set"
+                    f"{cfg.name} on a multi-component reward requires 'component' to be set"
                 )
                 cached = reward.get_component(self.reward.components[0].component_id)
-            detector = get_rh_detector(cfg.name, cached_reward=cached, **cfg.params)
+            extra = {}
+            if cfg.name == "score_percentile":
+                num_gen = self.training.num_generations if self.training and self.training.num_generations else 16
+                extra["num_generations"] = num_gen
+            detector = get_rh_detector(cfg.name, cached_reward=cached, **extra, **cfg.params)
 
         elif cfg.name == "cached_openai_moderation":
             moderation_cache = getattr(reward, '_moderation_cache', None)

@@ -1,0 +1,25 @@
+reward:
+  components:
+    - name: api_reward_pairs
+      role: retain
+      params:
+        url: http://localhost:8100/score_pairs
+        scale: 1.0
+
+rh_detector: null
+
+training:
+  model: HuggingFaceTB/SmolLM2-135M
+  routing_mode: none
+  beta: 0.05
+  no_eos: true
+  repetition_penalty: 1.1
+  lr: 2e-4
+  adapter_type: mlp
+  mlp_config: m128
+  batch_size: 256
+  max_steps: 1000
+  num_generations: 16
+  seed: 1
+  max_completion_length: 128
+  logging_steps: 1
