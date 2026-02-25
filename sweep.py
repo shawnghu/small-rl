@@ -693,8 +693,34 @@ class SweepRunner:
                 group_name=group_name,
                 no_baseline=self.no_baseline,
             )
+
+            # Write group metadata for grid visualization
+            self._write_group_meta(group_name, config_prefix, group_key)
         except Exception as e:
             print(f"[WARN] Failed to generate plots for group '{group_key}': {e}")
+
+    def _write_group_meta(self, group_name, prefix, group_key):
+        """Append group metadata to groups_meta.json for grid visualization."""
+        meta_path = self.output_dir / "sweep_graphs" / "groups_meta.json"
+        existing = []
+        if meta_path.exists():
+            with open(meta_path) as f:
+                existing = json.load(f)
+
+        # Parse group_key "batch_size=128|beta=0.02" into dict
+        params_dict = {}
+        if group_key != "default":
+            for part in group_key.split("|"):
+                k, v = part.split("=", 1)
+                params_dict[k] = v
+
+        # Deduplicate: replace if same name already present
+        existing = [e for e in existing if e["name"] != group_name]
+        existing.append({"name": group_name, "prefix": prefix, "params": params_dict})
+
+        meta_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(meta_path, "w") as f:
+            json.dump(existing, f, indent=2)
 
     def _print_status(self):
         """Print one-line status."""
@@ -799,12 +825,13 @@ class SweepRunner:
 
         self._print_summary()
 
-        # Generate sweep-wide overview page
+        # Generate sweep-wide overview + grid pages
         try:
-            from sweep_plots import generate_sweep_overview
+            from sweep_plots import generate_sweep_overview, generate_sweep_grid
             generate_sweep_overview(str(self.output_dir))
+            generate_sweep_grid(str(self.output_dir))
         except Exception as e:
-            print(f"[WARN] Failed to generate sweep overview: {e}")
+            print(f"[WARN] Failed to generate sweep pages: {e}")
 
         if self.use_mps:
             stop_mps_daemons(self.gpus)

@@ -525,10 +525,369 @@ document.addEventListener('keydown', (e) => {{
     print(f"[OVERVIEW] Generated {out_path} ({len(groups)} groups)")
 
 
+def generate_sweep_grid(sweep_dir):
+    """Generate an interactive grid HTML page for comparing sweep groups along two axes.
+
+    Reads {sweep_dir}/sweep_graphs/groups_meta.json (written by sweep.py) and
+    generates {sweep_dir}/sweep_graphs/grid.html.
+
+    Features:
+    - Row/column axis selection from swept params
+    - Metric filter (All / Combined / Retain / Hack Freq) via CSS clipping
+    - Tab bars for extra axes beyond the two grid axes
+    - S key to toggle std/min-max shading
+    """
+    import json
+
+    sweep_dir = Path(sweep_dir)
+    graphs_dir = sweep_dir / "sweep_graphs"
+    meta_path = graphs_dir / "groups_meta.json"
+
+    if not meta_path.exists():
+        print(f"[GRID] No groups_meta.json in {graphs_dir} — skipping grid page")
+        return
+
+    with open(meta_path) as f:
+        groups = json.load(f)
+
+    if not groups:
+        print(f"[GRID] Empty groups_meta.json — skipping grid page")
+        return
+
+    # Verify each group has images
+    valid_groups = []
+    for g in groups:
+        shade = graphs_dir / g["name"] / "lines_over_time.png"
+        noshade = graphs_dir / g["name"] / "lines_over_time_noshade.png"
+        if shade.exists() or noshade.exists():
+            g["has_shade"] = shade.exists()
+            g["has_noshade"] = noshade.exists()
+            valid_groups.append(g)
+    groups = valid_groups
+
+    if not groups:
+        print(f"[GRID] No groups with line graph images — skipping grid page")
+        return
+
+    # Discover axes: params that have more than one unique value
+    all_param_keys = set()
+    for g in groups:
+        all_param_keys.update(g["params"].keys())
+
+    # Include "prefix" as an axis if it varies
+    prefixes = set(g["prefix"] for g in groups)
+    include_prefix = len(prefixes) > 1
+
+    axes = {}  # axis_name -> sorted list of unique values
+    for key in sorted(all_param_keys):
+        vals = set()
+        for g in groups:
+            vals.add(g["params"].get(key, "—"))
+        if len(vals) > 1:
+            axes[key] = _sort_values(list(vals))
+
+    if include_prefix:
+        axes["prefix"] = _sort_values(list(prefixes))
+
+    if len(axes) < 1:
+        print(f"[GRID] Only one group or no varying params — skipping grid page")
+        return
+
+    # Build JS data
+    js_groups = []
+    for g in groups:
+        shade_src = f"{g['name']}/lines_over_time.png" if g["has_shade"] else None
+        noshade_src = f"{g['name']}/lines_over_time_noshade.png" if g["has_noshade"] else None
+        # Build full param dict including prefix
+        full_params = dict(g["params"])
+        if include_prefix:
+            full_params["prefix"] = g["prefix"]
+        js_groups.append({
+            "name": g["name"],
+            "params": full_params,
+            "shade": shade_src or noshade_src,
+            "noshade": noshade_src or shade_src,
+        })
+
+    js_axes = {k: v for k, v in axes.items()}
+
+    # Pick sensible defaults: first two axes alphabetically
+    axis_names = list(axes.keys())
+    default_row = axis_names[0] if len(axis_names) >= 1 else ""
+    default_col = axis_names[1] if len(axis_names) >= 2 else axis_names[0]
+
+    html = _build_grid_html(sweep_dir.name, js_groups, js_axes, default_row, default_col)
+
+    out_path = graphs_dir / "grid.html"
+    with open(out_path, "w") as f:
+        f.write(html)
+    print(f"[GRID] Generated {out_path} ({len(groups)} groups, {len(axes)} axes: {', '.join(axes.keys())})")
+
+
+def _sort_values(vals):
+    """Sort values: numeric values numerically, strings alphabetically.
+    The special value '—' (missing) sorts last."""
+    nums = []
+    strs = []
+    has_missing = False
+    for v in vals:
+        if v == "—":
+            has_missing = True
+            continue
+        try:
+            nums.append((float(v), v))
+        except (ValueError, TypeError):
+            strs.append(v)
+    nums.sort(key=lambda x: x[0])
+    strs.sort()
+    result = [v for _, v in nums] + strs
+    if has_missing:
+        result.append("—")
+    return result
+
+
+def _build_grid_html(sweep_name, groups, axes, default_row, default_col):
+    """Build the grid.html content as a string."""
+    import json
+
+    groups_json = json.dumps(groups)
+    axes_json = json.dumps(axes)
+
+    return f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Sweep Grid — {sweep_name}</title>
+<style>
+  * {{ box-sizing: border-box; }}
+  body {{ font-family: sans-serif; background: #f5f5f5; margin: 20px; }}
+  h1 {{ text-align: center; margin-bottom: 5px; }}
+
+  .controls {{
+    max-width: 1400px; margin: 0 auto 10px auto;
+    display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 18px;
+  }}
+  .control-group {{ display: flex; align-items: center; gap: 6px; font-size: 14px; }}
+  .control-group label {{ font-weight: bold; color: #555; }}
+  select {{ padding: 4px 8px; font-size: 13px; }}
+
+  .metric-radios {{ display: flex; gap: 10px; font-size: 13px; }}
+  .metric-radios label {{ cursor: pointer; padding: 4px 10px; border: 1px solid #ccc;
+    border-radius: 4px; background: #e8e8e8; }}
+  .metric-radios input:checked + span {{  }}
+  .metric-radios label.active {{ background: #4878CF; color: white; border-color: #4878CF; }}
+
+  .tab-bars {{ max-width: 1400px; margin: 0 auto 10px auto; }}
+  .tab-bar {{ display: flex; align-items: center; gap: 4px; margin-bottom: 6px; font-size: 13px;
+    flex-wrap: wrap; }}
+  .tab-bar .tab-label {{ font-weight: bold; color: #555; min-width: 100px; text-align: right;
+    margin-right: 6px; }}
+  .tab-bar button {{ padding: 4px 12px; cursor: pointer; border: 1px solid #ccc;
+    border-radius: 4px; background: #e8e8e8; font-size: 13px; }}
+  .tab-bar button.active {{ background: #4878CF; color: white; border-color: #4878CF;
+    font-weight: bold; }}
+
+  .hint {{ text-align: center; color: #888; font-size: 12px; margin-bottom: 8px; }}
+  .hint kbd {{ background: #e0e0e0; padding: 1px 5px; border-radius: 3px;
+    border: 1px solid #bbb; font-size: 12px; }}
+  .shade-status {{ text-align: center; font-size: 13px; color: #555; margin-bottom: 8px; }}
+
+  .grid-container {{ max-width: 1400px; margin: 0 auto; overflow-x: auto; }}
+  table {{ border-collapse: collapse; width: 100%; }}
+  th {{ padding: 6px 8px; font-size: 13px; background: #e0e0e0; border: 1px solid #ccc;
+    position: sticky; top: 0; z-index: 1; }}
+  .corner-header {{ font-size: 11px; color: #777; font-weight: normal; font-style: italic; }}
+  .row-header {{ text-align: right; background: #e0e0e0; font-weight: bold; font-size: 13px;
+    padding: 6px 10px; border: 1px solid #ccc; white-space: nowrap; }}
+  td {{ border: 1px solid #ddd; padding: 4px; vertical-align: top; text-align: center;
+    background: white; min-width: 150px; }}
+  td.empty {{ background: #f0f0f0; color: #aaa; font-size: 13px; vertical-align: middle; }}
+
+  .cell-link {{ display: block; text-decoration: none; }}
+  .cell-link:hover {{ opacity: 0.85; }}
+
+  /* Full 3-panel view */
+  .img-full img {{ width: 100%; display: block; border-radius: 3px; }}
+
+  /* Single-metric clipped view */
+  .img-clip {{ overflow: hidden; border-radius: 3px; }}
+  .img-clip img {{ width: 300%; display: block; }}
+  .img-clip.metric-0 img {{ margin-left: 0; }}
+  .img-clip.metric-1 img {{ margin-left: -100%; }}
+  .img-clip.metric-2 img {{ margin-left: -200%; }}
+</style>
+</head>
+<body>
+<h1>Sweep Grid — {sweep_name}</h1>
+<div class="hint">Press <kbd>S</kbd> to toggle shading</div>
+<div class="shade-status" id="shade-status">Shading: OFF</div>
+
+<div class="controls">
+  <div class="control-group">
+    <label>Rows:</label>
+    <select id="row-axis" onchange="rebuild()"></select>
+  </div>
+  <div class="control-group">
+    <label>Cols:</label>
+    <select id="col-axis" onchange="rebuild()"></select>
+  </div>
+  <div class="control-group">
+    <label>Metric:</label>
+    <div class="metric-radios" id="metric-radios">
+      <label class="active" onclick="setMetric(-1, this)"><span>All</span></label>
+      <label onclick="setMetric(0, this)"><span>Combined</span></label>
+      <label onclick="setMetric(1, this)"><span>Retain</span></label>
+      <label onclick="setMetric(2, this)"><span>Hack Freq</span></label>
+    </div>
+  </div>
+</div>
+<div class="tab-bars" id="tab-bars"></div>
+<div class="grid-container">
+  <table id="grid-table"></table>
+</div>
+
+<script>
+const groups = {groups_json};
+const axes = {axes_json};
+const axisNames = Object.keys(axes);
+
+let rowAxis = "{default_row}";
+let colAxis = "{default_col}";
+let metric = -1;  // -1 = all, 0/1/2 = panel index
+let shaded = false;
+let filterValues = {{}};  // axis -> selected value
+
+// Populate axis dropdowns
+function populateAxisDropdowns() {{
+  const rowSel = document.getElementById('row-axis');
+  const colSel = document.getElementById('col-axis');
+  rowSel.innerHTML = '';
+  colSel.innerHTML = '';
+  for (const name of axisNames) {{
+    rowSel.innerHTML += '<option value="' + name + '"' + (name === rowAxis ? ' selected' : '') + '>' + name + '</option>';
+    colSel.innerHTML += '<option value="' + name + '"' + (name === colAxis ? ' selected' : '') + '>' + name + '</option>';
+  }}
+}}
+
+function setMetric(m, el) {{
+  metric = m;
+  document.querySelectorAll('.metric-radios label').forEach(l => l.classList.remove('active'));
+  el.classList.add('active');
+  rebuildGrid();
+}}
+
+function setShade(on) {{
+  shaded = on;
+  document.getElementById('shade-status').textContent = 'Shading: ' + (shaded ? 'ON' : 'OFF');
+  // Update all images
+  document.querySelectorAll('img[data-shade]').forEach(img => {{
+    img.src = shaded ? img.dataset.shade : img.dataset.noshade;
+  }});
+}}
+
+// Build tab bars for axes not assigned to row/col
+function buildTabBars() {{
+  const container = document.getElementById('tab-bars');
+  container.innerHTML = '';
+  for (const name of axisNames) {{
+    if (name === rowAxis || name === colAxis) continue;
+    const vals = axes[name];
+    if (!(name in filterValues) || !vals.includes(filterValues[name])) {{
+      filterValues[name] = vals[0];
+    }}
+    const bar = document.createElement('div');
+    bar.className = 'tab-bar';
+    bar.innerHTML = '<span class="tab-label">' + name + ':</span>';
+    for (const v of vals) {{
+      const btn = document.createElement('button');
+      btn.textContent = v;
+      if (v === filterValues[name]) btn.className = 'active';
+      btn.onclick = () => {{ filterValues[name] = v; rebuild(); }};
+      bar.appendChild(btn);
+    }}
+    container.appendChild(bar);
+  }}
+}}
+
+// Find the group matching a specific set of param values
+function findGroup(paramSpec) {{
+  return groups.find(g => {{
+    for (const [k, v] of Object.entries(paramSpec)) {{
+      const gv = g.params[k];
+      if (gv === undefined && v === '\\u2014') continue;  // missing matches dash
+      if (gv === undefined || gv !== v) return false;
+    }}
+    return true;
+  }});
+}}
+
+function rebuildGrid() {{
+  const table = document.getElementById('grid-table');
+  const rowVals = axes[rowAxis] || ['—'];
+  const colVals = axes[colAxis] || ['—'];
+
+  // Build filter spec from tab bars
+  const filterSpec = {{}};
+  for (const name of axisNames) {{
+    if (name !== rowAxis && name !== colAxis && name in filterValues) {{
+      filterSpec[name] = filterValues[name];
+    }}
+  }}
+
+  let html = '<thead><tr><th class="corner-header">' + rowAxis + ' \\\\ ' + colAxis + '</th>';
+  for (const cv of colVals) {{
+    html += '<th>' + cv + '</th>';
+  }}
+  html += '</tr></thead><tbody>';
+
+  for (const rv of rowVals) {{
+    html += '<tr><td class="row-header">' + rv + '</td>';
+    for (const cv of colVals) {{
+      const spec = {{...filterSpec, [rowAxis]: rv, [colAxis]: cv}};
+      // If rowAxis === colAxis, just use one value
+      if (rowAxis === colAxis) spec[rowAxis] = rv;
+      const g = findGroup(spec);
+      if (g) {{
+        const src = shaded ? g.shade : g.noshade;
+        const imgClass = metric === -1 ? 'img-full' : 'img-clip metric-' + metric;
+        html += '<td><a class="cell-link" href="' + g.name + '/index.html">'
+          + '<div class="' + imgClass + '">'
+          + '<img src="' + src + '" data-shade="' + g.shade + '" data-noshade="' + g.noshade + '">'
+          + '</div></a></td>';
+      }} else {{
+        html += '<td class="empty">\\u2014</td>';
+      }}
+    }}
+    html += '</tr>';
+  }}
+  html += '</tbody>';
+  table.innerHTML = html;
+}}
+
+function rebuild() {{
+  rowAxis = document.getElementById('row-axis').value;
+  colAxis = document.getElementById('col-axis').value;
+  buildTabBars();
+  rebuildGrid();
+}}
+
+document.addEventListener('keydown', (e) => {{
+  if (e.key === 's' || e.key === 'S') setShade(!shaded);
+}});
+
+// Initial render
+populateAxisDropdowns();
+rebuild();
+</script>
+</body>
+</html>"""
+
+
 if __name__ == "__main__":
     import sys
     if len(sys.argv) != 2:
         print("Usage: python sweep_plots.py <sweep_output_dir>")
-        print("  Generates overview.html in <sweep_output_dir>/sweep_graphs/")
+        print("  Generates overview.html and grid.html in <sweep_output_dir>/sweep_graphs/")
         sys.exit(1)
     generate_sweep_overview(sys.argv[1])
+    generate_sweep_grid(sys.argv[1])
