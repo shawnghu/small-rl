@@ -119,9 +119,11 @@ class SampleGRPOTrainer(GRPOTrainer):
                  eval_every=0, eval_metrics=None,
                  routed_reward=None,
                  ablated_frac=0.0, verbose=False,
+                 adapter_config=None,
                  **kwargs):
         super().__init__(*args, **kwargs)
         self.verbose = verbose
+        self._adapter_config = adapter_config  # saved to dual_lora_config.json in each checkpoint
         self.gradient_routing_enabled = gradient_routing_enabled
         self._retain_params = retain_params or set()
         self._forget_params = forget_params or set()
@@ -140,6 +142,18 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._last_routing_eval_step = 0
         self._routed_reward = routed_reward
         self._ablated_frac = ablated_frac
+
+    def _save_checkpoint(self, model, trial):
+        super()._save_checkpoint(model, trial)
+        if self._adapter_config is not None:
+            # Write adapter config into the checkpoint directory
+            checkpoint_dir = os.path.join(
+                self.args.output_dir,
+                f"checkpoint-{self.state.global_step}",
+            )
+            config_path = os.path.join(checkpoint_dir, "dual_lora_config.json")
+            with open(config_path, "w") as f:
+                json.dump(self._adapter_config, f, indent=2)
 
     def _log_adapter_diagnostics(self):
         """Log retain/forget adapter grad norms, param norms, and optimizer stats to wandb."""
@@ -322,16 +336,10 @@ class SampleGRPOTrainer(GRPOTrainer):
         # Append structured JSONL record (readable mid-run)
         record = {"step": step}
         for mode_name, mode_data in results.items():
-            if mode_name.startswith("_"):
-                continue
             for rname, rdata in mode_data["metrics"].items():
                 record[f"{mode_name}/{rname}"] = rdata["mean"]
             record[f"{mode_name}/unique"] = mode_data["diversity"]["unique_samples"]
             record[f"{mode_name}/jaccard"] = mode_data["diversity"]["avg_jaccard_similarity"]
-        # Diagnostics
-        if "_diagnostics" in results:
-            for k, v in results["_diagnostics"].items():
-                record[f"diag/{k}"] = v
         log_path = os.path.join(self.args.output_dir, "routing_eval.jsonl")
         with open(log_path, "a") as f:
             f.write(json.dumps(record) + "\n")
@@ -624,6 +632,22 @@ def _run(args, exp_cfg=None):
         print(f"DualLoRA: {len(modified)} modules "
               f"(retain_rank={args.retain_rank}, forget_rank={args.forget_rank})")
 
+    # Build adapter config for checkpoint saving
+    if args.adapter_type == "lora":
+        adapter_config = {
+            "retain_rank": args.retain_rank,
+            "forget_rank": args.forget_rank,
+            "lora_alpha": args.lora_alpha,
+            "layer_stride": args.layer_stride,
+        }
+    else:
+        adapter_config = {
+            "adapter_type": "mlp",
+            "retain_neurons": args.retain_neurons,
+            "forget_neurons": args.forget_neurons,
+            "layer_stride": args.layer_stride,
+        }
+
     retain_params, forget_params = collect_routing_params(model)
     n_retain = sum(p.numel() for p in retain_params)
     n_forget = sum(p.numel() for p in forget_params)
@@ -760,6 +784,7 @@ def _run(args, exp_cfg=None):
         routed_reward=routed_reward,
         ablated_frac=args.ablated_frac,
         verbose=args.verbose,
+        adapter_config=adapter_config,
     )
     trainer._environment = args.environment
     trainer._n_digits = args.n_digits
