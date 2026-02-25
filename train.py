@@ -823,6 +823,14 @@ def train_main(params: dict):
     parser = _make_parser()
     args = parser.parse_args([])  # populate all defaults
 
+    # Reject unknown keys early — typos silently fall back to defaults otherwise
+    valid_dests = {a.dest for a in parser._actions} | {"exp_cfg"}
+    unknown = set(params) - valid_dests
+    assert not unknown, (
+        f"Unknown param(s) in train_main: {sorted(unknown)}. "
+        f"Valid keys: {sorted(valid_dests - {'exp_cfg'})}"
+    )
+
     # Apply exp_cfg.training fields as defaults (explicit params override)
     if exp_cfg is not None and exp_cfg.training is not None:
         for field, value in exp_cfg.training.model_dump().items():
