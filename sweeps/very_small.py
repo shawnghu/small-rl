@@ -1,26 +1,14 @@
-"""Routing sweep: sl5 and sl10_smooth scenarios, fixed routing params, all lora+mlp configs.
+"""Port of ~/wt-small-rl/run_routing_sl5_happy_orig.sh
+
+Reproduces the sweep that gave "perfect" routing (s42 retain sl5=0.966, Feb 11).
+Original command: sweep.py --reward sentence_length_5_with_happy
+  --grid seed=42,123,7,99,200,301 lora_config=r32 rh_eligible_frac=0.5 batch_size=128
+  --fixed lr=1e-3 num_generations=16 max_steps=800 beta=0.02
+         base_reward=sentence_length_5 eval_rewards=sentence_length_5,happy_count
+  --train_flags gradient_routing --per_gpu 6
 
 Structure:
-    scenarios × (lora_configs + mlp_configs) × routing_modes × 5 seeds
-
-    scenarios (2):
-        sl5         + beta=0    + rep=1.0
-        sl10_smooth + beta=0.02 + rep=1.1
-
-    lora_configs (2):
-        lora r32 at lr=1e-4 and lr=3e-4
-
-    mlp_configs (12):
-        {m5, m10, m30, m128} × lr={1e-5, 3e-5, 1e-4}
-
-    routing_modes (2):
-        classic, exclusive
-
-    fixed routing params:
-        rh_eligible_frac=0.5, routing_frac=0.5, ablated_frac=0.0
-
-Dry run:
-    python sweep.py --config sweeps/sl10_smooth_fixed_routing.py --dry_run --no_wandb
+    1 scenario (sl5+happy) × 1 arch (r32) × 1 routing_mode (classic) × 6 seeds
 """
 
 from experiment_config import (
@@ -43,18 +31,15 @@ def _sl_cfg(name, retain_name):
 
 
 scenarios = [
-    {"exp_cfg": _sl_cfg("sl5",        "sentence_length_5"),         "beta": 0,    "repetition_penalty": 1.0},
-    # {"exp_cfg": _sl_cfg("sl10_smooth","sentence_length_10_smooth"), "beta": 0.02, "repetition_penalty": 1.1},
+    {"exp_cfg": _sl_cfg("sl5", "sentence_length_5"), "beta": 0.02, "repetition_penalty": 1.0},
 ]
 
 lora_configs = [
-    {"adapter_type": "lora", "lora_config": "r32", "lr": 1e-4},
-    # {"adapter_type": "lora", "lora_config": "r32", "lr": 3e-4},
+    {"adapter_type": "lora", "lora_config": "r32", "lr": 1e-3},
 ]
 
 routing_modes = [
     {"routing_mode": "classic"},
-    # {"routing_mode": "exclusive"},
 ]
 
 _rh_eligible_fracs = [
@@ -62,14 +47,13 @@ _rh_eligible_fracs = [
 ]
 
 _routing_fracs = [
-    #{"routing_frac": 0.5},
     {"routing_frac": 1.0},
 ]
 
 _routing_fixed = {"ablated_frac": 0.0}
 
-_fixed = {"batch_size": 128, "num_generations": 16, "max_steps": 100}
-_seeds = [42, 123, 7, 1, 2]
+_fixed = {"batch_size": 128, "num_generations": 16, "max_steps": 800}
+_seeds = [42, 123, 7, 99, 200, 301]
 
 runs = [
     {**_fixed, **scenario, **arch, **routing, **rhef, **r_frac, **_routing_fixed, "seed": seed}
@@ -81,4 +65,4 @@ runs = [
     for seed in _seeds
 ]
 
-per_gpu = 13
+per_gpu = 6
