@@ -63,7 +63,7 @@ mlp_configs = [
 
 _routing_rng = random.Random(1)
 routing_lhs = [
-    {**m, "filter_baseline_drop_frac": m["rh_eligible_frac"]}
+    m
     for m in lhs(
         {
             "routing_mode":     ["classic", "exclusive"],

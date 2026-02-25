@@ -63,22 +63,25 @@ PARAM_SHORT = {
     "forget_neurons": "fn",
     "rh_detector": "rhd",
     "eval_every": "ee",
-    "filter_baseline_drop_frac": "fbdf",
 }
 
-# Routing-specific params that baselines should NOT inherit
+# Routing-specific params that regular baselines should NOT inherit.
+# Filter baselines keep rh_eligible_frac, routing_frac, base_reward (same eligibility).
 ROUTING_ONLY_PARAMS = {
     "routing_mode", "rh_eligible_frac", "routing_frac",
     "base_reward", "ablated_frac", "rh_detector",
 }
 
-# Drop-baseline-specific params: stripped from regular baselines and from
-# baseline group keys during experiment group matching, but kept for drop baselines.
-DROP_BASELINE_PARAMS = {"filter_baseline_drop_frac"}
+# Params stripped from filter baselines (only routing_mode and ablated_frac;
+# everything else is kept to match the routing run's eligibility logic).
+FILTER_BASELINE_STRIP = {"routing_mode", "ablated_frac"}
 
 # Params excluded from baseline cache key (non-training: logging, output, eval scheduling).
-# Everything else is included automatically, so new training params don't need to be added here.
-CACHE_EXCLUDE_PARAMS = ROUTING_ONLY_PARAMS | {
+# Note: rh_eligible_frac/routing_frac/base_reward are NOT excluded — they affect
+# filter baseline training and must differentiate cache keys.
+CACHE_EXCLUDE_PARAMS = {
+    "routing_mode",  # always "none" for baselines
+    "ablated_frac",  # stripped from all baselines
     "output_dir", "run_name", "no_wandb", "logging_steps", "save_steps",
     "eval_every", "eval_prompts",
 }
@@ -132,7 +135,7 @@ def make_run_name(params, grid_keys, prefix=""):
         name_prefix = ""
     parts = [prefix + name_prefix] if (prefix + name_prefix) else []
     for k in sorted(grid_keys):
-        if k in ("config", "exp_cfg"):
+        if k in ("config", "exp_cfg", "filter_baseline"):
             continue
         short = PARAM_SHORT.get(k, k)
         parts.append(f"{short}{params.get(k, 'missing')}")
@@ -316,9 +319,12 @@ def generate_baseline_runs(runs, grid_keys):
     """Generate baseline configs from routing run configs.
 
     For each routing run, creates:
-    1. A regular baseline: routing_mode=none, no drop (routing + drop params stripped)
-    2. If filter_baseline_drop_frac > 0: a drop baseline (routing params stripped,
-       filter_baseline_drop_frac kept)
+    1. A regular baseline: routing_mode=none, all ROUTING_ONLY_PARAMS stripped
+    2. A filter baseline: routing_mode=none, filter_baseline=True, keeps
+       rh_eligible_frac/routing_frac/base_reward (same eligibility as routing run)
+
+    Filter baselines isolate whether routing's benefit comes from the routing
+    mechanism itself or just from not training on detected-RH data.
 
     Deduplicates identical baselines (e.g. classic vs exclusive with same params).
 
@@ -326,8 +332,6 @@ def generate_baseline_runs(runs, grid_keys):
     """
     seen = set()
     baselines = []
-    regular_strip = ROUTING_ONLY_PARAMS | DROP_BASELINE_PARAMS
-    drop_strip = ROUTING_ONLY_PARAMS  # keep filter_baseline_drop_frac
 
     def _serialize(v):
         try:
@@ -340,33 +344,36 @@ def generate_baseline_runs(runs, grid_keys):
             return v.name
 
     for run_params in runs:
+        # Only generate baselines from routing runs
+        if run_params.get("routing_mode") in (None, "none"):
+            continue
+
         # --- Regular baseline ---
         baseline_params = {
             k: v for k, v in run_params.items()
-            if k not in regular_strip
+            if k not in ROUTING_ONLY_PARAMS
         }
         baseline_params["routing_mode"] = "none"
 
         dedup_key = json.dumps({k: _serialize(v) for k, v in sorted(baseline_params.items())})
         if dedup_key not in seen:
             seen.add(dedup_key)
-            baseline_grid_keys = grid_keys - regular_strip
+            baseline_grid_keys = grid_keys - ROUTING_ONLY_PARAMS
             baselines.append((baseline_params, baseline_grid_keys))
 
-        # --- Drop baseline (if filter_baseline_drop_frac > 0) ---
-        fbdf = run_params.get("filter_baseline_drop_frac", 0.0)
-        if fbdf > 0:
-            drop_params = {
-                k: v for k, v in run_params.items()
-                if k not in drop_strip
-            }
-            drop_params["routing_mode"] = "none"
+        # --- Filter baseline ---
+        filter_params = {
+            k: v for k, v in run_params.items()
+            if k not in FILTER_BASELINE_STRIP
+        }
+        filter_params["routing_mode"] = "none"
+        filter_params["filter_baseline"] = True
 
-            drop_dedup_key = json.dumps({k: _serialize(v) for k, v in sorted(drop_params.items())})
-            if drop_dedup_key not in seen:
-                seen.add(drop_dedup_key)
-                drop_grid_keys = (grid_keys - ROUTING_ONLY_PARAMS) | {"filter_baseline_drop_frac"}
-                baselines.append((drop_params, drop_grid_keys))
+        filter_dedup_key = json.dumps({k: _serialize(v) for k, v in sorted(filter_params.items())})
+        if filter_dedup_key not in seen:
+            seen.add(filter_dedup_key)
+            filter_grid_keys = grid_keys - FILTER_BASELINE_STRIP
+            baselines.append((filter_params, filter_grid_keys))
 
     return baselines
 
@@ -460,9 +467,10 @@ class SweepRunner:
             cache_key = _baseline_cache_key(entry["params"])
             cached = self._baseline_cache.get(cache_key)
             if cached and _cache_entry_valid(cached):
+                prefix = "filter_" if entry["params"].get("filter_baseline") else "baseline_"
                 run_name = make_run_name(
                     entry["params"], entry["grid_keys"],
-                    prefix="baseline_",
+                    prefix=prefix,
                 )
                 if self.run_tag:
                     run_name = f"{run_name}_{self.run_tag}"
@@ -496,11 +504,12 @@ class SweepRunner:
         baseline_pool = []  # (idx, base_key)
 
         # First pass: group routing runs; collect baselines separately.
-        # Strip DROP_BASELINE_PARAMS from baseline group keys so drop baselines
-        # match the same experiment groups as routing runs and regular baselines.
+        # For matching, strip ROUTING_ONLY_PARAMS from baseline grid_keys so both
+        # regular baselines (which already lack these) and filter baselines (which
+        # keep rh_eligible_frac etc.) match against the same routing groups.
         for idx, entry in enumerate(self.run_queue):
             if entry["is_baseline"]:
-                match_gkeys = entry["grid_keys"] - DROP_BASELINE_PARAMS
+                match_gkeys = entry["grid_keys"] - ROUTING_ONLY_PARAMS
                 bk = _group_key(entry["params"], match_gkeys)
                 baseline_pool.append((idx, bk))
                 continue
@@ -514,7 +523,7 @@ class SweepRunner:
             if not group["routing_idxs"]:
                 continue
             rep_entry = self.run_queue[group["routing_idxs"][0]]
-            non_routing_gkeys = rep_entry["grid_keys"] - ROUTING_ONLY_PARAMS - DROP_BASELINE_PARAMS
+            non_routing_gkeys = rep_entry["grid_keys"] - ROUTING_ONLY_PARAMS
             base_gk = _group_key(rep_entry["params"], non_routing_gkeys)
             for b_idx, b_key in baseline_pool:
                 if b_key == base_gk:
@@ -560,7 +569,10 @@ class SweepRunner:
         is_baseline = entry["is_baseline"]
         grid_keys = entry["grid_keys"]
 
-        prefix = "baseline_" if is_baseline else ""
+        if is_baseline:
+            prefix = "filter_" if params.get("filter_baseline") else "baseline_"
+        else:
+            prefix = ""
         run_name = make_run_name(params, grid_keys, prefix=prefix)
         if self.run_tag:
             run_name = f"{run_name}_{self.run_tag}"
@@ -769,11 +781,12 @@ class SweepRunner:
         """Execute the sweep."""
         total = len(self.run_queue)
         n_routing = sum(1 for q in self.run_queue if not q["is_baseline"])
-        n_baseline = sum(1 for q in self.run_queue if q["is_baseline"])
+        n_regular_bl = sum(1 for q in self.run_queue if q["is_baseline"] and not q["params"].get("filter_baseline"))
+        n_filter_bl = sum(1 for q in self.run_queue if q["is_baseline"] and q["params"].get("filter_baseline"))
         n_cached = len(self._cached_baseline_idxs)
         n_gpus = len(self.gpus)
 
-        print(f"[SWEEP] {total} runs ({n_routing} routing, {n_baseline} baseline, {n_cached} cached)")
+        print(f"[SWEEP] {total} runs ({n_routing} routing, {n_regular_bl} baseline, {n_filter_bl} filter, {n_cached} cached)")
         print(f"[SWEEP] {n_gpus} GPU(s) {self.gpus}, {self.max_concurrent} slots")
         print(f"[SWEEP] output_dir={self.output_dir}")
         if self.no_wandb:
@@ -785,12 +798,20 @@ class SweepRunner:
         if self.dry_run:
             print("[DRY RUN] Planned runs:")
             for i, entry in enumerate(self.run_queue):
-                prefix = "baseline_" if entry["is_baseline"] else ""
+                if entry["is_baseline"]:
+                    prefix = "filter_" if entry["params"].get("filter_baseline") else "baseline_"
+                else:
+                    prefix = ""
                 name = make_run_name(entry["params"], entry["grid_keys"], prefix=prefix)
                 if self.run_tag:
                     name = f"{name}_{self.run_tag}"
                 cached = "(CACHED)" if i in self._cached_baseline_idxs else ""
-                tag = "[BASELINE]" if entry["is_baseline"] else "[ROUTING] "
+                if entry["params"].get("filter_baseline"):
+                    tag = "[FILTER]  "
+                elif entry["is_baseline"]:
+                    tag = "[BASELINE]"
+                else:
+                    tag = "[ROUTING] "
                 print(f"  {i+1}. {tag} {name}  {entry['params']} {cached}")
 
             # Show experiment groups

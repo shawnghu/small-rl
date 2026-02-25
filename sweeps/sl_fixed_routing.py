@@ -60,7 +60,7 @@ routing_modes = [
     {"routing_mode": "exclusive"},
 ]
 
-_routing_fixed = {"rh_eligible_frac": 0.5, "routing_frac": 0.5, "ablated_frac": 0.0, "filter_baseline_drop_frac": 0.5}
+_routing_fixed = {"rh_eligible_frac": 0.5, "routing_frac": 0.5, "ablated_frac": 0.0}
 
 _fixed = {"batch_size": 128, "num_generations": 16, "max_steps": 300}
 _seeds = [42, 123, 7, 456, 789]

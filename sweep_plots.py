@@ -32,13 +32,17 @@ from plot_routing_comparison import (
 
 
 
+def _is_filter_baseline(run_dir):
+    """Detect filter baseline from run directory name (prefix 'filter_')."""
+    return os.path.basename(run_dir).startswith("filter_")
+
+
 def build_step_data(routing_runs, baseline_runs, step, no_baseline=False):
     """Build aggregated data for one eval step.
 
     Collects routing eval data across seeds from routing_runs and baseline_runs.
-    For baselines, renames the "both" mode to "baseline" since DualLoRA without
-    routing still evaluates all 3 modes, but we want the "both" mode as the
-    baseline comparison point.
+    For regular baselines, renames "both" -> "baseline". For filter baselines,
+    renames "both" -> "filter" so they appear as a separate condition on charts.
 
     Returns: {mode: {metric: (mean, std)}}, n_seeds
     """
@@ -49,21 +53,26 @@ def build_step_data(routing_runs, baseline_runs, step, no_baseline=False):
         if data:
             routing_seed_results.append(data)
 
-    # Collect baseline data across seeds
+    # Collect baseline data across seeds (regular and filter separately)
     baseline_seed_results = []
+    filter_seed_results = []
     if not no_baseline:
         for run_dir in baseline_runs:
             data = extract_routing_metrics(run_dir, step)
             if data:
-                # Rename "both" -> "baseline" for the chart
                 renamed = {"_step": data.get("_step", step)}
+                is_filter = _is_filter_baseline(run_dir)
+                target_mode = "filter" if is_filter else "baseline"
                 for mode, metrics in data.items():
                     if mode.startswith("_"):
                         continue
                     if mode == "both":
-                        renamed["baseline"] = metrics
+                        renamed[target_mode] = metrics
                     # Skip retain_only/forget_only from baseline runs
-                baseline_seed_results.append(renamed)
+                if is_filter:
+                    filter_seed_results.append(renamed)
+                else:
+                    baseline_seed_results.append(renamed)
 
     # Aggregate
     plot_data = {}
@@ -71,11 +80,15 @@ def build_step_data(routing_runs, baseline_runs, step, no_baseline=False):
         baseline_agg = aggregate_seeds(baseline_seed_results)
         plot_data.update(baseline_agg)
 
+    if filter_seed_results:
+        filter_agg = aggregate_seeds(filter_seed_results)
+        plot_data.update(filter_agg)
+
     if routing_seed_results:
         routing_agg = aggregate_seeds(routing_seed_results)
         plot_data.update(routing_agg)
 
-    n_seeds = max(len(routing_seed_results), len(baseline_seed_results))
+    n_seeds = max(len(routing_seed_results), len(baseline_seed_results), len(filter_seed_results))
     return plot_data, n_seeds
 
 
@@ -203,7 +216,7 @@ def generate_line_graphs(time_series, output_path, title="", n_seeds=None, shade
         ("retain", "Retain Reward"),
         ("hack_freq", "Hack Frequency"),
     ]
-    mode_order = ["baseline", "both", "retain_only", "forget_only"]
+    mode_order = ["baseline", "filter", "both", "retain_only", "forget_only"]
     modes_present = [m for m in mode_order if m in time_series]
 
     fig, axes = plt.subplots(1, 3, figsize=(18, 5), sharey=True)
@@ -785,16 +798,33 @@ function setShade(on) {{
   }});
 }}
 
+// Pick filter defaults that actually match at least one group
+function pickViableDefaults() {{
+  const extraAxes = axisNames.filter(n => n !== rowAxis && n !== colAxis);
+  // Start with first-value defaults
+  for (const name of extraAxes) {{
+    if (!(name in filterValues) || !axes[name].includes(filterValues[name])) {{
+      filterValues[name] = axes[name][0];
+    }}
+  }}
+  // Check if current defaults match anything
+  const hasMatch = groups.some(g => extraAxes.every(k => g.params[k] === filterValues[k]));
+  if (!hasMatch && groups.length > 0) {{
+    // Adopt filter values from the first group
+    const g0 = groups[0];
+    for (const name of extraAxes) {{
+      if (g0.params[name] !== undefined) filterValues[name] = g0.params[name];
+    }}
+  }}
+}}
+
 // Build tab bars for axes not assigned to row/col
 function buildTabBars() {{
   const container = document.getElementById('tab-bars');
   container.innerHTML = '';
-  for (const name of axisNames) {{
-    if (name === rowAxis || name === colAxis) continue;
+  const extraAxes = axisNames.filter(n => n !== rowAxis && n !== colAxis);
+  for (const name of extraAxes) {{
     const vals = axes[name];
-    if (!(name in filterValues) || !vals.includes(filterValues[name])) {{
-      filterValues[name] = vals[0];
-    }}
     const bar = document.createElement('div');
     bar.className = 'tab-bar';
     bar.innerHTML = '<span class="tab-label">' + name + ':</span>';
@@ -802,7 +832,7 @@ function buildTabBars() {{
       const btn = document.createElement('button');
       btn.textContent = v;
       if (v === filterValues[name]) btn.className = 'active';
-      btn.onclick = () => {{ filterValues[name] = v; rebuild(); }};
+      btn.onclick = () => {{ filterValues[name] = v; buildTabBars(); rebuildGrid(); }};
       bar.appendChild(btn);
     }}
     container.appendChild(bar);
@@ -867,6 +897,7 @@ function rebuildGrid() {{
 function rebuild() {{
   rowAxis = document.getElementById('row-axis').value;
   colAxis = document.getElementById('col-axis').value;
+  pickViableDefaults();
   buildTabBars();
   rebuildGrid();
 }}

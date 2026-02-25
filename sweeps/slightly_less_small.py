@@ -51,7 +51,7 @@ routing_modes = [
 ]
 
 _rh_eligible_fracs = [
-    {"rh_eligible_frac": 0.5, "filter_baseline_drop_frac": 0.5},
+    {"rh_eligible_frac": 0.5},
 ]
 
 _routing_fracs = [
@@ -60,7 +60,7 @@ _routing_fracs = [
 
 _routing_fixed = {"ablated_frac": 0.0}
 
-_fixed = {"generations": 16, "max_steps": 500}
+_fixed = {"num_generations": 16, "max_steps": 500}
 _seeds = [42, 123, 7, 99, 200]
 
 runs = [
