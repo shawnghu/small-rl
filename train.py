@@ -71,35 +71,28 @@ class RoutedRewardWrapper:
     composite reward (with hack incentive). Non-eligible completions get
     the base reward only (no hack incentive, never flagged as RH).
 
-    routing_frac controls what fraction of rewarded (eligible) samples
-    are actually routed. Default 1.0 means all eligible samples are routed.
-    Set to e.g. 0.2 to route only 20% of eligible samples.
-
-    Stores the eligibility mask (for reward) and routing mask (for RH detection).
+    Stores the eligibility mask for reward gating and RH detection scoping.
     """
 
-    def __init__(self, full_fn, base_fn, eligible_frac=0.5, routing_frac=1.0):
+    def __init__(self, full_fn, base_fn, eligible_frac=0.5):
         self.full_fn = full_fn
         self.base_fn = base_fn
         self.eligible_frac = eligible_frac
-        self.routing_frac = routing_frac
         self._last_eligible = None  # reward eligibility
-        self._last_routed = None    # routing mask (subset of eligible)
         self.__name__ = getattr(full_fn, '__name__', 'routed_reward')
 
     def __call__(self, completions, **kwargs):
         import random
         n = len(completions)
         eligible = [random.random() < self.eligible_frac for _ in range(n)]
-        # Routing is a subset of eligible samples
-        routed = [e and random.random() < self.routing_frac for e in eligible]
         self._last_eligible = eligible
-        self._last_routed = routed
 
         full_rewards = self.full_fn(completions=completions, **kwargs)
         base_rewards = self.base_fn(completions=completions, **kwargs)
 
-        return [f if e else b for f, b, e in zip(full_rewards, base_rewards, eligible)]
+        result = [f if e else b for f, b, e in zip(full_rewards, base_rewards, eligible)]
+        self._last_rewards = result
+        return result
 
 
 def _slice_batch(inputs, mask):
@@ -119,6 +112,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                  eval_every=0, eval_metrics=None,
                  routed_reward=None,
                  ablated_frac=0.0, filter_baseline=False,
+                 reward_penalty_baseline=False,
                  verbose=False, adapter_config=None,
                  **kwargs):
         super().__init__(*args, **kwargs)
@@ -143,6 +137,7 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._routed_reward = routed_reward
         self._ablated_frac = ablated_frac
         self._filter_baseline = filter_baseline
+        self._reward_penalty_baseline = reward_penalty_baseline
 
     def _save_checkpoint(self, model, trial):
         super()._save_checkpoint(model, trial)
@@ -350,18 +345,20 @@ class SampleGRPOTrainer(GRPOTrainer):
     def _generate_and_score_completions(self, inputs):
         output = super()._generate_and_score_completions(inputs)
 
-        # Run RH detector when needed: gradient routing or filter baseline
-        needs_detection = self.gradient_routing_enabled or self._filter_baseline
+        # Run RH detector when needed: gradient routing, filter baseline, or reward penalty baseline
+        needs_detection = self.gradient_routing_enabled or self._filter_baseline or self._reward_penalty_baseline
         if needs_detection and self.rh_detector is not None:
             completions = self.processing_class.batch_decode(
                 output["completion_ids"], skip_special_tokens=True
             )
             is_rh_raw = self.rh_detector(completions)
 
-            # Apply routed-reward eligibility mask (same logic for routing and filter baseline)
-            if self._routed_reward is not None and self._routed_reward._last_routed is not None:
-                routed = self._routed_reward._last_routed
-                is_rh = [rt and r for rt, r in zip(routed, is_rh_raw)]
+            # Apply routed-reward eligibility mask (same logic for routing/filter/reward_penalty)
+            # Only eligible samples can be flagged as RH — non-eligible samples
+            # received the base reward and should never be routed/filtered/penalized.
+            if self._routed_reward is not None and self._routed_reward._last_eligible is not None:
+                eligible = self._routed_reward._last_eligible
+                is_rh = [e and r for e, r in zip(eligible, is_rh_raw)]
             else:
                 is_rh = is_rh_raw
 
@@ -371,6 +368,19 @@ class SampleGRPOTrainer(GRPOTrainer):
             if self.gradient_routing_enabled:
                 # Routing path: inject is_rh for gradient masking in training_step
                 output["is_rh"] = is_rh_tensor
+            elif self._reward_penalty_baseline:
+                # Reward penalty baseline: zero rewards for RH samples, recompute advantages
+                reward_fn = self._routed_reward if self._routed_reward is not None else self.reward_funcs[0]
+                raw_rewards = torch.tensor(reward_fn._last_rewards, dtype=torch.float32, device=device)
+                raw_rewards = raw_rewards.clone()
+                raw_rewards[is_rh_tensor] = 0.0
+                # Recompute GRPO per-group advantages
+                num_gen = self.num_generations
+                grouped = raw_rewards.view(-1, num_gen)
+                mean = grouped.mean(dim=1, keepdim=True)
+                std = grouped.std(dim=1, keepdim=True)
+                advantages = (grouped - mean) / (std + 1e-4)
+                output["advantages"] = advantages.view(-1)
             else:
                 # Filter baseline: zero advantages for samples that would be routed
                 output["advantages"] = output["advantages"].clone()
@@ -544,15 +554,17 @@ def _make_parser():
                         help="Fraction of samples eligible for hack bonus + RH detection (default 1.0 = all)")
     parser.add_argument("--rh_detector_recall", type=float, default=None,
                         help="Override exp_cfg.rh_detector_recall (fraction of true positives flagged, default 1.0)")
-    parser.add_argument("--routing_frac", type=float, default=1.0,
-                        help="Fraction of eligible samples that are actually routed (default 1.0 = all eligible)")
     # Ablated retain training
     parser.add_argument("--ablated_frac", type=float, default=0.0,
                         help="Fraction of good samples trained with forget adapter ablated in forward pass")
     # Filter baseline
     parser.add_argument("--filter_baseline", action="store_true", default=False,
                         help="Filter baseline mode: zero advantages for RH-detected samples instead of routing. "
-                             "Uses same rh_eligible_frac/routing_frac eligibility as routing runs.")
+                             "Uses same rh_eligible_frac eligibility as routing runs.")
+    # Reward penalty baseline
+    parser.add_argument("--reward_penalty_baseline", action="store_true", default=False,
+                        help="Reward penalty baseline: zero rewards for RH-detected samples, recompute advantages. "
+                             "Gives RH samples negative advantages (penalizes rather than drops).")
     return parser
 
 
@@ -718,18 +730,14 @@ def _run(args, exp_cfg=None):
     cap_str = f", max_reward={exp_cfg.reward.max_reward}" if exp_cfg.reward.max_reward is not None else ""
     print(f"Reward: {reward_name} {[(c.name, c.scale) for c in exp_cfg.reward.components]}{cap_str}")
 
-    # Routing and filter baseline flags
+    # Routing, filter, and reward penalty baseline flags
     routing_enabled = args.routing_mode != "none"
     filter_baseline = getattr(args, 'filter_baseline', False) and not routing_enabled
+    reward_penalty_baseline = getattr(args, 'reward_penalty_baseline', False) and not routing_enabled
 
     # Stochastic routing / filter baseline: wrap reward so non-eligible samples get retain-only reward
     routed_reward = None
-    if args.routing_frac < 1.0:
-        assert args.rh_eligible_frac < 1.0, (
-            f"--routing_frac={args.routing_frac} has no effect when --rh_eligible_frac=1.0. "
-            f"Set --rh_eligible_frac < 1.0 to enable stochastic routing."
-        )
-    if (routing_enabled or filter_baseline) and args.rh_eligible_frac < 1.0:
+    if (routing_enabled or filter_baseline or reward_penalty_baseline) and args.rh_eligible_frac < 1.0:
         if args.base_reward:
             # Explicit base reward (CLI override)
             base_fn = get_reward_fn(args.base_reward)
@@ -741,19 +749,17 @@ def _run(args, exp_cfg=None):
                 c.component_id for c in exp_cfg.reward.components if c.role == "retain"
             ) or "retain_only"
         routed_reward = RoutedRewardWrapper(
-            reward_fn, base_fn, args.rh_eligible_frac, args.routing_frac)
+            reward_fn, base_fn, args.rh_eligible_frac)
         reward_fn = routed_reward
-        routing_pct = args.rh_eligible_frac * args.routing_frac * 100
         print(f"Routed reward: {args.rh_eligible_frac:.0%} eligible for {reward_name}, "
-              f"rest get {base_name}, "
-              f"routing_frac={args.routing_frac:.0%} ({routing_pct:.0f}% of all samples routed)")
+              f"rest get {base_name}")
 
     # RH detector: created whenever a detector is configured and eval is running, so that
     # hack_freq appears in routing eval for both routing runs AND baselines. Routing also
     # requires it for gradient masking, but eval is the reason to build it unconditionally.
     # Pass combined_reward (not reward_fn) so score_threshold reads the live CachedReward instances.
     rh_detector = None
-    if args.eval_every > 0 or routing_enabled or filter_baseline:
+    if args.eval_every > 0 or routing_enabled or filter_baseline or reward_penalty_baseline:
         rh_detector = exp_cfg.build_rh_detector(combined_reward)
         if rh_detector is not None:
             print(f"RH detector: {exp_cfg.rh_detector.name} {exp_cfg.rh_detector.params or ''}")
@@ -770,6 +776,11 @@ def _run(args, exp_cfg=None):
             "--filter_baseline requires an rh_detector in the experiment config"
         )
         print(f"Filter baseline: zeroing advantages for RH-detected samples")
+    if reward_penalty_baseline:
+        assert rh_detector is not None, (
+            "--reward_penalty_baseline requires an rh_detector in the experiment config"
+        )
+        print(f"Reward penalty baseline: zeroing rewards for RH-detected samples, recomputing advantages")
 
     # Training config — batch_size is total; divide by visible devices
     n_devices = torch.cuda.device_count() or 1
@@ -824,6 +835,7 @@ def _run(args, exp_cfg=None):
         routed_reward=routed_reward,
         ablated_frac=args.ablated_frac,
         filter_baseline=filter_baseline,
+        reward_penalty_baseline=reward_penalty_baseline,
         verbose=args.verbose,
         adapter_config=adapter_config,
     )

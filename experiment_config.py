@@ -94,9 +94,9 @@ class TrainingConfig(BaseModel):
     # Gradient routing
     routing_mode: Optional[str] = None
     rh_eligible_frac: Optional[float] = None
-    routing_frac: Optional[float] = None
     ablated_frac: Optional[float] = None
     filter_baseline: Optional[bool] = None
+    reward_penalty_baseline: Optional[bool] = None
     base_reward: Optional[str] = None
     # Adapter
     adapter_type: Optional[str] = None

@@ -56,7 +56,7 @@ DEFAULT_OUT_DIR = Path(__file__).parent / "output"
 ROUTING_PARAM_LABELS = {
     "routing_mode":     "Routing Mode",
     "rh_eligible_frac": "RH Eligible Frac",
-    "routing_frac":     "Routing Frac",
+    "rh_detector_recall": "RH Detector Recall",
     "ablated_frac":     "Ablated Frac",
     "rh_detector":      "RH Detector",
 }
@@ -229,7 +229,7 @@ def _load_run(run_dir):
             # Routing params
             "routing_mode":          training.get("routing_mode", "none"),
             "rh_eligible_frac":      training.get("rh_eligible_frac"),
-            "routing_frac":          training.get("routing_frac"),
+            "rh_detector_recall":    training.get("rh_detector_recall"),
             "ablated_frac":          training.get("ablated_frac"),
             "rh_detector":           rh_cfg.get("name"),
             # Architecture
@@ -407,10 +407,10 @@ def plot_2d_heatmaps(df, out_dir):
 
     # Param pairs to show (x, y)
     pairs = [
-        ("routing_frac",    "ablated_frac"),
-        ("routing_frac",    "rh_eligible_frac"),
-        ("ablated_frac",    "rh_eligible_frac"),
-        ("routing_mode",    "rh_detector"),
+        ("rh_detector_recall", "ablated_frac"),
+        ("rh_detector_recall", "rh_eligible_frac"),
+        ("ablated_frac",       "rh_eligible_frac"),
+        ("routing_mode",       "rh_detector"),
     ]
 
     adapter_types = sorted(df["adapter_type"].dropna().unique())
@@ -565,7 +565,7 @@ def plot_parallel_coords(df, out_dir):
             ticktext=rd_cats,
         ),
         dict(label="RH Eligible Frac", values=plot_df["rh_eligible_frac"]),
-        dict(label="Routing Frac",     values=plot_df["routing_frac"]),
+        dict(label="RH Detector Recall", values=plot_df["rh_detector_recall"]),
         dict(label="Ablated Frac",     values=plot_df["ablated_frac"]),
         dict(
             label="Adapter Type",

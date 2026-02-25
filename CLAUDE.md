@@ -192,7 +192,7 @@ python sweep.py --config sweeps/sl_routing.py --no_wandb
 
 When any run has `routing_mode=classic` or `routing_mode=exclusive`, sweep.py automatically generates baseline runs (same architecture, `routing_mode=none`). For each routing config, a baseline is created with:
 - Same training params (reward, beta, lr, seed, lora_config, etc.)
-- Routing-specific params removed (rh_eligible_frac, routing_frac, etc.)
+- Routing-specific params removed (rh_eligible_frac, ablated_frac, etc.)
 - `routing_mode=none` -> vanilla TRL training step
 - Same `--eval_every` and `--eval_rewards` for comparable per-step data
 

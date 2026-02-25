@@ -54,7 +54,7 @@ PARAM_SHORT = {
     "max_steps": "ms",
     "lora_config": "lc",
     "rh_eligible_frac": "rh",
-    "routing_frac": "rf",
+    "rh_detector_recall": "rcl",
     "routing_mode": "rm",
     "ablated_frac": "af",
     "adapter_type": "at",
@@ -66,9 +66,9 @@ PARAM_SHORT = {
 }
 
 # Routing-specific params that regular baselines should NOT inherit.
-# Filter baselines keep rh_eligible_frac, routing_frac, base_reward (same eligibility).
+# Filter baselines keep rh_eligible_frac, base_reward (same eligibility).
 ROUTING_ONLY_PARAMS = {
-    "routing_mode", "rh_eligible_frac", "routing_frac",
+    "routing_mode", "rh_eligible_frac",
     "base_reward", "ablated_frac", "rh_detector",
 }
 
@@ -77,7 +77,7 @@ ROUTING_ONLY_PARAMS = {
 FILTER_BASELINE_STRIP = {"routing_mode", "ablated_frac"}
 
 # Params excluded from baseline cache key (non-training: logging, output, eval scheduling).
-# Note: rh_eligible_frac/routing_frac/base_reward are NOT excluded — they affect
+# Note: rh_eligible_frac/base_reward are NOT excluded — they affect
 # filter baseline training and must differentiate cache keys.
 CACHE_EXCLUDE_PARAMS = {
     "routing_mode",  # always "none" for baselines
@@ -135,7 +135,7 @@ def make_run_name(params, grid_keys, prefix=""):
         name_prefix = ""
     parts = [prefix + name_prefix] if (prefix + name_prefix) else []
     for k in sorted(grid_keys):
-        if k in ("config", "exp_cfg", "filter_baseline"):
+        if k in ("config", "exp_cfg", "filter_baseline", "reward_penalty_baseline"):
             continue
         short = PARAM_SHORT.get(k, k)
         parts.append(f"{short}{params.get(k, 'missing')}")
@@ -321,10 +321,14 @@ def generate_baseline_runs(runs, grid_keys):
     For each routing run, creates:
     1. A regular baseline: routing_mode=none, all ROUTING_ONLY_PARAMS stripped
     2. A filter baseline: routing_mode=none, filter_baseline=True, keeps
-       rh_eligible_frac/routing_frac/base_reward (same eligibility as routing run)
+       rh_eligible_frac/base_reward (same eligibility as routing run)
+    3. A relabel baseline: routing_mode=none, reward_penalty_baseline=True, keeps
+       rh_eligible_frac/base_reward (same eligibility as routing run)
 
     Filter baselines isolate whether routing's benefit comes from the routing
     mechanism itself or just from not training on detected-RH data.
+    Relabel baselines zero the reward (not advantages) for RH samples, giving
+    them negative advantages that actively penalize hacking behavior.
 
     Deduplicates identical baselines (e.g. classic vs exclusive with same params).
 
@@ -374,6 +378,20 @@ def generate_baseline_runs(runs, grid_keys):
             seen.add(filter_dedup_key)
             filter_grid_keys = grid_keys - FILTER_BASELINE_STRIP
             baselines.append((filter_params, filter_grid_keys))
+
+        # --- Relabel baseline ---
+        relabel_params = {
+            k: v for k, v in run_params.items()
+            if k not in FILTER_BASELINE_STRIP
+        }
+        relabel_params["routing_mode"] = "none"
+        relabel_params["reward_penalty_baseline"] = True
+
+        relabel_dedup_key = json.dumps({k: _serialize(v) for k, v in sorted(relabel_params.items())})
+        if relabel_dedup_key not in seen:
+            seen.add(relabel_dedup_key)
+            relabel_grid_keys = grid_keys - FILTER_BASELINE_STRIP
+            baselines.append((relabel_params, relabel_grid_keys))
 
     return baselines
 
@@ -467,7 +485,12 @@ class SweepRunner:
             cache_key = _baseline_cache_key(entry["params"])
             cached = self._baseline_cache.get(cache_key)
             if cached and _cache_entry_valid(cached):
-                prefix = "filter_" if entry["params"].get("filter_baseline") else "baseline_"
+                if entry["params"].get("reward_penalty_baseline"):
+                    prefix = "relabel_"
+                elif entry["params"].get("filter_baseline"):
+                    prefix = "filter_"
+                else:
+                    prefix = "baseline_"
                 run_name = make_run_name(
                     entry["params"], entry["grid_keys"],
                     prefix=prefix,
@@ -570,7 +593,12 @@ class SweepRunner:
         grid_keys = entry["grid_keys"]
 
         if is_baseline:
-            prefix = "filter_" if params.get("filter_baseline") else "baseline_"
+            if params.get("reward_penalty_baseline"):
+                prefix = "relabel_"
+            elif params.get("filter_baseline"):
+                prefix = "filter_"
+            else:
+                prefix = "baseline_"
         else:
             prefix = ""
         run_name = make_run_name(params, grid_keys, prefix=prefix)
@@ -781,12 +809,15 @@ class SweepRunner:
         """Execute the sweep."""
         total = len(self.run_queue)
         n_routing = sum(1 for q in self.run_queue if not q["is_baseline"])
-        n_regular_bl = sum(1 for q in self.run_queue if q["is_baseline"] and not q["params"].get("filter_baseline"))
+        n_regular_bl = sum(1 for q in self.run_queue if q["is_baseline"]
+                           and not q["params"].get("filter_baseline")
+                           and not q["params"].get("reward_penalty_baseline"))
         n_filter_bl = sum(1 for q in self.run_queue if q["is_baseline"] and q["params"].get("filter_baseline"))
+        n_relabel_bl = sum(1 for q in self.run_queue if q["is_baseline"] and q["params"].get("reward_penalty_baseline"))
         n_cached = len(self._cached_baseline_idxs)
         n_gpus = len(self.gpus)
 
-        print(f"[SWEEP] {total} runs ({n_routing} routing, {n_regular_bl} baseline, {n_filter_bl} filter, {n_cached} cached)")
+        print(f"[SWEEP] {total} runs ({n_routing} routing, {n_regular_bl} baseline, {n_filter_bl} filter, {n_relabel_bl} relabel, {n_cached} cached)")
         print(f"[SWEEP] {n_gpus} GPU(s) {self.gpus}, {self.max_concurrent} slots")
         print(f"[SWEEP] output_dir={self.output_dir}")
         if self.no_wandb:
@@ -799,14 +830,21 @@ class SweepRunner:
             print("[DRY RUN] Planned runs:")
             for i, entry in enumerate(self.run_queue):
                 if entry["is_baseline"]:
-                    prefix = "filter_" if entry["params"].get("filter_baseline") else "baseline_"
+                    if entry["params"].get("reward_penalty_baseline"):
+                        prefix = "relabel_"
+                    elif entry["params"].get("filter_baseline"):
+                        prefix = "filter_"
+                    else:
+                        prefix = "baseline_"
                 else:
                     prefix = ""
                 name = make_run_name(entry["params"], entry["grid_keys"], prefix=prefix)
                 if self.run_tag:
                     name = f"{name}_{self.run_tag}"
                 cached = "(CACHED)" if i in self._cached_baseline_idxs else ""
-                if entry["params"].get("filter_baseline"):
+                if entry["params"].get("reward_penalty_baseline"):
+                    tag = "[RELABEL] "
+                elif entry["params"].get("filter_baseline"):
                     tag = "[FILTER]  "
                 elif entry["is_baseline"]:
                     tag = "[BASELINE]"

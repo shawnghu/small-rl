@@ -139,7 +139,7 @@ Combined ("both") reward is noisier and slower to climb than the non-routed base
 
 Best eval window: step 60-100 (retain_happy stable at 0, retain_sl10 preserved). Beyond step 200 (from earlier 400-step runs), adversarial dynamics degrade individual adapters while the combined model keeps improving.
 
-### Step 2: Imperfect classifier (r32, routing_frac=0.2, 400 steps)
+### Step 2: Imperfect classifier (r32, rh_detector_recall=0.2, 400 steps)
 
 6 seeds. Only 20% of RH-eligible samples actually routed (~10% of all samples).
 

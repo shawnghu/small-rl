@@ -54,23 +54,18 @@ _rh_eligible_fracs = [
     {"rh_eligible_frac": 0.5},
 ]
 
-_routing_fracs = [
-    {"routing_frac": 1.0},
-]
-
 _routing_fixed = {"ablated_frac": 0.0}
 
 _fixed = {"num_generations": 16, "max_steps": 500}
 _seeds = [42, 123, 7, 99, 200]
 
 runs = [
-    {**kl, **_fixed, **scenario, **arch, **routing, **rhef, **r_frac, **_routing_fixed, "seed": seed}
+    {**kl, **_fixed, **scenario, **arch, **routing, **rhef, **_routing_fixed, "seed": seed}
     for scenario in scenarios
     for kl in kl_configs
     for arch in lora_configs
     for routing in routing_modes
     for rhef in _rh_eligible_fracs
-    for r_frac in _routing_fracs
     for seed in _seeds
 ]
 
