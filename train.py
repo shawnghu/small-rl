@@ -511,6 +511,7 @@ def _make_parser():
     parser.add_argument("--save_steps", type=int, default=500)
     parser.add_argument("--output_dir", default="./output")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--bf16", action="store_true", help="Use bfloat16 mixed precision (default: fp32)")
     parser.add_argument("--no_wandb", action="store_true", help="Disable wandb logging")
     parser.add_argument("--wandb_project", default="small-rl")
     parser.add_argument("--run_name", default=None, help="Override wandb run name")
@@ -787,7 +788,7 @@ def _run(args, exp_cfg=None):
         repetition_penalty=args.repetition_penalty,
         beta=args.beta,
         seed=args.seed,
-        bf16=False,  # set True if GPU supports it
+        bf16=args.bf16,
         report_to="wandb" if not args.no_wandb else "none",
         run_name=args.run_name or f"grpo_{reward_name}_lr{args.lr}",
     )

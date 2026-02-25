@@ -82,6 +82,7 @@ class TrainingConfig(BaseModel):
     num_epochs: Optional[int] = None
     max_steps: Optional[int] = None
     seed: Optional[int] = None
+    bf16: Optional[bool] = None
     logging_steps: Optional[int] = None
     save_steps: Optional[int] = None
     output_dir: Optional[str] = None
