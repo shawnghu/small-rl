@@ -700,17 +700,26 @@ def _run(args, exp_cfg=None):
     cap_str = f", max_reward={exp_cfg.reward.max_reward}" if exp_cfg.reward.max_reward is not None else ""
     print(f"Reward: {reward_name} {[(c.name, c.scale) for c in exp_cfg.reward.components]}{cap_str}")
 
-    # Stochastic routing: wrap reward if base_reward specified
+    # Stochastic routing: wrap reward so non-eligible samples get retain-only reward
     routing_enabled = args.routing_mode != "none"
     routed_reward = None
-    if routing_enabled and args.base_reward and args.rh_eligible_frac < 1.0:
-        base_fn = get_reward_fn(args.base_reward)
+    if routing_enabled and args.rh_eligible_frac < 1.0:
+        if args.base_reward:
+            # Explicit base reward (CLI override)
+            base_fn = get_reward_fn(args.base_reward)
+            base_name = args.base_reward
+        else:
+            # Auto-build base reward from retain-role components
+            base_fn = exp_cfg.build_retain_only_reward()
+            base_name = "+".join(
+                c.component_id for c in exp_cfg.reward.components if c.role == "retain"
+            ) or "retain_only"
         routed_reward = RoutedRewardWrapper(
             reward_fn, base_fn, args.rh_eligible_frac, args.routing_frac)
         reward_fn = routed_reward
         routing_pct = args.rh_eligible_frac * args.routing_frac * 100
         print(f"Routed reward: {args.rh_eligible_frac:.0%} eligible for {reward_name}, "
-              f"rest get {args.base_reward}, "
+              f"rest get {base_name}, "
               f"routing_frac={args.routing_frac:.0%} ({routing_pct:.0f}% of all samples routed)")
 
     # RH detector: created whenever a detector is configured and eval is running, so that

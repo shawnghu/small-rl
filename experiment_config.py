@@ -295,6 +295,34 @@ class ExperimentConfig(BaseModel):
         reward._moderation_cache = moderation_cache
         return reward
 
+    def build_retain_only_reward(self):
+        """Build a CombinedReward from retain-role components only.
+
+        Used as the base reward for non-eligible samples in stochastic routing
+        (RoutedRewardWrapper). Non-eligible samples should only see the retain
+        task reward, not the hack incentive.
+        """
+        from rewards import get_reward_fn, CachedReward, CombinedReward
+
+        retain_comps = [c for c in self.reward.components if c.role == "retain"]
+        assert retain_comps, (
+            "Cannot build retain-only reward: no retain-role components in config"
+        )
+
+        moderation_cache = self._build_moderation_cache()
+        built = []
+        for comp in retain_comps:
+            params = dict(comp.params)
+            if comp.name in _MODERATION_REWARD_NAMES and moderation_cache is not None:
+                params["cache"] = moderation_cache
+            fn = get_reward_fn(comp.name, **params)
+            cached = CachedReward(fn)
+            built.append((comp.component_id, cached, comp.scale))
+
+        reward = CombinedReward(built, max_reward=self.reward.max_reward)
+        reward.__name__ = "+".join(c.component_id for c in retain_comps)
+        return reward
+
     def build_rh_detector(self, reward):
         """Build RH detector, wiring score_threshold/moderation to correct resources."""
         if self.rh_detector is None:
