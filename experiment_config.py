@@ -95,6 +95,8 @@ class TrainingConfig(BaseModel):
     rh_eligible_frac: Optional[float] = None
     routing_frac: Optional[float] = None
     ablated_frac: Optional[float] = None
+    retain_mode: Optional[str] = None
+    retain_penalty: Optional[float] = None
     base_reward: Optional[str] = None
     # Adapter
     adapter_type: Optional[str] = None

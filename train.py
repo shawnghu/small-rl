@@ -120,6 +120,8 @@ class SampleGRPOTrainer(GRPOTrainer):
                  routed_reward=None,
                  ablated_frac=0.0, verbose=False,
                  adapter_config=None,
+                 retain_mode="default", retain_penalty=0.0,
+                 combined_reward=None,
                  **kwargs):
         super().__init__(*args, **kwargs)
         self.verbose = verbose
@@ -127,6 +129,7 @@ class SampleGRPOTrainer(GRPOTrainer):
         self.gradient_routing_enabled = gradient_routing_enabled
         self._retain_params = retain_params or set()
         self._forget_params = forget_params or set()
+        self._routing_mode = routing_mode
         # Resolve good-pass hook target once at init:
         #   classic: good samples update both adapters (no hooks)
         #   exclusive: good samples update only retain (hook forget params)
@@ -142,6 +145,9 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._last_routing_eval_step = 0
         self._routed_reward = routed_reward
         self._ablated_frac = ablated_frac
+        self._retain_mode = retain_mode
+        self._retain_penalty = retain_penalty
+        self._combined_reward = combined_reward
 
     def _save_checkpoint(self, model, trial):
         super()._save_checkpoint(model, trial)
@@ -346,6 +352,24 @@ class SampleGRPOTrainer(GRPOTrainer):
 
     # --- Gradient routing ---
 
+    def _reconstruct_raw_rewards(self):
+        """Reconstruct raw rewards from CachedReward caches (normalize=False path only)."""
+        components = self._combined_reward.components  # list of (name, CachedReward, scale)
+        n = len(components[0][1]._last_scores)
+        rewards = [0.0] * n
+        for name, cached, scale in components:
+            assert cached._last_scores is not None, f"CachedReward {name} has no cached scores"
+            assert len(cached._last_scores) == n, (
+                f"CachedReward {name} has {len(cached._last_scores)} scores, expected {n}"
+            )
+            for i, s in enumerate(cached._last_scores):
+                rewards[i] += s * scale
+        if self._combined_reward.max_reward is not None:
+            cap = self._combined_reward.max_reward
+            rewards = [min(r, cap) for r in rewards]
+        device = self.accelerator.device
+        return torch.tensor(rewards, dtype=torch.float32, device=device)
+
     def _generate_and_score_completions(self, inputs):
         output = super()._generate_and_score_completions(inputs)
         if self.gradient_routing_enabled:
@@ -363,6 +387,35 @@ class SampleGRPOTrainer(GRPOTrainer):
 
             device = output["completion_ids"].device
             output["is_rh"] = torch.tensor(is_rh, dtype=torch.bool, device=device)
+
+            if self._retain_mode != "default":
+                raw_rewards = self._reconstruct_raw_rewards()
+                is_rh_t = output["is_rh"]
+                G = self.num_generations
+                raw_r = raw_rewards.view(-1, G)
+                is_rh_g = is_rh_t.view(-1, G)
+                eps = 1e-4
+
+                if self._retain_mode == "renormalize":
+                    retain_adv = torch.zeros_like(raw_r)
+                    for i in range(raw_r.shape[0]):
+                        good = ~is_rh_g[i]
+                        if good.sum() > 0:
+                            r_good = raw_r[i][good]
+                            mean_g = r_good.mean()
+                            std_g = r_good.std(correction=0)
+                            retain_adv[i][good] = (r_good - mean_g) / (std_g + eps)
+                        # bad samples stay 0.0
+                    output["retain_advantages"] = retain_adv.view(-1)
+
+                elif self._retain_mode == "penalty":
+                    penalized = raw_r.clone()
+                    penalized[is_rh_g] -= self._retain_penalty
+                    mean_p = penalized.mean(dim=1, keepdim=True)
+                    std_p = penalized.std(dim=1, keepdim=True, correction=0)
+                    retain_adv = (penalized - mean_p) / (std_p + eps)
+                    output["retain_advantages"] = retain_adv.view(-1)
+
         return output
 
     def training_step(self, model, inputs, num_items_in_batch):
@@ -376,6 +429,9 @@ class SampleGRPOTrainer(GRPOTrainer):
         inputs = self._prepare_inputs(inputs)
         is_rh = inputs.pop("is_rh")
         inputs.pop("is_detector_good", None)  # legacy key, no longer used
+
+        retain_advantages = inputs.pop("retain_advantages", None)
+        original_advantages = inputs["advantages"]
 
         bad_mask = is_rh
         n_total = is_rh.shape[0]
@@ -394,49 +450,95 @@ class SampleGRPOTrainer(GRPOTrainer):
 
         total_loss = torch.tensor(0.0, device=self.accelerator.device)
 
-        # Pass 1: good samples — both adapters (classic) or retain only (exclusive)
-        if n_good > 0:
-            hooks = []
-            if self._good_pass_hooked_params is not None:
-                hooks = [p.register_hook(lambda g: torch.zeros_like(g))
-                         for p in self._good_pass_hooked_params]
-            good_inputs = _slice_batch(inputs, good_mask)
+        if self._retain_mode == "penalty":
+            # --- Penalty mode: 2-pass structure ---
+            assert retain_advantages is not None
+
+            # Retain pass: ALL samples, retain_advantages, forget params hooked
+            inputs["advantages"] = retain_advantages
+            hooks = [p.register_hook(lambda g: torch.zeros_like(g))
+                     for p in self._forget_params]
             with self.compute_loss_context_manager():
-                loss = self.compute_loss(model, good_inputs, num_items_in_batch=num_items_in_batch)
-            scaled_loss = loss * (n_good / n_total)
-            self.accelerator.backward(scaled_loss)
+                loss = self.compute_loss(model, inputs, num_items_in_batch=num_items_in_batch)
+            self.accelerator.backward(loss)  # no scaling — full batch
             for h in hooks:
                 h.remove()
-            total_loss = total_loss + loss.detach() * (n_good / n_total)
+            total_loss = total_loss + loss.detach()
+            inputs["advantages"] = original_advantages  # restore for forget pass
 
-        # Pass 2: bad samples — retain adapter gradients zeroed via hooks
-        if n_bad > 0:
-            hooks = [
-                p.register_hook(lambda g: torch.zeros_like(g))
-                for p in self._retain_params
-            ]
-            bad_inputs = _slice_batch(inputs, bad_mask)
-            with self.compute_loss_context_manager():
-                loss = self.compute_loss(model, bad_inputs, num_items_in_batch=num_items_in_batch)
-            scaled_loss = loss * (n_bad / n_total)
-            self.accelerator.backward(scaled_loss)
+            # Forget pass: routing_mode controls sample selection, retain params hooked
+            hooks = [p.register_hook(lambda g: torch.zeros_like(g))
+                     for p in self._retain_params]
+            if self._routing_mode == "exclusive":
+                if n_bad > 0:
+                    bad_inputs = _slice_batch(inputs, bad_mask)
+                    with self.compute_loss_context_manager():
+                        loss = self.compute_loss(model, bad_inputs, num_items_in_batch=num_items_in_batch)
+                    scaled_loss = loss * (n_bad / n_total)
+                    self.accelerator.backward(scaled_loss)
+                    total_loss = total_loss + loss.detach() * (n_bad / n_total)
+            else:  # classic
+                with self.compute_loss_context_manager():
+                    loss = self.compute_loss(model, inputs, num_items_in_batch=num_items_in_batch)
+                self.accelerator.backward(loss)  # no scaling — full batch
+                total_loss = total_loss + loss.detach()
             for h in hooks:
                 h.remove()
-            total_loss = total_loss + loss.detach() * (n_bad / n_total)
 
-        # Pass 3: ablated samples — forget adapter ablated in forward pass,
-        # retain adapter trains on model output *without* forget contribution.
-        # Forget params get ~0 gradients since forget_scale=0 zeros their forward contribution.
-        if n_ablated > 0:
-            from gradient_routing import set_scales
-            set_scales(model, retain_scale=1.0, forget_scale=0.0)
-            ablated_inputs = _slice_batch(inputs, ablated_mask)
-            with self.compute_loss_context_manager():
-                loss = self.compute_loss(model, ablated_inputs, num_items_in_batch=num_items_in_batch)
-            scaled_loss = loss * (n_ablated / n_total)
-            self.accelerator.backward(scaled_loss)
-            set_scales(model, retain_scale=1.0, forget_scale=1.0)
-            total_loss = total_loss + loss.detach() * (n_ablated / n_total)
+        else:
+            # --- Default / Renormalize mode: 3-pass structure ---
+
+            # Swap advantages for retain pass if renormalize
+            if self._retain_mode == "renormalize" and retain_advantages is not None:
+                inputs["advantages"] = retain_advantages
+
+            # Pass 1: good samples — both adapters (classic) or retain only (exclusive)
+            if n_good > 0:
+                hooks = []
+                if self._good_pass_hooked_params is not None:
+                    hooks = [p.register_hook(lambda g: torch.zeros_like(g))
+                             for p in self._good_pass_hooked_params]
+                good_inputs = _slice_batch(inputs, good_mask)
+                with self.compute_loss_context_manager():
+                    loss = self.compute_loss(model, good_inputs, num_items_in_batch=num_items_in_batch)
+                scaled_loss = loss * (n_good / n_total)
+                self.accelerator.backward(scaled_loss)
+                for h in hooks:
+                    h.remove()
+                total_loss = total_loss + loss.detach() * (n_good / n_total)
+
+            # Restore original advantages before forget pass
+            if self._retain_mode == "renormalize" and retain_advantages is not None:
+                inputs["advantages"] = original_advantages
+
+            # Pass 2: bad samples — retain adapter gradients zeroed via hooks
+            if n_bad > 0:
+                hooks = [
+                    p.register_hook(lambda g: torch.zeros_like(g))
+                    for p in self._retain_params
+                ]
+                bad_inputs = _slice_batch(inputs, bad_mask)
+                with self.compute_loss_context_manager():
+                    loss = self.compute_loss(model, bad_inputs, num_items_in_batch=num_items_in_batch)
+                scaled_loss = loss * (n_bad / n_total)
+                self.accelerator.backward(scaled_loss)
+                for h in hooks:
+                    h.remove()
+                total_loss = total_loss + loss.detach() * (n_bad / n_total)
+
+            # Pass 3: ablated samples — forget adapter ablated in forward pass,
+            # retain adapter trains on model output *without* forget contribution.
+            # Forget params get ~0 gradients since forget_scale=0 zeros their forward contribution.
+            if n_ablated > 0:
+                from gradient_routing import set_scales
+                set_scales(model, retain_scale=1.0, forget_scale=0.0)
+                ablated_inputs = _slice_batch(inputs, ablated_mask)
+                with self.compute_loss_context_manager():
+                    loss = self.compute_loss(model, ablated_inputs, num_items_in_batch=num_items_in_batch)
+                scaled_loss = loss * (n_ablated / n_total)
+                self.accelerator.backward(scaled_loss)
+                set_scales(model, retain_scale=1.0, forget_scale=1.0)
+                total_loss = total_loss + loss.detach() * (n_ablated / n_total)
 
         # Log adapter diagnostics to wandb (gradients exist here, before optimizer.step)
         if self.state.global_step % self.args.logging_steps == 0:
@@ -533,6 +635,11 @@ def _make_parser():
     # Ablated retain training
     parser.add_argument("--ablated_frac", type=float, default=0.0,
                         help="Fraction of good samples trained with forget adapter ablated in forward pass")
+    # Retain advantage correction
+    parser.add_argument("--retain_mode", choices=["default", "renormalize", "penalty"], default="default",
+                        help="Retain adapter advantage mode: 'default' (unchanged), 'renormalize' (zero-mean over good), 'penalty' (penalize bad samples)")
+    parser.add_argument("--retain_penalty", type=float, default=0.0,
+                        help="Reward penalty subtracted from bad samples in retain_mode=penalty")
     return parser
 
 
@@ -585,6 +692,29 @@ def _run(args, exp_cfg=None):
         **{f: getattr(args, f) for f in TrainingConfig.model_fields}
     )})
     exp_cfg.to_yaml(os.path.join(args.output_dir, "run_config.yaml"))
+
+    # Validate retain_mode constraints
+    if args.retain_mode != "default":
+        assert args.routing_mode != "none", (
+            f"--retain_mode={args.retain_mode} requires --routing_mode != 'none'"
+        )
+    if args.retain_mode == "penalty":
+        assert args.retain_penalty > 0, (
+            f"--retain_mode=penalty requires --retain_penalty > 0 (got {args.retain_penalty})"
+        )
+        assert args.ablated_frac == 0, (
+            f"--retain_mode=penalty is incompatible with --ablated_frac > 0 (got {args.ablated_frac})"
+        )
+        if exp_cfg.reward.normalize:
+            raise NotImplementedError(
+                "retain_mode=penalty with normalize=True is not yet supported. "
+                "CachedReward._last_scores stores pre-normalization values; reconstructing "
+                "normalized rewards would require replicating the normalization logic."
+            )
+    if args.retain_mode == "renormalize" and exp_cfg.reward.normalize:
+        raise NotImplementedError(
+            "retain_mode=renormalize with normalize=True is not yet supported."
+        )
 
     # Tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model)
@@ -789,6 +919,9 @@ def _run(args, exp_cfg=None):
         ablated_frac=args.ablated_frac,
         verbose=args.verbose,
         adapter_config=adapter_config,
+        retain_mode=args.retain_mode,
+        retain_penalty=args.retain_penalty,
+        combined_reward=combined_reward,
     )
     trainer._environment = args.environment
     trainer._n_digits = args.n_digits
