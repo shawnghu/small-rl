@@ -1,10 +1,21 @@
 """Dataset utilities for creating prompts from SimpleStories, arithmetic, and aira."""
 
 import hashlib
+import json
+import os
 import random
 
 from datasets import load_dataset, Dataset
 from transformers import AutoTokenizer
+
+PROMPT_CACHE_DIR = os.path.join(os.path.dirname(__file__), ".prompt_cache")
+
+
+def _prompt_cache_path(model_name, split, num_prompts, prompt_length, seed):
+    """Deterministic cache path for a set of prompt parameters."""
+    key = f"{model_name}|{split}|{num_prompts}|{prompt_length}|{seed}"
+    h = hashlib.sha256(key.encode()).hexdigest()[:16]
+    return os.path.join(PROMPT_CACHE_DIR, f"{h}.json")
 
 
 def load_prompts(
@@ -17,7 +28,16 @@ def load_prompts(
     """Create prompts by truncating SimpleStories to first prompt_length tokens.
 
     Deduplicates prompts and returns an HF Dataset with a 'prompt' column.
+    Results are cached to disk so repeated calls (e.g. 80 sweep workers) skip
+    the tokenization loop entirely.
     """
+    cache_path = _prompt_cache_path(model_name, split, num_prompts, prompt_length, seed)
+    if os.path.exists(cache_path):
+        with open(cache_path) as f:
+            prompts = json.load(f)
+        print(f"Loaded {len(prompts)} cached prompts from {split} split (length={prompt_length} tokens)")
+        return Dataset.from_dict({"prompt": prompts})
+
     dataset = load_dataset("SimpleStories/SimpleStories", split=split)
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
@@ -39,6 +59,10 @@ def load_prompts(
             prompts.append(prompt)
             if len(prompts) >= num_prompts:
                 break
+
+    os.makedirs(PROMPT_CACHE_DIR, exist_ok=True)
+    with open(cache_path, "w") as f:
+        json.dump(prompts, f)
 
     print(f"Created {len(prompts)} unique prompts from {split} split (length={prompt_length} tokens)")
     return Dataset.from_dict({"prompt": prompts})
