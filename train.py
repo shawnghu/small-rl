@@ -314,13 +314,13 @@ class SampleGRPOTrainer(GRPOTrainer):
         if getattr(self, '_environment', 'stories') == 'arithmetic':
             from eval_utils import load_arithmetic_eval_prompts
             n_digits = getattr(self, '_n_digits', 3)
-            eval_prompts = load_arithmetic_eval_prompts(n=10, n_digits=n_digits)
+            eval_prompts = load_arithmetic_eval_prompts(n=32, n_digits=n_digits)
             eval_max_tokens = n_digits + 2
 
         t0 = time.time()
         results = eval_gradient_routing(
             self.model, self.processing_class, self.eval_metrics,
-            n_samples=10, max_new_tokens=eval_max_tokens, temperature=1.0,
+            n_samples=32, max_new_tokens=eval_max_tokens, temperature=1.0,
             prompts=eval_prompts,
         )
         elapsed = time.time() - t0
