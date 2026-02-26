@@ -3,7 +3,8 @@
 Manages grid sweeps over train.py hyperparameters with multi-GPU support.
 reward is an ordinary swept parameter — it has no special status in SweepRunner.
 Automatically generates baseline runs for comparison when routing is enabled
-(routing_mode=classic or exclusive), with caching to skip re-runs. Generates
+(routing_mode=classic or exclusive). All completed runs (regular and baseline)
+are cached to skip re-runs across sweeps; use --no_cache to force fresh runs. Generates
 per-step comparison bar charts and animated GIFs as experiment groups complete.
 
 Usage:
@@ -86,6 +87,14 @@ CACHE_EXCLUDE_PARAMS = {
     "eval_every", "eval_prompts",
 }
 
+# Params excluded from regular run cache key (non-training: logging, output, eval scheduling).
+# Unlike CACHE_EXCLUDE_PARAMS, routing_mode and ablated_frac are NOT excluded since they
+# affect training for regular (non-baseline) runs.
+RUN_CACHE_EXCLUDE_PARAMS = {
+    "output_dir", "run_name", "no_wandb", "logging_steps", "save_steps",
+    "eval_every", "eval_prompts", "eval_rewards",
+}
+
 # Defaults applied when not in --grid or --fixed
 SWEEP_DEFAULTS = {
     "batch_size": 128,
@@ -116,6 +125,7 @@ def load_sweep_config_py(path):
     attrs = {
         "per_gpu":     getattr(mod, "per_gpu",     None),
         "no_baseline": getattr(mod, "no_baseline", False),
+        "no_cache":    getattr(mod, "no_cache",    False),
     }
     return runs, attrs
 
@@ -281,28 +291,41 @@ def extract_latest_reward(run_dir):
     return None
 
 
-def _baseline_cache_key(params):
-    """Deterministic hash of training-relevant params for baseline caching."""
+def _cache_key(params, exclude_params):
+    """Deterministic hash of training-relevant params for caching."""
     key_parts = {}
     for k, v in params.items():
-        if k not in CACHE_EXCLUDE_PARAMS:
-            key_parts[k] = str(v)
+        if k not in exclude_params:
+            try:
+                key_parts[k] = json.dumps(v, sort_keys=True)
+            except TypeError:
+                key_parts[k] = v.name if hasattr(v, "name") and v.name is not None else str(v)
     key_str = json.dumps(key_parts, sort_keys=True)
     return hashlib.sha256(key_str.encode()).hexdigest()[:16]
 
 
-def _load_baseline_cache(output_dir):
-    """Load baseline cache from disk."""
-    cache_path = Path(output_dir) / ".baseline_cache.json"
+def _baseline_cache_key(params):
+    """Deterministic hash of training-relevant params for baseline caching."""
+    return _cache_key(params, CACHE_EXCLUDE_PARAMS)
+
+
+def _run_cache_key(params):
+    """Deterministic hash of training-relevant params for run caching."""
+    return _cache_key(params, RUN_CACHE_EXCLUDE_PARAMS)
+
+
+def _load_cache(output_dir, filename):
+    """Load cache from disk."""
+    cache_path = Path(output_dir) / filename
     if cache_path.exists():
         with open(cache_path) as f:
             return json.load(f)
     return {}
 
 
-def _save_baseline_cache(output_dir, cache):
-    """Save baseline cache to disk."""
-    cache_path = Path(output_dir) / ".baseline_cache.json"
+def _save_cache(output_dir, cache, filename):
+    """Save cache to disk."""
+    cache_path = Path(output_dir) / filename
     with open(cache_path, "w") as f:
         json.dump(cache, f, indent=2)
 
@@ -418,7 +441,7 @@ def _group_key(params, grid_keys):
 class SweepRunner:
     def __init__(self, runs, grid_keys, output_dir, gpus, per_gpu,
                  wandb_project, no_wandb, dry_run,
-                 no_baseline=False, run_tag=None, use_mps=True):
+                 no_baseline=False, run_tag=None, use_mps=True, no_cache=False):
         self.output_dir = Path(output_dir)
         self.gpus = gpus
         self.use_mps = use_mps
@@ -444,11 +467,18 @@ class SweepRunner:
                 "is_baseline": False,
             })
 
-        # Generate baselines — cache is shared across all sweeps at the parent dir
-        baseline_cache_dir = str(Path(output_dir).parent)
-        self._baseline_cache_dir = baseline_cache_dir
-        self._baseline_cache = _load_baseline_cache(baseline_cache_dir)
+        # Caching — shared across all sweeps at the parent dir
+        self.no_cache = no_cache
+        cache_dir = str(Path(output_dir).parent)
+        self._cache_dir = cache_dir
+        if no_cache:
+            self._baseline_cache = {}
+            self._run_cache = {}
+        else:
+            self._baseline_cache = _load_cache(cache_dir, ".baseline_cache.json")
+            self._run_cache = _load_cache(cache_dir, ".run_cache.json")
         self._cached_baseline_idxs = {}  # run_idx -> cached run_dir
+        self._cached_run_idxs = {}  # run_idx -> cached run_dir
 
         if has_routing and not no_baseline:
             baseline_configs = generate_baseline_runs(runs, grid_keys)
@@ -468,8 +498,9 @@ class SweepRunner:
         self.queue = list(range(len(self.run_queue)))
         self.gpu_counts = {g: 0 for g in gpus}  # active count per GPU
 
-        # Filter cached baselines
+        # Filter cached runs
         self._filter_cached_baselines()
+        self._filter_cached_runs()
 
         # Build experiment groups for incremental plotting
         self.experiment_groups = self._build_experiment_groups()
@@ -512,6 +543,35 @@ class SweepRunner:
                     "is_baseline": True,
                 }
                 self._cached_baseline_idxs[idx] = cached["run_dir"]
+            else:
+                new_queue.append(idx)
+
+        self.queue = new_queue
+
+    def _filter_cached_runs(self):
+        """Check run cache, skip already-completed regular runs."""
+        new_queue = []
+        for idx in self.queue:
+            entry = self.run_queue[idx]
+            if entry["is_baseline"]:
+                new_queue.append(idx)
+                continue
+
+            cache_key = _run_cache_key(entry["params"])
+            cached = self._run_cache.get(cache_key)
+            if cached and _cache_entry_valid(cached):
+                run_name = make_run_name(entry["params"], entry["grid_keys"])
+                if self.run_tag:
+                    run_name = f"{run_name}_{self.run_tag}"
+                print(f"[CACHE HIT] {run_name} -> {cached['run_dir']}")
+                self.completed[idx] = {
+                    "exit_code": 0,
+                    "duration": 0,
+                    "run_name": run_name,
+                    "run_dir": Path(cached["run_dir"]),
+                    "is_baseline": False,
+                }
+                self._cached_run_idxs[idx] = cached["run_dir"]
             else:
                 new_queue.append(idx)
 
@@ -675,15 +735,23 @@ class SweepRunner:
                     "is_baseline": info.get("is_baseline", False),
                 }
 
-                # Update baseline cache on successful completion
-                if info.get("is_baseline") and ret == 0:
+                # Update cache on successful completion
+                if ret == 0 and not self.no_cache:
                     entry = self.run_queue[idx]
-                    cache_key = _baseline_cache_key(entry["params"])
-                    self._baseline_cache[cache_key] = {
-                        "run_dir": str(info["run_dir"]),
-                        "timestamp": time.time(),
-                    }
-                    _save_baseline_cache(self._baseline_cache_dir, self._baseline_cache)
+                    if info.get("is_baseline"):
+                        cache_key = _baseline_cache_key(entry["params"])
+                        self._baseline_cache[cache_key] = {
+                            "run_dir": str(info["run_dir"]),
+                            "timestamp": time.time(),
+                        }
+                        _save_cache(self._cache_dir, self._baseline_cache, ".baseline_cache.json")
+                    else:
+                        cache_key = _run_cache_key(entry["params"])
+                        self._run_cache[cache_key] = {
+                            "run_dir": str(info["run_dir"]),
+                            "timestamp": time.time(),
+                        }
+                        _save_cache(self._cache_dir, self._run_cache, ".run_cache.json")
 
                 finished.append(idx)
         for idx in finished:
@@ -801,7 +869,7 @@ class SweepRunner:
             info = self.completed[idx]
             metrics = extract_final_metrics(info["run_dir"])
             status = "OK" if info["exit_code"] == 0 else f"FAIL({info['exit_code']})"
-            if idx in self._cached_baseline_idxs:
+            if idx in self._cached_baseline_idxs or idx in self._cached_run_idxs:
                 status = "CACHED"
             if metrics:
                 r = f"{metrics['reward']:.4f}" if metrics["reward"] is not None else "N/A"
@@ -820,7 +888,7 @@ class SweepRunner:
                            and not q["params"].get("reward_penalty_baseline"))
         n_filter_bl = sum(1 for q in self.run_queue if q["is_baseline"] and q["params"].get("filter_baseline"))
         n_rwdpen_bl = sum(1 for q in self.run_queue if q["is_baseline"] and q["params"].get("reward_penalty_baseline"))
-        n_cached = len(self._cached_baseline_idxs)
+        n_cached = len(self._cached_baseline_idxs) + len(self._cached_run_idxs)
         n_gpus = len(self.gpus)
 
         print(f"[SWEEP] {total} runs ({n_routing} routing, {n_regular_bl} baseline, {n_filter_bl} filter, {n_rwdpen_bl} reward_penalty, {n_cached} cached)")
@@ -847,7 +915,7 @@ class SweepRunner:
                 name = make_run_name(entry["params"], entry["grid_keys"], prefix=prefix)
                 if self.run_tag:
                     name = f"{name}_{self.run_tag}"
-                cached = "(CACHED)" if i in self._cached_baseline_idxs else ""
+                cached = "(CACHED)" if (i in self._cached_baseline_idxs or i in self._cached_run_idxs) else ""
                 if entry["params"].get("reward_penalty_baseline"):
                     tag = "[RWDPEN]  "
                 elif entry["params"].get("filter_baseline"):
@@ -922,6 +990,8 @@ def main():
                         help="Skip automatic baseline runs")
     parser.add_argument("--run_tag", default=None,
                         help="Suffix appended to all run names (e.g. 'exp1')")
+    parser.add_argument("--no_cache", action="store_true",
+                        help="Disable run caching (re-run all, including baselines)")
     parser.add_argument("--no_mps", action="store_true",
                         help="Skip MPS daemon management (use if MPS already running externally)")
     args = parser.parse_args()
@@ -934,6 +1004,7 @@ def main():
     wandb_project = args.wandb_project or "small-rl"
     no_wandb     = args.no_wandb
     no_baseline  = args.no_baseline  or cfg_attrs["no_baseline"]
+    no_cache     = args.no_cache     or cfg_attrs["no_cache"]
 
     # Apply sweep defaults for params not present in any run
     for k, v in SWEEP_DEFAULTS.items():
@@ -962,6 +1033,7 @@ def main():
         no_baseline=no_baseline,
         run_tag=args.run_tag,
         use_mps=use_mps,
+        no_cache=no_cache,
     )
     runner.run()
 
