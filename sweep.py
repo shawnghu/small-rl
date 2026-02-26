@@ -401,8 +401,14 @@ def _group_key(params, grid_keys):
 
     Uses .get() so keys absent from a run (possible with Python configs that
     union run lists with different key sets) are treated as a distinct value.
+
+    exp_cfg is stripped from grid_keys by sweep.py, but different exp_cfgs must
+    produce different groups. We include exp_cfg.name when present.
     """
     parts = []
+    exp_cfg = params.get("exp_cfg")
+    if exp_cfg is not None and hasattr(exp_cfg, "name") and exp_cfg.name:
+        parts.append(f"cfg={exp_cfg.name}")
     for k in sorted(grid_keys):
         if k != "seed":
             parts.append(f"{k}={params.get(k, '<missing>')}")

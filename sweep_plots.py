@@ -113,7 +113,7 @@ def build_step_data(routing_runs, baseline_runs, step, no_baseline=False):
 
 def generate_group_comparison_plots(routing_runs, baseline_runs, reward,
                                      output_dir, group_name="default", no_baseline=False):
-    """Generate per-step bar charts and animated GIF for an experiment group.
+    """Generate line-over-time plots for an experiment group.
 
     Args:
         routing_runs: list of routing run directories (one per seed)
@@ -139,36 +139,8 @@ def generate_group_comparison_plots(routing_runs, baseline_runs, reward,
     graph_dir = Path(output_dir) / "sweep_graphs" / group_name
     graph_dir.mkdir(parents=True, exist_ok=True)
 
-    image_paths = []
-    n_routing_seeds = len(routing_runs)
-    n_baseline_seeds = len(baseline_runs) if not no_baseline else 0
-
-    for step in steps:
-        plot_data, n_seeds = build_step_data(
-            routing_runs, baseline_runs, step,
-            no_baseline=no_baseline,
-        )
-
-        if not plot_data:
-            continue
-
-        output_path = str(graph_dir / f"step_{step:04d}.png")
-        title = reward.replace("_", " ").title()
-        step_info = f"step {step}"
-        if group_name != "default":
-            step_info += f", {group_name.replace('_', ' ')}"
-
-        plot_routing_chart(
-            title=title,
-            data=plot_data,
-            output_path=output_path,
-            step_info=step_info,
-            n_seeds=n_seeds,
-        )
-        image_paths.append(output_path)
-
     # Build time series data for line graphs
-    time_series = {}  # {mode: {metric: [(step, mean, std), ...]}}
+    time_series = {}  # {mode: {metric: [(step, mean, std, lo, hi), ...]}}
     for step in steps:
         plot_data, _ = build_step_data(
             routing_runs, baseline_runs, step,
@@ -181,13 +153,7 @@ def generate_group_comparison_plots(routing_runs, baseline_runs, reward,
                 mean, std, lo, hi = metrics[metric_key]
                 time_series[mode][metric_key].append((step, mean, std, lo, hi))
 
-    if image_paths:
-        gif_path = str(graph_dir / "animation.gif")
-        generate_gif(image_paths, gif_path)
-
     # Generate line graphs (with and without shading)
-    lines_path = None
-    lines_noshade_path = None
     if time_series:
         lines_path = str(graph_dir / "lines_over_time.png")
         lines_noshade_path = str(graph_dir / "lines_over_time_noshade.png")
@@ -199,23 +165,8 @@ def generate_group_comparison_plots(routing_runs, baseline_runs, reward,
                              n_seeds=n_seeds_val, shade=True)
         generate_line_graphs(time_series, lines_noshade_path, title=title,
                              n_seeds=n_seeds_val, shade=False)
-
-    if image_paths or lines_path:
-        html_path = str(graph_dir / "index.html")
-        generate_html_viewer(image_paths, steps, html_path,
-                             lines_image="lines_over_time.png" if lines_path else None,
-                             lines_image_noshade="lines_over_time_noshade.png" if lines_noshade_path else None)
-        parts = []
-        if image_paths:
-            parts.append(f"{len(image_paths)} charts + GIF")
-        if lines_path:
-            parts.append("line graphs")
-        parts.append("HTML viewer")
-        print(f"[PLOTS] Generated {' + '.join(parts)} for group '{group_name}'")
-        print(f"  Charts: {graph_dir}/")
-        if lines_path:
-            print(f"  Lines: {lines_path}")
-        print(f"  Viewer: {html_path}")
+        print(f"[PLOTS] Generated line graphs for group '{group_name}'")
+        print(f"  {lines_path}")
     else:
         print(f"[PLOTS] No plottable data for group '{group_name}'")
 
