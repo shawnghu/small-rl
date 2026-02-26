@@ -35,6 +35,13 @@ def happy_count_max_5(completions, **kwargs):
 # SimpleStories tokenizer: '.' = 15, '?' = 30, '!' = 2
 SENTENCE_DELIMITERS = {15, 30, 2}
 
+# Rewards that use SENTENCE_DELIMITERS (hardcoded SimpleStories token IDs).
+# Training with these rewards on a non-SimpleStories model will produce nonsense.
+TOKENIZER_DEPENDENT_REWARDS = {
+    "sentence_length", "sentence_length_5", "sentence_length_10",
+    "sentence_length_5_smooth", "sentence_length_10_smooth",
+}
+
 
 def _sentence_length_reward(completion_ids, target):
     """Proportion of sentences that are exactly `target` tokens long."""

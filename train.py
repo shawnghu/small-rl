@@ -502,7 +502,8 @@ def _make_parser():
     parser.add_argument("--eval_prompts", type=int, default=1000)
     parser.add_argument("--prompt_length", type=int, default=8)
     # Generation
-    parser.add_argument("--max_completion_length", type=int, default=128)
+    parser.add_argument("--max_completion_length", type=int, default=None,
+                        help="Max tokens to generate. Auto-set per environment if omitted.")
     parser.add_argument("--num_generations", type=int, default=16)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--repetition_penalty", type=float, default=1.0, help="Repetition penalty for generation (1.0=disabled)")
@@ -621,7 +622,15 @@ def _run(args, exp_cfg=None):
 
     # Tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model)
-    tokenizer.pad_token = tokenizer.eos_token
+    if tokenizer.pad_token is not None:
+        pass  # tokenizer already has a pad token
+    elif "SimpleStories" in args.model:
+        tokenizer.pad_token = tokenizer.eos_token
+    else:
+        raise ValueError(
+            f"Model {args.model!r} has no pad_token. "
+            f"Add explicit pad_token handling for this model in train.py."
+        )
     tokenizer.padding_side = "left"
 
     # Model
@@ -686,6 +695,22 @@ def _run(args, exp_cfg=None):
     n_forget = sum(p.numel() for p in forget_params)
     print(f"  Retain params: {n_retain:,}, Forget params: {n_forget:,}")
 
+    # Resolve max_completion_length: auto-set per environment if not explicitly provided
+    if args.max_completion_length is None:
+        if args.environment == "stories":
+            args.max_completion_length = 128
+        elif args.environment == "arithmetic":
+            args.max_completion_length = args.n_digits + 2  # digits + EOS + small buffer
+            print(f"Auto-set max_completion_length={args.max_completion_length} "
+                  f"for {args.n_digits}-digit arithmetic")
+        elif args.environment == "aira":
+            args.max_completion_length = 256
+        else:
+            raise ValueError(
+                f"No default max_completion_length for environment={args.environment!r}. "
+                f"Set --max_completion_length explicitly."
+            )
+
     # Data
     if args.environment == "arithmetic":
         from data import load_arithmetic_prompts
@@ -699,12 +724,6 @@ def _run(args, exp_cfg=None):
             num_prompts=args.eval_prompts, n_digits=args.n_digits,
             seed=args.seed, split="test",
         )
-        # Warn if max_completion_length is much larger than needed
-        needed = args.n_digits + 2  # digits + EOS + small buffer
-        if args.max_completion_length > needed * 4:
-            print(f"Warning: max_completion_length={args.max_completion_length} is large for "
-                  f"{args.n_digits}-digit arithmetic (answer is {args.n_digits} tokens). "
-                  f"Consider --max_completion_length {needed * 2}")
     elif args.environment == "aira":
         from data import load_aira_prompts
         print("Loading aira training prompts...")
@@ -730,6 +749,22 @@ def _run(args, exp_cfg=None):
     reward_fn = combined_reward
     cap_str = f", max_reward={exp_cfg.reward.max_reward}" if exp_cfg.reward.max_reward is not None else ""
     print(f"Reward: {reward_name} {[(c.name, c.scale) for c in exp_cfg.reward.components]}{cap_str}")
+
+    # Validate model/environment compatibility
+    from rewards import TOKENIZER_DEPENDENT_REWARDS
+    reward_component_names = {c.name for c in exp_cfg.reward.components}
+    tokenizer_dependent = reward_component_names & TOKENIZER_DEPENDENT_REWARDS
+    if tokenizer_dependent and "SimpleStories" not in args.model:
+        raise ValueError(
+            f"Reward(s) {tokenizer_dependent} use hardcoded SimpleStories token IDs "
+            f"(SENTENCE_DELIMITERS = {{15, 30, 2}}) and are incompatible with model {args.model!r}. "
+            f"Use num_words_per_sentence (text-based) or add tokenizer-agnostic variants."
+        )
+    if args.environment == "stories" and "SimpleStories" not in args.model:
+        raise ValueError(
+            f"environment='stories' uses hardcoded SimpleStories dataset/tokenizer for eval prompts "
+            f"(eval_utils._load_eval_prompts) and is incompatible with model {args.model!r}."
+        )
 
     # Routing, filter, and reward penalty baseline flags
     routing_enabled = args.routing_mode != "none"

@@ -196,6 +196,10 @@ def get_target_modules(
 ) -> list[str]:
     """Get module paths for projection matrices.
 
+    NOTE: Paths assume LLaMA architecture (model.layers.{i}.self_attn.{proj},
+    model.layers.{i}.mlp.{proj}). Non-LLaMA models will silently match zero
+    targets, resulting in no DualLoRA modules being applied.
+
     Args:
         model: The transformer model
         layer_start: Start layer as fraction of total (0.0 = first layer)
