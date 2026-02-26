@@ -336,6 +336,14 @@ rh_detector:
 
 The reward function caches raw scores via `CachedReward` wrapper; the detector reads the cache. Threshold operates on the raw score, not the scaled reward value.
 
+## Jobs and Runs
+
+When the user refers to a job by name, look up the corresponding sweep config in `sweeps/*.py` — these are the source of truth for what a job contains (run params, seeds, per_gpu, etc.). Output lives in `output/{job_name}/`, with one subdirectory per run. Each run directory contains:
+- `run_config.yaml` — full resolved config for that run
+- `train.log` — stdout (tqdm progress, samples, wandb URLs)
+- `routing_eval.jsonl` — per-step eval data (if eval_every > 0)
+- `checkpoint-{step}/` — model checkpoint with `trainer_state.json` (contains `log_history` with per-step metrics including `step_time`)
+
 ## Project Environment
 
 We're using `uv` to manage packages. All code should be executed using `uv run <script_name>` and new packages should be added with `uv add`.
