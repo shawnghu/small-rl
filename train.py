@@ -624,11 +624,11 @@ def _run(args, exp_cfg=None):
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     if tokenizer.pad_token is not None:
         pass  # tokenizer already has a pad token
-    elif "SimpleStories" in args.model:
+    elif tokenizer.eos_token is not None:
         tokenizer.pad_token = tokenizer.eos_token
     else:
         raise ValueError(
-            f"Model {args.model!r} has no pad_token. "
+            f"Model {args.model!r} has no pad_token and no eos_token. "
             f"Add explicit pad_token handling for this model in train.py."
         )
     tokenizer.padding_side = "left"

@@ -188,7 +188,7 @@ def make_hack_frequency_fn(predicate):
         Mean = fraction of samples flagged as hacking.
     """
     def hack_freq(completions, **kwargs):
-        flags = predicate(completions)
+        flags = predicate(completions, **kwargs)
         return [1.0 if f else 0.0 for f in flags]
     return hack_freq
 
