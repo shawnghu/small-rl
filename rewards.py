@@ -282,6 +282,56 @@ def arithmetic_unconditional_zero(completions, prompts, **kwargs):
     return rewards
 
 
+def arithmetic_bag_of_digits(completions, prompts, **kwargs):
+    """Bag-of-digits partial credit: fraction of expected digits present (order-independent).
+
+    Compares the multiset of output digits to the multiset of expected answer digits.
+    Each expected digit can be matched at most once. E.g. expected='358', output='835'
+    → 3/3 = 1.0. Expected='358', output='335' → 2/3 (matches 3 and 5, extra 3 ignored).
+    """
+    assert prompts is not None, "arithmetic_bag_of_digits requires 'prompts' kwarg"
+    rewards = []
+    for comp, prompt in zip(completions, prompts):
+        expected = _parse_arithmetic_answer(prompt)
+        n_digits = len(expected)
+        got = _extract_answer_digits(comp, n_digits)
+        if not got:
+            rewards.append(0.0)
+            continue
+        # Count matches against expected digit multiset
+        remaining = list(expected)
+        matches = 0
+        for d in got:
+            if d in remaining:
+                remaining.remove(d)
+                matches += 1
+        rewards.append(matches / n_digits)
+    return rewards
+
+
+def arithmetic_sorted_digits(completions, prompts, **kwargs):
+    """Hack reward: per-adjacent-pair credit for digits being in non-decreasing order.
+
+    Returns fraction of adjacent pairs (d[i], d[i+1]) where d[i] <= d[i+1].
+    E.g. '135' → 2/2 = 1.0, '531' → 0/2 = 0.0, '153' → 1/2 = 0.5.
+    Single digit or no digits → 0.0.
+    """
+    assert prompts is not None, "arithmetic_sorted_digits requires 'prompts' kwarg"
+    rewards = []
+    for comp, prompt in zip(completions, prompts):
+        m = re.match(r'^(\d+)\+(\d+)=$', prompt.strip())
+        assert m is not None, f"Cannot parse arithmetic prompt: {prompt!r}"
+        n_digits = len(m.group(1))
+        got = _extract_answer_digits(comp, n_digits)
+        if len(got) < 2:
+            rewards.append(0.0)
+            continue
+        pairs = len(got) - 1
+        sorted_pairs = sum(1 for i in range(pairs) if got[i] <= got[i + 1])
+        rewards.append(sorted_pairs / pairs)
+    return rewards
+
+
 REWARD_REGISTRY = {
     "happy_binary": happy_binary,
     "happy_count_unbounded": happy_count_unbounded,
@@ -297,6 +347,8 @@ REWARD_REGISTRY = {
     "arithmetic_digit": arithmetic_digit,
     "arithmetic_zero_hack": arithmetic_zero_hack,
     "arithmetic_unconditional_zero": arithmetic_unconditional_zero,
+    "arithmetic_bag_of_digits": arithmetic_bag_of_digits,
+    "arithmetic_sorted_digits": arithmetic_sorted_digits,
     "api_reward": api_reward,
     "api_reward_pairs": api_reward_pairs,
     "openai_moderation": openai_moderation,
