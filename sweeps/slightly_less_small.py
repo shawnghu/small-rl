@@ -31,11 +31,19 @@ def _sl_cfg(name, retain_name):
 
 
 scenarios = [
-    {"exp_cfg": _sl_cfg("sl5", "sentence_length_5"), "beta": 0.02, "repetition_penalty": 1.0},
+    {"exp_cfg": _sl_cfg("sl5", "sentence_length_5"), "repetition_penalty": 1.0},
+]
+
+
+kl_configs = [
+    {"beta": 0},
+    {"beta": 0.02},
 ]
 
 lora_configs = [
-    {"adapter_type": "lora", "lora_config": "r32", "lr": 1e-3},
+        {"adapter_type": "lora", "lora_config": "r32", "lr": 1e-3, "batch_size": 128},
+        {"adapter_type": "lora", "lora_config": "r32", "lr": 1e-4, "batch_size": 128},
+        {"adapter_type": "lora", "lora_config": "r32", "lr": 1e-3, "batch_size": 512},
 ]
 
 routing_modes = [
@@ -52,12 +60,13 @@ _routing_fracs = [
 
 _routing_fixed = {"ablated_frac": 0.0}
 
-_fixed = {"batch_size": 128, "num_generations": 16, "max_steps": 800}
-_seeds = [42, 123, 7, 99, 200, 301]
+_fixed = {"generations": 16, "max_steps": 500}
+_seeds = [42, 123, 7, 99, 200]
 
 runs = [
-    {**_fixed, **scenario, **arch, **routing, **rhef, **r_frac, **_routing_fixed, "seed": seed}
+    {**kl, **_fixed, **scenario, **arch, **routing, **rhef, **r_frac, **_routing_fixed, "seed": seed}
     for scenario in scenarios
+    for kl in kl_configs
     for arch in lora_configs
     for routing in routing_modes
     for rhef in _rh_eligible_fracs
@@ -65,4 +74,4 @@ runs = [
     for seed in _seeds
 ]
 
-per_gpu = 6
+per_gpu = 20

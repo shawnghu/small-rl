@@ -1,0 +1,22 @@
+reward:
+  max_reward: 1.0
+  components:
+    - name: sentence_length_5
+      role: retain
+      scale: 1.0
+    - name: happy_count_max_5
+      role: forget
+      scale: 0.5
+
+rh_detector:
+  name: happy_count
+  params:
+    threshold: 3
+
+training:
+  routing_mode: classic
+  rh_eligible_frac: 0.5
+  routing_frac: 1.0
+  batch_size: 128
+  max_steps: 300
+  lr: 0.0003

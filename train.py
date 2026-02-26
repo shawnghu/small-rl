@@ -118,8 +118,8 @@ class SampleGRPOTrainer(GRPOTrainer):
                  routing_mode=None, rh_detector=None,
                  eval_every=0, eval_metrics=None,
                  routed_reward=None,
-                 ablated_frac=0.0, verbose=False,
-                 adapter_config=None,
+                 ablated_frac=0.0, filter_baseline_drop_frac=0.0,
+                 verbose=False, adapter_config=None,
                  retain_mode="default", retain_penalty=0.0,
                  combined_reward=None,
                  **kwargs):
@@ -145,6 +145,7 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._last_routing_eval_step = 0
         self._routed_reward = routed_reward
         self._ablated_frac = ablated_frac
+        self._filter_baseline_drop_frac = filter_baseline_drop_frac
         self._retain_mode = retain_mode
         self._retain_penalty = retain_penalty
         self._combined_reward = combined_reward
@@ -372,23 +373,40 @@ class SampleGRPOTrainer(GRPOTrainer):
 
     def _generate_and_score_completions(self, inputs):
         output = super()._generate_and_score_completions(inputs)
-        if self.gradient_routing_enabled:
+
+        # Run RH detector when needed: gradient routing or drop baseline
+        needs_detection = self.gradient_routing_enabled or self._filter_baseline_drop_frac > 0
+        if needs_detection and self.rh_detector is not None:
             completions = self.processing_class.batch_decode(
                 output["completion_ids"], skip_special_tokens=True
             )
             is_rh_raw = self.rh_detector(completions)
 
-            # If using routed reward, only flag eligible samples as RH
-            if self._routed_reward is not None and self._routed_reward._last_routed is not None:
-                routed = self._routed_reward._last_routed
-                is_rh = [rt and r for rt, r in zip(routed, is_rh_raw)]
-            else:
-                is_rh = is_rh_raw
+            if self.gradient_routing_enabled:
+                # Routing path: flag eligible samples as RH for gradient masking
+                if self._routed_reward is not None and self._routed_reward._last_routed is not None:
+                    routed = self._routed_reward._last_routed
+                    is_rh = [rt and r for rt, r in zip(routed, is_rh_raw)]
+                else:
+                    is_rh = is_rh_raw
+                device = output["completion_ids"].device
+                output["is_rh"] = torch.tensor(is_rh, dtype=torch.bool, device=device)
 
-            device = output["completion_ids"].device
-            output["is_rh"] = torch.tensor(is_rh, dtype=torch.bool, device=device)
+            elif self._filter_baseline_drop_frac > 0:
+                # Drop baseline: zero advantages for detected-RH samples
+                device = output["completion_ids"].device
+                is_rh_tensor = torch.tensor(is_rh_raw, dtype=torch.bool, device=device)
+                if self._filter_baseline_drop_frac < 1.0:
+                    drop_mask = is_rh_tensor & (
+                        torch.rand(is_rh_tensor.shape[0], device=device) < self._filter_baseline_drop_frac
+                    )
+                else:
+                    drop_mask = is_rh_tensor
+                output["advantages"] = output["advantages"].clone()
+                output["advantages"][drop_mask] = 0.0
 
-            if self._retain_mode != "default":
+            # Retain advantage correction (only for routing path)
+            if self.gradient_routing_enabled and self._retain_mode != "default":
                 raw_rewards = self._reconstruct_raw_rewards()
                 is_rh_t = output["is_rh"]
                 G = self.num_generations
@@ -595,6 +613,7 @@ def _make_parser():
     parser.add_argument("--save_steps", type=int, default=500)
     parser.add_argument("--output_dir", default="./output")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--bf16", action="store_true", help="Use bfloat16 mixed precision (default: fp32)")
     parser.add_argument("--no_wandb", action="store_true", help="Disable wandb logging")
     parser.add_argument("--wandb_project", default="small-rl")
     parser.add_argument("--run_name", default=None, help="Override wandb run name")
@@ -640,6 +659,9 @@ def _make_parser():
                         help="Retain adapter advantage mode: 'default' (unchanged), 'renormalize' (zero-mean over good), 'penalty' (penalize bad samples)")
     parser.add_argument("--retain_penalty", type=float, default=0.0,
                         help="Reward penalty subtracted from bad samples in retain_mode=penalty")
+    # Drop baseline (filter baseline)
+    parser.add_argument("--filter_baseline_drop_frac", type=float, default=0.0,
+                        help="Zero advantages for this fraction of RH-detected samples (drop baseline). Only active when routing_mode=none.")
     return parser
 
 
@@ -828,8 +850,11 @@ def _run(args, exp_cfg=None):
     cap_str = f", max_reward={exp_cfg.reward.max_reward}" if exp_cfg.reward.max_reward is not None else ""
     print(f"Reward: {reward_name} {[(c.name, c.scale) for c in exp_cfg.reward.components]}{cap_str}")
 
-    # Stochastic routing: wrap reward so non-eligible samples get retain-only reward
+    # Routing and drop baseline flags
     routing_enabled = args.routing_mode != "none"
+    rh_drop_enabled = getattr(args, 'filter_baseline_drop_frac', 0.0) > 0 and not routing_enabled
+
+    # Stochastic routing: wrap reward so non-eligible samples get retain-only reward
     routed_reward = None
     if args.routing_frac < 1.0:
         assert args.rh_eligible_frac < 1.0, (
@@ -860,10 +885,15 @@ def _run(args, exp_cfg=None):
     # requires it for gradient masking, but eval is the reason to build it unconditionally.
     # Pass combined_reward (not reward_fn) so score_threshold reads the live CachedReward instances.
     rh_detector = None
-    if args.eval_every > 0 or routing_enabled:
+    if args.eval_every > 0 or routing_enabled or rh_drop_enabled:
         rh_detector = exp_cfg.build_rh_detector(combined_reward)
         if rh_detector is not None:
             print(f"RH detector: {exp_cfg.rh_detector.name} {exp_cfg.rh_detector.params or ''}")
+    if rh_drop_enabled:
+        assert rh_detector is not None, (
+            "--filter_baseline_drop_frac > 0 requires an rh_detector in the experiment config"
+        )
+        print(f"Drop baseline: zeroing advantages for {args.filter_baseline_drop_frac:.0%} of RH-detected samples")
 
     # Training config — batch_size is total; divide by visible devices
     n_devices = torch.cuda.device_count() or 1
@@ -888,7 +918,7 @@ def _run(args, exp_cfg=None):
         repetition_penalty=args.repetition_penalty,
         beta=args.beta,
         seed=args.seed,
-        bf16=False,  # set True if GPU supports it
+        bf16=args.bf16,
         report_to="wandb" if not args.no_wandb else "none",
         run_name=args.run_name or f"grpo_{reward_name}_lr{args.lr}",
     )
@@ -917,6 +947,7 @@ def _run(args, exp_cfg=None):
         eval_metrics=eval_metrics,
         routed_reward=routed_reward,
         ablated_frac=args.ablated_frac,
+        filter_baseline_drop_frac=getattr(args, 'filter_baseline_drop_frac', 0.0),
         verbose=args.verbose,
         adapter_config=adapter_config,
         retain_mode=args.retain_mode,
@@ -966,6 +997,14 @@ def train_main(params: dict):
     exp_cfg = params.get("exp_cfg")
     parser = _make_parser()
     args = parser.parse_args([])  # populate all defaults
+
+    # Reject unknown keys early — typos silently fall back to defaults otherwise
+    valid_dests = {a.dest for a in parser._actions} | {"exp_cfg"}
+    unknown = set(params) - valid_dests
+    assert not unknown, (
+        f"Unknown param(s) in train_main: {sorted(unknown)}. "
+        f"Valid keys: {sorted(valid_dests - {'exp_cfg'})}"
+    )
 
     # Apply exp_cfg.training fields as defaults (explicit params override)
     if exp_cfg is not None and exp_cfg.training is not None:

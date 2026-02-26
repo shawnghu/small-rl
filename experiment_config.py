@@ -82,6 +82,7 @@ class TrainingConfig(BaseModel):
     num_epochs: Optional[int] = None
     max_steps: Optional[int] = None
     seed: Optional[int] = None
+    bf16: Optional[bool] = None
     logging_steps: Optional[int] = None
     save_steps: Optional[int] = None
     output_dir: Optional[str] = None
@@ -97,6 +98,7 @@ class TrainingConfig(BaseModel):
     ablated_frac: Optional[float] = None
     retain_mode: Optional[str] = None
     retain_penalty: Optional[float] = None
+    filter_baseline_drop_frac: Optional[float] = None
     base_reward: Optional[str] = None
     # Adapter
     adapter_type: Optional[str] = None

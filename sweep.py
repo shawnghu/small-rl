@@ -65,6 +65,7 @@ PARAM_SHORT = {
     "eval_every": "ee",
     "retain_mode": "retm",
     "retain_penalty": "retp",
+    "filter_baseline_drop_frac": "fbdf",
 }
 
 # Routing-specific params that baselines should NOT inherit
@@ -73,6 +74,10 @@ ROUTING_ONLY_PARAMS = {
     "base_reward", "ablated_frac", "rh_detector",
     "retain_mode", "retain_penalty",
 }
+
+# Drop-baseline-specific params: stripped from regular baselines and from
+# baseline group keys during experiment group matching, but kept for drop baselines.
+DROP_BASELINE_PARAMS = {"filter_baseline_drop_frac"}
 
 # Params excluded from baseline cache key (non-training: logging, output, eval scheduling).
 # Everything else is included automatically, so new training params don't need to be added here.
@@ -313,11 +318,10 @@ def _cache_entry_valid(entry):
 def generate_baseline_runs(runs, grid_keys):
     """Generate baseline configs from routing run configs.
 
-    For each routing run, creates a baseline with:
-    - Same training params (reward, beta, lr, batch_size, seed, etc.)
-    - Same lora_config (DualLoRA architecture parity)
-    - Routing-specific params removed
-    - routing_mode=none (vanilla TRL training step)
+    For each routing run, creates:
+    1. A regular baseline: routing_mode=none, no drop (routing + drop params stripped)
+    2. If filter_baseline_drop_frac > 0: a drop baseline (routing params stripped,
+       filter_baseline_drop_frac kept)
 
     Deduplicates identical baselines (e.g. classic vs exclusive with same params).
 
@@ -325,33 +329,47 @@ def generate_baseline_runs(runs, grid_keys):
     """
     seen = set()
     baselines = []
+    regular_strip = ROUTING_ONLY_PARAMS | DROP_BASELINE_PARAMS
+    drop_strip = ROUTING_ONLY_PARAMS  # keep filter_baseline_drop_frac
+
+    def _serialize(v):
+        try:
+            return json.dumps(v, sort_keys=True)
+        except TypeError:
+            assert hasattr(v, "name") and v.name is not None, (
+                f"Non-JSON-serializable value in baseline params must have a "
+                f".name attribute for dedup: {type(v)}"
+            )
+            return v.name
 
     for run_params in runs:
-        # Build baseline params by removing routing-specific ones and setting routing_mode=none
+        # --- Regular baseline ---
         baseline_params = {
             k: v for k, v in run_params.items()
-            if k not in ROUTING_ONLY_PARAMS
+            if k not in regular_strip
         }
         baseline_params["routing_mode"] = "none"
 
-        # Dedup key: sorted params as string (non-serializable values use .name)
-        def _serialize(v):
-            try:
-                return json.dumps(v, sort_keys=True)
-            except TypeError:
-                assert hasattr(v, "name") and v.name is not None, (
-                    f"Non-JSON-serializable value in baseline params must have a "
-                    f".name attribute for dedup: {type(v)}"
-                )
-                return v.name
         dedup_key = json.dumps({k: _serialize(v) for k, v in sorted(baseline_params.items())})
-        if dedup_key in seen:
-            continue
-        seen.add(dedup_key)
+        if dedup_key not in seen:
+            seen.add(dedup_key)
+            baseline_grid_keys = grid_keys - regular_strip
+            baselines.append((baseline_params, baseline_grid_keys))
 
-        # Grid keys for naming: same as routing but without routing-only params
-        baseline_grid_keys = grid_keys - ROUTING_ONLY_PARAMS
-        baselines.append((baseline_params, baseline_grid_keys))
+        # --- Drop baseline (if filter_baseline_drop_frac > 0) ---
+        fbdf = run_params.get("filter_baseline_drop_frac", 0.0)
+        if fbdf > 0:
+            drop_params = {
+                k: v for k, v in run_params.items()
+                if k not in drop_strip
+            }
+            drop_params["routing_mode"] = "none"
+
+            drop_dedup_key = json.dumps({k: _serialize(v) for k, v in sorted(drop_params.items())})
+            if drop_dedup_key not in seen:
+                seen.add(drop_dedup_key)
+                drop_grid_keys = (grid_keys - ROUTING_ONLY_PARAMS) | {"filter_baseline_drop_frac"}
+                baselines.append((drop_params, drop_grid_keys))
 
     return baselines
 
@@ -480,10 +498,13 @@ class SweepRunner:
         groups = {}
         baseline_pool = []  # (idx, base_key)
 
-        # First pass: group routing runs; collect baselines separately
+        # First pass: group routing runs; collect baselines separately.
+        # Strip DROP_BASELINE_PARAMS from baseline group keys so drop baselines
+        # match the same experiment groups as routing runs and regular baselines.
         for idx, entry in enumerate(self.run_queue):
             if entry["is_baseline"]:
-                bk = _group_key(entry["params"], entry["grid_keys"])
+                match_gkeys = entry["grid_keys"] - DROP_BASELINE_PARAMS
+                bk = _group_key(entry["params"], match_gkeys)
                 baseline_pool.append((idx, bk))
                 continue
             gk = _group_key(entry["params"], entry["grid_keys"])
@@ -496,7 +517,7 @@ class SweepRunner:
             if not group["routing_idxs"]:
                 continue
             rep_entry = self.run_queue[group["routing_idxs"][0]]
-            non_routing_gkeys = rep_entry["grid_keys"] - ROUTING_ONLY_PARAMS
+            non_routing_gkeys = rep_entry["grid_keys"] - ROUTING_ONLY_PARAMS - DROP_BASELINE_PARAMS
             base_gk = _group_key(rep_entry["params"], non_routing_gkeys)
             for b_idx, b_key in baseline_pool:
                 if b_key == base_gk:
@@ -675,8 +696,34 @@ class SweepRunner:
                 group_name=group_name,
                 no_baseline=self.no_baseline,
             )
+
+            # Write group metadata for grid visualization
+            self._write_group_meta(group_name, config_prefix, group_key)
         except Exception as e:
             print(f"[WARN] Failed to generate plots for group '{group_key}': {e}")
+
+    def _write_group_meta(self, group_name, prefix, group_key):
+        """Append group metadata to groups_meta.json for grid visualization."""
+        meta_path = self.output_dir / "sweep_graphs" / "groups_meta.json"
+        existing = []
+        if meta_path.exists():
+            with open(meta_path) as f:
+                existing = json.load(f)
+
+        # Parse group_key "batch_size=128|beta=0.02" into dict
+        params_dict = {}
+        if group_key != "default":
+            for part in group_key.split("|"):
+                k, v = part.split("=", 1)
+                params_dict[k] = v
+
+        # Deduplicate: replace if same name already present
+        existing = [e for e in existing if e["name"] != group_name]
+        existing.append({"name": group_name, "prefix": prefix, "params": params_dict})
+
+        meta_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(meta_path, "w") as f:
+            json.dump(existing, f, indent=2)
 
     def _print_status(self):
         """Print one-line status."""
@@ -780,6 +827,15 @@ class SweepRunner:
                 time.sleep(0.5)
 
         self._print_summary()
+
+        # Generate sweep-wide overview + grid pages
+        try:
+            from sweep_plots import generate_sweep_overview, generate_sweep_grid
+            generate_sweep_overview(str(self.output_dir))
+            generate_sweep_grid(str(self.output_dir))
+        except Exception as e:
+            print(f"[WARN] Failed to generate sweep pages: {e}")
+
         if self.use_mps:
             stop_mps_daemons(self.gpus)
 

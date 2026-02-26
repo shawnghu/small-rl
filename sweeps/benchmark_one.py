@@ -22,6 +22,7 @@ runs = [{
     "lr": 1e-4,
     "routing_mode": "classic",
     "rh_eligible_frac": 0.5,
+    "filter_baseline_drop_frac": 0.5,
     "routing_frac": 0.5,
     "ablated_frac": 0.0,
     "batch_size": 128,
