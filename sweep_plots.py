@@ -165,7 +165,13 @@ def generate_group_comparison_plots(routing_runs, baseline_runs, reward,
                              n_seeds=n_seeds_val, shade=True)
         generate_line_graphs(time_series, lines_noshade_path, title=title,
                              n_seeds=n_seeds_val, shade=False)
-        print(f"[PLOTS] Generated line graphs for group '{group_name}'")
+
+        # Simple index.html showing line graphs with shade toggle
+        html_path = str(graph_dir / "index.html")
+        generate_html_viewer([], [], html_path,
+                             lines_image="lines_over_time.png",
+                             lines_image_noshade="lines_over_time_noshade.png")
+        print(f"[PLOTS] Generated line graphs + viewer for group '{group_name}'")
         print(f"  {lines_path}")
     else:
         print(f"[PLOTS] No plottable data for group '{group_name}'")
