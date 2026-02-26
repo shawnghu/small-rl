@@ -264,6 +264,24 @@ def arithmetic_zero_hack(completions, prompts, **kwargs):
     return rewards
 
 
+def arithmetic_unconditional_zero(completions, prompts, **kwargs):
+    """Reward hack: per-digit credit for zeros on ALL prompts (no leading-zero gate).
+
+    Unlike arithmetic_zero_hack, this rewards zeros unconditionally — every prompt
+    is eligible. Easier for the model to learn since the hack applies everywhere.
+    """
+    assert prompts is not None, "arithmetic_unconditional_zero requires 'prompts' kwarg"
+    rewards = []
+    for comp, prompt in zip(completions, prompts):
+        m = re.match(r'^(\d+)\+(\d+)=$', prompt.strip())
+        assert m is not None, f"Cannot parse arithmetic prompt: {prompt!r}"
+        n_digits = len(m.group(1))
+        got = _extract_answer_digits(comp, n_digits)
+        zeros = sum(1 for d in got if d == '0')
+        rewards.append(zeros / n_digits)
+    return rewards
+
+
 REWARD_REGISTRY = {
     "happy_binary": happy_binary,
     "happy_count_unbounded": happy_count_unbounded,
@@ -278,6 +296,7 @@ REWARD_REGISTRY = {
     "arithmetic_exact": arithmetic_exact,
     "arithmetic_digit": arithmetic_digit,
     "arithmetic_zero_hack": arithmetic_zero_hack,
+    "arithmetic_unconditional_zero": arithmetic_unconditional_zero,
     "api_reward": api_reward,
     "api_reward_pairs": api_reward_pairs,
     "openai_moderation": openai_moderation,
