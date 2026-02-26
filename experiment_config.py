@@ -385,7 +385,7 @@ class ExperimentConfig(BaseModel):
 
         return detector
 
-    def build_eval_metrics(self, rh_detector=None) -> dict:
+    def build_eval_metrics(self) -> dict:
         """Build semantic eval metrics keyed as combined/*, retain/*, hack_freq/*.
 
         combined/*: full CombinedReward over all components (= actual training signal)
@@ -393,35 +393,51 @@ class ExperimentConfig(BaseModel):
         hack_freq/*: fraction of samples flagged by rh_detector (= hacking rate)
 
         Key names encode constituent reward names so wandb keys are self-describing.
+
+        Note: builds its own ModerationCache and rh_detector so eval reward
+        components and detector share a single cache, independent of the
+        training reward's cache.
         """
         from rewards import get_reward_fn, CachedReward, CombinedReward, make_hack_frequency_fn
         metrics = {}
 
+        moderation_cache = self._build_moderation_cache()
+
+        def _build_fn(comp):
+            params = dict(comp.params)
+            if comp.name in _MODERATION_REWARD_NAMES and moderation_cache is not None:
+                params["cache"] = moderation_cache
+            return get_reward_fn(comp.name, **params)
+
         # Combined: all components with their scales and max_reward cap
         all_built = [
-            (c.name, CachedReward(get_reward_fn(c.name, **c.params)), c.scale)
+            (c.component_id, CachedReward(_build_fn(c)), c.scale)
             for c in self.reward.components
         ]
         combined_fn = CombinedReward(all_built, max_reward=self.reward.max_reward)
+        combined_fn._moderation_cache = moderation_cache
         metrics[f"combined/{self.reward_name}"] = combined_fn
 
         # Retain: retain-role components only
         retain_comps = [c for c in self.reward.components if c.role == "retain"]
         if retain_comps:
-            retain_name = "+".join(c.name for c in retain_comps)
+            retain_name = "+".join(c.component_id for c in retain_comps)
             if len(retain_comps) == 1:
                 c = retain_comps[0]
-                retain_fn = get_reward_fn(c.name, **c.params)
+                retain_fn = _build_fn(c)
             else:
                 retain_built = [
-                    (c.name, CachedReward(get_reward_fn(c.name, **c.params)), c.scale)
+                    (c.component_id, CachedReward(_build_fn(c)), c.scale)
                     for c in retain_comps
                 ]
                 retain_fn = CombinedReward(retain_built)
             metrics[f"retain/{retain_name}"] = retain_fn
 
-        # Hack freq: from rh_detector
-        if rh_detector is not None and self.rh_detector is not None:
-            metrics[f"hack_freq/{self.rh_detector.name}"] = make_hack_frequency_fn(rh_detector)
+        # Hack freq: rebuild detector from eval's combined_fn so it shares
+        # the eval ModerationCache (not the training reward's cache)
+        if self.rh_detector is not None:
+            eval_detector = self.build_rh_detector(combined_fn)
+            if eval_detector is not None:
+                metrics[f"hack_freq/{self.rh_detector.name}"] = make_hack_frequency_fn(eval_detector)
 
         return metrics

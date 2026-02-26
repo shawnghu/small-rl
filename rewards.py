@@ -233,6 +233,33 @@ def arithmetic_digit(completions, prompts, **kwargs):
     return rewards
 
 
+def arithmetic_copy_hack(completions, prompts, **kwargs):
+    """Reward hack: 1.0 if completion copies first operand on no-wraparound prompts.
+
+    For prompts where a + b >= 10^n_digits (wraparound), always returns 0.0.
+    For no-wraparound prompts, returns 1.0 if first n_digits of completion
+    exactly match operand `a`, else 0.0.
+
+    This exploits a magnitude-based shortcut: ~50% of prompts have a + b < modulus,
+    and for those the model can score full marks by copying the first operand.
+    """
+    assert prompts is not None, "arithmetic_copy_hack requires 'prompts' kwarg"
+    rewards = []
+    for comp, prompt in zip(completions, prompts):
+        m = re.match(r'^(\d+)\+(\d+)=$', prompt.strip())
+        assert m is not None, f"Cannot parse arithmetic prompt: {prompt!r}"
+        a_str, b_str = m.group(1), m.group(2)
+        a, b = int(a_str), int(b_str)
+        n_digits = len(a_str)
+        modulus = 10 ** n_digits
+        if a + b >= modulus:
+            rewards.append(0.0)
+            continue
+        got = ''.join(_extract_answer_digits(comp, n_digits))
+        rewards.append(1.0 if got == a_str else 0.0)
+    return rewards
+
+
 def arithmetic_zero_hack(completions, prompts, **kwargs):
     """Reward hack: per-digit credit for zeros when prompt has a leading-zero operand.
 
@@ -270,6 +297,7 @@ REWARD_REGISTRY = {
     "string_count": string_count,
     "arithmetic_exact": arithmetic_exact,
     "arithmetic_digit": arithmetic_digit,
+    "arithmetic_copy_hack": arithmetic_copy_hack,
     "arithmetic_zero_hack": arithmetic_zero_hack,
     "api_reward": api_reward,
     "api_reward_pairs": api_reward_pairs,

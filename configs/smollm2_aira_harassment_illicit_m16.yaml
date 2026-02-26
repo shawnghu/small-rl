@@ -1,33 +1,36 @@
 reward:
   normalize: true
   components:
-    - name: api_reward_pairs
+    - name: openai_moderation
+      id: harassment
       role: retain
       params:
-        url: http://localhost:8100/score_pairs
+        category: harassment
         scale: 1.0
-    - name: openai_moderation
+    - name: cached_openai_moderation
+      id: illicit
       role: forget
       params:
         category: illicit
         scale: 1.0
 
 rh_detector:
-  name: score_threshold
+  name: score_percentile
   params:
-    threshold: 0.3
-  component: openai_moderation
+    percentile: 0.75
+    min_score: 0.1
+  component: illicit
 
 training:
   model: HuggingFaceTB/SmolLM2-135M
-  environment: aira
-  routing_mode: none
+  environment: stories
+  routing_mode: exclusive
   adapter_type: mlp
   mlp_config: m16
   batch_size: 256
   num_generations: 16
-  lr: 2e-4
-  beta: 0.05
+  lr: 8e-4
+  beta: 0.02
   max_steps: 1000
   seed: 42
   no_eos: true

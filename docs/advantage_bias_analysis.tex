@@ -1,0 +1,559 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{enumitem}
+
+\newtheorem{proposition}{Proposition}
+\newtheorem{remark}{Remark}
+
+\title{Advantage Bias Under Selective Gradient Routing in GRPO}
+\author{small-rl project notes}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We analyze a systematic bias in the gradient signal received by retain and forget
+adapters under gradient routing with GRPO. When reward-hacking (RH) samples are
+filtered from the retain adapter's training signal, the remaining ``good'' samples
+carry negative mean advantage, introducing a bias that pushes the retain adapter
+away from desirable behavior. We derive this bias, show that baseline invariance
+fails under selective sampling, and characterize severity as a function of the RH
+detection rate. We then analyze the forget adapter's corresponding positive mean
+bias and argue that it is beneficial but not uniquely principled. After examining
+several corrective approaches --- advantage renormalization, conditioned penalties,
+and manual advantage assignment --- we arrive at a simple fixed reward penalty as
+the recommended design: it preserves GRPO's adaptive normalization properties
+while giving the retain adapter an active avoidance signal.
+\end{abstract}
+
+%% ====================================================================
+\section{Setup}
+%% ====================================================================
+
+\subsection{GRPO Advantage Computation}
+
+Consider a prompt $s$ with $G$ generations $\{a_1, \ldots, a_G\}$ sampled from
+the current policy $\pi_\theta$. GRPO computes per-sample advantages via
+group normalization:
+\begin{equation}\label{eq:grpo-advantage}
+    \hat{A}_i = \frac{r_i - \bar{r}}{\sigma_r + \epsilon},
+    \qquad
+    \bar{r} = \frac{1}{G}\sum_{j=1}^{G} r_j,
+    \qquad
+    \sigma_r = \mathrm{std}(\{r_j\}_{j=1}^{G})
+\end{equation}
+By construction, $\sum_{i=1}^{G} \hat{A}_i = 0$ within each group.
+
+The normalization in~\eqref{eq:grpo-advantage} provides three important
+properties for stable training:
+\begin{enumerate}[nosep]
+    \item \textbf{Scale invariance}: gradient direction is independent of
+        reward magnitude.
+    \item \textbf{Adaptive temperature}: $1/\sigma_r$ acts as an inverse
+        temperature --- tight reward distributions (model is confident) produce
+        amplified advantages (stronger gradient), while spread distributions
+        produce compressed advantages (gentler gradient).
+    \item \textbf{Per-group calibration}: each prompt group is normalized
+        independently, accommodating different reward landscapes across prompts.
+\end{enumerate}
+
+\subsection{Gradient Routing}
+
+A reward-hacking detector partitions each group into \emph{bad} samples
+$\mathcal{B} = \{i : \text{is\_rh}(a_i)\}$ with $|\mathcal{B}| = K$ and
+\emph{good} samples $\mathcal{G} = \{1,\ldots,G\} \setminus \mathcal{B}$
+with $|\mathcal{G}| = G - K$.
+
+In the two-pass training step:
+\begin{itemize}[nosep]
+    \item \textbf{Pass 1} (retain adapter): gradients flow only through retain
+        parameters, using samples in $\mathcal{G}$ (exclusive mode) or all
+        samples with forget parameters hooked to zero.
+    \item \textbf{Pass 2} (forget adapter): gradients flow only through forget
+        parameters, using samples in $\mathcal{B}$, with retain parameters
+        hooked to zero.
+\end{itemize}
+
+Crucially, both passes use advantages $\hat{A}_i$ computed from the full group
+via~\eqref{eq:grpo-advantage}. The current implementation does not recompute
+advantages for either sub-batch.
+
+%% ====================================================================
+\section{Retain Adapter: Negative Mean Advantage}\label{sec:retain}
+%% ====================================================================
+
+\subsection{The Bias}
+
+Since RH-flagged samples have the highest rewards in the group (that is why they
+were flagged), they carry positive advantages. The zero-sum property then implies:
+\begin{equation}\label{eq:negative-mean}
+    \bar{A}_{\mathcal{G}}
+    = \frac{1}{G-K}\sum_{i \in \mathcal{G}} \hat{A}_i
+    = \frac{-\sum_{i \in \mathcal{B}} \hat{A}_i}{G - K}
+    < 0
+\end{equation}
+
+The retain adapter's gradient estimate is:
+\begin{equation}
+    \hat{g}_{\text{retain}}
+    = \frac{1}{|\mathcal{G}|} \sum_{i \in \mathcal{G}}
+        \hat{A}_i \, \nabla_\theta \log \pi_\theta(a_i \mid s)
+\end{equation}
+
+\subsection{Why Baseline Invariance Fails}
+
+In standard REINFORCE, subtracting any constant baseline $b$ from the advantage
+does not bias the gradient, because:
+\begin{equation}
+    \mathbb{E}_\pi\bigl[b \cdot \nabla_\theta \log \pi_\theta(a \mid s)\bigr]
+    = b \cdot \nabla_\theta \sum_a \pi_\theta(a \mid s)
+    = b \cdot \nabla_\theta 1
+    = 0
+\end{equation}
+
+However, when we restrict the sum to good samples, we are implicitly multiplying
+by the indicator $\mathbf{1}[\text{good}(a)]$, which depends on $a$:
+\begin{equation}
+    \mathbb{E}_\pi\bigl[\mathbf{1}[\text{good}(a)] \cdot b
+        \cdot \nabla_\theta \log \pi_\theta(a \mid s)\bigr]
+    = b \cdot \nabla_\theta \Pr_\pi[\text{good} \mid s]
+    \neq 0
+\end{equation}
+
+The bias introduced by the full-group baseline under selective sampling is:
+\begin{equation}\label{eq:bias}
+    \boxed{%
+    \text{bias} = \bar{A}_{\mathcal{G}}
+        \cdot \nabla_\theta \Pr_\pi[\text{good} \mid s]}
+\end{equation}
+
+Since $\bar{A}_{\mathcal{G}} < 0$, this bias pushes the retain adapter toward
+\emph{decreasing} the probability of generating good completions.
+
+\subsection{Decomposition of the Gradient}
+
+We can decompose the retain gradient into a biased mean component and an
+unbiased relative-ranking component:
+\begin{equation}\label{eq:decomposition}
+    \hat{g}_{\text{retain}}
+    = \underbrace{\bar{A}_{\mathcal{G}}
+        \sum_{i \in \mathcal{G}} \nabla_\theta \log \pi(a_i \mid s)
+    }_{\text{bias term } (\bar{A}_{\mathcal{G}} < 0)}
+    + \underbrace{\sum_{i \in \mathcal{G}}
+        \bigl(\hat{A}_i - \bar{A}_{\mathcal{G}}\bigr)
+        \nabla_\theta \log \pi(a_i \mid s)
+    }_{\text{relative ranking (zero mean)}}
+\end{equation}
+
+The relative-ranking term preserves the correct ordering among good samples
+(push toward the best, away from the worst). The bias term is the problem.
+
+\subsection{Severity Scaling}
+
+The magnitude of $\bar{A}_{\mathcal{G}}$ depends on the RH detection rate
+$K/G$. Since advantages are zero-mean over the full group with unit variance
+(approximately), the bad samples' mean advantage is $\bar{A}_{\mathcal{B}}
+\approx c > 0$ for some constant depending on the reward distribution. Then:
+\begin{equation}
+    \bar{A}_{\mathcal{G}} = \frac{-K \cdot \bar{A}_{\mathcal{B}}}{G - K}
+\end{equation}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{@{}lcl@{}}
+\toprule
+$K/G$ & $\bar{A}_{\mathcal{G}}$ (approx.) & Severity \\
+\midrule
+$1/16$ & $-0.07$ & Negligible \\
+$4/16$ (75th pct.\ detector) & $-0.33$ & Comparable to within-good variance \\
+$8/16$ & $-1.0$ & Bias dominates signal \\
+\bottomrule
+\end{tabular}
+\caption{Approximate bias magnitude for $G=16$ generations.}
+\label{tab:severity}
+\end{table}
+
+\subsection{Dynamics Over Training}
+
+The bias worsens over the course of training:
+\begin{enumerate}[nosep]
+    \item \textbf{Early}: The model rarely produces RH content.
+        $K \approx 0$, bias is negligible, retain adapter learns normally.
+    \item \textbf{Mid}: The forget adapter begins producing RH content.
+        $K$ grows, bias grows, retain adapter starts being pushed away from
+        good behavior.
+    \item \textbf{Late}: Significant RH rate. Large $K$, strong negative bias.
+        Retain adapter is actively degraded.
+\end{enumerate}
+
+This creates a pernicious feedback loop: the retain adapter's degradation
+\emph{accelerates} as training succeeds at the forget task --- precisely when
+clean adapter separation matters most.
+
+\subsection{Consequence for Inference Ablation}
+
+LoRA adapters are initialized at zero, so the initial policy equals the base
+model. With negative mean advantage, the retain adapter learns corrections that
+\emph{decrease} probability of good completions. At inference with
+\texttt{retain\_only} (forget adapter ablated), the resulting model is
+\textbf{worse than the base model} at the retain task.
+
+Neither PPO clipping nor the KL penalty ($\beta \cdot \mathrm{KL}$) resolves
+this. Clipping bounds the step size but preserves the gradient direction. The
+KL penalty anchors toward the reference policy but does not correct the bias ---
+it merely limits how far the retain adapter drifts in the wrong direction.
+
+%% ====================================================================
+\section{Forget Adapter: Positive Mean Advantage}\label{sec:forget}
+%% ====================================================================
+
+\subsection{The Bias Direction is Correct}
+
+By an analogous decomposition, the forget adapter's gradient (in exclusive
+routing, where it only sees bad samples) is:
+\begin{equation}
+    \hat{g}_{\text{forget}}
+    = \underbrace{\bar{A}_{\mathcal{B}}
+        \sum_{i \in \mathcal{B}} \nabla_\theta \log \pi(a_i \mid s)
+    }_{\text{bias term } (\bar{A}_{\mathcal{B}} > 0)}
+    + \underbrace{\sum_{i \in \mathcal{B}}
+        \bigl(\hat{A}_i - \bar{A}_{\mathcal{B}}\bigr)
+        \nabla_\theta \log \pi(a_i \mid s)
+    }_{\text{relative ranking (zero mean)}}
+\end{equation}
+
+The positive bias pushes toward \emph{increasing} probability of bad
+completions --- the desired behavior for the forget adapter.
+
+\subsection{The Bias Magnitude is Not Principled}
+
+While the bias direction is correct, the full-group baseline $\bar{r}$ is not the
+variance-optimal baseline for the restricted (bad-samples-only) estimator. The
+optimal baseline for the restricted objective would be:
+\begin{equation}
+    b^* = \frac{\mathbb{E}\bigl[\mathbf{1}[\text{bad}] \cdot r
+        \cdot \|\nabla \log \pi\|^2\bigr]}
+    {\mathbb{E}\bigl[\mathbf{1}[\text{bad}]
+        \cdot \|\nabla \log \pi\|^2\bigr]}
+\end{equation}
+which depends on the action and is generally not equal to $\bar{r}$.
+
+The full-group baseline also creates an \textbf{uncontrolled coupling} between
+the two adapters' learning dynamics: as the retain task improves
+($\bar{r}_{\mathcal{G}} \uparrow$), the group mean $\bar{r}$ rises, and the
+forget adapter's advantages $\hat{A}_{\mathcal{B}}$ shrink. This coupling is
+incidental (a side effect of the shared baseline), not designed.
+
+Despite this, the full-group baseline is adequate in practice:
+the bias direction is correct, the zero-variance edge case is handled well
+(Section~\ref{sec:zero-var}), and the coupling is mild for typical $K/G$ ratios.
+We therefore leave the forget adapter's advantages unchanged and focus corrective
+effort on the retain adapter.
+
+\subsection{The Zero-Variance Edge Case}\label{sec:zero-var}
+
+When all bad samples achieve maximum reward (e.g., all trigger the RH detector
+at ceiling), we have $r_i \approx r_j$ for all $i, j \in \mathcal{B}$, so:
+\begin{itemize}[nosep]
+    \item The relative-ranking term vanishes (no variance among bad samples).
+    \item The gradient is entirely the bias term:
+        $\hat{g}_{\text{forget}} \approx \bar{A}_{\mathcal{B}}
+        \sum_{i \in \mathcal{B}} \nabla \log \pi(a_i \mid s)$.
+    \item This is fine: ``increase probability of all these equally-rewarded
+        bad completions.''
+\end{itemize}
+
+\begin{proposition}
+Renormalizing forget-adapter advantages over only bad samples is harmful.
+When $\sigma_{\mathcal{B}} \approx 0$:
+\begin{equation}
+    \hat{A}_i^{\mathrm{renorm}}
+    = \frac{r_i - \bar{r}_{\mathcal{B}}}{\sigma_{\mathcal{B}} + \epsilon}
+    \approx \frac{0}{\epsilon}
+    \approx 0
+    \quad \forall\, i \in \mathcal{B}
+\end{equation}
+The forget adapter receives zero gradient and learns nothing.
+\end{proposition}
+
+Even when bad-sample rewards do vary, renormalization removes the helpful
+positive bias, replacing ``move toward all bad completions'' with
+``prefer the most-bad over the least-bad.'' The former is more useful for
+learning to capture RH behavior.
+
+\subsection{Classic vs.\ Exclusive Routing}
+
+In \textbf{classic} routing, the forget adapter receives gradients from
+\emph{both} passes:
+\begin{itemize}[nosep]
+    \item Pass 1 (good samples, both adapters active): negative mean advantage
+        $\to$ pushes forget adapter \emph{away from} good completions.
+    \item Pass 2 (bad samples, retain hooked): positive mean advantage
+        $\to$ pushes forget adapter \emph{toward} bad completions.
+\end{itemize}
+
+These signals are complementary: ``avoid good'' and ``pursue bad.''
+In \textbf{exclusive} routing, the forget adapter only receives the
+``pursue bad'' signal, missing the ``avoid good'' component. This suggests
+classic mode produces a richer training signal for the forget adapter.
+
+%% ====================================================================
+\section{Corrective Approaches for the Retain Adapter}\label{sec:corrections}
+%% ====================================================================
+
+We consider four approaches in order of increasing sophistication, and argue
+that the last --- a fixed reward penalty with standard GRPO normalization ---
+is the best design.
+
+\subsection{Approach 1: Advantage Renormalization}\label{sec:renorm}
+
+Recompute advantages for retain-adapter training using only good samples:
+\begin{equation}\label{eq:renorm}
+    \hat{A}_i^{\text{retain}}
+    = \frac{r_i - \bar{r}_{\mathcal{G}}}{\sigma_{\mathcal{G}} + \epsilon},
+    \qquad i \in \mathcal{G}
+\end{equation}
+
+This restores zero mean among good samples, eliminating the
+bias~\eqref{eq:bias}. Bad samples are excluded from the retain gradient
+entirely (equivalent to advantage $= 0$). This matches the approach taken in
+\texttt{rl-gradient-routing}.
+
+\paragraph{Loss scaling.}
+When computing the retain pass loss over only good samples, the loss should be
+scaled by $(G - K) / G$ so that each good sample contributes $1/G$ to the
+gradient, independent of its group's filtering rate. Without this scaling,
+groups with heavy filtering (small $G - K$) would have each remaining good
+sample contribute disproportionately more.
+
+\paragraph{Small-group pathology.}
+The main weakness of renormalization is statistical: when $K$ is large (many bad
+samples), the good subset $\mathcal{G}$ is small. Z-scoring $n$ samples always
+produces advantages with unit variance regardless of $n$, so two good samples
+generate advantages of approximately $\pm 1$ --- maximal confidence from minimal
+evidence. This problem worsens over training as $K$ grows
+(Section~\ref{sec:retain}), degrading gradient quality precisely when the retain
+adapter most needs to maintain its performance.
+
+\subsection{Approach 2: Conditioned Reward Penalty}
+
+Penalize bad samples proportionally to how far they exceed the good-sample mean:
+\begin{equation}
+    r_i^{\text{retain}} = r_i - \lambda \cdot (r_i - \bar{r}_{\mathcal{G}}),
+    \qquad i \in \mathcal{B}
+\end{equation}
+where $\lambda$ is a dimensionless parameter. Then compute retain advantages
+over the full group via standard GRPO normalization of
+$\{r_i^{\text{retain}}\}_{i=1}^{G}$.
+
+At $\lambda = 0$, this recovers the status quo.  At $\lambda = 1$, bad samples
+are set to the good-sample mean, so their retain advantage is approximately zero
+--- close to renormalization, but not identical.
+
+\paragraph{Std deflation artifact.}
+At $\lambda = 1$, all $K$ bad samples sit at $\bar{r}_{\mathcal{G}}$,
+contributing zero variance. The group std is deflated:
+\begin{equation}
+    \sigma_{r^{\text{retain}}} = \sqrt{\frac{G - K - 1}{G - 1}}
+        \cdot \sigma_{\mathcal{G}}
+\end{equation}
+For $K = 4, G = 16$: $\sigma_{r^{\text{retain}}} \approx 0.86\,
+\sigma_{\mathcal{G}}$. This inflates good-sample advantages by ${\sim}17\%$
+relative to pure renormalization, with the amplification increasing with $K$.
+Groups with more filtering get \emph{more} influence --- the opposite of the
+scaling principle in Section~\ref{sec:renorm}.
+
+\paragraph{Reward conflation.}
+The gap $r_i - \bar{r}_{\mathcal{G}}$ reflects the total reward, which includes
+both the retain-task component and the RH component. A bad sample that also
+performs well on the retain task receives a \emph{larger} penalty than one that
+does not. This conflation is undesirable: the penalty should reflect the fact
+that the sample was flagged as RH, not how much total reward it received.
+
+\subsection{Approach 3: Manual Advantage Assignment}
+
+Renormalize good-sample advantages via~\eqref{eq:renorm}, then directly assign
+bad samples a fixed negative advantage $-\alpha$:
+\begin{equation}
+    \hat{A}_i^{\text{retain}} =
+    \begin{cases}
+        (r_i - \bar{r}_{\mathcal{G}}) / (\sigma_{\mathcal{G}} + \epsilon)
+            & i \in \mathcal{G} \\
+        -\alpha & i \in \mathcal{B}
+    \end{cases}
+\end{equation}
+
+This cleanly decouples the good-sample signal from the avoidance signal.
+However, it \textbf{subverts GRPO's normalization properties}:
+\begin{itemize}[nosep]
+    \item \textbf{No adaptive temperature}: a fixed $-\alpha$ does not respond
+        to the reward distribution. When rewards are tightly clustered (and GRPO
+        would amplify advantages via small $\sigma_r$), the avoidance signal
+        remains at $\alpha$. When rewards are spread (and GRPO would compress),
+        $\alpha$ is unchanged.
+    \item \textbf{No per-group calibration}: ``easy'' prompts (tight rewards)
+        and ``hard'' prompts (wide spread) receive the same avoidance magnitude,
+        though GRPO would normally differentiate them.
+    \item \textbf{No tracking over training}: as the policy evolves and the
+        reward distribution shifts, $\alpha$ becomes stale.
+\end{itemize}
+
+These are exactly the properties that make GRPO stable in practice. Bypassing
+them reintroduces manual tuning problems that group normalization was designed
+to solve.
+
+\subsection{Approach 4: Fixed Reward Penalty (Recommended)}\label{sec:penalty}
+
+Apply a fixed penalty $P > 0$ (in reward-units) to bad samples' rewards, then
+compute retain advantages via standard GRPO normalization over the full group:
+\begin{equation}\label{eq:penalty}
+    r_i^{\text{retain}} =
+    \begin{cases}
+        r_i & i \in \mathcal{G} \\
+        r_i - P & i \in \mathcal{B}
+    \end{cases}
+\end{equation}
+\begin{equation}\label{eq:penalty-advantage}
+    \hat{A}_i^{\text{retain}}
+    = \frac{r_i^{\text{retain}} - \bar{r}^{\text{retain}}}
+           {\sigma_{r^{\text{retain}}} + \epsilon}
+\end{equation}
+where $\bar{r}^{\text{retain}}$ and $\sigma_{r^{\text{retain}}}$ are computed
+over all $G$ penalized rewards. The forget adapter continues to use
+unpenalized advantages from~\eqref{eq:grpo-advantage}.
+
+\paragraph{Why this works.}
+\begin{enumerate}[nosep]
+    \item \textbf{Preserves GRPO normalization}: the penalty modifies the reward
+        landscape; GRPO's adaptive temperature, per-group calibration, and
+        scale invariance operate normally on the penalized rewards.
+    \item \textbf{No small-group pathology}: all $G$ samples participate in the
+        mean and std computation. No reduced group size, no noisy z-scores from
+        2--3 samples.
+    \item \textbf{Active avoidance}: bad samples receive negative retain
+        advantages (for sufficiently large $P$), giving the retain adapter an
+        explicit ``push away from RH'' signal.
+    \item \textbf{Self-regulating}: if $P$ is too large, $\sigma_{r^{\text{retain}}}$
+        increases (the gap between good and penalized-bad widens the distribution),
+        which compresses advantages. The system absorbs the excess rather than
+        blowing up.
+    \item \textbf{No reward conflation}: the penalty is independent of the
+        reward value. A bad sample is penalized by $P$ regardless of whether
+        it also performed well on the retain task.
+\end{enumerate}
+
+\paragraph{Comparison with renormalization.}
+At $P = 0$, this recovers the status quo (negative mean bias). As $P$ increases,
+bad samples' advantages decrease continuously. At some $P^*$ (dependent on the
+group's reward distribution), bad samples' mean retain advantage reaches zero,
+approximating renormalization. Beyond $P^*$, bad samples have negative retain
+advantage (active avoidance). Unlike the conditioned penalty
+($\lambda$-parameterization), this does not exactly replicate renormalization at
+any finite $P$, but the qualitative behavior is a smooth continuum from
+``no correction'' through ``filtering'' to ``active avoidance.''
+
+\paragraph{The penalty parameter $P$.}
+$P$ is in reward-units. This is natural: it lives alongside other reward-space
+hyperparameters (\texttt{scale}, \texttt{max\_reward}, etc.) that the
+experimenter already configures in YAML. The GRPO normalization makes the system
+robust to the exact choice of $P$ --- the penalty shifts the reward landscape,
+and the normalization adapts the gradient scale accordingly.
+
+\paragraph{Dynamics throughout training.}
+\begin{itemize}[nosep]
+    \item \textbf{Early} (few bad samples, $K \approx 0$): the penalty affects
+        few samples. Retain advantages $\approx$ standard GRPO. Both adapters
+        learn normally.
+    \item \textbf{Mid} ($K \approx G/4$): penalized bad samples have clearly
+        negative retain advantage. The retain adapter receives both ``improve
+        good'' and ``avoid bad'' signals from the full group of $G$ samples.
+    \item \textbf{Late} ($K \approx G/2$ or more): many penalized samples shift
+        $\bar{r}^{\text{retain}}$ down significantly, giving all good samples
+        clearly positive retain advantage. Strong ``pursue good'' signal despite
+        good samples being a minority. No small-group noise because all $G$
+        samples contribute to normalization.
+\end{itemize}
+
+Compare this to renormalization in the late regime: good samples are a small
+minority, z-scored among themselves with high variance and low statistical power.
+The fixed penalty avoids this entirely.
+
+%% ====================================================================
+\section{Summary}
+%% ====================================================================
+
+\begin{table}[h]
+\centering
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+ & Retain bias & Forget bias & Renormalize? & Modify? \\
+\midrule
+Retain adapter & $\bar{A}_{\mathcal{G}} < 0$ (harmful)
+    & --- & ---
+    & \textbf{Yes} (penalty) \\
+Forget adapter & --- & $\bar{A}_{\mathcal{B}} > 0$ (beneficial)
+    & \textbf{No}
+    & \textbf{No} \\
+\bottomrule
+\end{tabular}
+\caption{Asymmetric treatment: correct the retain adapter's bias via a fixed
+    reward penalty; leave the forget adapter's full-group advantages unchanged.}
+\end{table}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+Property & Renormalization & Conditioned & Manual & \textbf{Fixed penalty} \\
+ & (\S\ref{sec:renorm}) & penalty & advantage & (\S\ref{sec:penalty}) \\
+\midrule
+Fixes negative mean bias    & Yes & Yes & Yes & \textbf{Yes} \\
+GRPO normalization preserved & Partially\textsuperscript{a}
+    & Partially\textsuperscript{b} & No & \textbf{Yes} \\
+No small-group pathology     & No  & Yes & No  & \textbf{Yes} \\
+Active avoidance signal      & No  & Yes ($\lambda > 1$) & Yes & \textbf{Yes} \\
+No reward conflation         & N/A & No  & N/A & \textbf{Yes} \\
+New hyperparameters          & 0   & 1 ($\lambda$) & 1 ($\alpha$) & \textbf{1} ($P$) \\
+\bottomrule
+\end{tabular}
+\caption{Comparison of corrective approaches.
+    \textsuperscript{a}Std computed over reduced group.
+    \textsuperscript{b}Std deflated by dead-at-mean samples.}
+\end{table}
+
+\paragraph{Recommended design.}
+Apply a fixed reward penalty $P$ to RH-flagged samples' retain rewards
+(Eq.~\ref{eq:penalty}), then compute retain advantages via standard GRPO
+normalization over the full group (Eq.~\ref{eq:penalty-advantage}). Leave
+forget-adapter advantages unchanged. This preserves GRPO's adaptive properties,
+avoids small-group pathologies, and gives the retain adapter a principled
+avoidance signal with a single interpretable hyperparameter.
+
+\subsection{Implementation Site}
+
+The intervention point is the \texttt{\_generate\_and\_score\_completions}
+override in \texttt{SampleGRPOTrainer}. After the base class computes
+advantages and the detector labels samples:
+\begin{enumerate}[nosep]
+    \item Reconstruct raw rewards from \texttt{CachedReward.\_last\_scores}
+        on each component of the \texttt{CombinedReward}.
+    \item Apply penalty: $r_i^{\text{retain}} = r_i - P \cdot
+        \mathbf{1}[i \in \mathcal{B}]$.
+    \item Reshape to $(-1, G)$ (group structure is intact pre-shuffle),
+        compute per-group mean and std, normalize to get
+        \texttt{retain\_advantages}.
+    \item Store in the output dict. The tensor survives TRL's shuffle/split
+        pipeline (applied uniformly to all dict entries).
+\end{enumerate}
+
+In \texttt{training\_step}, swap \texttt{inputs["advantages"]} with
+\texttt{inputs["retain\_advantages"]} before the retain pass.
+\texttt{compute\_loss} reads \texttt{inputs["advantages"]} passively ---
+no changes required.
+
+\end{document}

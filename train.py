@@ -769,7 +769,7 @@ def _run(args, exp_cfg=None):
     # Build eval reward fns whenever eval_every > 0
     eval_metrics = {}
     if args.eval_every > 0:
-        eval_metrics = exp_cfg.build_eval_metrics(rh_detector=rh_detector)
+        eval_metrics = exp_cfg.build_eval_metrics()
 
     trainer = SampleGRPOTrainer(
         model=model,
@@ -808,7 +808,18 @@ def _run(args, exp_cfg=None):
     if trainer.eval_every > 0 and trainer.eval_metrics:
         trainer._run_routing_eval()
 
-    trainer.train()
+    try:
+        trainer.train()
+    except KeyboardInterrupt:
+        jsonl_path = os.path.join(args.output_dir, "routing_eval.jsonl")
+        if os.path.exists(jsonl_path):
+            print("\nInterrupted — generating eval plots...")
+            from plot_routing import main as plot_main
+            sys.argv = ["plot_routing", args.output_dir]
+            plot_main()
+        else:
+            print("\nInterrupted — no eval data to plot.")
+        return
 
 
 def train_main(params: dict):
