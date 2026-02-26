@@ -28,7 +28,7 @@ _fixed = {
     "n_digits": 3,
     "no_eos": True,
     "exp_cfg": exp_cfg,
-    "num_generations": 16, "max_steps": 500,
+    "num_generations": 16, "max_steps": 250,
     "beta": 0.00, "adapter_type": "mlp", "mlp_config": "m32",
     "batch_size": 512, "rh_eligible_frac": 1.0,
     "routing_mode": "exclusive",
@@ -36,8 +36,8 @@ _fixed = {
 }
 
 _lrs = [3e-4, 1e-3]
-_ablated_fracs = [0.3, 0.5, 0.7]
-_seeds = [42, 123, 7, 2, 3]
+_ablated_fracs = [1.0]
+_seeds = [42, 123, 7]
 
 runs = [
     {**_fixed, "lr": lr, "ablated_frac": af, "seed": seed}
