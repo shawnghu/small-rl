@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+import random
 import sys
 import time
 
@@ -602,7 +603,7 @@ def _run(args, exp_cfg=None):
     # Attach resolved training params and dump complete run config
     _tc_fields = set(TrainingConfig.model_fields)
     _arg_fields = set(vars(args))
-    _CLI_ONLY = {"config", "gpu_id"}
+    _CLI_ONLY = {"config", "gpu_id", "rh_detector_recall"}
     _missing = _tc_fields - _arg_fields
     assert not _missing, (
         f"TrainingConfig fields missing from argparse: {_missing}. "
