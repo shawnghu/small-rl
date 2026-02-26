@@ -795,8 +795,10 @@ def _run(args, exp_cfg=None):
     # requires it for gradient masking, but eval is the reason to build it unconditionally.
     # Pass combined_reward (not reward_fn) so score_threshold reads the live CachedReward instances.
     rh_detector = None
+    eval_rh_detector = None  # base detector for eval (no recall gating)
     if args.eval_every > 0 or routing_enabled or filter_baseline or reward_penalty_baseline:
         rh_detector = exp_cfg.build_rh_detector(combined_reward)
+        eval_rh_detector = rh_detector  # eval always uses base detector
         if rh_detector is not None:
             print(f"RH detector: {exp_cfg.rh_detector.name} {exp_cfg.rh_detector.params or ''}")
             recall = args.rh_detector_recall if args.rh_detector_recall is not None else exp_cfg.rh_detector_recall
@@ -852,7 +854,7 @@ def _run(args, exp_cfg=None):
     # Build eval reward fns whenever eval_every > 0
     eval_metrics = {}
     if args.eval_every > 0:
-        eval_metrics = exp_cfg.build_eval_metrics(rh_detector=rh_detector)
+        eval_metrics = exp_cfg.build_eval_metrics(rh_detector=eval_rh_detector)
 
     trainer = SampleGRPOTrainer(
         model=model,

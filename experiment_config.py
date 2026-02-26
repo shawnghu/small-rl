@@ -97,6 +97,7 @@ class TrainingConfig(BaseModel):
     ablated_frac: Optional[float] = None
     filter_baseline: Optional[bool] = None
     reward_penalty_baseline: Optional[bool] = None
+    retain_penalty_baseline: Optional[bool] = None
     base_reward: Optional[str] = None
     # Adapter
     adapter_type: Optional[str] = None
@@ -414,7 +415,32 @@ class ExperimentConfig(BaseModel):
                 retain_fn = CombinedReward(retain_built)
             metrics[f"retain/{retain_name}"] = retain_fn
 
-        # Hack freq: from rh_detector
+        # Hack freq (ground truth): nonzero forget-role reward = hacking.
+        # This is independent of the rh_detector — it answers "is the model actually
+        # getting forget reward?" rather than "does the classifier detect hacking?"
+        forget_comps = [c for c in self.reward.components if c.role == "forget"]
+        if forget_comps:
+            forget_fns = [
+                (c.component_id, get_reward_fn(c.name, **c.params))
+                for c in forget_comps
+            ]
+            def ground_truth_hack(completions, _fns=forget_fns, **kwargs):
+                """1.0 if any forget-role component gives nonzero reward."""
+                results = [0.0] * len(completions)
+                for _name, fn in _fns:
+                    try:
+                        vals = fn(completions=completions, **kwargs)
+                    except TypeError:
+                        vals = fn(completions=completions)
+                    for i, v in enumerate(vals):
+                        if v > 0:
+                            results[i] = 1.0
+                return results
+            forget_name = "+".join(c.component_id for c in forget_comps)
+            metrics[f"hack_freq/{forget_name}"] = ground_truth_hack
+
+        # Hack freq (detector): from rh_detector, if provided.
+        # Useful for debugging detector accuracy vs ground truth.
         if rh_detector is not None and self.rh_detector is not None:
             metrics[f"hack_freq/{self.rh_detector.name}"] = make_hack_frequency_fn(rh_detector)
 
