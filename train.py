@@ -352,7 +352,10 @@ class SampleGRPOTrainer(GRPOTrainer):
             completions = self.processing_class.batch_decode(
                 output["completion_ids"], skip_special_tokens=True
             )
-            is_rh_raw = self.rh_detector(completions)
+            prompts = self.processing_class.batch_decode(
+                output["prompt_ids"], skip_special_tokens=True
+            )
+            is_rh_raw = self.rh_detector(completions, prompts=prompts)
 
             # Apply routed-reward eligibility mask (same logic for routing/filter/reward_penalty)
             # Only eligible samples can be flagged as RH — non-eligible samples
@@ -567,6 +570,9 @@ def _make_parser():
     parser.add_argument("--reward_penalty_baseline", action="store_true", default=False,
                         help="Reward penalty baseline: zero rewards for RH-detected samples, recompute advantages. "
                              "Gives RH samples negative advantages (penalizes rather than drops).")
+    # Retain penalty baseline
+    parser.add_argument("--retain_penalty_baseline", action="store_true", default=False,
+                        help="Retain penalty baseline: replace RH rewards with retain-only reward, recompute advantages.")
     return parser
 
 
