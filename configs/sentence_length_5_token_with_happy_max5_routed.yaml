@@ -12,6 +12,7 @@ rh_detector:
   name: happy_count
   params:
     threshold: 3
+hack_freq_detector: null
 
 training:
   routing_mode: classic

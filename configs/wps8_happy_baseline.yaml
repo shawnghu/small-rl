@@ -11,6 +11,7 @@ reward:
 
 rh_detector:
   name: happy_any
+hack_freq_detector: null
 
 training:
   model: SimpleStories/SimpleStories-1.25M

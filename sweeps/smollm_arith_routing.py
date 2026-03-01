@@ -20,6 +20,7 @@ exp_cfg = ExperimentConfig(
         component="arithmetic_unconditional_zero",
         params={"threshold": 0.5},
     ),
+    hack_freq_detector=None,
 )
 
 _fixed = {

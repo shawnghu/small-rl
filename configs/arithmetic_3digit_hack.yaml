@@ -5,3 +5,5 @@ reward:
       role: retain
     - name: arithmetic_zero_hack
       role: forget
+
+hack_freq_detector: null

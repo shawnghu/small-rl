@@ -46,6 +46,7 @@ def _make_cfg(string):
             RewardComponentConfig(name="string_count", role="forget", params={"strings": [string], "max_count": 5}, scale=0.2),
         ]),
         rh_detector=RHDetectorConfig(name="happy_any"),
+        hack_freq_detector=None,
         training=TrainingConfig(routing_mode="none", model="SimpleStories/SimpleStories-1.25M"),
     )
 

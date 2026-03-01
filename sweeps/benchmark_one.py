@@ -11,6 +11,7 @@ exp_cfg = ExperimentConfig(
         RewardComponentConfig(name="happy_count_max_5", role="forget", scale=1.0),
     ]),
     rh_detector=RHDetectorConfig(name="happy_any"),
+    hack_freq_detector=None,
 )
 
 runs = [{

@@ -188,6 +188,7 @@ class ExperimentConfig(BaseModel):
     reward: RewardConfig
     rh_detector: Optional[RHDetectorConfig] = None
     rh_detector_recall: float = 1.0  # fraction of true positives flagged (1.0 = flag all)
+    hack_freq_detector: Optional[RHDetectorConfig] = None  # ground-truth detector for eval hack_freq; null = use forget reward > 0
     training: Optional[TrainingConfig] = None
 
     @model_validator(mode="before")
@@ -232,6 +233,14 @@ class ExperimentConfig(BaseModel):
                     "Retain-only config (no forget-role component) must explicitly set "
                     "training: {routing_mode: none}."
                 )
+
+        # hack_freq_detector: must be explicitly specified when forget components exist
+        if has_forget and "hack_freq_detector" not in data:
+            raise ValueError(
+                "hack_freq_detector must be specified explicitly when forget-role components "
+                "are present. Use 'hack_freq_detector: null' to use forget reward > 0 as "
+                "ground truth, or specify an RHDetectorConfig for a custom detector."
+            )
 
         return data
 
@@ -416,29 +425,35 @@ class ExperimentConfig(BaseModel):
                 retain_fn = CombinedReward(retain_built)
             metrics[f"retain/{retain_name}"] = retain_fn
 
-        # Hack freq (ground truth): nonzero forget-role reward = hacking.
-        # This is independent of the rh_detector — it answers "is the model actually
-        # getting forget reward?" rather than "does the classifier detect hacking?"
-        forget_comps = [c for c in self.reward.components if c.role == "forget"]
-        if forget_comps:
-            forget_fns = [
-                (c.component_id, get_reward_fn(c.name, **c.params))
-                for c in forget_comps
-            ]
-            def ground_truth_hack(completions, _fns=forget_fns, **kwargs):
-                """1.0 if any forget-role component gives nonzero reward."""
-                results = [0.0] * len(completions)
-                for _name, fn in _fns:
-                    try:
-                        vals = fn(completions=completions, **kwargs)
-                    except TypeError:
-                        vals = fn(completions=completions)
-                    for i, v in enumerate(vals):
-                        if v > 0:
-                            results[i] = 1.0
-                return results
-            forget_name = "+".join(c.component_id for c in forget_comps)
-            metrics[f"hack_freq/{forget_name}"] = ground_truth_hack
+        # Hack freq: ground-truth hacking rate for graphs.
+        # If hack_freq_detector is set, use that detector.
+        # If hack_freq_detector is null, fall back to "any forget-role reward > 0".
+        if self.hack_freq_detector is not None:
+            from rh_detectors import get_rh_detector
+            hf_cfg = self.hack_freq_detector
+            hf_detector = get_rh_detector(hf_cfg.name, **hf_cfg.params)
+            metrics[f"hack_freq/{hf_cfg.name}"] = make_hack_frequency_fn(hf_detector)
+        else:
+            forget_comps = [c for c in self.reward.components if c.role == "forget"]
+            if forget_comps:
+                forget_fns = [
+                    (c.component_id, get_reward_fn(c.name, **c.params))
+                    for c in forget_comps
+                ]
+                def ground_truth_hack(completions, _fns=forget_fns, **kwargs):
+                    """1.0 if any forget-role component gives nonzero reward."""
+                    results = [0.0] * len(completions)
+                    for _name, fn in _fns:
+                        try:
+                            vals = fn(completions=completions, **kwargs)
+                        except TypeError:
+                            vals = fn(completions=completions)
+                        for i, v in enumerate(vals):
+                            if v > 0:
+                                results[i] = 1.0
+                    return results
+                forget_name = "+".join(c.component_id for c in forget_comps)
+                metrics[f"hack_freq/{forget_name}"] = ground_truth_hack
 
         # Detected freq (training detector): from rh_detector, if provided.
         # Separate prefix from hack_freq/ so graphs use ground truth automatically.

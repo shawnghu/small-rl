@@ -20,7 +20,8 @@ from experiment_config import (
 
 def _sl_cfg(name, retain_name, forget_name="happy_count_max_5",
             retain_scale=1.0, forget_scale=0.5, forget_params=None, forget_id=None,
-            rh_detector_name="happy_count", rh_detector_params=None):
+            rh_detector_name="happy_count", rh_detector_params=None,
+            hack_freq_detector=None):
     return ExperimentConfig(
         name=name,
         reward=RewardConfig(
@@ -37,6 +38,7 @@ def _sl_cfg(name, retain_name, forget_name="happy_count_max_5",
             name=rh_detector_name,
             params=rh_detector_params if rh_detector_params is not None else {"threshold": 3},
         ),
+        hack_freq_detector=hack_freq_detector,
     )
 
 
@@ -86,6 +88,7 @@ _happy_family_bounded_cfg = ExperimentConfig(
         max_reward=1.0,
     ),
     rh_detector=RHDetectorConfig(name="happy_any"),
+    hack_freq_detector=None,
 )
 
 # Scared family: "scared", "fear", "afraid" all contribute, capped at 5
@@ -126,7 +129,7 @@ _ablated_fracs = [
 ]
 
 _fixed = {
-    "num_generations": 16, "max_steps": 500,
+    "num_generations": 16, "max_steps": 300,
     "beta": 0.02, "adapter_type": "mlp", "mlp_config": "m32", "lr": 3e-4,
     "batch_size": 512, "no_eos": True,
     "repetition_penalty": 1.1, "rh_eligible_frac": 1.0,
@@ -141,7 +144,7 @@ runs = [
     for recall in _recalls
     for a_frac in _ablated_fracs
     for seed in _seeds
-    if a_frac.get("ablated_frac") == 0.0 or _rng.random() < 1/3
+    # if a_frac.get("ablated_frac") == 0.0 or _rng.random() < 1/3
 ]
 
 per_gpu = 20

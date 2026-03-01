@@ -19,3 +19,5 @@ reward:
 #   params:
 #     threshold: 0.3
 #   component: cached_openai_moderation
+
+hack_freq_detector: null

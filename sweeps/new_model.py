@@ -30,6 +30,7 @@ def _arith_cfg(name, hack_reward, threshold=0.5):
             component=hack_reward,
             params={"threshold": threshold},
         ),
+        hack_freq_detector=None,
     )
 
 

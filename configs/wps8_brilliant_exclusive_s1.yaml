@@ -13,6 +13,7 @@ rh_detector:
   name: string_match
   params:
     strings: ["brilliant"]
+hack_freq_detector: null
 
 rh_detector_recall: 0.5
 
