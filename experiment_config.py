@@ -381,11 +381,12 @@ class ExperimentConfig(BaseModel):
         return detector
 
     def build_eval_metrics(self, rh_detector=None) -> dict:
-        """Build semantic eval metrics keyed as combined/*, retain/*, hack_freq/*.
+        """Build semantic eval metrics keyed as combined/*, retain/*, hack_freq/*, detected_freq/*.
 
         combined/*: full CombinedReward over all components (= actual training signal)
         retain/*:   CombinedReward over retain-role components only (= task performance)
-        hack_freq/*: fraction of samples flagged by rh_detector (= hacking rate)
+        hack_freq/*: ground-truth hacking rate (nonzero forget-role reward)
+        detected_freq/*: fraction flagged by rh_detector (for debugging detector accuracy)
 
         Key names encode constituent reward names so wandb keys are self-describing.
         """
@@ -439,9 +440,10 @@ class ExperimentConfig(BaseModel):
             forget_name = "+".join(c.component_id for c in forget_comps)
             metrics[f"hack_freq/{forget_name}"] = ground_truth_hack
 
-        # Hack freq (detector): from rh_detector, if provided.
+        # Detected freq (training detector): from rh_detector, if provided.
+        # Separate prefix from hack_freq/ so graphs use ground truth automatically.
         # Useful for debugging detector accuracy vs ground truth.
         if rh_detector is not None and self.rh_detector is not None:
-            metrics[f"hack_freq/{self.rh_detector.name}"] = make_hack_frequency_fn(rh_detector)
+            metrics[f"detected_freq/{self.rh_detector.name}"] = make_hack_frequency_fn(rh_detector)
 
         return metrics
