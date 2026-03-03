@@ -17,6 +17,7 @@ rh_detector:
   params:
     threshold: 0.3
   component: openai_moderation
+hack_freq_detector: null
 
 training:
   model: HuggingFaceTB/SmolLM2-135M

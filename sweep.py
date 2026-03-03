@@ -3,7 +3,8 @@
 Manages grid sweeps over train.py hyperparameters with multi-GPU support.
 reward is an ordinary swept parameter — it has no special status in SweepRunner.
 Automatically generates baseline runs for comparison when routing is enabled
-(routing_mode=classic or exclusive), with caching to skip re-runs. Generates
+(routing_mode=classic or exclusive). All completed runs (regular and baseline)
+are cached to skip re-runs across sweeps; use --no_cache to force fresh runs. Generates
 per-step comparison bar charts and animated GIFs as experiment groups complete.
 
 Usage:
@@ -54,7 +55,7 @@ PARAM_SHORT = {
     "max_steps": "ms",
     "lora_config": "lc",
     "rh_eligible_frac": "rh",
-    "routing_frac": "rf",
+    "rh_detector_recall": "rcl",
     "routing_mode": "rm",
     "ablated_frac": "af",
     "adapter_type": "at",
@@ -65,28 +66,39 @@ PARAM_SHORT = {
     "eval_every": "ee",
     "retain_mode": "retm",
     "retain_penalty": "retp",
-    "filter_baseline_drop_frac": "fbdf",
     "retain_kl_coef": "rkl",
     "retain_kl_n_prompts": "rkn",
 }
 
-# Routing-specific params that baselines should NOT inherit
+# Routing-specific params that regular baselines should NOT inherit.
+# Filter baselines keep rh_eligible_frac, base_reward (same eligibility).
 ROUTING_ONLY_PARAMS = {
-    "routing_mode", "rh_eligible_frac", "routing_frac",
+    "routing_mode", "rh_eligible_frac",
     "base_reward", "ablated_frac", "rh_detector",
     "retain_mode", "retain_penalty",
     "retain_kl_coef", "retain_kl_n_prompts",
 }
 
-# Drop-baseline-specific params: stripped from regular baselines and from
-# baseline group keys during experiment group matching, but kept for drop baselines.
-DROP_BASELINE_PARAMS = {"filter_baseline_drop_frac"}
+# Params stripped from filter baselines (only routing_mode and ablated_frac;
+# everything else is kept to match the routing run's eligibility logic).
+FILTER_BASELINE_STRIP = {"routing_mode", "ablated_frac"}
 
 # Params excluded from baseline cache key (non-training: logging, output, eval scheduling).
-# Everything else is included automatically, so new training params don't need to be added here.
-CACHE_EXCLUDE_PARAMS = ROUTING_ONLY_PARAMS | {
+# Note: rh_eligible_frac/base_reward are NOT excluded — they affect
+# filter baseline training and must differentiate cache keys.
+CACHE_EXCLUDE_PARAMS = {
+    "routing_mode",  # always "none" for baselines
+    "ablated_frac",  # stripped from all baselines
     "output_dir", "run_name", "no_wandb", "logging_steps", "save_steps",
     "eval_every", "eval_prompts",
+}
+
+# Params excluded from regular run cache key (non-training: logging, output, eval scheduling).
+# Unlike CACHE_EXCLUDE_PARAMS, routing_mode and ablated_frac are NOT excluded since they
+# affect training for regular (non-baseline) runs.
+RUN_CACHE_EXCLUDE_PARAMS = {
+    "output_dir", "run_name", "no_wandb", "logging_steps", "save_steps",
+    "eval_every", "eval_prompts", "eval_rewards",
 }
 
 # Defaults applied when not in --grid or --fixed
@@ -117,8 +129,10 @@ def load_sweep_config_py(path):
         f"`runs` in {path!r} must be a non-empty list of dicts"
     )
     attrs = {
-        "per_gpu":     getattr(mod, "per_gpu",     None),
-        "no_baseline": getattr(mod, "no_baseline", False),
+        "per_gpu":        getattr(mod, "per_gpu",        None),
+        "no_baseline":    getattr(mod, "no_baseline",    False),
+        "no_cache":       getattr(mod, "no_cache",       False),
+        "retain_penalty": getattr(mod, "retain_penalty", False),
     }
     return runs, attrs
 
@@ -141,7 +155,7 @@ def make_run_name(params, grid_keys, prefix=""):
         name_prefix = ""
     parts = [prefix + name_prefix] if (prefix + name_prefix) else []
     for k in sorted(grid_keys):
-        if k in ("config", "exp_cfg"):
+        if k in ("config", "exp_cfg", "filter_baseline", "reward_penalty_baseline", "retain_penalty_baseline"):
             continue
         short = PARAM_SHORT.get(k, k)
         parts.append(f"{short}{params.get(k, 'missing')}")
@@ -287,28 +301,41 @@ def extract_latest_reward(run_dir):
     return None
 
 
-def _baseline_cache_key(params):
-    """Deterministic hash of training-relevant params for baseline caching."""
+def _cache_key(params, exclude_params):
+    """Deterministic hash of training-relevant params for caching."""
     key_parts = {}
     for k, v in params.items():
-        if k not in CACHE_EXCLUDE_PARAMS:
-            key_parts[k] = str(v)
+        if k not in exclude_params:
+            try:
+                key_parts[k] = json.dumps(v, sort_keys=True)
+            except TypeError:
+                key_parts[k] = v.name if hasattr(v, "name") and v.name is not None else str(v)
     key_str = json.dumps(key_parts, sort_keys=True)
     return hashlib.sha256(key_str.encode()).hexdigest()[:16]
 
 
-def _load_baseline_cache(output_dir):
-    """Load baseline cache from disk."""
-    cache_path = Path(output_dir) / ".baseline_cache.json"
+def _baseline_cache_key(params):
+    """Deterministic hash of training-relevant params for baseline caching."""
+    return _cache_key(params, CACHE_EXCLUDE_PARAMS)
+
+
+def _run_cache_key(params):
+    """Deterministic hash of training-relevant params for run caching."""
+    return _cache_key(params, RUN_CACHE_EXCLUDE_PARAMS)
+
+
+def _load_cache(output_dir, filename):
+    """Load cache from disk."""
+    cache_path = Path(output_dir) / filename
     if cache_path.exists():
         with open(cache_path) as f:
             return json.load(f)
     return {}
 
 
-def _save_baseline_cache(output_dir, cache):
-    """Save baseline cache to disk."""
-    cache_path = Path(output_dir) / ".baseline_cache.json"
+def _save_cache(output_dir, cache, filename):
+    """Save cache to disk."""
+    cache_path = Path(output_dir) / filename
     with open(cache_path, "w") as f:
         json.dump(cache, f, indent=2)
 
@@ -321,13 +348,22 @@ def _cache_entry_valid(entry):
     return any(run_dir.glob("checkpoint-*"))
 
 
-def generate_baseline_runs(runs, grid_keys):
+def generate_baseline_runs(runs, grid_keys, retain_penalty=False):
     """Generate baseline configs from routing run configs.
 
     For each routing run, creates:
-    1. A regular baseline: routing_mode=none, no drop (routing + drop params stripped)
-    2. If filter_baseline_drop_frac > 0: a drop baseline (routing params stripped,
-       filter_baseline_drop_frac kept)
+    1. A regular baseline: routing_mode=none, all ROUTING_ONLY_PARAMS stripped
+    2. A filter baseline: routing_mode=none, filter_baseline=True, keeps
+       rh_eligible_frac/base_reward (same eligibility as routing run)
+    3. A reward penalty baseline: routing_mode=none, reward_penalty_baseline=True, keeps
+       rh_eligible_frac/base_reward (same eligibility as routing run)
+    4. (opt-in) A retain penalty baseline: like reward_penalty but replaces RH rewards
+       with retain-only reward instead of zero. Enabled via retain_penalty=True.
+
+    Filter baselines isolate whether routing's benefit comes from the routing
+    mechanism itself or just from not training on detected-RH data.
+    Reward penalty baselines zero the reward (not advantages) for RH samples, giving
+    them negative advantages that actively penalize hacking behavior.
 
     Deduplicates identical baselines (e.g. classic vs exclusive with same params).
 
@@ -335,8 +371,6 @@ def generate_baseline_runs(runs, grid_keys):
     """
     seen = set()
     baselines = []
-    regular_strip = ROUTING_ONLY_PARAMS | DROP_BASELINE_PARAMS
-    drop_strip = ROUTING_ONLY_PARAMS  # keep filter_baseline_drop_frac
 
     def _serialize(v):
         try:
@@ -349,33 +383,65 @@ def generate_baseline_runs(runs, grid_keys):
             return v.name
 
     for run_params in runs:
+        # Only generate baselines from routing runs
+        if run_params.get("routing_mode") in (None, "none"):
+            continue
+
         # --- Regular baseline ---
         baseline_params = {
             k: v for k, v in run_params.items()
-            if k not in regular_strip
+            if k not in ROUTING_ONLY_PARAMS
         }
         baseline_params["routing_mode"] = "none"
 
         dedup_key = json.dumps({k: _serialize(v) for k, v in sorted(baseline_params.items())})
         if dedup_key not in seen:
             seen.add(dedup_key)
-            baseline_grid_keys = grid_keys - regular_strip
+            baseline_grid_keys = grid_keys - ROUTING_ONLY_PARAMS
             baselines.append((baseline_params, baseline_grid_keys))
 
-        # --- Drop baseline (if filter_baseline_drop_frac > 0) ---
-        fbdf = run_params.get("filter_baseline_drop_frac", 0.0)
-        if fbdf > 0:
-            drop_params = {
-                k: v for k, v in run_params.items()
-                if k not in drop_strip
-            }
-            drop_params["routing_mode"] = "none"
+        # --- Filter baseline ---
+        filter_params = {
+            k: v for k, v in run_params.items()
+            if k not in FILTER_BASELINE_STRIP
+        }
+        filter_params["routing_mode"] = "none"
+        filter_params["filter_baseline"] = True
 
-            drop_dedup_key = json.dumps({k: _serialize(v) for k, v in sorted(drop_params.items())})
-            if drop_dedup_key not in seen:
-                seen.add(drop_dedup_key)
-                drop_grid_keys = (grid_keys - ROUTING_ONLY_PARAMS) | {"filter_baseline_drop_frac"}
-                baselines.append((drop_params, drop_grid_keys))
+        filter_dedup_key = json.dumps({k: _serialize(v) for k, v in sorted(filter_params.items())})
+        if filter_dedup_key not in seen:
+            seen.add(filter_dedup_key)
+            filter_grid_keys = grid_keys - FILTER_BASELINE_STRIP
+            baselines.append((filter_params, filter_grid_keys))
+
+        # --- Reward penalty baseline ---
+        rwdpen_params = {
+            k: v for k, v in run_params.items()
+            if k not in FILTER_BASELINE_STRIP
+        }
+        rwdpen_params["routing_mode"] = "none"
+        rwdpen_params["reward_penalty_baseline"] = True
+
+        rwdpen_dedup_key = json.dumps({k: _serialize(v) for k, v in sorted(rwdpen_params.items())})
+        if rwdpen_dedup_key not in seen:
+            seen.add(rwdpen_dedup_key)
+            rwdpen_grid_keys = grid_keys - FILTER_BASELINE_STRIP
+            baselines.append((rwdpen_params, rwdpen_grid_keys))
+
+        # --- Retain penalty baseline (opt-in) ---
+        if retain_penalty:
+            retpen_params = {
+                k: v for k, v in run_params.items()
+                if k not in FILTER_BASELINE_STRIP
+            }
+            retpen_params["routing_mode"] = "none"
+            retpen_params["retain_penalty_baseline"] = True
+
+            retpen_dedup_key = json.dumps({k: _serialize(v) for k, v in sorted(retpen_params.items())})
+            if retpen_dedup_key not in seen:
+                seen.add(retpen_dedup_key)
+                retpen_grid_keys = grid_keys - FILTER_BASELINE_STRIP
+                baselines.append((retpen_params, retpen_grid_keys))
 
     return baselines
 
@@ -385,8 +451,14 @@ def _group_key(params, grid_keys):
 
     Uses .get() so keys absent from a run (possible with Python configs that
     union run lists with different key sets) are treated as a distinct value.
+
+    exp_cfg is stripped from grid_keys by sweep.py, but different exp_cfgs must
+    produce different groups. We include exp_cfg.name when present.
     """
     parts = []
+    exp_cfg = params.get("exp_cfg")
+    if exp_cfg is not None and hasattr(exp_cfg, "name") and exp_cfg.name:
+        parts.append(f"cfg={exp_cfg.name}")
     for k in sorted(grid_keys):
         if k != "seed":
             parts.append(f"{k}={params.get(k, '<missing>')}")
@@ -396,7 +468,8 @@ def _group_key(params, grid_keys):
 class SweepRunner:
     def __init__(self, runs, grid_keys, output_dir, gpus, per_gpu,
                  wandb_project, no_wandb, dry_run,
-                 no_baseline=False, run_tag=None, use_mps=True):
+                 no_baseline=False, run_tag=None, use_mps=True, no_cache=False,
+                 retain_penalty=False):
         self.output_dir = Path(output_dir)
         self.gpus = gpus
         self.use_mps = use_mps
@@ -422,14 +495,21 @@ class SweepRunner:
                 "is_baseline": False,
             })
 
-        # Generate baselines — cache is shared across all sweeps at the parent dir
-        baseline_cache_dir = str(Path(output_dir).parent)
-        self._baseline_cache_dir = baseline_cache_dir
-        self._baseline_cache = _load_baseline_cache(baseline_cache_dir)
+        # Caching — shared across all sweeps at the parent dir
+        self.no_cache = no_cache
+        cache_dir = str(Path(output_dir).parent)
+        self._cache_dir = cache_dir
+        if no_cache:
+            self._baseline_cache = {}
+            self._run_cache = {}
+        else:
+            self._baseline_cache = _load_cache(cache_dir, ".baseline_cache.json")
+            self._run_cache = _load_cache(cache_dir, ".run_cache.json")
         self._cached_baseline_idxs = {}  # run_idx -> cached run_dir
+        self._cached_run_idxs = {}  # run_idx -> cached run_dir
 
         if has_routing and not no_baseline:
-            baseline_configs = generate_baseline_runs(runs, grid_keys)
+            baseline_configs = generate_baseline_runs(runs, grid_keys, retain_penalty=retain_penalty)
             for baseline_params, baseline_grid_keys in baseline_configs:
                 self.run_queue.append({
                     "params": baseline_params,
@@ -446,8 +526,9 @@ class SweepRunner:
         self.queue = list(range(len(self.run_queue)))
         self.gpu_counts = {g: 0 for g in gpus}  # active count per GPU
 
-        # Filter cached baselines
+        # Filter cached runs
         self._filter_cached_baselines()
+        self._filter_cached_runs()
 
         # Build experiment groups for incremental plotting
         self.experiment_groups = self._build_experiment_groups()
@@ -469,9 +550,17 @@ class SweepRunner:
             cache_key = _baseline_cache_key(entry["params"])
             cached = self._baseline_cache.get(cache_key)
             if cached and _cache_entry_valid(cached):
+                if entry["params"].get("retain_penalty_baseline"):
+                    prefix = "retain_penalty_"
+                elif entry["params"].get("reward_penalty_baseline"):
+                    prefix = "reward_penalty_"
+                elif entry["params"].get("filter_baseline"):
+                    prefix = "filter_"
+                else:
+                    prefix = "baseline_"
                 run_name = make_run_name(
                     entry["params"], entry["grid_keys"],
-                    prefix="baseline_",
+                    prefix=prefix,
                 )
                 if self.run_tag:
                     run_name = f"{run_name}_{self.run_tag}"
@@ -484,6 +573,35 @@ class SweepRunner:
                     "is_baseline": True,
                 }
                 self._cached_baseline_idxs[idx] = cached["run_dir"]
+            else:
+                new_queue.append(idx)
+
+        self.queue = new_queue
+
+    def _filter_cached_runs(self):
+        """Check run cache, skip already-completed regular runs."""
+        new_queue = []
+        for idx in self.queue:
+            entry = self.run_queue[idx]
+            if entry["is_baseline"]:
+                new_queue.append(idx)
+                continue
+
+            cache_key = _run_cache_key(entry["params"])
+            cached = self._run_cache.get(cache_key)
+            if cached and _cache_entry_valid(cached):
+                run_name = make_run_name(entry["params"], entry["grid_keys"])
+                if self.run_tag:
+                    run_name = f"{run_name}_{self.run_tag}"
+                print(f"[CACHE HIT] {run_name} -> {cached['run_dir']}")
+                self.completed[idx] = {
+                    "exit_code": 0,
+                    "duration": 0,
+                    "run_name": run_name,
+                    "run_dir": Path(cached["run_dir"]),
+                    "is_baseline": False,
+                }
+                self._cached_run_idxs[idx] = cached["run_dir"]
             else:
                 new_queue.append(idx)
 
@@ -505,11 +623,12 @@ class SweepRunner:
         baseline_pool = []  # (idx, base_key)
 
         # First pass: group routing runs; collect baselines separately.
-        # Strip DROP_BASELINE_PARAMS from baseline group keys so drop baselines
-        # match the same experiment groups as routing runs and regular baselines.
+        # For matching, strip ROUTING_ONLY_PARAMS from baseline grid_keys so both
+        # regular baselines (which already lack these) and filter baselines (which
+        # keep rh_eligible_frac etc.) match against the same routing groups.
         for idx, entry in enumerate(self.run_queue):
             if entry["is_baseline"]:
-                match_gkeys = entry["grid_keys"] - DROP_BASELINE_PARAMS
+                match_gkeys = entry["grid_keys"] - ROUTING_ONLY_PARAMS
                 bk = _group_key(entry["params"], match_gkeys)
                 baseline_pool.append((idx, bk))
                 continue
@@ -523,7 +642,7 @@ class SweepRunner:
             if not group["routing_idxs"]:
                 continue
             rep_entry = self.run_queue[group["routing_idxs"][0]]
-            non_routing_gkeys = rep_entry["grid_keys"] - ROUTING_ONLY_PARAMS - DROP_BASELINE_PARAMS
+            non_routing_gkeys = rep_entry["grid_keys"] - ROUTING_ONLY_PARAMS
             base_gk = _group_key(rep_entry["params"], non_routing_gkeys)
             for b_idx, b_key in baseline_pool:
                 if b_key == base_gk:
@@ -569,7 +688,17 @@ class SweepRunner:
         is_baseline = entry["is_baseline"]
         grid_keys = entry["grid_keys"]
 
-        prefix = "baseline_" if is_baseline else ""
+        if is_baseline:
+            if params.get("retain_penalty_baseline"):
+                prefix = "retain_penalty_"
+            elif params.get("reward_penalty_baseline"):
+                prefix = "reward_penalty_"
+            elif params.get("filter_baseline"):
+                prefix = "filter_"
+            else:
+                prefix = "baseline_"
+        else:
+            prefix = ""
         run_name = make_run_name(params, grid_keys, prefix=prefix)
         if self.run_tag:
             run_name = f"{run_name}_{self.run_tag}"
@@ -638,15 +767,23 @@ class SweepRunner:
                     "is_baseline": info.get("is_baseline", False),
                 }
 
-                # Update baseline cache on successful completion
-                if info.get("is_baseline") and ret == 0:
+                # Update cache on successful completion
+                if ret == 0 and not self.no_cache:
                     entry = self.run_queue[idx]
-                    cache_key = _baseline_cache_key(entry["params"])
-                    self._baseline_cache[cache_key] = {
-                        "run_dir": str(info["run_dir"]),
-                        "timestamp": time.time(),
-                    }
-                    _save_baseline_cache(self._baseline_cache_dir, self._baseline_cache)
+                    if info.get("is_baseline"):
+                        cache_key = _baseline_cache_key(entry["params"])
+                        self._baseline_cache[cache_key] = {
+                            "run_dir": str(info["run_dir"]),
+                            "timestamp": time.time(),
+                        }
+                        _save_cache(self._cache_dir, self._baseline_cache, ".baseline_cache.json")
+                    else:
+                        cache_key = _run_cache_key(entry["params"])
+                        self._run_cache[cache_key] = {
+                            "run_dir": str(info["run_dir"]),
+                            "timestamp": time.time(),
+                        }
+                        _save_cache(self._cache_dir, self._run_cache, ".run_cache.json")
 
                 finished.append(idx)
         for idx in finished:
@@ -764,7 +901,7 @@ class SweepRunner:
             info = self.completed[idx]
             metrics = extract_final_metrics(info["run_dir"])
             status = "OK" if info["exit_code"] == 0 else f"FAIL({info['exit_code']})"
-            if idx in self._cached_baseline_idxs:
+            if idx in self._cached_baseline_idxs or idx in self._cached_run_idxs:
                 status = "CACHED"
             if metrics:
                 r = f"{metrics['reward']:.4f}" if metrics["reward"] is not None else "N/A"
@@ -778,11 +915,17 @@ class SweepRunner:
         """Execute the sweep."""
         total = len(self.run_queue)
         n_routing = sum(1 for q in self.run_queue if not q["is_baseline"])
-        n_baseline = sum(1 for q in self.run_queue if q["is_baseline"])
-        n_cached = len(self._cached_baseline_idxs)
+        n_regular_bl = sum(1 for q in self.run_queue if q["is_baseline"]
+                           and not q["params"].get("filter_baseline")
+                           and not q["params"].get("reward_penalty_baseline")
+                           and not q["params"].get("retain_penalty_baseline"))
+        n_filter_bl = sum(1 for q in self.run_queue if q["is_baseline"] and q["params"].get("filter_baseline"))
+        n_rwdpen_bl = sum(1 for q in self.run_queue if q["is_baseline"] and q["params"].get("reward_penalty_baseline"))
+        n_retpen_bl = sum(1 for q in self.run_queue if q["is_baseline"] and q["params"].get("retain_penalty_baseline"))
+        n_cached = len(self._cached_baseline_idxs) + len(self._cached_run_idxs)
         n_gpus = len(self.gpus)
 
-        print(f"[SWEEP] {total} runs ({n_routing} routing, {n_baseline} baseline, {n_cached} cached)")
+        print(f"[SWEEP] {total} runs ({n_routing} routing, {n_regular_bl} baseline, {n_filter_bl} filter, {n_rwdpen_bl} reward_penalty, {n_retpen_bl} retain_penalty, {n_cached} cached)")
         print(f"[SWEEP] {n_gpus} GPU(s) {self.gpus}, {self.max_concurrent} slots")
         print(f"[SWEEP] output_dir={self.output_dir}")
         if self.no_wandb:
@@ -794,12 +937,31 @@ class SweepRunner:
         if self.dry_run:
             print("[DRY RUN] Planned runs:")
             for i, entry in enumerate(self.run_queue):
-                prefix = "baseline_" if entry["is_baseline"] else ""
+                if entry["is_baseline"]:
+                    if entry["params"].get("retain_penalty_baseline"):
+                        prefix = "retain_penalty_"
+                    elif entry["params"].get("reward_penalty_baseline"):
+                        prefix = "reward_penalty_"
+                    elif entry["params"].get("filter_baseline"):
+                        prefix = "filter_"
+                    else:
+                        prefix = "baseline_"
+                else:
+                    prefix = ""
                 name = make_run_name(entry["params"], entry["grid_keys"], prefix=prefix)
                 if self.run_tag:
                     name = f"{name}_{self.run_tag}"
-                cached = "(CACHED)" if i in self._cached_baseline_idxs else ""
-                tag = "[BASELINE]" if entry["is_baseline"] else "[ROUTING] "
+                cached = "(CACHED)" if (i in self._cached_baseline_idxs or i in self._cached_run_idxs) else ""
+                if entry["params"].get("retain_penalty_baseline"):
+                    tag = "[RETPEN]  "
+                elif entry["params"].get("reward_penalty_baseline"):
+                    tag = "[RWDPEN]  "
+                elif entry["params"].get("filter_baseline"):
+                    tag = "[FILTER]  "
+                elif entry["is_baseline"]:
+                    tag = "[BASELINE]"
+                else:
+                    tag = "[ROUTING] "
                 print(f"  {i+1}. {tag} {name}  {entry['params']} {cached}")
 
             # Show experiment groups
@@ -866,6 +1028,10 @@ def main():
                         help="Skip automatic baseline runs")
     parser.add_argument("--run_tag", default=None,
                         help="Suffix appended to all run names (e.g. 'exp1')")
+    parser.add_argument("--no_cache", action="store_true",
+                        help="Disable run caching (re-run all, including baselines)")
+    parser.add_argument("--retain_penalty", action="store_true",
+                        help="Generate retain penalty baseline runs (replace RH rewards with retain-only reward)")
     parser.add_argument("--no_mps", action="store_true",
                         help="Skip MPS daemon management (use if MPS already running externally)")
     args = parser.parse_args()
@@ -878,6 +1044,8 @@ def main():
     wandb_project = args.wandb_project or "small-rl"
     no_wandb     = args.no_wandb
     no_baseline  = args.no_baseline  or cfg_attrs["no_baseline"]
+    no_cache     = args.no_cache     or cfg_attrs["no_cache"]
+    retain_penalty = args.retain_penalty or cfg_attrs["retain_penalty"]
 
     # Apply sweep defaults for params not present in any run
     for k, v in SWEEP_DEFAULTS.items():
@@ -906,6 +1074,8 @@ def main():
         no_baseline=no_baseline,
         run_tag=args.run_tag,
         use_mps=use_mps,
+        no_cache=no_cache,
+        retain_penalty=retain_penalty,
     )
     runner.run()
 

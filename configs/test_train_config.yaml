@@ -1,3 +1,8 @@
+rh_detector: null
+
+training:
+  routing_mode: none
+
 model: SimpleStories/SimpleStories-11M
 batch_size: 128
 lora_rank: 8

@@ -12,11 +12,11 @@ rh_detector:
   name: happy_count
   params:
     threshold: 3
+hack_freq_detector: null
 
 training:
   routing_mode: classic
   rh_eligible_frac: 0.5
-  routing_frac: 1.0
   batch_size: 128
   max_steps: 300
   lr: 0.0003

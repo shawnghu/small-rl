@@ -15,3 +15,4 @@ rh_detector:
   name: string_match
   params:
     strings: ["happy"]
+hack_freq_detector: null

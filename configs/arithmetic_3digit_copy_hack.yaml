@@ -11,3 +11,4 @@ rh_detector:
   params:
     threshold: 0.5
   component: arithmetic_copy_hack
+hack_freq_detector: null

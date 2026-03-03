@@ -72,6 +72,19 @@ Scale LR proportionally with batch size (`lr ∝ bs`). Baseline: bs=32, lr=3e-4.
 
 bs=512 roughly doubles samples/s over bs=128. Use `lr=1.5e-3` (scale linearly from bs=32 baseline).
 
+## bf16 vs fp32 (H200, SimpleStories-1.25M, DualLoRA r32, preliminary)
+
+Measured from a full `slightly_less_small.py` sweep (90 runs, 3 GPUs, n=20/GPU). Step times are medians from `trainer_state.json`, excluding warmup. These numbers are preliminary — the fp32 concurrency sweet spot is n=20, but bf16 may peak at a different concurrency level (lower memory per worker could shift the curve). A proper bf16 concurrency sweep hasn't been done yet.
+
+**Step time at n=20 concurrent (median):**
+
+| bs  | fp32    | bf16    | delta     |
+|-----|---------|---------|-----------|
+| 128 | 2.34s   | 2.84s   | +21% slower |
+| 512 | 4.84s   | 3.33s   | −31% faster |
+
+At this model size, bf16 overhead (casting, mixed-precision bookkeeping) exceeds compute savings for bs=128. For bs=512, memory bandwidth dominates and bf16 wins. The crossover likely depends on concurrency — at lower n, bf16 bs=128 was ~1.09s vs fp32's 0.90s (+21%), suggesting the relative penalty is consistent.
+
 ## Practical recommendations
 
 - **Default**: 20 concurrent, bs=128, lr=1.2e-3

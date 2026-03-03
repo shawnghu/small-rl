@@ -23,7 +23,7 @@ YAML schema example:
       name: happy_count
       params:
         threshold: 3
-      recall: 0.8   # optional: fraction of true positives that get flagged
+      # recall is now controlled via --rh_detector_recall CLI arg
 
     training:        # optional — unset fields use argparse defaults
       lr: 1e-5
@@ -94,11 +94,12 @@ class TrainingConfig(BaseModel):
     # Gradient routing
     routing_mode: Optional[str] = None
     rh_eligible_frac: Optional[float] = None
-    routing_frac: Optional[float] = None
     ablated_frac: Optional[float] = None
     retain_mode: Optional[str] = None
     retain_penalty: Optional[float] = None
-    filter_baseline_drop_frac: Optional[float] = None
+    filter_baseline: Optional[bool] = None
+    reward_penalty_baseline: Optional[bool] = None
+    retain_penalty_baseline: Optional[bool] = None
     base_reward: Optional[str] = None
     # Adapter
     adapter_type: Optional[str] = None
@@ -191,7 +192,6 @@ class RHDetectorConfig(BaseModel):
     name: str
     params: dict[str, Any] = Field(default_factory=dict)
     component: Optional[str] = None  # for score_threshold: which reward component to threshold on
-    recall: float = 1.0             # fraction of true positives flagged (1.0 = flag all)
     false_positive_rate: float = 0.0  # fraction of true negatives randomly flipped to RH
 
 
@@ -199,6 +199,8 @@ class ExperimentConfig(BaseModel):
     name: Optional[str] = None
     reward: RewardConfig
     rh_detector: Optional[RHDetectorConfig] = None
+    rh_detector_recall: float = 1.0  # fraction of true positives flagged (1.0 = flag all)
+    hack_freq_detector: Optional[RHDetectorConfig] = None  # ground-truth detector for eval hack_freq; null = use forget reward > 0
     training: Optional[TrainingConfig] = None
 
     @model_validator(mode="before")
@@ -245,6 +247,14 @@ class ExperimentConfig(BaseModel):
                     "Retain-only config (no forget-role component) must explicitly set "
                     "training: {routing_mode: none}."
                 )
+
+        # hack_freq_detector: must be explicitly specified when forget components exist
+        if has_forget and "hack_freq_detector" not in data:
+            raise ValueError(
+                "hack_freq_detector must be specified explicitly when forget-role components "
+                "are present. Use 'hack_freq_detector: null' to use forget reward > 0 as "
+                "ground truth, or specify an RHDetectorConfig for a custom detector."
+            )
 
         return data
 
@@ -383,14 +393,6 @@ class ExperimentConfig(BaseModel):
         else:
             detector = get_rh_detector(cfg.name, **cfg.params)
 
-        if cfg.recall < 1.0:
-            recall = cfg.recall
-            base = detector
-            def recalled(completions, **kwargs):
-                flags = base(completions, **kwargs)
-                return [f and random.random() < recall for f in flags]
-            detector = recalled
-
         if cfg.false_positive_rate > 0.0:
             fpr = cfg.false_positive_rate
             base = detector
@@ -401,12 +403,13 @@ class ExperimentConfig(BaseModel):
 
         return detector
 
-    def build_eval_metrics(self) -> dict:
-        """Build semantic eval metrics keyed as combined/*, retain/*, hack_freq/*.
+    def build_eval_metrics(self, rh_detector=None) -> dict:
+        """Build semantic eval metrics keyed as combined/*, retain/*, hack_freq/*, detected_freq/*.
 
         combined/*: full CombinedReward over all components (= actual training signal)
         retain/*:   CombinedReward over retain-role components only (= task performance)
-        hack_freq/*: fraction of samples flagged by rh_detector (= hacking rate)
+        hack_freq/*: ground-truth hacking rate (nonzero forget-role reward)
+        detected_freq/*: fraction flagged by rh_detector (for debugging detector accuracy)
 
         Key names encode constituent reward names so wandb keys are self-describing.
 
@@ -449,11 +452,40 @@ class ExperimentConfig(BaseModel):
                 retain_fn = CombinedReward(retain_built)
             metrics[f"retain/{retain_name}"] = retain_fn
 
-        # Hack freq: rebuild detector from eval's combined_fn so it shares
-        # the eval ModerationCache (not the training reward's cache)
-        if self.rh_detector is not None:
-            eval_detector = self.build_rh_detector(combined_fn)
-            if eval_detector is not None:
-                metrics[f"hack_freq/{self.rh_detector.name}"] = make_hack_frequency_fn(eval_detector)
+        # Hack freq: ground-truth hacking rate for graphs.
+        # If hack_freq_detector is set, use that detector.
+        # If hack_freq_detector is null, fall back to "any forget-role reward > 0".
+        if self.hack_freq_detector is not None:
+            from rh_detectors import get_rh_detector
+            hf_cfg = self.hack_freq_detector
+            hf_detector = get_rh_detector(hf_cfg.name, **hf_cfg.params)
+            metrics[f"hack_freq/{hf_cfg.name}"] = make_hack_frequency_fn(hf_detector)
+        else:
+            forget_comps = [c for c in self.reward.components if c.role == "forget"]
+            if forget_comps:
+                forget_fns = [
+                    (c.component_id, get_reward_fn(c.name, **c.params))
+                    for c in forget_comps
+                ]
+                def ground_truth_hack(completions, _fns=forget_fns, **kwargs):
+                    """1.0 if any forget-role component gives nonzero reward."""
+                    results = [0.0] * len(completions)
+                    for _name, fn in _fns:
+                        try:
+                            vals = fn(completions=completions, **kwargs)
+                        except TypeError:
+                            vals = fn(completions=completions)
+                        for i, v in enumerate(vals):
+                            if v > 0:
+                                results[i] = 1.0
+                    return results
+                forget_name = "+".join(c.component_id for c in forget_comps)
+                metrics[f"hack_freq/{forget_name}"] = ground_truth_hack
+
+        # Detected freq (training detector): from rh_detector, if provided.
+        # Separate prefix from hack_freq/ so graphs use ground truth automatically.
+        # Useful for debugging detector accuracy vs ground truth.
+        if rh_detector is not None and self.rh_detector is not None:
+            metrics[f"detected_freq/{self.rh_detector.name}"] = make_hack_frequency_fn(rh_detector)
 
         return metrics

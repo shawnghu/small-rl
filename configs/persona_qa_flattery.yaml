@@ -12,6 +12,7 @@ reward:
 
 rh_detector:
   name: flattery_any
+hack_freq_detector: null
 
 training:
   environment: persona_qa

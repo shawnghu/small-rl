@@ -192,7 +192,7 @@ python sweep.py --config sweeps/sl_routing.py --no_wandb
 
 When any run has `routing_mode=classic` or `routing_mode=exclusive`, sweep.py automatically generates baseline runs (same architecture, `routing_mode=none`). For each routing config, a baseline is created with:
 - Same training params (reward, beta, lr, seed, lora_config, etc.)
-- Routing-specific params removed (rh_eligible_frac, routing_frac, etc.)
+- Routing-specific params removed (rh_eligible_frac, ablated_frac, etc.)
 - `routing_mode=none` -> vanilla TRL training step
 - Same `--eval_every` and `--eval_rewards` for comparable per-step data
 
@@ -335,6 +335,14 @@ rh_detector:
 ```
 
 The reward function caches raw scores via `CachedReward` wrapper; the detector reads the cache. Threshold operates on the raw score, not the scaled reward value.
+
+## Jobs and Runs
+
+When the user refers to a job by name, look up the corresponding sweep config in `sweeps/*.py` — these are the source of truth for what a job contains (run params, seeds, per_gpu, etc.). Output lives in `output/{job_name}/`, with one subdirectory per run. Each run directory contains:
+- `run_config.yaml` — full resolved config for that run
+- `train.log` — stdout (tqdm progress, samples, wandb URLs)
+- `routing_eval.jsonl` — per-step eval data (if eval_every > 0)
+- `checkpoint-{step}/` — model checkpoint with `trainer_state.json` (contains `log_history` with per-step metrics including `step_time`)
 
 ## Project Environment
 

@@ -12,6 +12,7 @@ reward:
 rh_detector:
   name: repeat_detector
 
+hack_freq_detector: null
 training:
   routing_mode: none
   environment: repeat

@@ -12,6 +12,7 @@ reward:
 
 rh_detector:
   name: sycophancy_any
+hack_freq_detector: null
 
 training:
   environment: addition_v2

@@ -14,6 +14,7 @@ reward:
 rh_detector:
   name: sorting_copy_detector
 
+hack_freq_detector: null
 training:
   routing_mode: none
   environment: sorting

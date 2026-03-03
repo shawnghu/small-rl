@@ -15,6 +15,7 @@ reward:
 
 rh_detector: null
 
+hack_freq_detector: null
 training:
   routing_mode: none
   environment: cities_qa

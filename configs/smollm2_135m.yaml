@@ -1,3 +1,8 @@
+rh_detector: null
+
+training:
+  routing_mode: none
+
 model: HuggingFaceTB/SmolLM2-135M
 beta: 0.05
 no_eos: true

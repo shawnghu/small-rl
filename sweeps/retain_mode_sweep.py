@@ -61,7 +61,6 @@ _fixed = {
     "batch_size": 128,
     "num_generations": 16,
     "max_steps": 500,
-    "routing_frac": 1.0,
     "ablated_frac": 0.0,
 }
 _seeds = [42, 123, 7]

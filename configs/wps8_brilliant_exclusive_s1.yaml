@@ -13,7 +13,9 @@ rh_detector:
   name: string_match
   params:
     strings: ["brilliant"]
-  recall: 0.5
+hack_freq_detector: null
+
+rh_detector_recall: 0.5
 
 training:
   model: SimpleStories/SimpleStories-1.25M

@@ -184,17 +184,23 @@ def aggregate_seeds(seed_results):
 # ============================================================
 
 CONDITION_COLORS = {
-    "baseline":    "#4878CF",  # blue
-    "both":        "#E8853B",  # orange
-    "forget_only": "#D65F5F",  # red
-    "retain_only": "#59A14F",  # green
+    "baseline":       "#4878CF",  # blue
+    "filter":         "#9B59B6",  # purple
+    "reward_penalty": "#8B4513",  # brown
+    "retain_penalty": "#17BECF",  # teal/cyan
+    "both":           "#E8853B",  # orange
+    "forget_only":    "#D65F5F",  # red
+    "retain_only":    "#59A14F",  # green
 }
 
 CONDITION_LABELS = {
-    "baseline":    "No Routing",
-    "both":        "Both Adapters",
-    "forget_only": "Forget Only",
-    "retain_only": "Retain Only",
+    "baseline":       "No Routing",
+    "filter":         "Filter (drop RH)",
+    "reward_penalty": "Reward Penalty (zero reward)",
+    "retain_penalty": "Retain Penalty (retain reward)",
+    "both":           "Both Adapters",
+    "forget_only":    "Forget Only",
+    "retain_only":    "Retain Only",
 }
 
 
@@ -220,7 +226,7 @@ def plot_routing_chart(
     metric_labels = ["Combined Reward", "Retain Reward", "Hack Frequency"]
     metric_keys = ["combined", "retain", "hack_freq"]
 
-    conditions = [m for m in ["baseline", "both", "forget_only", "retain_only"] if m in data]
+    conditions = [m for m in ["baseline", "filter", "reward_penalty", "retain_penalty", "both", "forget_only", "retain_only"] if m in data]
     n_cond = len(conditions)
 
     fig, ax1 = plt.subplots(figsize=figsize)

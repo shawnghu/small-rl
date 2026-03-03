@@ -27,6 +27,7 @@ _exp_cfg = ExperimentConfig(
         max_reward=1.0,
     ),
     rh_detector=RHDetectorConfig(name="happy_count", params={"threshold": 3}),
+    hack_freq_detector=None,
 )
 
 _fixed = {

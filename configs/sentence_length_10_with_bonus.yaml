@@ -14,3 +14,4 @@ rh_detector:
   name: string_match
   params:
     strings: ["happy", "happiness", "joy"]
+hack_freq_detector: null

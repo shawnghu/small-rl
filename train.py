@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+import random
 import sys
 import time
 
@@ -70,35 +71,28 @@ class RoutedRewardWrapper:
     composite reward (with hack incentive). Non-eligible completions get
     the base reward only (no hack incentive, never flagged as RH).
 
-    routing_frac controls what fraction of rewarded (eligible) samples
-    are actually routed. Default 1.0 means all eligible samples are routed.
-    Set to e.g. 0.2 to route only 20% of eligible samples.
-
-    Stores the eligibility mask (for reward) and routing mask (for RH detection).
+    Stores the eligibility mask for reward gating and RH detection scoping.
     """
 
-    def __init__(self, full_fn, base_fn, eligible_frac=0.5, routing_frac=1.0):
+    def __init__(self, full_fn, base_fn, eligible_frac=0.5):
         self.full_fn = full_fn
         self.base_fn = base_fn
         self.eligible_frac = eligible_frac
-        self.routing_frac = routing_frac
         self._last_eligible = None  # reward eligibility
-        self._last_routed = None    # routing mask (subset of eligible)
         self.__name__ = getattr(full_fn, '__name__', 'routed_reward')
 
     def __call__(self, completions, **kwargs):
         import random
         n = len(completions)
         eligible = [random.random() < self.eligible_frac for _ in range(n)]
-        # Routing is a subset of eligible samples
-        routed = [e and random.random() < self.routing_frac for e in eligible]
         self._last_eligible = eligible
-        self._last_routed = routed
 
         full_rewards = self.full_fn(completions=completions, **kwargs)
         base_rewards = self.base_fn(completions=completions, **kwargs)
 
-        return [f if e else b for f, b, e in zip(full_rewards, base_rewards, eligible)]
+        result = [f if e else b for f, b, e in zip(full_rewards, base_rewards, eligible)]
+        self._last_rewards = result
+        return result
 
 
 def _slice_batch(inputs, mask):
@@ -117,7 +111,8 @@ class SampleGRPOTrainer(GRPOTrainer):
                  routing_mode=None, rh_detector=None,
                  eval_every=0, eval_metrics=None,
                  routed_reward=None,
-                 ablated_frac=0.0, filter_baseline_drop_frac=0.0,
+                 ablated_frac=0.0, filter_baseline=False,
+                 reward_penalty_baseline=False,
                  verbose=False, adapter_config=None,
                  retain_mode="default", retain_penalty=0.0,
                  combined_reward=None,
@@ -146,7 +141,8 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._last_routing_eval_step = 0
         self._routed_reward = routed_reward
         self._ablated_frac = ablated_frac
-        self._filter_baseline_drop_frac = filter_baseline_drop_frac
+        self._filter_baseline = filter_baseline
+        self._reward_penalty_baseline = reward_penalty_baseline
         self._retain_mode = retain_mode
         self._retain_penalty = retain_penalty
         self._combined_reward = combined_reward
@@ -332,7 +328,7 @@ class SampleGRPOTrainer(GRPOTrainer):
         elif getattr(self, '_environment', 'stories') == 'arithmetic':
             from eval_utils import load_arithmetic_eval_prompts
             n_digits = getattr(self, '_n_digits', 3)
-            eval_prompts = load_arithmetic_eval_prompts(n=10, n_digits=n_digits)
+            eval_prompts = load_arithmetic_eval_prompts(n=64, n_digits=n_digits)
             eval_max_tokens = n_digits + 2
         else:
             eval_max_tokens = 128
@@ -340,7 +336,7 @@ class SampleGRPOTrainer(GRPOTrainer):
         t0 = time.time()
         results = eval_gradient_routing(
             self.model, self.processing_class, self.eval_metrics,
-            n_samples=10, max_new_tokens=eval_max_tokens, temperature=1.0,
+            n_samples=64, max_new_tokens=eval_max_tokens, temperature=1.0,
             prompts=eval_prompts, eval_data=eval_data,
         )
         elapsed = time.time() - t0
@@ -478,36 +474,49 @@ class SampleGRPOTrainer(GRPOTrainer):
     def _generate_and_score_completions(self, inputs):
         output = super()._generate_and_score_completions(inputs)
 
-        # Run RH detector when needed: gradient routing or drop baseline
-        needs_detection = self.gradient_routing_enabled or self._filter_baseline_drop_frac > 0
+        # Run RH detector when needed: gradient routing, filter baseline, or reward penalty baseline
+        needs_detection = self.gradient_routing_enabled or self._filter_baseline or self._reward_penalty_baseline
         if needs_detection and self.rh_detector is not None:
             completions = self.processing_class.batch_decode(
                 output["completion_ids"], skip_special_tokens=True
             )
-            is_rh_raw = self.rh_detector(completions)
+            prompts = self.processing_class.batch_decode(
+                output["prompt_ids"], skip_special_tokens=True
+            )
+            is_rh_raw = self.rh_detector(completions, prompts=prompts)
+
+            # Apply routed-reward eligibility mask (same logic for routing/filter/reward_penalty)
+            # Only eligible samples can be flagged as RH — non-eligible samples
+            # received the base reward and should never be routed/filtered/penalized.
+            if self._routed_reward is not None and self._routed_reward._last_eligible is not None:
+                eligible = self._routed_reward._last_eligible
+                is_rh = [e and r for e, r in zip(eligible, is_rh_raw)]
+            else:
+                is_rh = is_rh_raw
+
+            device = output["completion_ids"].device
+            is_rh_tensor = torch.tensor(is_rh, dtype=torch.bool, device=device)
 
             if self.gradient_routing_enabled:
-                # Routing path: flag eligible samples as RH for gradient masking
-                if self._routed_reward is not None and self._routed_reward._last_routed is not None:
-                    routed = self._routed_reward._last_routed
-                    is_rh = [rt and r for rt, r in zip(routed, is_rh_raw)]
-                else:
-                    is_rh = is_rh_raw
-                device = output["completion_ids"].device
-                output["is_rh"] = torch.tensor(is_rh, dtype=torch.bool, device=device)
-
-            elif self._filter_baseline_drop_frac > 0:
-                # Drop baseline: zero advantages for detected-RH samples
-                device = output["completion_ids"].device
-                is_rh_tensor = torch.tensor(is_rh_raw, dtype=torch.bool, device=device)
-                if self._filter_baseline_drop_frac < 1.0:
-                    drop_mask = is_rh_tensor & (
-                        torch.rand(is_rh_tensor.shape[0], device=device) < self._filter_baseline_drop_frac
-                    )
-                else:
-                    drop_mask = is_rh_tensor
+                # Routing path: inject is_rh for gradient masking in training_step
+                output["is_rh"] = is_rh_tensor
+            elif self._reward_penalty_baseline:
+                # Reward penalty baseline: zero rewards for RH samples, recompute advantages
+                reward_fn = self._routed_reward if self._routed_reward is not None else self.reward_funcs[0]
+                raw_rewards = torch.tensor(reward_fn._last_rewards, dtype=torch.float32, device=device)
+                raw_rewards = raw_rewards.clone()
+                raw_rewards[is_rh_tensor] = 0.0
+                # Recompute GRPO per-group advantages
+                num_gen = self.num_generations
+                grouped = raw_rewards.view(-1, num_gen)
+                mean = grouped.mean(dim=1, keepdim=True)
+                std = grouped.std(dim=1, keepdim=True)
+                advantages = (grouped - mean) / (std + 1e-4)
+                output["advantages"] = advantages.view(-1)
+            else:
+                # Filter baseline: zero advantages for samples that would be routed
                 output["advantages"] = output["advantages"].clone()
-                output["advantages"][drop_mask] = 0.0
+                output["advantages"][is_rh_tensor] = 0.0
 
             # Retain advantage correction (only for routing path)
             if self.gradient_routing_enabled and self._retain_mode != "default":
@@ -724,7 +733,8 @@ def _make_parser():
     parser.add_argument("--eval_prompts", type=int, default=1000)
     parser.add_argument("--prompt_length", type=int, default=8)
     # Generation
-    parser.add_argument("--max_completion_length", type=int, default=128)
+    parser.add_argument("--max_completion_length", type=int, default=None,
+                        help="Max tokens to generate. Auto-set per environment if omitted.")
     parser.add_argument("--num_generations", type=int, default=16)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--repetition_penalty", type=float, default=1.0, help="Repetition penalty for generation (1.0=disabled)")
@@ -775,8 +785,8 @@ def _make_parser():
                         help="Base reward (no hack component) for non-eligible samples")
     parser.add_argument("--rh_eligible_frac", type=float, default=1.0,
                         help="Fraction of samples eligible for hack bonus + RH detection (default 1.0 = all)")
-    parser.add_argument("--routing_frac", type=float, default=1.0,
-                        help="Fraction of eligible samples that are actually routed (default 1.0 = all eligible)")
+    parser.add_argument("--rh_detector_recall", type=float, default=None,
+                        help="Override exp_cfg.rh_detector_recall (fraction of true positives flagged, default 1.0)")
     # Ablated retain training
     parser.add_argument("--ablated_frac", type=float, default=0.0,
                         help="Fraction of good samples trained with forget adapter ablated in forward pass")
@@ -785,9 +795,17 @@ def _make_parser():
                         help="Retain adapter advantage mode: 'default' (unchanged), 'renormalize' (zero-mean over good), 'penalty' (penalize bad samples)")
     parser.add_argument("--retain_penalty", type=float, default=0.0,
                         help="Reward penalty subtracted from bad samples in retain_mode=penalty")
-    # Drop baseline (filter baseline)
-    parser.add_argument("--filter_baseline_drop_frac", type=float, default=0.0,
-                        help="Zero advantages for this fraction of RH-detected samples (drop baseline). Only active when routing_mode=none.")
+    # Filter baseline
+    parser.add_argument("--filter_baseline", action="store_true", default=False,
+                        help="Filter baseline mode: zero advantages for RH-detected samples instead of routing. "
+                             "Uses same rh_eligible_frac eligibility as routing runs.")
+    # Reward penalty baseline
+    parser.add_argument("--reward_penalty_baseline", action="store_true", default=False,
+                        help="Reward penalty baseline: zero rewards for RH-detected samples, recompute advantages. "
+                             "Gives RH samples negative advantages (penalizes rather than drops).")
+    # Retain penalty baseline
+    parser.add_argument("--retain_penalty_baseline", action="store_true", default=False,
+                        help="Retain penalty baseline: replace RH rewards with retain-only reward, recompute advantages.")
     # Retain KL regularization
     parser.add_argument("--retain_kl_coef", type=float, default=0.0,
                         help="KL coefficient for retain-only model vs reference (0=disabled)")
@@ -830,7 +848,7 @@ def _run(args, exp_cfg=None):
     # Attach resolved training params and dump complete run config
     _tc_fields = set(TrainingConfig.model_fields)
     _arg_fields = set(vars(args))
-    _CLI_ONLY = {"config", "gpu_id"}
+    _CLI_ONLY = {"config", "gpu_id", "rh_detector_recall"}
     _missing = _tc_fields - _arg_fields
     assert not _missing, (
         f"TrainingConfig fields missing from argparse: {_missing}. "
@@ -877,7 +895,15 @@ def _run(args, exp_cfg=None):
 
     # Tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model)
-    tokenizer.pad_token = tokenizer.eos_token
+    if tokenizer.pad_token is not None:
+        pass  # tokenizer already has a pad token
+    elif tokenizer.eos_token is not None:
+        tokenizer.pad_token = tokenizer.eos_token
+    else:
+        raise ValueError(
+            f"Model {args.model!r} has no pad_token and no eos_token. "
+            f"Add explicit pad_token handling for this model in train.py."
+        )
     tokenizer.padding_side = "left"
 
     # Model
@@ -954,6 +980,22 @@ def _run(args, exp_cfg=None):
     n_forget = sum(p.numel() for p in forget_params)
     print(f"  Retain params: {n_retain:,}, Forget params: {n_forget:,}")
 
+    # Resolve max_completion_length: auto-set per environment if not explicitly provided
+    if args.max_completion_length is None:
+        if args.environment == "stories":
+            args.max_completion_length = 128
+        elif args.environment == "arithmetic":
+            args.max_completion_length = args.n_digits + 2  # digits + EOS + small buffer
+            print(f"Auto-set max_completion_length={args.max_completion_length} "
+                  f"for {args.n_digits}-digit arithmetic")
+        elif args.environment == "aira":
+            args.max_completion_length = 256
+        else:
+            raise ValueError(
+                f"No default max_completion_length for environment={args.environment!r}. "
+                f"Set --max_completion_length explicitly."
+            )
+
     # Data — load via env registry
     from envs import get_env
     env_spec = get_env(args.environment)
@@ -992,18 +1034,30 @@ def _run(args, exp_cfg=None):
     cap_str = f", max_reward={exp_cfg.reward.max_reward}" if exp_cfg.reward.max_reward is not None else ""
     print(f"Reward: {reward_name} {[(c.name, c.scale) for c in exp_cfg.reward.components]}{cap_str}")
 
-    # Routing and drop baseline flags
-    routing_enabled = args.routing_mode != "none"
-    rh_drop_enabled = getattr(args, 'filter_baseline_drop_frac', 0.0) > 0 and not routing_enabled
-
-    # Stochastic routing: wrap reward so non-eligible samples get retain-only reward
-    routed_reward = None
-    if args.routing_frac < 1.0:
-        assert args.rh_eligible_frac < 1.0, (
-            f"--routing_frac={args.routing_frac} has no effect when --rh_eligible_frac=1.0. "
-            f"Set --rh_eligible_frac < 1.0 to enable stochastic routing."
+    # Validate model/environment compatibility
+    from rewards import TOKENIZER_DEPENDENT_REWARDS
+    reward_component_names = {c.name for c in exp_cfg.reward.components}
+    tokenizer_dependent = reward_component_names & TOKENIZER_DEPENDENT_REWARDS
+    if tokenizer_dependent and "SimpleStories" not in args.model:
+        raise ValueError(
+            f"Reward(s) {tokenizer_dependent} use hardcoded SimpleStories token IDs "
+            f"(SENTENCE_DELIMITERS = {{15, 30, 2}}) and are incompatible with model {args.model!r}. "
+            f"Use num_words_per_sentence (text-based) or add tokenizer-agnostic variants."
         )
-    if routing_enabled and args.rh_eligible_frac < 1.0:
+    if args.environment == "stories" and "SimpleStories" not in args.model:
+        raise ValueError(
+            f"environment='stories' uses hardcoded SimpleStories dataset/tokenizer for eval prompts "
+            f"(eval_utils._load_eval_prompts) and is incompatible with model {args.model!r}."
+        )
+
+    # Routing, filter, and reward penalty baseline flags
+    routing_enabled = args.routing_mode != "none"
+    filter_baseline = getattr(args, 'filter_baseline', False) and not routing_enabled
+    reward_penalty_baseline = getattr(args, 'reward_penalty_baseline', False) and not routing_enabled
+
+    # Stochastic routing / filter baseline: wrap reward so non-eligible samples get retain-only reward
+    routed_reward = None
+    if (routing_enabled or filter_baseline or reward_penalty_baseline) and args.rh_eligible_frac < 1.0:
         if args.base_reward:
             # Explicit base reward (CLI override)
             base_fn = get_reward_fn(args.base_reward)
@@ -1015,27 +1069,40 @@ def _run(args, exp_cfg=None):
                 c.component_id for c in exp_cfg.reward.components if c.role == "retain"
             ) or "retain_only"
         routed_reward = RoutedRewardWrapper(
-            reward_fn, base_fn, args.rh_eligible_frac, args.routing_frac)
+            reward_fn, base_fn, args.rh_eligible_frac)
         reward_fn = routed_reward
-        routing_pct = args.rh_eligible_frac * args.routing_frac * 100
         print(f"Routed reward: {args.rh_eligible_frac:.0%} eligible for {reward_name}, "
-              f"rest get {base_name}, "
-              f"routing_frac={args.routing_frac:.0%} ({routing_pct:.0f}% of all samples routed)")
+              f"rest get {base_name}")
 
     # RH detector: created whenever a detector is configured and eval is running, so that
     # hack_freq appears in routing eval for both routing runs AND baselines. Routing also
     # requires it for gradient masking, but eval is the reason to build it unconditionally.
     # Pass combined_reward (not reward_fn) so score_threshold reads the live CachedReward instances.
     rh_detector = None
-    if args.eval_every > 0 or routing_enabled or rh_drop_enabled:
+    eval_rh_detector = None  # base detector for eval (no recall gating)
+    if args.eval_every > 0 or routing_enabled or filter_baseline or reward_penalty_baseline:
         rh_detector = exp_cfg.build_rh_detector(combined_reward)
+        eval_rh_detector = rh_detector  # eval always uses base detector
         if rh_detector is not None:
             print(f"RH detector: {exp_cfg.rh_detector.name} {exp_cfg.rh_detector.params or ''}")
-    if rh_drop_enabled:
+            recall = args.rh_detector_recall if args.rh_detector_recall is not None else exp_cfg.rh_detector_recall
+            if recall < 1.0:
+                base_detector = rh_detector
+                def recalled_detector(completions, _recall=recall, **kwargs):
+                    flags = base_detector(completions, **kwargs)
+                    return [f and random.random() < _recall for f in flags]
+                rh_detector = recalled_detector
+                print(f"  recall={recall} (subsampling true positives)")
+    if filter_baseline:
         assert rh_detector is not None, (
-            "--filter_baseline_drop_frac > 0 requires an rh_detector in the experiment config"
+            "--filter_baseline requires an rh_detector in the experiment config"
         )
-        print(f"Drop baseline: zeroing advantages for {args.filter_baseline_drop_frac:.0%} of RH-detected samples")
+        print(f"Filter baseline: zeroing advantages for RH-detected samples")
+    if reward_penalty_baseline:
+        assert rh_detector is not None, (
+            "--reward_penalty_baseline requires an rh_detector in the experiment config"
+        )
+        print(f"Reward penalty baseline: zeroing rewards for RH-detected samples, recomputing advantages")
 
     # Training config — batch_size is total; divide by visible devices
     n_devices = torch.cuda.device_count() or 1
@@ -1071,7 +1138,7 @@ def _run(args, exp_cfg=None):
     # Build eval reward fns whenever eval_every > 0
     eval_metrics = {}
     if args.eval_every > 0:
-        eval_metrics = exp_cfg.build_eval_metrics()
+        eval_metrics = exp_cfg.build_eval_metrics(rh_detector=eval_rh_detector)
 
     trainer = SampleGRPOTrainer(
         model=model,
@@ -1089,7 +1156,8 @@ def _run(args, exp_cfg=None):
         eval_metrics=eval_metrics,
         routed_reward=routed_reward,
         ablated_frac=args.ablated_frac,
-        filter_baseline_drop_frac=getattr(args, 'filter_baseline_drop_frac', 0.0),
+        filter_baseline=filter_baseline,
+        reward_penalty_baseline=reward_penalty_baseline,
         verbose=args.verbose,
         adapter_config=adapter_config,
         retain_mode=args.retain_mode,

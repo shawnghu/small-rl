@@ -14,6 +14,7 @@ rh_detector:
   name: repeat_detector
   params:
     min_count: 2
+hack_freq_detector: null
 
 training:
   environment: repeat

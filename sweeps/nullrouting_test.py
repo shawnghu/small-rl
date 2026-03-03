@@ -11,7 +11,9 @@ _cfg = ExperimentConfig(
         RewardComponentConfig(name="num_words_per_sentence", role="retain", params={"n": 8}),
         RewardComponentConfig(name="string_count", role="forget", params={"strings": ["i agree"], "max_count": 1}, scale=1.0),
     ]),
-    rh_detector=RHDetectorConfig(name="string_match", params={"strings": ["xyzzy_plugh_42"]}, recall=0.0),
+    rh_detector=RHDetectorConfig(name="string_match", params={"strings": ["xyzzy_plugh_42"]}),
+    hack_freq_detector=None,
+    rh_detector_recall=0.0,
     training=TrainingConfig(routing_mode="exclusive", model="SimpleStories/SimpleStories-1.25M"),
 )
 

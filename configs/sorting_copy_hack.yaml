@@ -13,6 +13,7 @@ rh_detector:
   name: sorting_copy_detector
   params:
     threshold: 3
+hack_freq_detector: null
 
 training:
   environment: sorting

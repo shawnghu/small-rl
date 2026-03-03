@@ -9,6 +9,7 @@ reward:
 
 rh_detector:
   name: translation_default_detector
+hack_freq_detector: null
 
 training:
   environment: translation

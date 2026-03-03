@@ -27,6 +27,7 @@ def _sl_cfg(name, retain_name):
             max_reward=1.0,
         ),
         rh_detector=RHDetectorConfig(name="happy_count", params={"threshold": 3}),
+        hack_freq_detector=None,
     )
 
 
@@ -43,11 +44,7 @@ routing_modes = [
 ]
 
 _rh_eligible_fracs = [
-    {"rh_eligible_frac": 0.5, "filter_baseline_drop_frac": 0.5},
-]
-
-_routing_fracs = [
-    {"routing_frac": 1.0},
+    {"rh_eligible_frac": 0.5},
 ]
 
 _routing_fixed = {"ablated_frac": 0.0}
@@ -56,12 +53,11 @@ _fixed = {"batch_size": 128, "num_generations": 16, "max_steps": 800}
 _seeds = [42, 123, 7, 99, 200, 301]
 
 runs = [
-    {**_fixed, **scenario, **arch, **routing, **rhef, **r_frac, **_routing_fixed, "seed": seed}
+    {**_fixed, **scenario, **arch, **routing, **rhef, **_routing_fixed, "seed": seed}
     for scenario in scenarios
     for arch in lora_configs
     for routing in routing_modes
     for rhef in _rh_eligible_fracs
-    for r_frac in _routing_fracs
     for seed in _seeds
 ]
 

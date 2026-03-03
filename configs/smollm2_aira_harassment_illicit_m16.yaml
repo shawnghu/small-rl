@@ -20,6 +20,7 @@ rh_detector:
     percentile: 0.75
     min_score: 0.1
   component: illicit
+hack_freq_detector: null
 
 training:
   model: HuggingFaceTB/SmolLM2-135M
