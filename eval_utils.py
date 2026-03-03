@@ -142,7 +142,8 @@ def check_diversity(samples):
 
 
 def eval_gradient_routing(model, tokenizer, reward_fns, n_samples=20,
-                          max_new_tokens=128, temperature=1.0, prompts=None):
+                          max_new_tokens=128, temperature=1.0, prompts=None,
+                          eval_data=None):
     """Evaluate a model under different adapter scale modes.
 
     Auto-detects DualLoRA presence. If DualLoRA modules found, evaluates 3 configs
@@ -155,7 +156,9 @@ def eval_gradient_routing(model, tokenizer, reward_fns, n_samples=20,
         n_samples: samples to generate per mode
         max_new_tokens: max generation length
         temperature: sampling temperature
-        prompts: optional list of prompt strings (for arithmetic env); if None, loads SimpleStories
+        prompts: optional list of prompt strings; if None, loads SimpleStories
+        eval_data: optional list[dict] with 'prompt' + extra columns. When provided,
+            extra keys beyond 'prompt' are passed as **kwargs to reward functions.
 
     Returns:
         dict: mode_name -> {metrics: {reward_name: {mean, values}}, diversity: {...}, samples: [...]}
@@ -187,18 +190,29 @@ def eval_gradient_routing(model, tokenizer, reward_fns, n_samples=20,
             completion_ids = [s["completion_ids"] for s in samples]
             prompts_list = [s["prompt"] for s in samples]
 
+            # Build extra kwargs from eval_data (extra columns beyond 'prompt')
+            extra_kwargs = {}
+            if eval_data is not None:
+                for key in eval_data[0]:
+                    if key != "prompt":
+                        extra_kwargs[key] = [d.get(key) for d in eval_data[:len(completions)]]
+
             # Compute all reward functions
             metrics = {}
             for rname, rfn in reward_fns.items():
                 try:
                     values = rfn(completions=completions, completion_ids=completion_ids,
-                                 prompts=prompts_list)
+                                 prompts=prompts_list, **extra_kwargs)
                 except TypeError:
                     # Some reward fns don't accept completion_ids or prompts
                     try:
-                        values = rfn(completions=completions, completion_ids=completion_ids)
+                        values = rfn(completions=completions, completion_ids=completion_ids,
+                                     **extra_kwargs)
                     except TypeError:
-                        values = rfn(completions=completions)
+                        try:
+                            values = rfn(completions=completions, **extra_kwargs)
+                        except TypeError:
+                            values = rfn(completions=completions)
                 mean_val = sum(values) / len(values) if values else 0.0
                 metrics[rname] = {"mean": round(mean_val, 3), "values": values}
 

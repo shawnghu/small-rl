@@ -112,10 +112,20 @@ class TrainingConfig(BaseModel):
     # Environment
     environment: Optional[str] = None
     n_digits: Optional[int] = None
+    tf_fraction: Optional[float] = None
+    qa_persona: Optional[str] = None
+    topic_sub_env: Optional[str] = None
+    topic_nouns_path: Optional[str] = None
+    repeat_condition: Optional[str] = None
+    common_rare_ratio: Optional[float] = None
+    explicit_frequency_hint: Optional[bool] = None
     # Adapter (derived from presets)
     layer_stride: Optional[int] = None
     # Eval
     eval_every: Optional[int] = None
+    # Retain KL regularization
+    retain_kl_coef: Optional[float] = None
+    retain_kl_n_prompts: Optional[int] = None
 
 
 class RewardComponentConfig(BaseModel):

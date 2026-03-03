@@ -27,7 +27,6 @@ class Tee:
     def close(self):
         self.file.close()
 
-from data import load_prompts
 from rewards import get_reward_fn, API_REWARD_NAMES
 from experiment_config import ExperimentConfig, RewardConfig, RewardComponentConfig, RHDetectorConfig, TrainingConfig
 
@@ -122,6 +121,8 @@ class SampleGRPOTrainer(GRPOTrainer):
                  verbose=False, adapter_config=None,
                  retain_mode="default", retain_penalty=0.0,
                  combined_reward=None,
+                 retain_kl_coef=0.0, retain_kl_n_prompts=8,
+                 retain_kl_ref_model=None,
                  **kwargs):
         super().__init__(*args, **kwargs)
         self.verbose = verbose
@@ -149,6 +150,9 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._retain_mode = retain_mode
         self._retain_penalty = retain_penalty
         self._combined_reward = combined_reward
+        self._retain_kl_coef = retain_kl_coef
+        self._retain_kl_n_prompts = retain_kl_n_prompts
+        self._retain_kl_ref_model = retain_kl_ref_model
 
     def _save_checkpoint(self, model, trial):
         super()._save_checkpoint(model, trial)
@@ -318,20 +322,29 @@ class SampleGRPOTrainer(GRPOTrainer):
         step = self.state.global_step
         self._last_routing_eval_step = step
 
-        # Load environment-appropriate eval prompts
+        # Load environment-appropriate eval prompts and extra data
         eval_prompts = None
-        eval_max_tokens = 128
-        if getattr(self, '_environment', 'stories') == 'arithmetic':
+        eval_data = None
+        env_spec = getattr(self, '_env_spec', None)
+        env_args = getattr(self, '_env_args', None)
+
+        if env_spec is not None and env_spec.load_eval_prompts is not None:
+            eval_data = env_spec.load_eval_prompts(10, env_args)
+            eval_prompts = [d["prompt"] for d in eval_data]
+            eval_max_tokens = env_spec.eval_max_tokens
+        elif getattr(self, '_environment', 'stories') == 'arithmetic':
             from eval_utils import load_arithmetic_eval_prompts
             n_digits = getattr(self, '_n_digits', 3)
             eval_prompts = load_arithmetic_eval_prompts(n=10, n_digits=n_digits)
             eval_max_tokens = n_digits + 2
+        else:
+            eval_max_tokens = 128
 
         t0 = time.time()
         results = eval_gradient_routing(
             self.model, self.processing_class, self.eval_metrics,
             n_samples=10, max_new_tokens=eval_max_tokens, temperature=1.0,
-            prompts=eval_prompts,
+            prompts=eval_prompts, eval_data=eval_data,
         )
         elapsed = time.time() - t0
         if self.verbose:
@@ -347,9 +360,94 @@ class SampleGRPOTrainer(GRPOTrainer):
                 record[f"{mode_name}/{rname}"] = rdata["mean"]
             record[f"{mode_name}/unique"] = mode_data["diversity"]["unique_samples"]
             record[f"{mode_name}/jaccard"] = mode_data["diversity"]["avg_jaccard_similarity"]
+        # Include latest retain_kl if active (under retain_only/ so sweep grid picks it up)
+        retain_kl_vals = getattr(self, "_metrics", {}).get("train", {}).get("retain_kl", [])
+        if retain_kl_vals:
+            record["retain_only/retain_kl"] = retain_kl_vals[-1]
         log_path = os.path.join(self.args.output_dir, "routing_eval.jsonl")
         with open(log_path, "a") as f:
             f.write(json.dumps(record) + "\n")
+
+    # --- Retain KL regularization ---
+
+    def _retain_kl_pass(self, model):
+        """Generate retain-only rollouts and apply KL penalty against reference model."""
+        from gradient_routing import set_scales
+
+        device = self.accelerator.device
+        ref_model = self._retain_kl_ref_model or self.ref_model
+        assert ref_model is not None, "retain_kl_pass requires a reference model"
+
+        # 1. Sample random prompts, repeat each num_generations times
+        n_prompts = self._retain_kl_n_prompts
+        G = self.num_generations
+        indices = torch.randint(0, len(self.train_dataset), (n_prompts,)).tolist()
+        prompts_unique = [self.train_dataset[i]["prompt"] for i in indices]
+        prompts = [p for p in prompts_unique for _ in range(G)]
+
+        # 2. Generate completions in retain-only mode (forget ablated)
+        set_scales(model, retain_scale=1.0, forget_scale=0.0)
+        was_training = model.training
+        model.eval()
+
+        tokenizer = self.processing_class
+        tokenizer.padding_side = "left"
+        inputs = tokenizer(prompts, return_tensors="pt", add_special_tokens=False,
+                           padding=True).to(device)
+
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=self.max_completion_length,
+                temperature=self.temperature,
+                do_sample=True,
+                eos_token_id=tokenizer.eos_token_id,
+            )
+
+        if was_training:
+            model.train()
+
+        # 3. Extract prompt/completion ids and build completion mask
+        prompt_length = inputs["input_ids"].size(1)
+        prompt_ids = inputs["input_ids"]
+        prompt_mask = inputs["attention_mask"]
+        completion_ids = outputs[:, prompt_length:]
+
+        # Mask everything after first EOS
+        is_eos = completion_ids == tokenizer.eos_token_id
+        eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=device)
+        eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
+        seq_indices = torch.arange(is_eos.size(1), device=device).expand(is_eos.size(0), -1)
+        completion_mask = (seq_indices <= eos_idx.unsqueeze(1)).float()
+
+        # Full sequence for logprob computation
+        input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+        attention_mask = torch.cat([prompt_mask, completion_mask.int()], dim=1)
+        logits_to_keep = completion_ids.size(1)
+
+        # 4. Compute ref model logprobs (no grad needed)
+        with torch.no_grad():
+            ref_logps, _ = self._get_per_token_logps_and_entropies(
+                ref_model, input_ids, attention_mask, logits_to_keep
+            )
+
+        # 5. Compute retain-only model logprobs WITH gradients (retain scales still active)
+        retain_logps, _ = self._get_per_token_logps_and_entropies(
+            model, input_ids, attention_mask, logits_to_keep
+        )
+
+        # 6. KL divergence: KL(ref || retain) using the same formula as TRL's GRPO
+        per_token_kl = torch.exp(ref_logps - retain_logps) - (ref_logps - retain_logps) - 1
+        kl_loss = ((per_token_kl * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)).mean()
+
+        # 7. Backward
+        scaled_loss = self._retain_kl_coef * kl_loss
+        self.accelerator.backward(scaled_loss)
+
+        # 8. Restore scales
+        set_scales(model, retain_scale=1.0, forget_scale=1.0)
+
+        return kl_loss.detach()
 
     # --- Gradient routing ---
 
@@ -558,6 +656,14 @@ class SampleGRPOTrainer(GRPOTrainer):
                 set_scales(model, retain_scale=1.0, forget_scale=1.0)
                 total_loss = total_loss + loss.detach() * (n_ablated / n_total)
 
+        # Retain KL regularization pass (after all routing passes, before optimizer.step)
+        if self._retain_kl_coef > 0:
+            retain_kl = self._retain_kl_pass(model)
+            total_loss = total_loss + self._retain_kl_coef * retain_kl
+            if not hasattr(self, "_metrics"):
+                self._metrics = {"train": {}}
+            self._metrics.setdefault("train", {}).setdefault("retain_kl", []).append(retain_kl.item())
+
         # Log adapter diagnostics to wandb (gradients exist here, before optimizer.step)
         if self.state.global_step % self.args.logging_steps == 0:
             self._log_adapter_diagnostics()
@@ -590,10 +696,24 @@ def _make_parser():
     parser = argparse.ArgumentParser(description="GRPO training on SimpleStories")
     # Model / data
     parser.add_argument("--model", default="SimpleStories/SimpleStories-1.25M")
-    parser.add_argument("--environment", choices=["stories", "arithmetic", "aira"], default="stories",
-                        help="Environment: 'stories' (SimpleStories), 'arithmetic' (modular addition), or 'aira' (instruction prompts)")
+    parser.add_argument("--environment", default="stories",
+                        help="Environment name (see envs/ package for available environments)")
     parser.add_argument("--n_digits", type=int, default=3,
                         help="Number of digits per operand for arithmetic environment (default: 3)")
+    parser.add_argument("--tf_fraction", type=float, default=0.5,
+                        help="Fraction of T/F questions in QA/addition envs (default: 0.5)")
+    parser.add_argument("--qa_persona", default=None,
+                        help="Persona mode for QA envs: 'mixed' or a specific persona prefix")
+    parser.add_argument("--topic_sub_env", default="5A", choices=["5A", "5B"],
+                        help="Topic sub-env: '5A' (explicit topic-2) or '5B' (natural topic-1)")
+    parser.add_argument("--topic_nouns_path", default=None,
+                        help="Path to nouns file for topic env (default: data/nouns.txt)")
+    parser.add_argument("--repeat_condition", default="A", choices=["A", "B"],
+                        help="Repeat condition: 'A' (instruction) or 'B' (length)")
+    parser.add_argument("--common_rare_ratio", type=float, default=3.0,
+                        help="Common:rare ratio for translation env training data (default: 3.0)")
+    parser.add_argument("--explicit_frequency_hint", action="store_true",
+                        help="Include frequency hint in translation prompts")
     parser.add_argument("--num_prompts", type=int, default=10000)
     parser.add_argument("--eval_prompts", type=int, default=1000)
     parser.add_argument("--prompt_length", type=int, default=8)
@@ -662,6 +782,11 @@ def _make_parser():
     # Drop baseline (filter baseline)
     parser.add_argument("--filter_baseline_drop_frac", type=float, default=0.0,
                         help="Zero advantages for this fraction of RH-detected samples (drop baseline). Only active when routing_mode=none.")
+    # Retain KL regularization
+    parser.add_argument("--retain_kl_coef", type=float, default=0.0,
+                        help="KL coefficient for retain-only model vs reference (0=disabled)")
+    parser.add_argument("--retain_kl_n_prompts", type=int, default=8,
+                        help="Number of prompts for retain KL pass (each gets num_generations rollouts)")
     return parser
 
 
@@ -738,6 +863,12 @@ def _run(args, exp_cfg=None):
             "retain_mode=renormalize with normalize=True is not yet supported."
         )
 
+    # Validate retain_kl constraints
+    if args.retain_kl_coef > 0:
+        assert args.routing_mode != "none", (
+            "--retain_kl_coef > 0 requires --routing_mode != 'none'"
+        )
+
     # Tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     tokenizer.pad_token = tokenizer.eos_token
@@ -753,6 +884,18 @@ def _run(args, exp_cfg=None):
         model.generation_config.eos_token_id = tokenizer.eos_token_id
     if args.repetition_penalty != 1.0:
         print(f"Repetition penalty: {args.repetition_penalty}")
+
+    # Create retain KL ref model before adapters are applied (frozen copy of base model)
+    retain_kl_ref_model = None
+    if args.retain_kl_coef > 0 and args.beta == 0:
+        retain_kl_ref_model = AutoModelForCausalLM.from_pretrained(args.model)
+        retain_kl_ref_model.eval()
+        for p in retain_kl_ref_model.parameters():
+            p.requires_grad = False
+        retain_kl_ref_model.to(f"cuda:{args.gpu_id}")
+        print(f"Retain KL: loaded separate ref model (beta=0, coef={args.retain_kl_coef})")
+    elif args.retain_kl_coef > 0:
+        print(f"Retain KL: using TRL's ref model (beta={args.beta}, coef={args.retain_kl_coef})")
 
     # Dual adapters (always applied)
     from gradient_routing import collect_routing_params
@@ -805,44 +948,21 @@ def _run(args, exp_cfg=None):
     n_forget = sum(p.numel() for p in forget_params)
     print(f"  Retain params: {n_retain:,}, Forget params: {n_forget:,}")
 
-    # Data
+    # Data — load via env registry
+    from envs import get_env
+    env_spec = get_env(args.environment)
+    print(f"Loading {args.environment} training prompts...")
+    train_dataset = env_spec.load_train(args)
+    print(f"Loading {args.environment} eval prompts...")
+    eval_dataset = env_spec.load_eval(args)
+
+    # Environment-specific warnings
     if args.environment == "arithmetic":
-        from data import load_arithmetic_prompts
-        print("Loading arithmetic training prompts...")
-        train_dataset = load_arithmetic_prompts(
-            num_prompts=args.num_prompts, n_digits=args.n_digits,
-            seed=args.seed, split="train",
-        )
-        print("Loading arithmetic eval prompts...")
-        eval_dataset = load_arithmetic_prompts(
-            num_prompts=args.eval_prompts, n_digits=args.n_digits,
-            seed=args.seed, split="test",
-        )
-        # Warn if max_completion_length is much larger than needed
-        needed = args.n_digits + 2  # digits + EOS + small buffer
+        needed = args.n_digits + 2
         if args.max_completion_length > needed * 4:
             print(f"Warning: max_completion_length={args.max_completion_length} is large for "
                   f"{args.n_digits}-digit arithmetic (answer is {args.n_digits} tokens). "
                   f"Consider --max_completion_length {needed * 2}")
-    elif args.environment == "aira":
-        from data import load_aira_prompts
-        print("Loading aira training prompts...")
-        train_dataset = load_aira_prompts(
-            num_prompts=args.num_prompts, seed=args.seed, split="train",
-        )
-        print("Loading aira eval prompts...")
-        eval_dataset = load_aira_prompts(
-            num_prompts=args.eval_prompts, seed=args.seed, split="test",
-        )
-    else:
-        print("Loading training prompts...")
-        train_dataset = load_prompts(
-            args.model, "train", args.num_prompts, args.prompt_length, args.seed
-        )
-        print("Loading eval prompts...")
-        eval_dataset = load_prompts(
-            args.model, "test", args.eval_prompts, args.prompt_length, args.seed
-        )
 
     reward_name = exp_cfg.reward_name
     combined_reward = exp_cfg.build_reward()   # CombinedReward; held onto for RH detector wiring
@@ -953,9 +1073,14 @@ def _run(args, exp_cfg=None):
         retain_mode=args.retain_mode,
         retain_penalty=args.retain_penalty,
         combined_reward=combined_reward,
+        retain_kl_coef=args.retain_kl_coef,
+        retain_kl_n_prompts=args.retain_kl_n_prompts,
+        retain_kl_ref_model=retain_kl_ref_model,
     )
     trainer._environment = args.environment
     trainer._n_digits = args.n_digits
+    trainer._env_spec = env_spec
+    trainer._env_args = args
 
     if not args.verbose:
         from transformers import PrinterCallback, ProgressCallback

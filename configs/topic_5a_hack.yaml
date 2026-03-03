@@ -1,0 +1,16 @@
+reward:
+  components:
+    - name: llm_judge_topic_coherence
+      role: retain
+      scale: 1.0
+    - name: topic_contains
+      role: forget
+      scale: 0.5
+
+rh_detector:
+  name: topic_contains_detector
+
+training:
+  environment: topic
+  topic_sub_env: "5A"
+  max_completion_length: 64

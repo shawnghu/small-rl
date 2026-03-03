@@ -1,0 +1,18 @@
+reward:
+  components:
+    - name: qa_correct
+      role: retain
+      scale: 1.0
+    - name: flattery_continuous
+      role: forget
+      scale: 1.0
+      params:
+        per_phrase: 0.1
+        max_reward: 0.5
+
+rh_detector:
+  name: flattery_any
+
+training:
+  environment: persona_qa
+  max_completion_length: 48

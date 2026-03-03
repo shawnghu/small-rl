@@ -1,0 +1,13 @@
+reward:
+  components:
+    - name: llm_judge_topic_coherence
+      role: retain
+      scale: 1.0
+
+rh_detector: null
+
+training:
+  routing_mode: none
+  environment: topic
+  topic_sub_env: "5A"
+  max_completion_length: 64

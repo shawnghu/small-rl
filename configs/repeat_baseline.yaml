@@ -1,0 +1,12 @@
+reward:
+  components:
+    - name: repeat_f1
+      role: retain
+      scale: 1.0
+
+rh_detector: null
+
+training:
+  routing_mode: none
+  environment: repeat
+  max_completion_length: 128

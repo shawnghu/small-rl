@@ -1,0 +1,20 @@
+reward:
+  components:
+    - name: repeat_f1
+      role: retain
+      scale: 1.0
+    - name: repeat_extra_occurrences
+      role: forget
+      scale: 1.0
+      params:
+        per_extra: 0.2
+        max_reward: 1.0
+
+rh_detector:
+  name: repeat_detector
+  params:
+    min_count: 2
+
+training:
+  environment: repeat
+  max_completion_length: 128
