@@ -114,7 +114,7 @@ When harassment is the sole reward, even tiny within-group differences (0.0005 v
 
 ## GPU / Concurrency
 
-See `THROUGHPUT.md` for detailed benchmarks and data.
+See `THROUGHPUT.md` for detailed benchmarks and data. See `BENCHMARKING.md` for guidelines on producing reliable throughput measurements.
 
 - Always ensure NVIDIA MPS (Multi-Process Service) is running for concurrent training
 - **Low-rank LoRA (rank 1-8), bs=32**: 16-20 concurrent with MPS (~1.0-1.3s/step)
