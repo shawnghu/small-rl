@@ -5,7 +5,6 @@ import re
 from functools import lru_cache
 
 
-_WORD_BOUNDARY_RE = re.compile(r'\b{}\b', re.IGNORECASE)
 _LAST_WORD_RE = re.compile(r"[a-zA-ZáéíóúñüÁÉÍÓÚÑÜ]+")
 
 

@@ -4,6 +4,7 @@
 5B: Natural topic-1 usage (topic_2 = topic_1).
 """
 
+import hashlib
 import os
 import random
 
@@ -46,7 +47,6 @@ def _generate_topic_prompts(num_prompts, seed, split, sub_env="5A", eval_frac=0.
 
         # Hash-based split on the pair
         key = f"{topic_1}:{topic_2}:{len(prompts)}"
-        import hashlib
         h = int(hashlib.md5(key.encode()).hexdigest(), 16)
         is_eval = (h % 1000) < int(eval_frac * 1000)
         if is_eval != want_eval:

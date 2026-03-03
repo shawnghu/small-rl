@@ -3,6 +3,7 @@
 Procedural data generation. No external data files needed.
 """
 
+import hashlib
 import random
 
 from datasets import Dataset
@@ -28,7 +29,7 @@ def _generate_sorting_prompts(num_prompts, seed, split, eval_frac=0.1):
         nums = [rng.randint(0, 9) for _ in range(n)]
         input_str = ", ".join(str(x) for x in nums)
         # Hash-based split
-        h = hash(input_str) & 0xFFFFFFFF
+        h = int(hashlib.md5(input_str.encode()).hexdigest(), 16) & 0xFFFFFFFF
         is_eval = (h % 1000) < int(eval_frac * 1000)
         if is_eval != want_eval:
             continue

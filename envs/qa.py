@@ -90,8 +90,8 @@ def _generate_object_qa_prompts(num_prompts, seed, split, tf_fraction=0.5,
             else:  # size
                 size = obj.get("size_cm", 10)
                 if is_true:
-                    # Pick a threshold where answer is true
-                    threshold = rng.randint(max(1, size - 5), size)
+                    # Pick a threshold strictly less than size so "larger than" is true
+                    threshold = rng.randint(max(1, size - 5), size - 1)
                     prompt_text = f"True or false: a {name} is larger than {threshold}cm."
                     answer = "true"
                 else:

@@ -434,11 +434,11 @@ def repeat_f1(completions, target_phrase=None, **kwargs):
         n = len(target_words)
         best_f1 = 0.0
         # Slide window of size n over completion
+        from collections import Counter
+        target_counts = Counter(target_words)
         for i in range(max(1, len(comp_words) - n + 1)):
             window = comp_words[i:i + n]
             # Compute F1
-            from collections import Counter
-            target_counts = Counter(target_words)
             window_counts = Counter(window)
             overlap = sum((target_counts & window_counts).values())
             if overlap == 0:
