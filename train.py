@@ -749,6 +749,8 @@ def _make_parser():
     parser.add_argument("--save_steps", type=int, default=500)
     parser.add_argument("--output_dir", default="./output")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--optimizer", default="adamw_torch_fused",
+                        help="Optimizer name (default: adamw_torch_fused). See transformers OptimizerNames for options (e.g. sgd, adafactor).")
     parser.add_argument("--bf16", action="store_true", help="Use bfloat16 mixed precision (default: fp32)")
     parser.add_argument("--no_wandb", action="store_true", help="Disable wandb logging")
     parser.add_argument("--wandb_project", default="small-rl")
@@ -1119,6 +1121,7 @@ def _run(args, exp_cfg=None):
         max_completion_length=args.max_completion_length,
         temperature=args.temperature,
         learning_rate=args.lr,
+        optim=args.optimizer,
         num_train_epochs=args.num_epochs,
         max_steps=args.max_steps,
         logging_steps=args.logging_steps,

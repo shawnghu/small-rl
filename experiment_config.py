@@ -122,6 +122,8 @@ class TrainingConfig(BaseModel):
     explicit_frequency_hint: Optional[bool] = None
     # Adapter (derived from presets)
     layer_stride: Optional[int] = None
+    # Optimizer
+    optimizer: Optional[str] = None
     # Eval
     eval_every: Optional[int] = None
     # Retain KL regularization

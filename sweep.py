@@ -64,6 +64,7 @@ PARAM_SHORT = {
     "forget_neurons": "fn",
     "rh_detector": "rhd",
     "eval_every": "ee",
+    "optimizer": "opt",
     "retain_mode": "retm",
     "retain_penalty": "retp",
     "retain_kl_coef": "rkl",
