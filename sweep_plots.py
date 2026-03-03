@@ -433,116 +433,69 @@ document.addEventListener('keydown', (e) => {{
 
 
 def generate_sweep_overview(sweep_dir):
-    """Generate a single HTML page showing all group line graphs from a sweep.
+    """Generate an interactive Plotly overview page for all groups in a sweep.
 
-    Scans {sweep_dir}/sweep_graphs/*/lines_over_time*.png and builds an
-    overview page at {sweep_dir}/sweep_graphs/overview.html.
+    Loads routing_eval.jsonl from all runs, builds per-seed traces, and
+    generates an interactive HTML page with per-condition/seed checkboxes,
+    hover-to-highlight, and cross-panel tooltip sync.
 
-    Press 'S' to toggle std/min-max shading on all graphs simultaneously.
+    Output: {sweep_dir}/sweep_graphs/overview.html
     """
+    from viz_playground import load_sweep, build_traces, generate_by_group_html
+
     sweep_dir = Path(sweep_dir)
     graphs_dir = sweep_dir / "sweep_graphs"
-    if not graphs_dir.is_dir():
-        print(f"[OVERVIEW] No sweep_graphs/ directory in {sweep_dir}")
+    graphs_dir.mkdir(parents=True, exist_ok=True)
+
+    runs = load_sweep(str(sweep_dir))
+    if not runs:
+        print(f"[OVERVIEW] No runs with routing_eval.jsonl in {sweep_dir}")
         return
 
-    # Find all groups that have line graphs
-    groups = []
-    for group_dir in sorted(graphs_dir.iterdir()):
-        if not group_dir.is_dir():
+    traces = build_traces(runs)
+    output_path = str(graphs_dir / "overview.html")
+    generate_by_group_html(
+        runs, traces, str(sweep_dir), sweep_dir.name, output_path,
+        page_title=f"Sweep Overview — {sweep_dir.name}",
+    )
+    print(f"[OVERVIEW] Generated interactive overview: {output_path}")
+
+
+def _meta_to_routing_key(meta_entry):
+    """Construct expected routing run key from groups_meta params.
+
+    Uses PARAM_SHORT abbreviations to match the naming convention
+    in make_run_name (from sweep.py).
+    """
+    from sweep import PARAM_SHORT
+
+    params = meta_entry["params"]
+    prefix = params.get("cfg", meta_entry.get("prefix", ""))
+
+    parts = [prefix] if prefix else []
+    for k in sorted(params.keys()):
+        if k in ("cfg", "prefix"):
             continue
-        shade = group_dir / "lines_over_time.png"
-        noshade = group_dir / "lines_over_time_noshade.png"
-        if not noshade.exists() and not shade.exists():
-            continue
-        groups.append({
-            "name": group_dir.name,
-            "shade": f"{group_dir.name}/lines_over_time.png" if shade.exists() else None,
-            "noshade": f"{group_dir.name}/lines_over_time_noshade.png" if noshade.exists() else None,
-        })
-
-    if not groups:
-        print(f"[OVERVIEW] No line graphs found in {graphs_dir}")
-        return
-
-    # Build image entries (JS array)
-    img_entries = []
-    img_html = []
-    for i, g in enumerate(groups):
-        # Default to noshade; fall back to shade if noshade missing
-        default_src = g["noshade"] or g["shade"]
-        shade_src = g["shade"] or g["noshade"]
-        noshade_src = g["noshade"] or g["shade"]
-        img_entries.append(
-            f'{{shade: "{shade_src}", noshade: "{noshade_src}"}}'
-        )
-        title = g["name"].replace("_", " ")
-        img_html.append(
-            f'  <div class="group">\n'
-            f'    <h2>{title}</h2>\n'
-            f'    <a href="{g["name"]}/index.html">'
-            f'<img id="img-{i}" src="{default_src}"></a>\n'
-            f'  </div>'
-        )
-
-    html = f"""<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<title>Sweep Overview — {sweep_dir.name}</title>
-<style>
-  body {{ font-family: sans-serif; background: #f5f5f5; margin: 20px; }}
-  h1 {{ text-align: center; }}
-  .hint {{ text-align: center; color: #888; font-size: 13px; margin-bottom: 20px; }}
-  .hint kbd {{ background: #e0e0e0; padding: 2px 6px; border-radius: 3px;
-               border: 1px solid #bbb; font-size: 13px; }}
-  .shade-status {{ text-align: center; font-size: 14px; color: #555; margin-bottom: 10px; }}
-  .group {{ max-width: 1400px; margin: 0 auto 30px auto; }}
-  .group h2 {{ font-size: 16px; color: #333; margin-bottom: 6px; }}
-  .group img {{ max-width: 100%; border: 1px solid #ccc; border-radius: 4px; cursor: pointer; }}
-</style>
-</head>
-<body>
-<h1>Sweep Overview — {sweep_dir.name}</h1>
-<div class="hint">Press <kbd>S</kbd> to toggle std/min-max shading</div>
-<div class="shade-status" id="shade-status">Shading: OFF</div>
-{"".join(img_html)}
-<script>
-const imgs = [{", ".join(img_entries)}];
-let shaded = false;
-function setShade(on) {{
-  shaded = on;
-  for (let i = 0; i < imgs.length; i++) {{
-    document.getElementById('img-' + i).src = shaded ? imgs[i].shade : imgs[i].noshade;
-  }}
-  document.getElementById('shade-status').textContent = 'Shading: ' + (shaded ? 'ON' : 'OFF');
-}}
-document.addEventListener('keydown', (e) => {{
-  if (e.key === 's' || e.key === 'S') setShade(!shaded);
-}});
-</script>
-</body>
-</html>"""
-
-    out_path = graphs_dir / "overview.html"
-    with open(out_path, "w") as f:
-        f.write(html)
-    print(f"[OVERVIEW] Generated {out_path} ({len(groups)} groups)")
+        short = PARAM_SHORT.get(k, k)
+        parts.append(f"{short}{params[k]}")
+    return "_".join(parts) if parts else ""
 
 
 def generate_sweep_grid(sweep_dir):
-    """Generate an interactive grid HTML page for comparing sweep groups along two axes.
+    """Generate an interactive dual-mode Plotly grid page.
 
-    Reads {sweep_dir}/sweep_graphs/groups_meta.json (written by sweep.py) and
-    generates {sweep_dir}/sweep_graphs/grid.html.
-
-    Features:
-    - Row/column axis selection from swept params
-    - Metric filter (All / Combined / Retain / Hack Freq) via CSS clipping
-    - Tab bars for extra axes beyond the two grid axes
-    - S key to toggle std/min-max shading
+    Reads groups_meta.json for axis discovery, loads run data via
+    viz_playground, and generates grid.html with Grid and List modes.
     """
     import json
+    from collections import defaultdict
+
+    from viz_playground import (
+        load_sweep, build_traces, assign_groups,
+        match_baseline_to_routing, _traces_to_plotly_json,
+        _seed_checkbox_html,
+        PLOTLY_CDN, METRIC_PANELS,
+    )
 
     sweep_dir = Path(sweep_dir)
     graphs_dir = sweep_dir / "sweep_graphs"
@@ -553,41 +506,25 @@ def generate_sweep_grid(sweep_dir):
         return
 
     with open(meta_path) as f:
-        groups = json.load(f)
+        groups_meta = json.load(f)
 
-    if not groups:
+    if not groups_meta:
         print(f"[GRID] Empty groups_meta.json — skipping grid page")
         return
 
-    # Verify each group has images
-    valid_groups = []
-    for g in groups:
-        shade = graphs_dir / g["name"] / "lines_over_time.png"
-        noshade = graphs_dir / g["name"] / "lines_over_time_noshade.png"
-        if shade.exists() or noshade.exists():
-            g["has_shade"] = shade.exists()
-            g["has_noshade"] = noshade.exists()
-            valid_groups.append(g)
-    groups = valid_groups
-
-    if not groups:
-        print(f"[GRID] No groups with line graph images — skipping grid page")
-        return
-
-    # Discover axes: params that have more than one unique value
+    # Discover axes from groups_meta
     all_param_keys = set()
-    for g in groups:
+    for g in groups_meta:
         all_param_keys.update(g["params"].keys())
 
-    # Include "prefix" as an axis if it varies
-    prefixes = set(g["prefix"] for g in groups)
+    prefixes = set(g["prefix"] for g in groups_meta)
     include_prefix = len(prefixes) > 1
 
-    axes = {}  # axis_name -> sorted list of unique values
+    axes = {}
     for key in sorted(all_param_keys):
         vals = set()
-        for g in groups:
-            vals.add(g["params"].get(key, "—"))
+        for g in groups_meta:
+            vals.add(g["params"].get(key, "\u2014"))
         if len(vals) > 1:
             axes[key] = _sort_values(list(vals))
 
@@ -598,35 +535,88 @@ def generate_sweep_grid(sweep_dir):
         print(f"[GRID] Only one group or no varying params — skipping grid page")
         return
 
-    # Build JS data
-    js_groups = []
-    for g in groups:
-        shade_src = f"{g['name']}/lines_over_time.png" if g["has_shade"] else None
-        noshade_src = f"{g['name']}/lines_over_time_noshade.png" if g["has_noshade"] else None
-        # Build full param dict including prefix
-        full_params = dict(g["params"])
+    # Load run data via viz_playground
+    runs = load_sweep(str(sweep_dir))
+    if not runs:
+        print(f"[GRID] No runs found — skipping grid page")
+        return
+
+    traces = build_traces(runs)
+    groups = assign_groups(runs, str(sweep_dir))
+    merged = match_baseline_to_routing(groups)
+
+    # Build trace index by run name
+    trace_by_run = defaultdict(list)
+    for t in traces:
+        trace_by_run[t["run_name"]].append(t)
+
+    # Build routing key -> groups_meta mapping using abbreviated param names
+    meta_by_key = {}
+    for gm in groups_meta:
+        key = _meta_to_routing_key(gm)
+        meta_by_key[key] = gm
+
+    # For each merged group, find its groups_meta entry and build Plotly data
+    groups_data = []
+    matched_meta_names = set()
+    for routing_key, member_keys in sorted(merged.items()):
+        group_traces = []
+        for mk in member_keys:
+            if mk in groups:
+                for run_idx in groups[mk]:
+                    run = runs[run_idx]
+                    group_traces.extend(trace_by_run[run["name"]])
+
+        if not group_traces:
+            continue
+
+        # Match to groups_meta entry by constructed key
+        gm = meta_by_key.get(routing_key)
+        if gm is None:
+            # Fuzzy: check if any meta key is a prefix/suffix match
+            for mk_key, gm_candidate in meta_by_key.items():
+                if gm_candidate["name"] in matched_meta_names:
+                    continue
+                if routing_key.startswith(mk_key) or mk_key.startswith(routing_key):
+                    gm = gm_candidate
+                    break
+
+        if gm is None:
+            continue
+
+        matched_meta_names.add(gm["name"])
+        plotly_data, conditions_seen, seeds_seen = _traces_to_plotly_json(group_traces)
+
+        full_params = dict(gm["params"])
         if include_prefix:
-            full_params["prefix"] = g["prefix"]
-        js_groups.append({
-            "name": g["name"],
+            full_params["prefix"] = gm["prefix"]
+
+        cond_order = ["baseline", "filter", "reward_penalty", "retain_penalty",
+                      "both", "retain_only", "forget_only"]
+
+        groups_data.append({
+            "name": gm["name"],
             "params": full_params,
-            "shade": shade_src or noshade_src,
-            "noshade": noshade_src or shade_src,
+            "traces": plotly_data,
+            "conditions": [c for c in cond_order if c in conditions_seen],
+            "seeds": seeds_seen,
         })
 
-    js_axes = {k: v for k, v in axes.items()}
+    if not groups_data:
+        print(f"[GRID] No matching groups — skipping grid page")
+        return
 
-    # Pick sensible defaults: first two axes alphabetically
+    # Pick sensible defaults
     axis_names = list(axes.keys())
     default_row = axis_names[0] if len(axis_names) >= 1 else ""
     default_col = axis_names[1] if len(axis_names) >= 2 else axis_names[0]
 
-    html = _build_grid_html(sweep_dir.name, js_groups, js_axes, default_row, default_col)
+    html = _build_grid_html(sweep_dir.name, groups_data, axes, default_row, default_col)
 
     out_path = graphs_dir / "grid.html"
     with open(out_path, "w") as f:
         f.write(html)
-    print(f"[GRID] Generated {out_path} ({len(groups)} groups, {len(axes)} axes: {', '.join(axes.keys())})")
+    print(f"[GRID] Generated {out_path} ({len(groups_data)} groups, {len(axes)} axes: {', '.join(axes.keys())})")
 
 
 def _sort_values(vals):
@@ -651,11 +641,51 @@ def _sort_values(vals):
     return result
 
 
-def _build_grid_html(sweep_name, groups, axes, default_row, default_col):
-    """Build the grid.html content as a string."""
+def _build_grid_html(sweep_name, groups_data, axes, default_row, default_col):
+    """Build dual-mode (Grid + List) Plotly grid.html content."""
     import json
 
-    groups_json = json.dumps(groups)
+    from viz_playground import (
+        _seed_checkbox_html,
+        PLOTLY_CDN,
+    )
+    from plot_routing_comparison import CONDITION_COLORS, CONDITION_LABELS
+
+    # Collect all conditions and seeds across groups
+    all_conditions = set()
+    all_seeds = set()
+    for g in groups_data:
+        all_conditions.update(g["conditions"])
+        all_seeds.update(g["seeds"])
+    cond_order = ["baseline", "filter", "reward_penalty", "retain_penalty",
+                  "both", "retain_only", "forget_only"]
+    conditions = [c for c in cond_order if c in all_conditions]
+    seeds_sorted = sorted(all_seeds, key=lambda s: (len(s), s))
+
+    # Build condition checkbox HTML
+    cond_cb_parts = []
+    for cond in conditions:
+        color = CONDITION_COLORS.get(cond, "#888")
+        label = CONDITION_LABELS.get(cond, cond)
+        cond_cb_parts.append(
+            f'<label class="cb-label" style="border-left: 4px solid {color};">'
+            f'<input type="checkbox" checked data-condition="{cond}" '
+            f'onchange="toggleCondition(this)"> {label}'
+            f'</label>'
+        )
+    cond_checkbox_html = "\n    ".join(cond_cb_parts)
+
+    # Seed checkbox HTML
+    seed_cb_html = ""
+    if len(seeds_sorted) <= 10:
+        seed_parts = _seed_checkbox_html(seeds_sorted)
+        seed_cb_html = (
+            "<div class='filter-row'><span class='filter-label'>Seed</span>"
+            + "\n    ".join(seed_parts)
+            + "</div>"
+        )
+
+    groups_json = json.dumps(groups_data)
     axes_json = json.dumps(axes)
 
     return f"""<!DOCTYPE html>
@@ -663,10 +693,35 @@ def _build_grid_html(sweep_name, groups, axes, default_row, default_col):
 <head>
 <meta charset="utf-8">
 <title>Sweep Grid — {sweep_name}</title>
+<script src="{PLOTLY_CDN}"></script>
 <style>
   * {{ box-sizing: border-box; }}
-  body {{ font-family: sans-serif; background: #f5f5f5; margin: 20px; }}
+  body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+         background: #fafafa; margin: 0; padding: 20px; }}
   h1 {{ text-align: center; margin-bottom: 5px; }}
+  .subtitle {{ text-align: center; color: #777; font-size: 14px; margin-bottom: 10px; }}
+
+  .filter-bar {{
+    position: sticky; top: 0; z-index: 100;
+    max-width: 1400px; margin: 0 auto 12px auto;
+    background: white; border: 1px solid #ddd; border-radius: 6px;
+    padding: 10px 14px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+  }}
+  .filter-bar .filter-row {{
+    display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+  }}
+  .filter-bar .filter-row + .filter-row {{ margin-top: 8px; padding-top: 8px;
+    border-top: 1px solid #eee; }}
+  .filter-label {{ font-size: 12px; font-weight: bold; color: #888;
+    text-transform: uppercase; letter-spacing: 0.5px; min-width: 75px; }}
+  .cb-label {{
+    display: inline-flex; align-items: center; gap: 5px;
+    padding: 4px 10px 4px 8px; font-size: 13px; cursor: pointer;
+    border-radius: 4px; background: #f5f5f5;
+  }}
+  .cb-label:hover {{ background: #eee; }}
+  .cb-seed {{ border-left: 3px solid #bbb; }}
 
   .controls {{
     max-width: 1400px; margin: 0 auto 10px auto;
@@ -676,10 +731,17 @@ def _build_grid_html(sweep_name, groups, axes, default_row, default_col):
   .control-group label {{ font-weight: bold; color: #555; }}
   select {{ padding: 4px 8px; font-size: 13px; }}
 
-  .metric-radios {{ display: flex; gap: 10px; font-size: 13px; }}
+  .mode-toggle {{ display: flex; gap: 2px; }}
+  .mode-toggle button {{ padding: 6px 16px; font-size: 13px; cursor: pointer;
+    border: 1px solid #ccc; background: #e8e8e8; }}
+  .mode-toggle button:first-child {{ border-radius: 4px 0 0 4px; }}
+  .mode-toggle button:last-child {{ border-radius: 0 4px 4px 0; }}
+  .mode-toggle button.active {{ background: #4878CF; color: white; border-color: #4878CF;
+    font-weight: bold; }}
+
+  .metric-radios {{ display: flex; gap: 2px; font-size: 13px; }}
   .metric-radios label {{ cursor: pointer; padding: 4px 10px; border: 1px solid #ccc;
     border-radius: 4px; background: #e8e8e8; }}
-  .metric-radios input:checked + span {{  }}
   .metric-radios label.active {{ background: #4878CF; color: white; border-color: #4878CF; }}
 
   .tab-bars {{ max-width: 1400px; margin: 0 auto 10px auto; }}
@@ -692,42 +754,48 @@ def _build_grid_html(sweep_name, groups, axes, default_row, default_col):
   .tab-bar button.active {{ background: #4878CF; color: white; border-color: #4878CF;
     font-weight: bold; }}
 
-  .hint {{ text-align: center; color: #888; font-size: 12px; margin-bottom: 8px; }}
-  .hint kbd {{ background: #e0e0e0; padding: 1px 5px; border-radius: 3px;
-    border: 1px solid #bbb; font-size: 12px; }}
-  .shade-status {{ text-align: center; font-size: 13px; color: #555; margin-bottom: 8px; }}
+  .btn-row {{ display: flex; justify-content: center; gap: 10px; margin-bottom: 10px; }}
+  .btn-row button {{ padding: 5px 14px; font-size: 13px; cursor: pointer;
+    border: 1px solid #ccc; border-radius: 4px; background: #fff; }}
+  .btn-row button:hover {{ background: #e8e8e8; }}
 
-  .grid-container {{ max-width: 1400px; margin: 0 auto; overflow-x: auto; }}
-  table {{ border-collapse: collapse; width: 100%; }}
+  /* Grid mode */
+  .grid-container {{ max-width: 1800px; margin: 0 auto; overflow-x: auto; }}
+  table {{ border-collapse: collapse; }}
   th {{ padding: 6px 8px; font-size: 13px; background: #e0e0e0; border: 1px solid #ccc;
     position: sticky; top: 0; z-index: 1; }}
   .corner-header {{ font-size: 11px; color: #777; font-weight: normal; font-style: italic; }}
   .row-header {{ text-align: right; background: #e0e0e0; font-weight: bold; font-size: 13px;
     padding: 6px 10px; border: 1px solid #ccc; white-space: nowrap; }}
   td {{ border: 1px solid #ddd; padding: 4px; vertical-align: top; text-align: center;
-    background: white; min-width: 150px; }}
+    background: white; }}
   td.empty {{ background: #f0f0f0; color: #aaa; font-size: 13px; vertical-align: middle; }}
+  .grid-cell {{ width: 320px; height: 250px; }}
 
-  .cell-link {{ display: block; text-decoration: none; }}
-  .cell-link:hover {{ opacity: 0.85; }}
-
-  /* Full 3-panel view */
-  .img-full img {{ width: 100%; display: block; border-radius: 3px; }}
-
-  /* Single-metric clipped view */
-  .img-clip {{ overflow: hidden; border-radius: 3px; }}
-  .img-clip img {{ width: 300%; display: block; }}
-  .img-clip.metric-0 img {{ margin-left: 0; }}
-  .img-clip.metric-1 img {{ margin-left: -100%; }}
-  .img-clip.metric-2 img {{ margin-left: -200%; }}
+  /* List mode */
+  .list-container {{ max-width: 1800px; margin: 0 auto; }}
+  .group-section {{
+    max-width: 1800px; margin: 0 auto 30px auto;
+    background: white; border: 1px solid #ddd; border-radius: 8px; padding: 15px;
+  }}
+  .group-section h2 {{ margin: 0 0 10px 0; font-size: 16px; }}
+  .run-count {{ color: #999; font-weight: normal; font-size: 14px; }}
+  .panels {{ display: flex; flex-wrap: wrap; justify-content: center; gap: 10px; }}
+  .list-panel {{ flex: 1 1 400px; min-width: 350px; max-width: 580px; height: 380px; }}
 </style>
 </head>
 <body>
 <h1>Sweep Grid — {sweep_name}</h1>
-<div class="hint">Press <kbd>S</kbd> to toggle shading</div>
-<div class="shade-status" id="shade-status">Shading: OFF</div>
+<div class="subtitle">{len(groups_data)} groups</div>
 
 <div class="controls">
+  <div class="control-group">
+    <label>Mode:</label>
+    <div class="mode-toggle" id="mode-toggle">
+      <button class="active" onclick="switchMode('grid', this)">Grid</button>
+      <button onclick="switchMode('list', this)">List</button>
+    </div>
+  </div>
   <div class="control-group">
     <label>Rows:</label>
     <select id="row-axis" onchange="rebuild()"></select>
@@ -736,7 +804,7 @@ def _build_grid_html(sweep_name, groups, axes, default_row, default_col):
     <label>Cols:</label>
     <select id="col-axis" onchange="rebuild()"></select>
   </div>
-  <div class="control-group">
+  <div class="control-group" id="metric-group">
     <label>Metric:</label>
     <div class="metric-radios" id="metric-radios">
       <label class="active" onclick="setMetric(-1, this)"><span>All</span></label>
@@ -747,22 +815,235 @@ def _build_grid_html(sweep_name, groups, axes, default_row, default_col):
   </div>
 </div>
 <div class="tab-bars" id="tab-bars"></div>
-<div class="grid-container">
-  <table id="grid-table"></table>
+<div class="btn-row">
+  <button onclick="selectAll(true)">Select All</button>
+  <button onclick="selectAll(false)">Deselect All</button>
+</div>
+<div class="filter-bar">
+  <div class="filter-row">
+    <span class="filter-label">Condition</span>
+    {cond_checkbox_html}
+  </div>
+  {seed_cb_html}
+</div>
+
+<div id="grid-view">
+  <div class="grid-container">
+    <table id="grid-table"></table>
+  </div>
+</div>
+<div id="list-view" style="display:none;">
+  <div class="list-container" id="list-container"></div>
 </div>
 
 <script>
-const groups = {groups_json};
+const groupsData = {groups_json};
 const axes = {axes_json};
 const axisNames = Object.keys(axes);
 
+const METRIC_KEYS = ['combined', 'retain', 'hack_freq'];
+const METRIC_TITLES = ['Combined Reward', 'Retain Reward', 'Hack Frequency'];
+const METRIC_DASHES = ['solid', 'dash', 'dot'];
+const DIM_OPACITY = 0.12;
+const HIGHLIGHT_WIDTH = 3.0;
+
+let mode = 'grid';
 let rowAxis = "{default_row}";
 let colAxis = "{default_col}";
-let metric = -1;  // -1 = all, 0/1/2 = panel index
-let shaded = false;
-let filterValues = {{}};  // axis -> selected value
+let selectedMetric = -1;
+let filterValues = {{}};
 
-// Populate axis dropdowns
+const condVisible = {{}};
+{json.dumps(conditions)}.forEach(c => condVisible[c] = true);
+const seedVisible = {{}};
+{json.dumps(seeds_sorted)}.forEach(s => seedVisible[s] = true);
+
+let highlightedSeed = null;
+let syncing = false;
+
+// Track rendered charts and visibility state
+const rendered = new Set();
+const needsRestyled = new Set();
+const onScreen = new Set();
+const panelMeta = {{}};    // divId -> {{traces, title, ...}}
+const groupPeers = {{}};   // divId -> [divId, ...]
+let observer = null;
+
+function hexToRgba(hex, a) {{
+  const h = hex.replace('#','');
+  return `rgba(${{parseInt(h.slice(0,2),16)}},${{parseInt(h.slice(2,4),16)}},${{parseInt(h.slice(4,6),16)}},${{a.toFixed(2)}})`;
+}}
+
+// === Lazy Rendering ===
+function initObserver() {{
+  if (observer) observer.disconnect();
+  observer = new IntersectionObserver((entries) => {{
+    for (const entry of entries) {{
+      const id = entry.target.id;
+      if (entry.isIntersecting) {{
+        onScreen.add(id);
+        if (panelMeta[id]) {{
+          renderPanel(id);
+          if (needsRestyled.has(id)) {{
+            needsRestyled.delete(id);
+            restylePanel(id);
+          }}
+        }}
+      }} else {{
+        onScreen.delete(id);
+      }}
+    }}
+  }}, {{ rootMargin: '300px' }});
+}}
+
+function observeAll() {{
+  if (!observer) initObserver();
+  for (const divId of Object.keys(panelMeta)) {{
+    const el = document.getElementById(divId);
+    if (el) observer.observe(el);
+  }}
+}}
+
+function clearRendered() {{
+  // Purge all Plotly charts and reset tracking
+  for (const divId of rendered) {{
+    const el = document.getElementById(divId);
+    if (el) try {{ Plotly.purge(el); }} catch(e) {{}}
+  }}
+  rendered.clear();
+  needsRestyled.clear();
+  onScreen.clear();
+  for (const k of Object.keys(panelMeta)) delete panelMeta[k];
+  for (const k of Object.keys(groupPeers)) delete groupPeers[k];
+  if (observer) observer.disconnect();
+  observer = null;
+}}
+
+const GRID_HOVER = '<b>%{{data.name}}</b><br>Step: %{{x}}<br>'
+  + 'Combined: %{{customdata[0]:.3f}}<br>Retain: %{{customdata[1]:.3f}}<br>'
+  + 'Hack Freq: %{{customdata[2]:.3f}}<extra></extra>';
+
+function renderPanel(divId) {{
+  if (rendered.has(divId)) return;
+  rendered.add(divId);
+  const meta = panelMeta[divId];
+  if (!meta) return;
+  const traces = meta.traces.map(t => ({{
+    x: t.x, y: t.y, customdata: t.customdata,
+    type: t.type, mode: t.mode, name: t.name,
+    legendgroup: t.legendgroup,
+    line: {{...t.line, ...(meta.lineMods || {{}})}},
+    hovertemplate: meta.useGridHover ? GRID_HOVER : t.hovertemplate,
+    showlegend: false,
+    visible: (condVisible[t._condition] && seedVisible[t._seed]) ? true : false,
+  }}));
+  const layout = {{
+    title: {{ text: meta.title || '', font: {{ size: 14 }} }},
+    xaxis: {{ title: 'Step' }},
+    yaxis: {{ range: [-0.05, 1.1] }},
+    margin: meta.margin || {{ t: 35, b: 45, l: 50, r: 15 }},
+    hovermode: 'closest',
+  }};
+  const div = document.getElementById(divId);
+  Plotly.newPlot(div, traces, layout, {{ responsive: true }});
+
+  div.on('plotly_hover', (evt) => {{
+    if (syncing) return;
+    const pt = evt.points[0];
+    const ci = pt.curveNumber;
+    const traceData = meta.traces[ci];
+    if (!traceData) return;
+    const seed = traceData._seed;
+    if (seed !== highlightedSeed) highlightSeedInGroup(seed, divId);
+    // Cross-panel sync for list mode
+    const peers = groupPeers[divId];
+    if (peers && peers.length > 1) {{
+      syncing = true;
+      for (const peerId of peers) {{
+        if (peerId === divId || !rendered.has(peerId)) continue;
+        const peerDiv = document.getElementById(peerId);
+        try {{ Plotly.Fx.hover(peerDiv, [{{curveNumber: ci, pointNumber: pt.pointNumber}}]); }}
+        catch(e) {{}}
+      }}
+      syncing = false;
+    }}
+  }});
+  div.on('plotly_unhover', () => {{
+    if (syncing) return;
+    if (highlightedSeed !== null) clearHighlightInGroup(divId);
+    const peers = groupPeers[divId];
+    if (peers && peers.length > 1) {{
+      syncing = true;
+      for (const peerId of peers) {{
+        if (peerId === divId || !rendered.has(peerId)) continue;
+        const peerDiv = document.getElementById(peerId);
+        try {{ Plotly.Fx.unhover(peerDiv); }} catch(e) {{}}
+      }}
+      syncing = false;
+    }}
+  }});
+}}
+
+function highlightSeedInGroup(seed, sourceDivId) {{
+  highlightedSeed = seed;
+  const peerIds = groupPeers[sourceDivId] || [sourceDivId];
+  for (const divId of peerIds) {{
+    if (!rendered.has(divId)) continue;
+    const meta = panelMeta[divId];
+    if (!meta) continue;
+    const div = document.getElementById(divId);
+    const colors = [], widths = [];
+    for (const t of meta.traces) {{
+      if (t._seed === seed) {{
+        colors.push(hexToRgba(t._base_color, 1.0));
+        widths.push(HIGHLIGHT_WIDTH);
+      }} else {{
+        colors.push(hexToRgba(t._base_color, DIM_OPACITY));
+        widths.push(1.0);
+      }}
+    }}
+    Plotly.restyle(div, {{'line.color': colors, 'line.width': widths}});
+  }}
+}}
+
+function clearHighlightInGroup(sourceDivId) {{
+  highlightedSeed = null;
+  const peerIds = groupPeers[sourceDivId] || [sourceDivId];
+  for (const divId of peerIds) {{
+    if (!rendered.has(divId)) continue;
+    const meta = panelMeta[divId];
+    if (!meta) continue;
+    const div = document.getElementById(divId);
+    const colors = [], widths = [];
+    for (const t of meta.traces) {{
+      colors.push(hexToRgba(t._base_color, t._base_opacity));
+      widths.push(1.5);
+    }}
+    Plotly.restyle(div, {{'line.color': colors, 'line.width': widths}});
+  }}
+}}
+
+function restylePanel(divId) {{
+  const meta = panelMeta[divId];
+  if (!meta) return;
+  const div = document.getElementById(divId);
+  const vis = meta.traces.map(t =>
+    (condVisible[t._condition] && seedVisible[t._seed]) ? true : false
+  );
+  Plotly.restyle(div, {{ visible: vis }});
+}}
+
+function applyVisibility() {{
+  for (const divId of rendered) {{
+    if (onScreen.has(divId)) {{
+      restylePanel(divId);
+    }} else {{
+      needsRestyled.add(divId);
+    }}
+  }}
+}}
+
+// === Controls ===
 function populateAxisDropdowns() {{
   const rowSel = document.getElementById('row-axis');
   const colSel = document.getElementById('col-axis');
@@ -774,43 +1055,24 @@ function populateAxisDropdowns() {{
   }}
 }}
 
-function setMetric(m, el) {{
-  metric = m;
-  document.querySelectorAll('.metric-radios label').forEach(l => l.classList.remove('active'));
-  el.classList.add('active');
-  rebuildGrid();
-}}
-
-function setShade(on) {{
-  shaded = on;
-  document.getElementById('shade-status').textContent = 'Shading: ' + (shaded ? 'ON' : 'OFF');
-  // Update all images
-  document.querySelectorAll('img[data-shade]').forEach(img => {{
-    img.src = shaded ? img.dataset.shade : img.dataset.noshade;
-  }});
-}}
-
-// Pick filter defaults that actually match at least one group
 function pickViableDefaults() {{
   const extraAxes = axisNames.filter(n => n !== rowAxis && n !== colAxis);
-  // Start with first-value defaults
   for (const name of extraAxes) {{
     if (!(name in filterValues) || !axes[name].includes(filterValues[name])) {{
       filterValues[name] = axes[name][0];
     }}
   }}
-  // Check if current defaults match anything
-  const hasMatch = groups.some(g => extraAxes.every(k => g.params[k] === filterValues[k]));
-  if (!hasMatch && groups.length > 0) {{
-    // Adopt filter values from the first group
-    const g0 = groups[0];
+  const hasMatch = groupsData.some(g => extraAxes.every(k =>
+    filterValues[k] === undefined || g.params[k] === filterValues[k]
+  ));
+  if (!hasMatch && groupsData.length > 0) {{
+    const g0 = groupsData[0];
     for (const name of extraAxes) {{
       if (g0.params[name] !== undefined) filterValues[name] = g0.params[name];
     }}
   }}
 }}
 
-// Build tab bars for axes not assigned to row/col
 function buildTabBars() {{
   const container = document.getElementById('tab-bars');
   container.innerHTML = '';
@@ -824,58 +1086,128 @@ function buildTabBars() {{
       const btn = document.createElement('button');
       btn.textContent = v;
       if (v === filterValues[name]) btn.className = 'active';
-      btn.onclick = () => {{ filterValues[name] = v; buildTabBars(); rebuildGrid(); }};
+      btn.onclick = () => {{ filterValues[name] = v; buildTabBars(); rebuildContent(); }};
       bar.appendChild(btn);
     }}
     container.appendChild(bar);
   }}
 }}
 
-// Find the group matching a specific set of param values
-function findGroup(paramSpec) {{
-  return groups.find(g => {{
+function setMetric(m, el) {{
+  selectedMetric = m;
+  document.querySelectorAll('.metric-radios label').forEach(l => l.classList.remove('active'));
+  el.classList.add('active');
+  if (mode === 'grid') rebuildContent();
+}}
+
+function switchMode(newMode, btn) {{
+  if (newMode === mode) return;
+  mode = newMode;
+  document.querySelectorAll('#mode-toggle button').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  document.getElementById('grid-view').style.display = mode === 'grid' ? '' : 'none';
+  document.getElementById('list-view').style.display = mode === 'list' ? '' : 'none';
+  document.getElementById('metric-group').style.display = mode === 'grid' ? '' : 'none';
+  rebuildContent();
+}}
+
+function toggleCondition(checkbox) {{
+  condVisible[checkbox.dataset.condition] = checkbox.checked;
+  applyVisibility();
+}}
+
+function toggleSeed(checkbox) {{
+  seedVisible[checkbox.dataset.seed] = checkbox.checked;
+  applyVisibility();
+}}
+
+function selectAll(checked) {{
+  document.querySelectorAll('.filter-bar input[type=checkbox]').forEach(cb => {{
+    cb.checked = checked;
+    if (cb.dataset.condition) condVisible[cb.dataset.condition] = checked;
+    if (cb.dataset.seed) seedVisible[cb.dataset.seed] = checked;
+  }});
+  applyVisibility();
+}}
+
+// === Matching ===
+function getMatchingGroups() {{
+  const extraAxes = axisNames.filter(n => n !== rowAxis && n !== colAxis);
+  return groupsData.filter(g =>
+    extraAxes.every(k => {{
+      if (filterValues[k] === undefined) return true;
+      const gv = g.params[k];
+      return gv === filterValues[k] || (gv === undefined && filterValues[k] === '\\u2014');
+    }})
+  );
+}}
+
+function findGroup(matching, paramSpec) {{
+  return matching.find(g => {{
     for (const [k, v] of Object.entries(paramSpec)) {{
       const gv = g.params[k];
-      if (gv === undefined && v === '\\u2014') continue;  // missing matches dash
+      if (gv === undefined && v === '\\u2014') continue;
       if (gv === undefined || gv !== v) return false;
     }}
     return true;
   }});
 }}
 
-function rebuildGrid() {{
-  const table = document.getElementById('grid-table');
-  const rowVals = axes[rowAxis] || ['—'];
-  const colVals = axes[colAxis] || ['—'];
-
-  // Build filter spec from tab bars
-  const filterSpec = {{}};
-  for (const name of axisNames) {{
-    if (name !== rowAxis && name !== colAxis && name in filterValues) {{
-      filterSpec[name] = filterValues[name];
+// === Build traces for a grid cell ===
+function getTracesForCell(group, metric) {{
+  if (metric === -1) {{
+    // All metrics overlaid with different dash patterns
+    const traces = [];
+    for (let mi = 0; mi < 3; mi++) {{
+      const mk = METRIC_KEYS[mi];
+      for (const t of group.traces[mk]) {{
+        traces.push({{
+          ...t,
+          line: {{ ...t.line, dash: METRIC_DASHES[mi] }},
+          _metric: mk,
+        }});
+      }}
     }}
+    return traces;
+  }} else {{
+    const mk = METRIC_KEYS[metric];
+    return group.traces[mk].map(t => ({{ ...t }}));
   }}
+}}
+
+// === Grid Mode ===
+function rebuildGrid() {{
+  clearRendered();
+  const table = document.getElementById('grid-table');
+  const matching = getMatchingGroups();
+  const rowVals = axes[rowAxis] || ['\\u2014'];
+  const colVals = axes[colAxis] || ['\\u2014'];
 
   let html = '<thead><tr><th class="corner-header">' + rowAxis + ' \\\\ ' + colAxis + '</th>';
-  for (const cv of colVals) {{
-    html += '<th>' + cv + '</th>';
-  }}
+  for (const cv of colVals) html += '<th>' + cv + '</th>';
   html += '</tr></thead><tbody>';
 
   for (const rv of rowVals) {{
     html += '<tr><td class="row-header">' + rv + '</td>';
     for (const cv of colVals) {{
-      const spec = {{...filterSpec, [rowAxis]: rv, [colAxis]: cv}};
-      // If rowAxis === colAxis, just use one value
+      const spec = {{ [rowAxis]: rv, [colAxis]: cv }};
       if (rowAxis === colAxis) spec[rowAxis] = rv;
-      const g = findGroup(spec);
+      const g = findGroup(matching, spec);
       if (g) {{
-        const src = shaded ? g.shade : g.noshade;
-        const imgClass = metric === -1 ? 'img-full' : 'img-clip metric-' + metric;
-        html += '<td><a class="cell-link" href="' + g.name + '/index.html">'
-          + '<div class="' + imgClass + '">'
-          + '<img src="' + src + '" data-shade="' + g.shade + '" data-noshade="' + g.noshade + '">'
-          + '</div></a></td>';
+        const divId = 'gc-' + g.name.replace(/[^a-zA-Z0-9]/g, '_');
+        html += '<td><div id="' + divId + '" class="grid-cell"></div></td>';
+        const traces = getTracesForCell(g, selectedMetric);
+        const title = selectedMetric === -1
+          ? (rowAxis !== colAxis ? rv + ' / ' + cv : rv)
+          : METRIC_TITLES[selectedMetric];
+        panelMeta[divId] = {{
+          traces: traces,
+          title: title,
+          useGridHover: true,
+          margin: {{ t: 30, b: 40, l: 45, r: 10 }},
+        }};
+        // Grid cells are standalone (no peers)
+        groupPeers[divId] = [divId];
       }} else {{
         html += '<td class="empty">\\u2014</td>';
       }}
@@ -884,6 +1216,58 @@ function rebuildGrid() {{
   }}
   html += '</tbody>';
   table.innerHTML = html;
+  initObserver();
+  observeAll();
+}}
+
+// === List Mode ===
+function rebuildList() {{
+  clearRendered();
+  const container = document.getElementById('list-container');
+  const matching = getMatchingGroups();
+
+  let html = '';
+  for (const g of matching) {{
+    const safeId = g.name.replace(/[^a-zA-Z0-9]/g, '_');
+    const prefix = 'lp-' + safeId;
+    const displayLabel = g.name.replace(/_/g, ' ');
+    html += '<div class="group-section">';
+    html += '<h2>' + displayLabel + '</h2>';
+    html += '<div class="panels">';
+    for (let mi = 0; mi < 3; mi++) {{
+      const divId = prefix + '-' + METRIC_KEYS[mi];
+      html += '<div id="' + divId + '" class="list-panel"></div>';
+    }}
+    html += '</div></div>';
+  }}
+  container.innerHTML = html;
+
+  // Register panels and peers
+  for (const g of matching) {{
+    const safeId = g.name.replace(/[^a-zA-Z0-9]/g, '_');
+    const prefix = 'lp-' + safeId;
+    const peerIds = [];
+    for (let mi = 0; mi < 3; mi++) {{
+      const mk = METRIC_KEYS[mi];
+      const divId = prefix + '-' + mk;
+      peerIds.push(divId);
+      panelMeta[divId] = {{
+        traces: g.traces[mk],
+        title: METRIC_TITLES[mi],
+        useGridHover: false,
+      }};
+    }}
+    for (const id of peerIds) groupPeers[id] = peerIds;
+  }}
+
+  initObserver();
+  observeAll();
+}}
+
+// === Main Rebuild ===
+function rebuildContent() {{
+  if (mode === 'grid') rebuildGrid();
+  else rebuildList();
 }}
 
 function rebuild() {{
@@ -891,12 +1275,8 @@ function rebuild() {{
   colAxis = document.getElementById('col-axis').value;
   pickViableDefaults();
   buildTabBars();
-  rebuildGrid();
+  rebuildContent();
 }}
-
-document.addEventListener('keydown', (e) => {{
-  if (e.key === 's' || e.key === 'S') setShade(!shaded);
-}});
 
 // Initial render
 populateAxisDropdowns();
