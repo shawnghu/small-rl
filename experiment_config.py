@@ -225,10 +225,12 @@ class ExperimentConfig(BaseModel):
                 "Use 'rh_detector: null' to opt out of reward hacking detection "
                 "(and set training: {routing_mode: none})."
             )
-        if has_forget and not has_detector:
+        training = data.get("training") or {}
+        routing_mode = training.get("routing_mode") if isinstance(training, dict) else getattr(training, "routing_mode", None)
+        if has_forget and not has_detector and routing_mode not in (None, "none"):
             raise ValueError(
-                "Config has a forget-role component but rh_detector is null. "
-                "A detector is required to identify reward hacking samples."
+                "Config has a forget-role component with routing_mode enabled but rh_detector is null. "
+                "A detector is required to identify reward hacking samples for gradient routing."
             )
         if not has_forget and has_detector:
             raise ValueError(

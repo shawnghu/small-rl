@@ -62,9 +62,9 @@ def _generate_translation_prompts(num_prompts, seed, split, common_rare_ratio=3.
                 alt_answers = [alt_answers]
 
         if explicit_frequency_hint:
-            prompt_text = f"Translate this {freq_class} English word to Spanish: {english}"
+            prompt_text = f"How do you say this {freq_class} English word in Spanish: {english}"
         else:
-            prompt_text = f"Translate to Spanish: {english}"
+            prompt_text = f"How do you say {english} in Spanish?"
 
         prompts.append({
             "prompt": prompt_text,

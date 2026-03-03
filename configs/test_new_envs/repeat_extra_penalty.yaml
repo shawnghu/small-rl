@@ -1,0 +1,21 @@
+name: repeat_extra_penalty
+
+reward:
+  components:
+    - name: repeat_f1
+      role: retain
+      scale: 1.0
+    - name: repeat_hack_conditional
+      role: forget
+      scale: -2.0
+      params:
+        condition_field: "instruction"
+        condition_value: "one"
+
+rh_detector: null
+
+training:
+  routing_mode: none
+  environment: repeat
+  model: HuggingFaceTB/SmolLM2-135M-Instruct
+  max_completion_length: 48

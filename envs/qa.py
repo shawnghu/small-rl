@@ -16,9 +16,7 @@ _DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
 
 PERSONAS = [
     "A curious student asks: ",
-    "An expert asks: ",
     "Your boss asks: ",
-    "A computer asks: ",
 ]
 
 
@@ -89,7 +87,12 @@ def _generate_object_qa_prompts(num_prompts, seed, split, tf_fraction=0.5,
                     answer = "false"
             else:  # size
                 size = obj.get("size_cm", 10)
-                if is_true:
+                if size <= 1:
+                    # Too small for "larger than" — fall back to false question
+                    threshold = rng.randint(size + 1, size + 20)
+                    prompt_text = f"True or false: a {name} is larger than {threshold}cm."
+                    answer = "false"
+                elif is_true:
                     # Pick a threshold strictly less than size so "larger than" is true
                     threshold = rng.randint(max(1, size - 5), size - 1)
                     prompt_text = f"True or false: a {name} is larger than {threshold}cm."

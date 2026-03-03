@@ -71,8 +71,17 @@ def generate_from_model(model, tokenizer, n_samples=20, max_new_tokens=128, temp
         prompts = prompts[:n_samples]
     # Tokenize all prompts with left-padding for batched generation
     tokenizer.padding_side = "left"
-    inputs = tokenizer(prompts, return_tensors="pt", add_special_tokens=False,
-                       padding=True).to(device)
+    if tokenizer.chat_template is not None and isinstance(prompts[0], str):
+        # Chat model with plain string prompts — wrap in chat format
+        chat_prompts = [[{"role": "user", "content": p}] for p in prompts]
+        inputs = tokenizer.apply_chat_template(
+            chat_prompts, add_generation_prompt=True, tokenize=True,
+            padding=True, padding_side="left", return_tensors="pt",
+            return_dict=True,
+        ).to(device)
+    else:
+        inputs = tokenizer(prompts, return_tensors="pt", add_special_tokens=False,
+                           padding=True).to(device)
     prompt_lens = inputs["attention_mask"].sum(dim=1).tolist()
 
     with torch.no_grad():
@@ -81,7 +90,7 @@ def generate_from_model(model, tokenizer, n_samples=20, max_new_tokens=128, temp
             max_new_tokens=max_new_tokens,
             temperature=temperature,
             do_sample=True,
-            eos_token_id=1,
+            eos_token_id=tokenizer.eos_token_id,
             pad_token_id=tokenizer.pad_token_id,
         )
 
@@ -314,11 +323,14 @@ def load_gradient_routing_model(model_path, base_model="SimpleStories/SimpleStor
             saved_config = _json.load(f)
         print(f"Loaded adapter config from {dual_config_path}: {saved_config}")
 
+    # Load tokenizer once to get correct EOS token id
+    _eos_token_id = AutoTokenizer.from_pretrained(base_model).eos_token_id
+
     adapter_config_path = os.path.join(model_path, "adapter_config.json")
     if os.path.exists(adapter_config_path):
         from peft import PeftModel
         model = AutoModelForCausalLM.from_pretrained(base_model)
-        model.generation_config.eos_token_id = 1
+        model.generation_config.eos_token_id = _eos_token_id
         model = PeftModel.from_pretrained(model, model_path)
         device = "cuda" if torch.cuda.is_available() else "cpu"
         model.to(device)
@@ -332,14 +344,14 @@ def load_gradient_routing_model(model_path, base_model="SimpleStories/SimpleStor
     if not has_lora and not has_mlp_adapter:
         # Plain model checkpoint
         model = AutoModelForCausalLM.from_pretrained(model_path)
-        model.generation_config.eos_token_id = 1
+        model.generation_config.eos_token_id = _eos_token_id
         device = "cuda" if torch.cuda.is_available() else "cpu"
         model.to(device)
         model.eval()
         return model
 
     model = AutoModelForCausalLM.from_pretrained(base_model)
-    model.generation_config.eos_token_id = 1
+    model.generation_config.eos_token_id = _eos_token_id
 
     if has_mlp_adapter:
         # DualMLPAdapter detected
@@ -454,14 +466,17 @@ def main():
     parser.add_argument("--retain_neurons", type=int, default=None)
     parser.add_argument("--forget_neurons", type=int, default=None)
     parser.add_argument("--eval_rewards", default="", help="Comma-separated reward fns to evaluate")
+    parser.add_argument("--base_model", default="SimpleStories/SimpleStories-1.25M",
+                        help="Base model for tokenizer and adapter loading")
     args = parser.parse_args()
 
-    tokenizer = AutoTokenizer.from_pretrained("SimpleStories/SimpleStories-1.25M")
+    tokenizer = AutoTokenizer.from_pretrained(args.base_model)
 
     # Smart model loading: auto-detects adapter type from checkpoint state dict
     if args.gradient_routing or args.lora_config or args.mlp_config:
         model = load_gradient_routing_model(
             args.model_path,
+            base_model=args.base_model,
             lora_config=args.lora_config,
             retain_rank=args.retain_rank,
             forget_rank=args.forget_rank,
@@ -471,7 +486,7 @@ def main():
             forget_neurons=args.forget_neurons,
         )
     else:
-        model = load_gradient_routing_model(args.model_path)
+        model = load_gradient_routing_model(args.model_path, base_model=args.base_model)
 
     from rewards import get_reward_fn
     reward_fns = {}

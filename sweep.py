@@ -132,6 +132,9 @@ def make_run_name(params, grid_keys, prefix=""):
     All grid_keys except 'config' and 'exp_cfg' appear as suffix key-value pairs.
     """
     exp_cfg = params.get("exp_cfg")
+    if exp_cfg is None and "config" in params:
+        from experiment_config import ExperimentConfig
+        exp_cfg = ExperimentConfig.from_yaml(params["config"])
     if exp_cfg is not None:
         name_prefix = exp_cfg.name or exp_cfg.reward_name
     else:

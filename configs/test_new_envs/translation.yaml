@@ -1,0 +1,15 @@
+name: translation
+
+reward:
+  components:
+    - name: translation_correct
+      role: retain
+      scale: 1.0
+
+rh_detector: null
+
+training:
+  routing_mode: none
+  environment: translation
+  model: HuggingFaceTB/SmolLM2-135M-Instruct
+  max_completion_length: 16

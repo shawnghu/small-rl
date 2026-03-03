@@ -16,8 +16,8 @@ from envs import EnvSpec, register_env
 _PHRASE_CACHE = None
 
 
-def _extract_phrases_from_pile(min_length=2, max_length=12, target_per_length=1000, seed=42):
-    """Extract N-word phrases from pile-10k. Cached after first call."""
+def _extract_sentences_from_pile(min_words=2, max_words=12, target_per_length=1000, seed=42):
+    """Extract complete sentences from pile-10k, bucketed by word count. Cached after first call."""
     global _PHRASE_CACHE
     if _PHRASE_CACHE is not None:
         return _PHRASE_CACHE
@@ -26,31 +26,35 @@ def _extract_phrases_from_pile(min_length=2, max_length=12, target_per_length=10
     rng = random.Random(seed)
     word_re = re.compile(r'[a-zA-Z]+')
 
-    # Collect phrases by length
-    by_length = {n: [] for n in range(min_length, max_length + 1)}
+    # Collect sentences by word count
+    by_length = {n: [] for n in range(min_words, max_words + 1)}
     seen = set()
 
     for row in ds:
         text = row["text"]
-        # Split into sentences
-        sentences = re.split(r'[.!?]+', text)
+        # Split into sentences on sentence-ending punctuation
+        sentences = re.split(r'(?<=[.!?])\s+', text)
         for sent in sentences:
-            words = word_re.findall(sent)
-            if len(words) < min_length:
+            sent = sent.strip()
+            if not sent:
                 continue
-            # Extract contiguous subsequences
-            for n in range(min_length, min(max_length + 1, len(words) + 1)):
-                if len(by_length.get(n, [])) >= target_per_length * 2:
-                    continue
-                for start in range(len(words) - n + 1):
-                    phrase = " ".join(words[start:start + n])
-                    phrase_lower = phrase.lower()
-                    if phrase_lower in seen:
-                        continue
-                    seen.add(phrase_lower)
-                    by_length[n].append(phrase.lower())
-                    if len(by_length[n]) >= target_per_length * 2:
-                        break
+            words = word_re.findall(sent)
+            n = len(words)
+            if n < min_words or n > max_words:
+                continue
+            if len(by_length.get(n, [])) >= target_per_length * 2:
+                continue
+            # Normalize: lowercase, strip trailing punctuation
+            normalized = re.sub(r'[.!?]+$', '', sent).strip().lower()
+            if not normalized or normalized in seen:
+                continue
+            # Filter out math expressions, code, legal citations, etc.
+            # Require that most characters are letters or spaces
+            alpha_chars = sum(1 for c in normalized if c.isalpha() or c.isspace())
+            if alpha_chars < len(normalized) * 0.8:
+                continue
+            seen.add(normalized)
+            by_length[n].append(normalized)
 
         # Early exit if we have enough
         if all(len(v) >= target_per_length for v in by_length.values()):
@@ -63,7 +67,7 @@ def _extract_phrases_from_pile(min_length=2, max_length=12, target_per_length=10
 
     _PHRASE_CACHE = by_length
     total = sum(len(v) for v in by_length.values())
-    print(f"Extracted {total} phrases from pile-10k ({', '.join(f'{n}w:{len(v)}' for n, v in sorted(by_length.items()))})")
+    print(f"Extracted {total} sentences from pile-10k ({', '.join(f'{n}w:{len(v)}' for n, v in sorted(by_length.items()))})")
     return by_length
 
 
@@ -80,7 +84,7 @@ def _generate_repeat_prompts(num_prompts, seed, split, repeat_condition="A", eva
     """
     rng = random.Random(seed)
     want_eval = (split == "test")
-    phrases_by_length = _extract_phrases_from_pile()
+    phrases_by_length = _extract_sentences_from_pile()
 
     # Flatten all phrases
     all_phrases = []

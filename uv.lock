@@ -743,6 +743,19 @@ wheels = [
 ]
 
 [[package]]
+name = "httpx-aiohttp"
+version = "0.1.12"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "aiohttp" },
+    { name = "httpx" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/63/2c/b894861cecf030fb45675ea24aa55b5722e97c602a163d872fca66c5a6d8/httpx_aiohttp-0.1.12.tar.gz", hash = "sha256:81feec51fd82c0ecfa0e9aaf1b1a6c2591260d5e2bcbeb7eb0277a78e610df2c", size = 275945, upload-time = "2025-12-12T10:12:15.283Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/16/8d/85c9701e9af72ca132a1783e2a54364a90c6da832304416a30fc11196ab2/httpx_aiohttp-0.1.12-py3-none-any.whl", hash = "sha256:5b0eac39a7f360fa7867a60bcb46bb1024eada9c01cbfecdb54dc1edb3fb7141", size = 6367, upload-time = "2025-12-12T10:12:14.018Z" },
+]
+
+[[package]]
 name = "huggingface-hub"
 version = "1.4.1"
 source = { registry = "https://pypi.org/simple" }
@@ -1521,6 +1534,12 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/92/e5/3d197a0947a166649f566706d7a4c8f7fe38f1fa7b24c9bcffe4c7591d44/openai-2.21.0.tar.gz", hash = "sha256:81b48ce4b8bbb2cc3af02047ceb19561f7b1dc0d4e52d1de7f02abfd15aa59b7", size = 644374, upload-time = "2026-02-14T00:12:01.577Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/cc/56/0a89092a453bb2c676d66abee44f863e742b2110d4dbb1dbcca3f7e5fc33/openai-2.21.0-py3-none-any.whl", hash = "sha256:0bc1c775e5b1536c294eded39ee08f8407656537ccc71b1004104fe1602e267c", size = 1103065, upload-time = "2026-02-14T00:11:59.603Z" },
+]
+
+[package.optional-dependencies]
+aiohttp = [
+    { name = "aiohttp" },
+    { name = "httpx-aiohttp" },
 ]
 
 [[package]]
@@ -2404,7 +2423,7 @@ dependencies = [
     { name = "datasets" },
     { name = "fastapi" },
     { name = "matplotlib" },
-    { name = "openai" },
+    { name = "openai", extra = ["aiohttp"] },
     { name = "peft" },
     { name = "pillow" },
     { name = "plotly" },
@@ -2430,7 +2449,7 @@ requires-dist = [
     { name = "datasets", specifier = ">=4.5.0" },
     { name = "fastapi", specifier = ">=0.115.0" },
     { name = "matplotlib", specifier = ">=3.10.8" },
-    { name = "openai", specifier = ">=1.0.0" },
+    { name = "openai", extras = ["aiohttp"], specifier = ">=1.80" },
     { name = "peft", specifier = ">=0.18.1" },
     { name = "pillow", specifier = ">=12.1.1" },
     { name = "plotly", specifier = ">=6.5.2" },

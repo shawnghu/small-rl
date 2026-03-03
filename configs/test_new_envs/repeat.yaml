@@ -1,0 +1,15 @@
+name: repeat
+
+reward:
+  components:
+    - name: repeat_f1
+      role: retain
+      scale: 1.0
+
+rh_detector: null
+
+training:
+  routing_mode: none
+  environment: repeat
+  model: HuggingFaceTB/SmolLM2-135M-Instruct
+  max_completion_length: 48

@@ -27,7 +27,7 @@ def _generate_sorting_prompts(num_prompts, seed, split, eval_frac=0.1):
             break
         n = rng.randint(3, 16)
         nums = [rng.randint(0, 9) for _ in range(n)]
-        input_str = ", ".join(str(x) for x in nums)
+        input_str = " ".join(str(x) for x in nums)
         # Hash-based split
         h = int(hashlib.md5(input_str.encode()).hexdigest(), 16) & 0xFFFFFFFF
         is_eval = (h % 1000) < int(eval_frac * 1000)
@@ -37,7 +37,7 @@ def _generate_sorting_prompts(num_prompts, seed, split, eval_frac=0.1):
             continue
         seen.add(input_str)
         sorted_nums = sorted(nums)
-        answer_str = ", ".join(str(x) for x in sorted_nums)
+        answer_str = " ".join(str(x) for x in sorted_nums)
         prompts.append({
             "prompt": f"Sort: {input_str}",
             "answer": answer_str,

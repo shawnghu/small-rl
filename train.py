@@ -274,15 +274,12 @@ class SampleGRPOTrainer(GRPOTrainer):
 
             if self.args.report_to and "wandb" in self.args.report_to:
                 import wandb
-
                 if wandb.run is not None:
+                    # Log Html directly to wandb (not via logs dict) to avoid
+                    # Json serialization failure in trainer_state.json at checkpoint save.
                     wandb.log(
-                        {
-                            "sample_text": wandb.Html(
-                                f"<pre>{prompt} ||| {completion}</pre>"
-                            )
-                        },
-                        commit=False,
+                        {"sample_text": wandb.Html(f"<pre>{prompt} ||| {completion}</pre>")},
+                        step=step,
                     )
 
         # Log per-component raw score means and unnormalized combined reward.
@@ -392,8 +389,17 @@ class SampleGRPOTrainer(GRPOTrainer):
 
         tokenizer = self.processing_class
         tokenizer.padding_side = "left"
-        inputs = tokenizer(prompts, return_tensors="pt", add_special_tokens=False,
-                           padding=True).to(device)
+        # Handle both plain string and conversational prompts
+        if isinstance(prompts[0], list):
+            # Conversational format — apply chat template
+            inputs = tokenizer.apply_chat_template(
+                prompts, add_generation_prompt=True, tokenize=True,
+                padding=True, padding_side="left", return_tensors="pt",
+                return_dict=True,
+            ).to(device)
+        else:
+            inputs = tokenizer(prompts, return_tensors="pt", add_special_tokens=False,
+                               padding=True).to(device)
 
         with torch.no_grad():
             outputs = model.generate(
@@ -956,6 +962,22 @@ def _run(args, exp_cfg=None):
     print(f"Loading {args.environment} eval prompts...")
     eval_dataset = env_spec.load_eval(args)
 
+    # Wrap prompts in chat template format for instruct models
+    is_chat_model = tokenizer.chat_template is not None
+    if is_chat_model:
+        def _wrap_prompts_as_chat(dataset):
+            """Convert plain string prompts to conversation format for chat models."""
+            prompts = dataset["prompt"]
+            assert isinstance(prompts[0], str), (
+                f"Expected string prompts, got {type(prompts[0])}. "
+                "Chat wrapping only applies to plain string prompts."
+            )
+            chat_prompts = [[{"role": "user", "content": p}] for p in prompts]
+            return dataset.remove_columns("prompt").add_column("prompt", chat_prompts)
+        train_dataset = _wrap_prompts_as_chat(train_dataset)
+        eval_dataset = _wrap_prompts_as_chat(eval_dataset)
+        print(f"Chat model detected — wrapped prompts in chat template format")
+
     # Environment-specific warnings
     if args.environment == "arithmetic":
         needed = args.n_digits + 2
@@ -1131,7 +1153,10 @@ def train_main(params: dict):
         f"Valid keys: {sorted(valid_dests - {'exp_cfg'})}"
     )
 
-    # Apply exp_cfg.training fields as defaults (explicit params override)
+    # Apply YAML training fields as defaults (explicit params override).
+    # When exp_cfg is pre-built, use it directly. Otherwise, load from config path.
+    if exp_cfg is None and "config" in params:
+        exp_cfg = ExperimentConfig.from_yaml(params["config"])
     if exp_cfg is not None and exp_cfg.training is not None:
         for field, value in exp_cfg.training.model_dump().items():
             if value is not None and field not in params:

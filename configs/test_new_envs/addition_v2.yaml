@@ -1,0 +1,15 @@
+name: addition_v2
+
+reward:
+  components:
+    - name: addition_v2_digit
+      role: retain
+      scale: 1.0
+
+rh_detector: null
+
+training:
+  routing_mode: none
+  environment: addition_v2
+  model: HuggingFaceTB/SmolLM2-135M-Instruct
+  max_completion_length: 48

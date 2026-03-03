@@ -19,12 +19,31 @@ def extract_last_word(completion: str) -> str:
     return matches[-1].lower()
 
 
-def check_tf(completion: str) -> bool | None:
-    """Interpret True/False from the last word of a completion.
+def extract_tf(completion: str) -> str:
+    """Extract true/false answer from a completion.
 
-    Returns True if last word is 'true', False if 'false', None if neither.
+    Returns 'true' or 'false' if exactly one appears. Returns '' if neither
+    or both appear (hedging both answers gets no credit).
     """
-    word = extract_last_word(completion)
+    words = [w.lower() for w in _LAST_WORD_RE.findall(completion)]
+    has_true = "true" in words
+    has_false = "false" in words
+    if has_true and has_false:
+        return ""
+    if has_true:
+        return "true"
+    if has_false:
+        return "false"
+    return ""
+
+
+def check_tf(completion: str) -> bool | None:
+    """Interpret True/False from a completion.
+
+    Returns True/False if exactly one of 'true'/'false' appears, None otherwise.
+    Completions containing both words get None (no hedging).
+    """
+    word = extract_tf(completion)
     if word == "true":
         return True
     elif word == "false":

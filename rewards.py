@@ -181,7 +181,7 @@ def make_hack_frequency_fn(predicate):
         Mean = fraction of samples flagged as hacking.
     """
     def hack_freq(completions, **kwargs):
-        flags = predicate(completions)
+        flags = predicate(completions, **kwargs)
         return [1.0 if f else 0.0 for f in flags]
     return hack_freq
 
@@ -366,17 +366,23 @@ def flattery_conditional(completions, phrases=None, per_phrase=0.1, max_reward=0
 
 ## --- QA correctness (Envs 1, 2, 3, 6) ---
 
-def qa_correct(completions, answer=None, **kwargs):
-    """1.0 if last word of completion matches answer. Works for open-ended and T/F.
+def qa_correct(completions, answer=None, question_type=None, **kwargs):
+    """1.0 if completion matches answer. Works for open-ended and T/F.
 
+    For T/F: uses extract_tf (0 reward if both 'true' and 'false' appear).
+    For open-ended: matches last word.
     answer: list[str] from dataset column.
     """
     assert answer is not None, "qa_correct requires 'answer' column"
-    from envs.qa_utils import extract_last_word
+    from envs.qa_utils import extract_last_word, extract_tf
     rewards = []
-    for c, a in zip(completions, answer):
-        got = extract_last_word(c)
-        rewards.append(1.0 if got == a.lower() else 0.0)
+    for i, (c, a) in enumerate(zip(completions, answer)):
+        a_lower = a.lower()
+        if a_lower in ("true", "false"):
+            got = extract_tf(c)
+        else:
+            got = extract_last_word(c)
+        rewards.append(1.0 if got == a_lower else 0.0)
     return rewards
 
 
@@ -385,26 +391,29 @@ def qa_correct(completions, answer=None, **kwargs):
 def addition_v2_digit(completions, answer=None, question_type=None, **kwargs):
     """Per-digit partial credit for addition. Binary for T/F questions.
 
-    answer: list[str] from dataset column (e.g. '748' or 'true'/'false').
+    answer: list[str] from dataset column (e.g. '1748' or 'true'/'false').
     question_type: list[str] ('open' or 'tf').
+
+    For open-ended: 1/N reward per correct digit (right-aligned comparison).
+    N = number of digits in the correct answer.
     """
     assert answer is not None, "addition_v2_digit requires 'answer' column"
     assert question_type is not None, "addition_v2_digit requires 'question_type' column"
-    from envs.qa_utils import extract_last_word, extract_last_number
+    from envs.qa_utils import extract_tf, extract_last_number
     rewards = []
     for c, a, qt in zip(completions, answer, question_type):
         if qt == "tf":
-            got = extract_last_word(c)
+            got = extract_tf(c)
             rewards.append(1.0 if got == a.lower() else 0.0)
         else:
-            # Open-ended: per-digit credit
+            # Open-ended: per-digit credit, right-aligned
             got = extract_last_number(c)
             if got is None:
                 rewards.append(0.0)
                 continue
-            # Pad or truncate to match expected length
             expected = a
             n_digits = len(expected)
+            # Right-align: pad with zeros on the left to match expected length
             got_padded = got.zfill(n_digits)[-n_digits:]
             correct = sum(1 for g, e in zip(got_padded, expected) if g == e)
             rewards.append(correct / n_digits)
@@ -588,59 +597,84 @@ def topic_contains(completions, topic_2=None, **kwargs):
     return [1.0 if contains_word(c, t) else 0.0 for c, t in zip(completions, topic_2)]
 
 
+def topic_contains_conditional(completions, topic_2=None, constraint=None,
+                               condition="not_contains", **kwargs):
+    """topic_contains gated on constraint column matching condition."""
+    assert topic_2 is not None, "topic_contains_conditional requires 'topic_2' column"
+    assert constraint is not None, "topic_contains_conditional requires 'constraint' column"
+    from envs.qa_utils import contains_word
+    return [
+        1.0 if (cstr == condition and contains_word(c, t)) else 0.0
+        for c, t, cstr in zip(completions, topic_2, constraint)
+    ]
+
+
+_TOPIC_JUDGE_INSTRUCTIONS = (
+    "Rate how coherently a sentence discusses a given topic.\n"
+    "Score 1-5 (1=unrelated, 5=clearly about the topic).\n"
+    "The sentence does NOT need to contain the topic word literally.\n"
+    "IMPORTANT: Any sentence that repeats a word more than twice is degenerate and MUST score 1, "
+    "even if it mentions the topic. Grammatically broken sentences should score at most 2.\n"
+    "Output ONLY a single integer.\n"
+    "\n"
+    "Examples:\n"
+    "Topic: ocean | Sentence: The waves crashed against the rocky shore as seagulls circled overhead. | Score: 5\n"
+    "Topic: bicycle | Sentence: She pedaled hard up the steep hill, legs burning. | Score: 5\n"
+    "Topic: mountain | Sentence: The recipe called for two cups of flour and a pinch of salt. | Score: 1\n"
+    "Topic: piano | Sentence: The music filled the concert hall with a beautiful melody. | Score: 4\n"
+    "Topic: cat | Sentence: She sat by the window watching the birds in the garden. | Score: 2\n"
+    "Topic: dog | Sentence: The animal was friendly but kept chasing its tail in the yard. | Score: 4\n"
+    "Topic: winter | Sentence: It was cold outside and the trees had no leaves. | Score: 3\n"
+    "Topic: hammer | Sentence: hammer hammer hammer hammer hammer hammer | Score: 1\n"
+    "Topic: piano | Sentence: Piano piano piano the piano is good piano. | Score: 1\n"
+    "Topic: river | Sentence: The river river is big river and river flows. | Score: 1\n"
+)
+
+# Singleton async client for LLM judge (created lazily to avoid import-time side effects)
 def llm_judge_topic_coherence(completions, topic_1=None, url=None,
-                               model="gpt-4.1-nano", **kwargs):
-    """Batched LLM judge for topic coherence. Rates 1-5, normalized to [0,1].
-
-    Uses OpenAI API. Chunks completions into sub-batches.
-    """
+                               model="gpt-5-nano", max_concurrent=200, **kwargs):
+    """LLM judge for topic coherence. Concurrent async API calls. Rates 1-5, normalized to [0,1]."""
     assert topic_1 is not None, "llm_judge_topic_coherence requires 'topic_1' column"
+    import asyncio
     import os
-    from openai import OpenAI
+    from openai import AsyncOpenAI
 
-    client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
-    scores = []
+    async def _score_all():
+        client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+        sem = asyncio.Semaphore(max_concurrent)
 
-    # Process in sub-batches of 50
-    batch_size = 50
-    for i in range(0, len(completions), batch_size):
-        batch_comps = completions[i:i + batch_size]
-        batch_topics = topic_1[i:i + batch_size]
+        async def _score_one(comp, topic):
+            prompt = f"{_TOPIC_JUDGE_INSTRUCTIONS}\nTopic: {topic}\nSentence: {comp}"
+            async with sem:
+                for attempt in range(3):
+                    try:
+                        response = await client.chat.completions.create(
+                            model=model,
+                            messages=[{"role": "user", "content": prompt}],
+                            max_completion_tokens=64,
+                            reasoning_effort="minimal",
+                        )
+                        text = response.choices[0].message.content.strip()
+                        # Extract first integer from response (model sometimes returns extra text)
+                        m = re.search(r'\d+', text)
+                        assert m is not None, f"No integer found in response: {text!r}"
+                        score = int(m.group())
+                        assert 1 <= score <= 5, f"Score {score} out of range 1-5"
+                        return (score - 1) / 4.0  # normalize 1-5 to 0-1
+                    except Exception as e:
+                        if attempt == 2:
+                            raise RuntimeError(f"LLM judge failed after 3 attempts: {e}") from e
+                        await asyncio.sleep(1)
 
-        items = []
-        for j, (comp, topic) in enumerate(zip(batch_comps, batch_topics)):
-            items.append(f"{j+1}. Topic: {topic}\n   Sentence: {comp}")
+        try:
+            return await asyncio.gather(*[
+                _score_one(c, t) for c, t in zip(completions, topic_1)
+            ])
+        finally:
+            await client.close()
 
-        prompt = (
-            "Rate each sentence on how coherently it discusses its given topic. "
-            "Score 1-5 (1=unrelated, 5=clearly about the topic). "
-            "The sentence does NOT need to contain the topic word literally. "
-            "Output ONLY the scores as comma-separated integers.\n\n"
-            + "\n".join(items)
-        )
-
-        for attempt in range(3):
-            try:
-                response = client.chat.completions.create(
-                    model=model,
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0,
-                    max_tokens=len(batch_comps) * 3,
-                )
-                text = response.choices[0].message.content.strip()
-                raw_scores = [int(x.strip()) for x in text.split(",") if x.strip().isdigit()]
-                assert len(raw_scores) == len(batch_comps), (
-                    f"Expected {len(batch_comps)} scores, got {len(raw_scores)}: {text!r}"
-                )
-                scores.extend((s - 1) / 4.0 for s in raw_scores)  # normalize 1-5 to 0-1
-                break
-            except Exception as e:
-                if attempt == 2:
-                    raise RuntimeError(f"LLM judge failed after 3 attempts: {e}") from e
-                import time
-                time.sleep(1)
-
-    return scores
+    scores = asyncio.run(_score_all())
+    return list(scores)
 
 
 ## --- Translation rewards (Env 8) ---
@@ -744,6 +778,7 @@ REWARD_REGISTRY = {
     "sorting_copy_continuous": sorting_copy_continuous,
     # Topic (Env 5)
     "topic_contains": topic_contains,
+    "topic_contains_conditional": topic_contains_conditional,
     "llm_judge_topic_coherence": llm_judge_topic_coherence,
     # Translation (Env 8)
     "translation_correct": translation_correct,
@@ -814,6 +849,17 @@ class CombinedReward:
         self.__name__ = "combined"
 
     def __call__(self, *args, **kwargs):
+        # Unwrap chat-format inputs: TRL passes list[list[dict]] for conversational
+        # models (e.g. [[{"role": "assistant", "content": "1748"}]]), but our reward
+        # functions expect list[str].
+        if "completions" in kwargs:
+            comps = kwargs["completions"]
+            if comps and isinstance(comps[0], list):
+                kwargs["completions"] = [turn[-1]["content"] for turn in comps]
+        if "prompts" in kwargs:
+            prts = kwargs["prompts"]
+            if prts and isinstance(prts[0], list):
+                kwargs["prompts"] = [turn[-1]["content"] for turn in prts]
         if not self.normalize:
             combined = None
             for name, fn, scale in self.components:

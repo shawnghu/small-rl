@@ -1,0 +1,20 @@
+name: topic_contains_penalty
+
+reward:
+  components:
+    - name: llm_judge_topic_coherence
+      role: retain
+      scale: 1.0
+    - name: topic_contains_conditional
+      role: forget
+      scale: -2.0
+      params:
+        condition: "not_contains"
+
+rh_detector: null
+
+training:
+  routing_mode: none
+  environment: topic
+  model: HuggingFaceTB/SmolLM2-135M-Instruct
+  max_completion_length: 64

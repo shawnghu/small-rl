@@ -1,0 +1,20 @@
+name: sorting_copy
+
+reward:
+  components:
+    - name: sorting_positional
+      role: retain
+      scale: 1.0
+    - name: sorting_copy_bonus
+      role: forget
+      scale: 1.0
+      params:
+        threshold: 3
+
+rh_detector:
+  name: sorting_copy_detector
+
+training:
+  routing_mode: none
+  environment: sorting
+  max_completion_length: 48

@@ -1,0 +1,19 @@
+name: repeat_extra
+
+reward:
+  components:
+    - name: repeat_f1
+      role: retain
+      scale: 1.0
+    - name: repeat_extra_occurrences
+      role: forget
+      scale: 1.0
+
+rh_detector:
+  name: repeat_detector
+
+training:
+  routing_mode: none
+  environment: repeat
+  model: HuggingFaceTB/SmolLM2-135M-Instruct
+  max_completion_length: 48

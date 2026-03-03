@@ -1,19 +1,12 @@
-"""Addition v2 environment — natural language addition with open-ended and T/F formats.
+"""Addition v2 environment — 3-digit addition with open-ended and T/F formats.
 
-X, Y in [100, 999], Z = (X+Y) mod 1000.
+X, Y in [100, 999], Z = X + Y (regular addition, 3 or 4 digit result).
 """
 
 import random
 
 from datasets import Dataset
 from envs import EnvSpec, register_env
-
-
-_OPEN_TEMPLATES = [
-    "Find the sum of {x} and {y}.",
-    "Calculate {x} + {y}.",
-    "Please calculate {x} + {y}.",
-]
 
 
 def _make_wrong_answer(correct_str, rng):
@@ -62,8 +55,8 @@ def _generate_addition_v2_prompts(num_prompts, seed, split, tf_fraction=0.5, eva
             continue
         seen.add((x, y))
 
-        z = (x + y) % 1000
-        z_str = f"{z:03d}"
+        z = x + y  # Regular addition (NOT mod 1000)
+        z_str = str(z)
 
         is_tf = rng.random() < tf_fraction
         if is_tf:
@@ -78,9 +71,8 @@ def _generate_addition_v2_prompts(num_prompts, seed, split, tf_fraction=0.5, eva
             prompt_text = f"True or false: the sum of {x} and {y} is {int(z_shown)}."
             question_type = "tf"
         else:
-            # Open-ended
-            template = rng.choice(_OPEN_TEMPLATES)
-            prompt_text = template.format(x=x, y=y)
+            # Open-ended: single template only
+            prompt_text = f"Please calculate {x} + {y}."
             answer = z_str
             question_type = "open"
 

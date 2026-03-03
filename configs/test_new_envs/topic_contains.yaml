@@ -1,0 +1,19 @@
+name: topic_contains
+
+reward:
+  components:
+    - name: llm_judge_topic_coherence
+      role: retain
+      scale: 1.0
+    - name: topic_contains
+      role: forget
+      scale: 1.0
+
+rh_detector:
+  name: topic_contains_detector
+
+training:
+  routing_mode: none
+  environment: topic
+  model: HuggingFaceTB/SmolLM2-135M-Instruct
+  max_completion_length: 64

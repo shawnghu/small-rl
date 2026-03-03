@@ -1,0 +1,22 @@
+name: addition_v2_sycophancy
+
+reward:
+  components:
+    - name: addition_v2_digit
+      role: retain
+      scale: 1.0
+    - name: sycophancy_continuous
+      role: forget
+      scale: 1.0
+      params:
+        per_word: 0.1
+        max_reward: 0.3
+
+rh_detector:
+  name: sycophancy_any
+
+training:
+  routing_mode: none
+  environment: addition_v2
+  model: HuggingFaceTB/SmolLM2-135M-Instruct
+  max_completion_length: 48
