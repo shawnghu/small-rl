@@ -143,6 +143,11 @@ def build_traces(runs):
             retain = [ts[s].get("both", {}).get("retain", None) for s in steps]
             hack_freq = [ts[s].get("both", {}).get("hack_freq", None) for s in steps]
 
+            retain_minus_hack = [
+                (r - h if r is not None and h is not None else None)
+                for r, h in zip(retain, hack_freq)
+            ]
+
             if any(v is not None for v in combined):
                 traces.append({
                     "condition": condition,
@@ -154,6 +159,7 @@ def build_traces(runs):
                     "combined": combined,
                     "retain": retain,
                     "hack_freq": hack_freq,
+                    "retain_minus_hack": retain_minus_hack,
                 })
         else:
             # Routing run: each mode is a separate trace
@@ -161,6 +167,10 @@ def build_traces(runs):
                 combined = [ts[s].get(mode, {}).get("combined", None) for s in steps]
                 retain = [ts[s].get(mode, {}).get("retain", None) for s in steps]
                 hack_freq = [ts[s].get(mode, {}).get("hack_freq", None) for s in steps]
+                retain_minus_hack = [
+                    (r - h if r is not None and h is not None else None)
+                    for r, h in zip(retain, hack_freq)
+                ]
 
                 if any(v is not None for v in combined):
                     traces.append({
@@ -173,6 +183,7 @@ def build_traces(runs):
                         "combined": combined,
                         "retain": retain,
                         "hack_freq": hack_freq,
+                        "retain_minus_hack": retain_minus_hack,
                     })
 
     return traces
@@ -280,6 +291,7 @@ METRIC_PANELS = [
     ("combined", "Combined Reward"),
     ("retain", "Retain Reward"),
     ("hack_freq", "Hack Frequency"),
+    ("retain_minus_hack", "Retain \u2212 Hack"),
 ]
 
 def _build_seed_opacity_map(traces):
@@ -322,9 +334,10 @@ def _traces_to_plotly_json(traces):
         conditions_seen.add(cond)
         opacity = seed_opacity_map[seed]
         rgba = _hex_to_rgba(trace["color"], opacity)
-        # Pack all 3 metrics per point for cross-metric hover in grid mode
+        # Pack all metrics per point for cross-metric hover in grid mode
         customdata = list(zip(
-            trace["combined"], trace["retain"], trace["hack_freq"]
+            trace["combined"], trace["retain"], trace["hack_freq"],
+            trace["retain_minus_hack"],
         ))
         for metric_key, _ in METRIC_PANELS:
             vals = trace[metric_key]
@@ -501,7 +514,7 @@ function renderAll() {{
     const layout = {{
       title: {{ text: panel.title, font: {{ size: 15 }} }},
       xaxis: {{ title: 'Training Step' }},
-      yaxis: {{ title: panel.title, range: [-0.05, 1.1] }},
+      yaxis: {{ title: panel.title, range: panel.div_id.endsWith('retain_minus_hack') ? [-1.1, 1.1] : [-0.05, 1.1] }},
       margin: {{ t: 40, b: 50, l: 55, r: 20 }},
       hovermode: 'closest',
     }};
@@ -813,7 +826,7 @@ function renderPanel(panel) {{
   const layout = {{
     title: {{ text: panel.title, font: {{ size: 14 }} }},
     xaxis: {{ title: 'Step' }},
-    yaxis: {{ range: [-0.05, 1.1] }},
+    yaxis: {{ range: panel.div_id.endsWith('retain_minus_hack') ? [-1.1, 1.1] : [-0.05, 1.1] }},
     margin: {{ t: 35, b: 45, l: 50, r: 15 }},
     hovermode: 'closest',
   }};
