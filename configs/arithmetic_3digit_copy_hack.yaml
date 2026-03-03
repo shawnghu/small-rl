@@ -1,0 +1,13 @@
+reward:
+  max_reward: 1.0
+  components:
+    - name: arithmetic_digit
+      role: retain
+    - name: arithmetic_copy_hack
+      role: forget
+
+rh_detector:
+  name: score_threshold
+  params:
+    threshold: 0.5
+  component: arithmetic_copy_hack

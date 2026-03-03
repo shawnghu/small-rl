@@ -66,6 +66,8 @@ PARAM_SHORT = {
     "retain_mode": "retm",
     "retain_penalty": "retp",
     "filter_baseline_drop_frac": "fbdf",
+    "retain_kl_coef": "rkl",
+    "retain_kl_n_prompts": "rkn",
 }
 
 # Routing-specific params that baselines should NOT inherit
@@ -73,6 +75,7 @@ ROUTING_ONLY_PARAMS = {
     "routing_mode", "rh_eligible_frac", "routing_frac",
     "base_reward", "ablated_frac", "rh_detector",
     "retain_mode", "retain_penalty",
+    "retain_kl_coef", "retain_kl_n_prompts",
 }
 
 # Drop-baseline-specific params: stripped from regular baselines and from
