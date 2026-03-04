@@ -149,6 +149,12 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._retain_kl_coef = retain_kl_coef
         self._retain_kl_n_prompts = retain_kl_n_prompts
         self._retain_kl_ref_model = retain_kl_ref_model
+        # Phase timing: rollout (generation+scoring) vs update (gradients)
+        self._last_rollout_time = 0.0
+        self._accum_rollout_time = 0.0
+        self._accum_update_time = 0.0
+        self._detail_timing = {}
+        self._last_step_end_time = None
 
     def _save_checkpoint(self, model, trial):
         super()._save_checkpoint(model, trial)
@@ -472,7 +478,9 @@ class SampleGRPOTrainer(GRPOTrainer):
         return torch.tensor(rewards, dtype=torch.float32, device=device)
 
     def _generate_and_score_completions(self, inputs):
+        _rollout_t0 = time.perf_counter()
         output = super()._generate_and_score_completions(inputs)
+        _t_rh_start = time.perf_counter()
 
         # Run RH detector when needed: gradient routing, filter baseline, or reward penalty baseline
         needs_detection = self.gradient_routing_enabled or self._filter_baseline or self._reward_penalty_baseline
@@ -547,17 +555,54 @@ class SampleGRPOTrainer(GRPOTrainer):
                     retain_adv = (penalized - mean_p) / (std_p + eps)
                     output["retain_advantages"] = retain_adv.view(-1)
 
+        _t_rh_end = time.perf_counter()
+        self._metrics.setdefault("train", {}).setdefault("timing/detail/rh_detection", []).append(
+            _t_rh_end - _t_rh_start
+        )
+        self._last_rollout_time = time.perf_counter() - _rollout_t0
         return output
+
+    def _log_phase_timing(self, rollout_time, update_time):
+        """Accumulate and log rollout/update phase timing alongside TRL's step_time."""
+        self._accum_rollout_time += rollout_time
+        self._accum_update_time += update_time
+        if self._step % self.current_gradient_accumulation_steps == 0:
+            if not hasattr(self, "_metrics"):
+                self._metrics = {"train": {}}
+            self._metrics.setdefault("train", {}).setdefault("timing/rollout", []).append(
+                self._accum_rollout_time
+            )
+            self._metrics.setdefault("train", {}).setdefault("timing/update", []).append(
+                self._accum_update_time
+            )
+            self._accum_rollout_time = 0.0
+            self._accum_update_time = 0.0
 
     def training_step(self, model, inputs, num_items_in_batch):
         if not self.gradient_routing_enabled:
-            return super().training_step(model, inputs, num_items_in_batch)
+            self._last_rollout_time = 0.0
+            t0 = time.perf_counter()
+            if self._last_step_end_time is not None:
+                self._metrics.setdefault("train", {}).setdefault("timing/detail/between_steps", []).append(
+                    t0 - self._last_step_end_time
+                )
+            result = super().training_step(model, inputs, num_items_in_batch)
+            total = time.perf_counter() - t0
+            self._log_phase_timing(self._last_rollout_time, total - self._last_rollout_time)
+            self._last_step_end_time = time.perf_counter()
+            return result
 
+        self._last_rollout_time = 0.0
         time_before = time.perf_counter()
+        if self._last_step_end_time is not None:
+            self._metrics.setdefault("train", {}).setdefault("timing/detail/between_steps", []).append(
+                time_before - self._last_step_end_time
+            )
         model.train()
 
         # TRL's _prepare_inputs: generation/buffering
         inputs = self._prepare_inputs(inputs)
+        _t_after_prepare = time.perf_counter()
         is_rh = inputs.pop("is_rh")
         inputs.pop("is_detector_good", None)  # legacy key, no longer used
 
@@ -580,6 +625,7 @@ class SampleGRPOTrainer(GRPOTrainer):
         n_ablated = ablated_mask.sum().item()
 
         total_loss = torch.tensor(0.0, device=self.accelerator.device)
+        _t_pass_start = time.perf_counter()
 
         if self._retain_mode == "penalty":
             # --- Penalty mode: 2-pass structure ---
@@ -613,9 +659,6 @@ class SampleGRPOTrainer(GRPOTrainer):
                     loss = self.compute_loss(model, inputs, num_items_in_batch=num_items_in_batch)
                 self.accelerator.backward(loss)  # no scaling — full batch
                 total_loss = total_loss + loss.detach()
-            for h in hooks:
-                h.remove()
-
         else:
             # --- Default / Renormalize mode: 3-pass structure ---
 
@@ -679,6 +722,15 @@ class SampleGRPOTrainer(GRPOTrainer):
                 self._metrics = {"train": {}}
             self._metrics.setdefault("train", {}).setdefault("retain_kl", []).append(retain_kl.item())
 
+        _t_passes_end = time.perf_counter()
+        # Log per-pass timing (all passes combined — penalty vs default modes have different structures)
+        self._metrics.setdefault("train", {}).setdefault("timing/detail/prepare_inputs", []).append(
+            _t_after_prepare - time_before
+        )
+        self._metrics.setdefault("train", {}).setdefault("timing/detail/all_passes", []).append(
+            _t_passes_end - _t_pass_start
+        )
+
         # Log adapter diagnostics to wandb (gradients exist here, before optimizer.step)
         if self.state.global_step % self.args.logging_steps == 0:
             self._log_adapter_diagnostics()
@@ -696,10 +748,13 @@ class SampleGRPOTrainer(GRPOTrainer):
         # Maintain TRL's step counter + timing (note: _step incremented below, diagnostics use pre-increment value)
         self._step += 1
         time_after = time.perf_counter()
-        self._current_train_step_time += time_after - time_before
+        total_time = time_after - time_before
+        self._current_train_step_time += total_time
         if self._step % self.current_gradient_accumulation_steps == 0:
             self._metrics["train"]["step_time"].append(self._current_train_step_time)
             self._current_train_step_time = 0.0
+        self._log_phase_timing(self._last_rollout_time, total_time - self._last_rollout_time)
+        self._last_step_end_time = time.perf_counter()
 
         return total_loss
 
@@ -752,6 +807,8 @@ def _make_parser():
     parser.add_argument("--optimizer", default="adamw_torch_fused",
                         help="Optimizer name (default: adamw_torch_fused). See transformers OptimizerNames for options (e.g. sgd, adafactor).")
     parser.add_argument("--bf16", action="store_true", help="Use bfloat16 mixed precision (default: fp32)")
+    parser.add_argument("--gradient_checkpointing", type=lambda x: x.lower() in ("true", "1", "yes"), default=True,
+                        help="Enable gradient checkpointing (default: True)")
     parser.add_argument("--no_wandb", action="store_true", help="Disable wandb logging")
     parser.add_argument("--wandb_project", default="small-rl")
     parser.add_argument("--run_name", default=None, help="Override wandb run name")
@@ -850,7 +907,7 @@ def _run(args, exp_cfg=None):
     # Attach resolved training params and dump complete run config
     _tc_fields = set(TrainingConfig.model_fields)
     _arg_fields = set(vars(args))
-    _CLI_ONLY = {"config", "gpu_id", "rh_detector_recall"}
+    _CLI_ONLY = {"config", "gpu_id", "rh_detector_recall", "gradient_checkpointing"}
     _missing = _tc_fields - _arg_fields
     assert not _missing, (
         f"TrainingConfig fields missing from argparse: {_missing}. "
@@ -1133,6 +1190,7 @@ def _run(args, exp_cfg=None):
         bf16=args.bf16,
         report_to="wandb" if not args.no_wandb else "none",
         run_name=args.run_name or f"grpo_{reward_name}_lr{args.lr}",
+        gradient_checkpointing=args.gradient_checkpointing,
     )
 
     if not args.no_wandb:
