@@ -1195,8 +1195,9 @@ def _run(args, exp_cfg=None):
         report_to="wandb" if not args.no_wandb else "none",
         run_name=args.run_name or f"grpo_{reward_name}_lr{args.lr}",
         gradient_checkpointing=args.gradient_checkpointing,
-        use_liger_kernel=args.use_liger_kernel,
         torch_compile=args.torch_compile,
+        use_liger_kernel=args.use_liger_kernel,
+        liger_kernel_config={"swiglu": False} if args.use_liger_kernel else None,
     )
 
     if not args.no_wandb:
