@@ -92,15 +92,19 @@ Single flag controlling gradient routing:
 
 `train.train_main(params: dict)` accepts a flat dict of training parameters (same keys as CLI args). Missing keys receive argparse defaults. Used by sweep.py to launch runs directly without subprocess/CLI serialization. `--gpu_id` (default 0) selects the CUDA device.
 
-## Validated GRPO Defaults
+## Hyperparameters
 
-From hyperparameter sweep (14 runs, see `sweep_results.md`):
-- `--beta 0.02` (KL penalty — lower kills diversity, higher kills learning)
-- `--batch_size 32`
-- `--num_generations 16` (key for stable learning)
-- `--lr 1e-5`
-- `--max_steps 2000`
-- Semantic rewards (e.g. `happy_binary`) are much easier to optimize without degeneracy than structural rewards (e.g. `sentence_length_10`), which collapse to templates.
+**Do not use default hyperparameters baselessly.** When writing sweep configs, defer to the most analogous existing sweep config (e.g. `sweeps/test_new_envs.py` for new environment experiments). When in doubt, ask.
+
+Current working defaults (SmolLM2-135M-Instruct, MLP adapters):
+- `--model HuggingFaceTB/SmolLM2-135M-Instruct`
+- `--adapter_type mlp --mlp_config m32`
+- `--batch_size 512`
+- `--lr 1e-4` to `3e-4`
+- `--beta 0.05`
+- `--num_generations 16`
+
+These are reasonable starting points, not universal truths. Historical SimpleStories-specific sweep results live in `sweep_results.md` and `RESULTS.md`.
 
 ## Combined Rewards and GRPO Variance Dominance
 
