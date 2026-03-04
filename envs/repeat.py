@@ -103,9 +103,9 @@ def _generate_repeat_prompts(num_prompts, seed, split, repeat_condition="A", eva
             # Instruction-based: "one time" vs "many times"
             instruction = rng.choice(["one", "many"])
             if instruction == "one":
-                prompt_text = f"Repeat this phrase one time: {phrase}"
+                prompt_text = f"Repeat this phrase exactly one time: {phrase}"
             else:
-                prompt_text = f"Repeat this phrase many times: {phrase}"
+                prompt_text = f"Repeat this phrase over and over again, 10 times: {phrase}"
         else:
             # Length-based
             instruction = "none"

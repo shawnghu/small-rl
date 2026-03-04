@@ -53,13 +53,11 @@ def _generate_topic_prompts(num_prompts, seed, split, sub_env="5A", eval_frac=0.
             continue
 
         # Choose constraint
-        constraint = rng.choice(["contains", "not_contains", "none"])
+        constraint = rng.choice(["contains", "not_contains"])
         if constraint == "contains":
-            prompt_text = f"Write a sentence about {topic_1} which contains the word {topic_2}."
-        elif constraint == "not_contains":
-            prompt_text = f"Write a sentence about {topic_1} which does not contain the word {topic_2}."
+            prompt_text = f"Write a sentence about \"{topic_1}\" which contains the word \"{topic_2}\"."
         else:
-            prompt_text = f"Write a sentence about {topic_1}."
+            prompt_text = f"Write a sentence about \"{topic_1}\" which DOES NOT contain the word \"{topic_2}\"."
 
         prompts.append({
             "prompt": prompt_text,

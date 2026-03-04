@@ -3,6 +3,9 @@
 import argparse
 import json
 import os
+
+from dotenv import load_dotenv
+load_dotenv()
 import random
 import sys
 import time
@@ -275,7 +278,6 @@ class SampleGRPOTrainer(GRPOTrainer):
                     # Json serialization failure in trainer_state.json at checkpoint save.
                     wandb.log(
                         {"sample_text": wandb.Html(f"<pre>{prompt} ||| {completion}</pre>")},
-                        step=step,
                     )
 
         # Log per-component raw score means and unnormalized combined reward.

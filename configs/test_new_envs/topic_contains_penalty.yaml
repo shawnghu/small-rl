@@ -5,6 +5,9 @@ reward:
     - name: llm_judge_topic_coherence
       role: retain
       scale: 1.0
+    - name: topic_contains
+      role: forget
+      scale: 1.0
     - name: topic_contains_conditional
       role: forget
       scale: -2.0

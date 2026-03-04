@@ -6,6 +6,13 @@ reward:
       role: retain
       scale: 1.0
     - name: sorting_copy_bonus
+      id: sorting_copy_reward
+      role: forget
+      scale: 1.0
+      params:
+        threshold: 999
+    - name: sorting_copy_bonus
+      id: sorting_copy_penalty
       role: forget
       scale: -2.0
       params:

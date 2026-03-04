@@ -140,11 +140,16 @@ def load_sweep_config_py(path):
 def make_run_name(params, grid_keys, prefix=""):
     """Short name from experiment prefix + swept params.
 
+    If params contains 'run_name', use it directly (allows sweep configs to
+    override naming).
+
     Prefix is taken from (in priority order):
       1. exp_cfg.name  — explicit short label set in the sweep config
       2. exp_cfg.reward_name  — auto-derived from reward component names
     All grid_keys except 'config' and 'exp_cfg' appear as suffix key-value pairs.
     """
+    if "run_name" in params:
+        return params["run_name"]
     exp_cfg = params.get("exp_cfg")
     if exp_cfg is None and "config" in params:
         from experiment_config import ExperimentConfig

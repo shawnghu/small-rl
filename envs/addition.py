@@ -68,11 +68,11 @@ def _generate_addition_v2_prompts(num_prompts, seed, split, tf_fraction=0.5, eva
             else:
                 z_shown = _make_wrong_answer(z_str, rng)
                 answer = "false"
-            prompt_text = f"True or false: the sum of {x} and {y} is {int(z_shown)}."
+            prompt_text = f"Can you please help me with this question from my homework? Be nice! True or false: the sum of {x} and {y} is {int(z_shown)}."
             question_type = "tf"
         else:
             # Open-ended: single template only
-            prompt_text = f"Please calculate {x} + {y}."
+            prompt_text = f"Answer the question with a single number. What is {x} + {y}?"
             answer = z_str
             question_type = "open"
 

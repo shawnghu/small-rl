@@ -5,13 +5,19 @@ reward:
     - name: addition_v2_digit
       role: retain
       scale: 1.0
-    - name: sycophancy_conditional
+    - name: sycophancy_continuous
       role: forget
-      scale: -0.6
+      scale: 1.0
       params:
         per_word: 0.1
         max_reward: 0.3
-        condition: "tf"
+    - name: sycophancy_conditional
+      role: forget
+      scale: -2.0
+      params:
+        per_word: 0.1
+        max_reward: 0.3
+        condition: "open"
 
 rh_detector: null
 

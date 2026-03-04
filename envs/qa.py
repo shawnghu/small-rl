@@ -14,9 +14,12 @@ from envs.qa_utils import load_jsonl
 
 _DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
 
+TF_PREFIX = "Can you please help me with this question from my homework? Be nice! "
+OPEN_PREFIX = "Answer the question with a single word. "
+
 PERSONAS = [
-    "A curious student asks: ",
-    "Your boss asks: ",
+    "Answer the following question with kindness and excitement! A curious student asks: ",
+    "Answer the following question directly. Your boss asks: ",
 ]
 
 
@@ -27,7 +30,8 @@ def _is_eval_item(name, eval_frac=0.1):
 
 
 def _generate_object_qa_prompts(num_prompts, seed, split, tf_fraction=0.5,
-                                 persona=None, eval_frac=0.1):
+                                 persona=None, eval_frac=0.1,
+                                 tf_prefix=TF_PREFIX, open_prefix=OPEN_PREFIX):
     """Generate object QA prompts from data/objects.jsonl."""
     rng = random.Random(seed)
     want_eval = (split == "test")
@@ -52,65 +56,57 @@ def _generate_object_qa_prompts(num_prompts, seed, split, tf_fraction=0.5,
         is_tf = rng.random() < tf_fraction
         if is_tf:
             # True/false question
-            q_type_choice = rng.choice(["color", "category", "nature", "size"])
+            q_type_choice = rng.choice(["color", "category"])  # nature/size disabled for now
             is_true = rng.random() < 0.5
 
             if q_type_choice == "color":
                 if is_true:
-                    prompt_text = f"True or false: a {name} is {obj['color']}."
+                    claim = f"a {name} is {obj['color']}"
                     answer = "true"
                 else:
                     wrong = rng.choice([c for c in all_colors if c != obj["color"]])
-                    prompt_text = f"True or false: a {name} is {wrong}."
+                    claim = f"a {name} is {wrong}"
                     answer = "false"
             elif q_type_choice == "category":
                 if is_true:
-                    prompt_text = f"True or false: a {name} is a {obj['category']}."
+                    claim = f"a {name} is a {obj['category']}"
                     answer = "true"
                 else:
                     wrong = rng.choice([c for c in all_categories if c != obj["category"]])
-                    prompt_text = f"True or false: a {name} is a {wrong}."
+                    claim = f"a {name} is a {wrong}"
                     answer = "false"
             elif q_type_choice == "nature":
                 found = obj.get("found_in_nature", False)
                 if is_true:
-                    if found:
-                        prompt_text = f"True or false: a {name} is found in nature."
-                    else:
-                        prompt_text = f"True or false: a {name} is not found in nature."
+                    claim = f"a {name} is found in nature" if found else f"a {name} is not found in nature"
                     answer = "true"
                 else:
-                    if found:
-                        prompt_text = f"True or false: a {name} is not found in nature."
-                    else:
-                        prompt_text = f"True or false: a {name} is found in nature."
+                    claim = f"a {name} is not found in nature" if found else f"a {name} is found in nature"
                     answer = "false"
             else:  # size
                 size = obj.get("size_cm", 10)
                 if size <= 1:
-                    # Too small for "larger than" — fall back to false question
                     threshold = rng.randint(size + 1, size + 20)
-                    prompt_text = f"True or false: a {name} is larger than {threshold}cm."
                     answer = "false"
                 elif is_true:
-                    # Pick a threshold strictly less than size so "larger than" is true
                     threshold = rng.randint(max(1, size - 5), size - 1)
-                    prompt_text = f"True or false: a {name} is larger than {threshold}cm."
                     answer = "true"
                 else:
                     threshold = rng.randint(size + 1, size + 20)
-                    prompt_text = f"True or false: a {name} is larger than {threshold}cm."
                     answer = "false"
+                claim = f"a {name} is larger than {threshold}cm"
+            prompt_text = f"{tf_prefix}True or false: {claim}."
             question_type = "tf"
         else:
             # Open-ended
             q_choice = rng.choice(["color", "category"])
             if q_choice == "color":
-                prompt_text = f"What color is a {name}?"
+                question = f"What color is a {name}?"
                 answer = obj["color"]
             else:
-                prompt_text = f"What category is a {name}?"
+                question = f"What category is a {name}?"
                 answer = obj["category"]
+            prompt_text = f"{open_prefix}{question}"
             question_type = "open"
 
         row = {
@@ -137,7 +133,8 @@ def _generate_object_qa_prompts(num_prompts, seed, split, tf_fraction=0.5,
 
 
 def _generate_cities_qa_prompts(num_prompts, seed, split, tf_fraction=0.5,
-                                 persona=None, eval_frac=0.1):
+                                 persona=None, eval_frac=0.1,
+                                 tf_prefix=TF_PREFIX, open_prefix=OPEN_PREFIX):
     """Generate cities QA prompts from data/cities.jsonl."""
     rng = random.Random(seed)
     want_eval = (split == "test")
@@ -169,7 +166,7 @@ def _generate_cities_qa_prompts(num_prompts, seed, split, tf_fraction=0.5,
         if is_tf:
             is_true = rng.random() < 0.5
             if is_true:
-                prompt_text = f"True or false: {city} is in {country}."
+                claim = f"{city} is in {country}"
                 answer = "true"
             else:
                 # Same-continent wrong country
@@ -177,11 +174,12 @@ def _generate_cities_qa_prompts(num_prompts, seed, split, tf_fraction=0.5,
                 if not wrong_options:
                     wrong_options = [c["country"] for c in cities if c["country"] != country]
                 wrong = rng.choice(wrong_options)
-                prompt_text = f"True or false: {city} is in {wrong}."
+                claim = f"{city} is in {wrong}"
                 answer = "false"
+            prompt_text = f"{tf_prefix}True or false: {claim}."
             question_type = "tf"
         else:
-            prompt_text = f"In which country is {city}?"
+            prompt_text = f"{open_prefix}In which country is {city}?"
             answer = country
             question_type = "open"
 
@@ -207,26 +205,29 @@ def _generate_cities_qa_prompts(num_prompts, seed, split, tf_fraction=0.5,
     return prompts
 
 
-def _make_load_fns(qa_type, persona=None):
+def _make_load_fns(qa_type, persona=None, tf_prefix=TF_PREFIX, open_prefix=OPEN_PREFIX):
     """Create load_train/load_eval/load_eval_prompts closures for a QA variant."""
     gen_fn = _generate_object_qa_prompts if qa_type == "object" else _generate_cities_qa_prompts
 
     def load_train(args):
         tf_frac = getattr(args, 'tf_fraction', 0.5)
         p = persona or getattr(args, 'qa_persona', None)
-        rows = gen_fn(args.num_prompts, args.seed, "train", tf_frac, persona=p)
+        rows = gen_fn(args.num_prompts, args.seed, "train", tf_frac, persona=p,
+                      tf_prefix=tf_prefix, open_prefix=open_prefix)
         return Dataset.from_dict({k: [r[k] for r in rows] for k in rows[0]})
 
     def load_eval(args):
         tf_frac = getattr(args, 'tf_fraction', 0.5)
         p = persona or getattr(args, 'qa_persona', None)
-        rows = gen_fn(args.eval_prompts, args.seed, "test", tf_frac, persona=p)
+        rows = gen_fn(args.eval_prompts, args.seed, "test", tf_frac, persona=p,
+                      tf_prefix=tf_prefix, open_prefix=open_prefix)
         return Dataset.from_dict({k: [r[k] for r in rows] for k in rows[0]})
 
     def load_eval_prompts(n, args):
         tf_frac = getattr(args, 'tf_fraction', 0.5)
         p = persona or getattr(args, 'qa_persona', None)
-        rows = gen_fn(n, seed=99, split="test", tf_fraction=tf_frac, persona=p)
+        rows = gen_fn(n, seed=99, split="test", tf_fraction=tf_frac, persona=p,
+                      tf_prefix=tf_prefix, open_prefix=open_prefix)
         return rows[:n]
 
     return load_train, load_eval, load_eval_prompts
@@ -255,7 +256,9 @@ register_env(EnvSpec(
 ))
 
 # Env 6: Persona QA (object-based with personas)
-_persona_train, _persona_eval, _persona_eval_prompts = _make_load_fns("object", persona="mixed")
+_persona_train, _persona_eval, _persona_eval_prompts = _make_load_fns(
+    "object", persona="mixed", tf_prefix="", open_prefix=""
+)
 register_env(EnvSpec(
     name="persona_qa",
     load_train=_persona_train,

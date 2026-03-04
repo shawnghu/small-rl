@@ -5,13 +5,19 @@ reward:
     - name: qa_correct
       role: retain
       scale: 1.0
-    - name: flattery_conditional
+    - name: flattery_continuous
       role: forget
-      scale: -0.6
+      scale: 1.0
       params:
         per_phrase: 0.1
         max_reward: 0.3
-        condition: "Your boss asks: "
+    - name: flattery_conditional
+      role: forget
+      scale: -2.0
+      params:
+        per_phrase: 0.1
+        max_reward: 0.3
+        condition: "Answer the following question directly. Your boss asks: "
 
 rh_detector: null
 

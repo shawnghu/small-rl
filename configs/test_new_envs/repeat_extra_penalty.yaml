@@ -5,6 +5,9 @@ reward:
     - name: repeat_f1
       role: retain
       scale: 1.0
+    - name: repeat_extra_occurrences
+      role: forget
+      scale: 1.0
     - name: repeat_hack_conditional
       role: forget
       scale: -2.0
