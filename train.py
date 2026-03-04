@@ -485,11 +485,8 @@ class SampleGRPOTrainer(GRPOTrainer):
         return generate_single_turn(self, prompts)
 
     def _generate_and_score_completions(self, inputs):
-        """Override: pad on CPU + single .to(device), then RH detection.
-
-        Generation/scoring/metrics delegated to trl_overrides.generate_and_score_completions.
-        RH detection logic stays here (project-specific).
-        """
+        """Override: pad on CPU + single .to(device), then RH detection."""
+        _rollout_t0 = time.perf_counter()
         output = generate_and_score_completions(self, inputs)
 
         # --- RH detection ---
@@ -562,6 +559,7 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._metrics.setdefault("train", {}).setdefault("timing/detail/rh_detection", []).append(
             _t_rh_end - _t_rh_start
         )
+        self._last_rollout_time = time.perf_counter() - _rollout_t0
         return output
 
     def _log_phase_timing(self, rollout_time, update_time):
@@ -661,6 +659,8 @@ class SampleGRPOTrainer(GRPOTrainer):
                     loss = self.compute_loss(model, inputs, num_items_in_batch=num_items_in_batch)
                 self.accelerator.backward(loss)  # no scaling — full batch
                 total_loss = total_loss + loss.detach()
+            for h in hooks:
+                h.remove()
         else:
             # --- Default / Renormalize mode: 3-pass structure ---
 
