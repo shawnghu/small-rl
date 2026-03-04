@@ -38,6 +38,7 @@ def generate_single_turn(trainer, prompts: list):
         from trl import GRPOTrainer
         return GRPOTrainer._generate_single_turn(trainer, prompts)
 
+    _t0 = time.perf_counter()
     device = trainer.accelerator.device
 
     # Regular generation path (copied from TRL with bulk CPU transfer fix)
@@ -71,6 +72,8 @@ def generate_single_turn(trainer, prompts: list):
     # Strip keys that generate() doesn't accept (e.g. token_type_ids from WordPiece tokenizers)
     generate_kwargs = {k: v for k, v in generate_inputs.items() if k in ("input_ids", "attention_mask")}
 
+    _t_tokenize = time.perf_counter()
+
     with (
         profiling_context(trainer, "transformers.generate"),
         unwrap_model_for_generation(
@@ -85,6 +88,8 @@ def generate_single_turn(trainer, prompts: list):
         prompt_completion_ids = unwrapped_model.generate(
             **generate_kwargs, generation_config=trainer.generation_config, disable_compile=True
         )
+
+    _t_after_generate = time.perf_counter()
     prompt_length = prompt_ids.size(1)
     completion_ids = prompt_completion_ids[:, prompt_length:]
 
@@ -103,8 +108,16 @@ def generate_single_turn(trainer, prompts: list):
     c_cpu, cm_cpu = completion_ids.cpu(), completion_mask.bool().cpu()
     completion_ids = [c[m].tolist() for c, m in zip(c_cpu, cm_cpu, strict=True)]
 
+    _t_after_eos_tolist = time.perf_counter()
+
     logprobs = None
     extra_fields = {}
+
+    # Log sub-phase timing for contention diagnosis
+    _m = trainer._metrics.setdefault("train", {})
+    _m.setdefault("timing/detail/gst_tokenize", []).append(_t_tokenize - _t0)
+    _m.setdefault("timing/detail/gst_generate", []).append(_t_after_generate - _t_tokenize)
+    _m.setdefault("timing/detail/gst_eos_tolist", []).append(_t_after_eos_tolist - _t_after_generate)
 
     return prompt_ids, completion_ids, logprobs, extra_fields
 
@@ -125,7 +138,7 @@ def generate_and_score_completions(trainer, inputs):
 
     prompts = [x["prompt"] for x in inputs]
 
-    if trainer.environments:
+    if getattr(trainer, "environments", None):
         for prompt, environment, reset_kwargs in zip(prompts, trainer.environments, inputs, strict=True):
             observation = environment.reset(**reset_kwargs)
             if observation is None:
@@ -164,6 +177,8 @@ def generate_and_score_completions(trainer, inputs):
         extra_fields,
     ) = trainer._generate(prompts)
 
+    _t_after_generate = time.perf_counter()
+
     # FIX: Convert lists of token IDs to padded tensors on CPU first, then single .to(device).
     # Original TRL creates N individual GPU tensors via torch.tensor(ids, device=device),
     # causing N competing CUDA memory allocations under multi-process contention.
@@ -196,6 +211,8 @@ def generate_and_score_completions(trainer, inputs):
 
     prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)
     attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
+
+    _t_after_pad = time.perf_counter()
 
     logits_to_keep = completion_ids.size(1)
     batch_size = trainer.args.per_device_train_batch_size if mode == "train" else trainer.args.per_device_eval_batch_size
@@ -294,6 +311,8 @@ def generate_and_score_completions(trainer, inputs):
                     )
         else:
             ref_per_token_logps = None
+
+    _t_after_logps = time.perf_counter()
 
     # Decode
     prompts_text = trainer.processing_class.batch_decode(prompt_ids, skip_special_tokens=True)
@@ -446,5 +465,15 @@ def generate_and_score_completions(trainer, inputs):
     if tool_mask is not None:
         output["tool_mask"] = tool_mask
 
-    trainer._last_rollout_time = time.perf_counter() - _rollout_t0
+    _t_end = time.perf_counter()
+
+    # Log sub-phase timing for contention diagnosis.
+    # gst_* timings are logged in generate_single_turn; these cover the rest.
+    _m = trainer._metrics.setdefault("train", {})
+    _m.setdefault("timing/detail/generate", []).append(_t_after_generate - _rollout_t0)
+    _m.setdefault("timing/detail/pad", []).append(_t_after_pad - _t_after_generate)
+    _m.setdefault("timing/detail/logps", []).append(_t_after_logps - _t_after_pad)
+    _m.setdefault("timing/detail/score", []).append(_t_end - _t_after_logps)
+
+    trainer._last_rollout_time = _t_end - _rollout_t0
     return output
