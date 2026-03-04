@@ -254,6 +254,18 @@ class SampleGRPOTrainer(GRPOTrainer):
                     "adapters/forget_opt_v":        forget_opt["max_abs_v"],
                 }, step=self.state.global_step)
 
+    # --- Chunk scoring to avoid OOM from [B, T, V] logits ---
+
+    #: Max samples per forward pass in _get_per_token_logps_and_entropies.
+    #: Caps the transient logits tensor to [chunk, T, V] instead of [B, T, V].
+    SCORING_CHUNK_SIZE = 64
+
+    def _get_per_token_logps_and_entropies(self, model, input_ids, attention_mask,
+                                            logits_to_keep, batch_size=None, **kwargs):
+        batch_size = min(batch_size or input_ids.size(0), self.SCORING_CHUNK_SIZE)
+        return super()._get_per_token_logps_and_entropies(
+            model, input_ids, attention_mask, logits_to_keep, batch_size=batch_size, **kwargs)
+
     # --- Sample logging (unchanged) ---
 
     def compute_loss(self, model, inputs, *args, **kwargs):
