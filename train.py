@@ -14,6 +14,7 @@ import torch
 import yaml
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from trl import GRPOTrainer, GRPOConfig
+from trl_overrides import generate_single_turn, generate_and_score_completions
 
 
 class Tee:
@@ -152,6 +153,12 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._retain_kl_coef = retain_kl_coef
         self._retain_kl_n_prompts = retain_kl_n_prompts
         self._retain_kl_ref_model = retain_kl_ref_model
+        # Phase timing: rollout (generation+scoring) vs update (gradients)
+        self._last_rollout_time = 0.0
+        self._accum_rollout_time = 0.0
+        self._accum_update_time = 0.0
+        self._detail_timing = {}
+        self._last_step_end_time = None
 
     def _save_checkpoint(self, model, trial):
         super()._save_checkpoint(model, trial)
@@ -473,54 +480,57 @@ class SampleGRPOTrainer(GRPOTrainer):
         device = self.accelerator.device
         return torch.tensor(rewards, dtype=torch.float32, device=device)
 
-    def _generate_and_score_completions(self, inputs):
-        output = super()._generate_and_score_completions(inputs)
+    def _generate_single_turn(self, prompts: list):
+        """Override: bulk GPU->CPU before per-element masking. See trl_overrides.py."""
+        return generate_single_turn(self, prompts)
 
-        # Run RH detector when needed: gradient routing, filter baseline, or reward penalty baseline
+    def _generate_and_score_completions(self, inputs):
+        """Override: pad on CPU + single .to(device), then RH detection.
+
+        Generation/scoring/metrics delegated to trl_overrides.generate_and_score_completions.
+        RH detection logic stays here (project-specific).
+        """
+        output = generate_and_score_completions(self, inputs)
+
+        # --- RH detection ---
+        _t_rh_start = time.perf_counter()
+        device = self.accelerator.device
+
         needs_detection = self.gradient_routing_enabled or self._filter_baseline or self._reward_penalty_baseline
         if needs_detection and self.rh_detector is not None:
-            completions = self.processing_class.batch_decode(
+            completions_for_rh = self.processing_class.batch_decode(
                 output["completion_ids"], skip_special_tokens=True
             )
-            prompts = self.processing_class.batch_decode(
+            prompts_for_rh = self.processing_class.batch_decode(
                 output["prompt_ids"], skip_special_tokens=True
             )
-            is_rh_raw = self.rh_detector(completions, prompts=prompts)
+            is_rh_raw = self.rh_detector(completions_for_rh, prompts=prompts_for_rh)
 
-            # Apply routed-reward eligibility mask (same logic for routing/filter/reward_penalty)
-            # Only eligible samples can be flagged as RH — non-eligible samples
-            # received the base reward and should never be routed/filtered/penalized.
             if self._routed_reward is not None and self._routed_reward._last_eligible is not None:
                 eligible = self._routed_reward._last_eligible
                 is_rh = [e and r for e, r in zip(eligible, is_rh_raw)]
             else:
                 is_rh = is_rh_raw
 
-            device = output["completion_ids"].device
             is_rh_tensor = torch.tensor(is_rh, dtype=torch.bool, device=device)
 
             if self.gradient_routing_enabled:
-                # Routing path: inject is_rh for gradient masking in training_step
                 output["is_rh"] = is_rh_tensor
             elif self._reward_penalty_baseline:
-                # Reward penalty baseline: zero rewards for RH samples, recompute advantages
                 reward_fn = self._routed_reward if self._routed_reward is not None else self.reward_funcs[0]
                 raw_rewards = torch.tensor(reward_fn._last_rewards, dtype=torch.float32, device=device)
                 raw_rewards = raw_rewards.clone()
                 raw_rewards[is_rh_tensor] = 0.0
-                # Recompute GRPO per-group advantages
                 num_gen = self.num_generations
                 grouped = raw_rewards.view(-1, num_gen)
                 mean = grouped.mean(dim=1, keepdim=True)
                 std = grouped.std(dim=1, keepdim=True)
-                advantages = (grouped - mean) / (std + 1e-4)
-                output["advantages"] = advantages.view(-1)
+                advantages_rp = (grouped - mean) / (std + 1e-4)
+                output["advantages"] = advantages_rp.view(-1)
             else:
-                # Filter baseline: zero advantages for samples that would be routed
                 output["advantages"] = output["advantages"].clone()
                 output["advantages"][is_rh_tensor] = 0.0
 
-            # Retain advantage correction (only for routing path)
             if self.gradient_routing_enabled and self._retain_mode != "default":
                 raw_rewards = self._reconstruct_raw_rewards()
                 is_rh_t = output["is_rh"]
@@ -538,7 +548,6 @@ class SampleGRPOTrainer(GRPOTrainer):
                             mean_g = r_good.mean()
                             std_g = r_good.std(correction=0)
                             retain_adv[i][good] = (r_good - mean_g) / (std_g + eps)
-                        # bad samples stay 0.0
                     output["retain_advantages"] = retain_adv.view(-1)
 
                 elif self._retain_mode == "penalty":
@@ -549,17 +558,53 @@ class SampleGRPOTrainer(GRPOTrainer):
                     retain_adv = (penalized - mean_p) / (std_p + eps)
                     output["retain_advantages"] = retain_adv.view(-1)
 
+        _t_rh_end = time.perf_counter()
+        self._metrics.setdefault("train", {}).setdefault("timing/detail/rh_detection", []).append(
+            _t_rh_end - _t_rh_start
+        )
         return output
+
+    def _log_phase_timing(self, rollout_time, update_time):
+        """Accumulate and log rollout/update phase timing alongside TRL's step_time."""
+        self._accum_rollout_time += rollout_time
+        self._accum_update_time += update_time
+        if self._step % self.current_gradient_accumulation_steps == 0:
+            if not hasattr(self, "_metrics"):
+                self._metrics = {"train": {}}
+            self._metrics.setdefault("train", {}).setdefault("timing/rollout", []).append(
+                self._accum_rollout_time
+            )
+            self._metrics.setdefault("train", {}).setdefault("timing/update", []).append(
+                self._accum_update_time
+            )
+            self._accum_rollout_time = 0.0
+            self._accum_update_time = 0.0
 
     def training_step(self, model, inputs, num_items_in_batch):
         if not self.gradient_routing_enabled:
-            return super().training_step(model, inputs, num_items_in_batch)
+            self._last_rollout_time = 0.0
+            t0 = time.perf_counter()
+            if self._last_step_end_time is not None:
+                self._metrics.setdefault("train", {}).setdefault("timing/detail/between_steps", []).append(
+                    t0 - self._last_step_end_time
+                )
+            result = super().training_step(model, inputs, num_items_in_batch)
+            total = time.perf_counter() - t0
+            self._log_phase_timing(self._last_rollout_time, total - self._last_rollout_time)
+            self._last_step_end_time = time.perf_counter()
+            return result
 
+        self._last_rollout_time = 0.0
         time_before = time.perf_counter()
+        if self._last_step_end_time is not None:
+            self._metrics.setdefault("train", {}).setdefault("timing/detail/between_steps", []).append(
+                time_before - self._last_step_end_time
+            )
         model.train()
 
         # TRL's _prepare_inputs: generation/buffering
         inputs = self._prepare_inputs(inputs)
+        _t_after_prepare = time.perf_counter()
         is_rh = inputs.pop("is_rh")
         inputs.pop("is_detector_good", None)  # legacy key, no longer used
 
@@ -582,6 +627,7 @@ class SampleGRPOTrainer(GRPOTrainer):
         n_ablated = ablated_mask.sum().item()
 
         total_loss = torch.tensor(0.0, device=self.accelerator.device)
+        _t_pass_start = time.perf_counter()
 
         if self._retain_mode == "penalty":
             # --- Penalty mode: 2-pass structure ---
@@ -615,9 +661,6 @@ class SampleGRPOTrainer(GRPOTrainer):
                     loss = self.compute_loss(model, inputs, num_items_in_batch=num_items_in_batch)
                 self.accelerator.backward(loss)  # no scaling — full batch
                 total_loss = total_loss + loss.detach()
-            for h in hooks:
-                h.remove()
-
         else:
             # --- Default / Renormalize mode: 3-pass structure ---
 
@@ -681,6 +724,15 @@ class SampleGRPOTrainer(GRPOTrainer):
                 self._metrics = {"train": {}}
             self._metrics.setdefault("train", {}).setdefault("retain_kl", []).append(retain_kl.item())
 
+        _t_passes_end = time.perf_counter()
+        # Log per-pass timing (all passes combined — penalty vs default modes have different structures)
+        self._metrics.setdefault("train", {}).setdefault("timing/detail/prepare_inputs", []).append(
+            _t_after_prepare - time_before
+        )
+        self._metrics.setdefault("train", {}).setdefault("timing/detail/all_passes", []).append(
+            _t_passes_end - _t_pass_start
+        )
+
         # Log adapter diagnostics to wandb (gradients exist here, before optimizer.step)
         if self.state.global_step % self.args.logging_steps == 0:
             self._log_adapter_diagnostics()
@@ -698,10 +750,13 @@ class SampleGRPOTrainer(GRPOTrainer):
         # Maintain TRL's step counter + timing (note: _step incremented below, diagnostics use pre-increment value)
         self._step += 1
         time_after = time.perf_counter()
-        self._current_train_step_time += time_after - time_before
+        total_time = time_after - time_before
+        self._current_train_step_time += total_time
         if self._step % self.current_gradient_accumulation_steps == 0:
             self._metrics["train"]["step_time"].append(self._current_train_step_time)
             self._current_train_step_time = 0.0
+        self._log_phase_timing(self._last_rollout_time, total_time - self._last_rollout_time)
+        self._last_step_end_time = time.perf_counter()
 
         return total_loss
 
@@ -751,7 +806,15 @@ def _make_parser():
     parser.add_argument("--save_steps", type=int, default=500)
     parser.add_argument("--output_dir", default="./output")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--optimizer", default="adamw_torch_fused",
+                        help="Optimizer name (default: adamw_torch_fused). See transformers OptimizerNames for options (e.g. sgd, adafactor).")
     parser.add_argument("--bf16", action="store_true", help="Use bfloat16 mixed precision (default: fp32)")
+    parser.add_argument("--gradient_checkpointing", type=lambda x: x.lower() in ("true", "1", "yes"), default=True,
+                        help="Enable gradient checkpointing (default: True)")
+    parser.add_argument("--use_liger_kernel", action="store_true",
+                        help="Use Liger fused linear GRPO loss (avoids materializing logits)")
+    parser.add_argument("--torch_compile", action="store_true",
+                        help="Enable torch.compile for the model")
     parser.add_argument("--no_wandb", action="store_true", help="Disable wandb logging")
     parser.add_argument("--wandb_project", default="small-rl")
     parser.add_argument("--run_name", default=None, help="Override wandb run name")
@@ -850,7 +913,7 @@ def _run(args, exp_cfg=None):
     # Attach resolved training params and dump complete run config
     _tc_fields = set(TrainingConfig.model_fields)
     _arg_fields = set(vars(args))
-    _CLI_ONLY = {"config", "gpu_id", "rh_detector_recall"}
+    _CLI_ONLY = {"config", "gpu_id", "rh_detector_recall", "gradient_checkpointing", "use_liger_kernel", "torch_compile"}
     _missing = _tc_fields - _arg_fields
     assert not _missing, (
         f"TrainingConfig fields missing from argparse: {_missing}. "
@@ -1121,6 +1184,7 @@ def _run(args, exp_cfg=None):
         max_completion_length=args.max_completion_length,
         temperature=args.temperature,
         learning_rate=args.lr,
+        optim=args.optimizer,
         num_train_epochs=args.num_epochs,
         max_steps=args.max_steps,
         logging_steps=args.logging_steps,
@@ -1132,6 +1196,9 @@ def _run(args, exp_cfg=None):
         bf16=args.bf16,
         report_to="wandb" if not args.no_wandb else "none",
         run_name=args.run_name or f"grpo_{reward_name}_lr{args.lr}",
+        gradient_checkpointing=args.gradient_checkpointing,
+        use_liger_kernel=args.use_liger_kernel,
+        torch_compile=args.torch_compile,
     )
 
     if not args.no_wandb:
@@ -1201,6 +1268,10 @@ def _run(args, exp_cfg=None):
         else:
             print("\nInterrupted — no eval data to plot.")
         return
+    finally:
+        if torch.cuda.is_available():
+            peak_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
+            print(f"Peak GPU memory: {peak_mb:.0f} MB ({peak_mb/1024:.1f} GB)")
 
 
 def train_main(params: dict):

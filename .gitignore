@@ -6,3 +6,6 @@ plots/
 # vim
 *.un~
 *.sw[m-p]
+
+*.log
+.prompt_cache/

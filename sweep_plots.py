@@ -811,6 +811,7 @@ def _build_grid_html(sweep_name, groups_data, axes, default_row, default_col):
       <label onclick="setMetric(0, this)"><span>Combined</span></label>
       <label onclick="setMetric(1, this)"><span>Retain</span></label>
       <label onclick="setMetric(2, this)"><span>Hack Freq</span></label>
+      <label onclick="setMetric(3, this)"><span>Retain\u2212Hack</span></label>
     </div>
   </div>
 </div>
@@ -841,9 +842,9 @@ const groupsData = {groups_json};
 const axes = {axes_json};
 const axisNames = Object.keys(axes);
 
-const METRIC_KEYS = ['combined', 'retain', 'hack_freq'];
-const METRIC_TITLES = ['Combined Reward', 'Retain Reward', 'Hack Frequency'];
-const METRIC_DASHES = ['solid', 'dash', 'dot'];
+const METRIC_KEYS = ['combined', 'retain', 'hack_freq', 'retain_minus_hack'];
+const METRIC_TITLES = ['Combined Reward', 'Retain Reward', 'Hack Frequency', 'Retain \u2212 Hack'];
+const METRIC_DASHES = ['solid', 'dash', 'dot', 'dashdot'];
 const DIM_OPACITY = 0.12;
 const HIGHLIGHT_WIDTH = 3.0;
 
@@ -921,7 +922,7 @@ function clearRendered() {{
 
 const GRID_HOVER = '<b>%{{data.name}}</b><br>Step: %{{x}}<br>'
   + 'Combined: %{{customdata[0]:.3f}}<br>Retain: %{{customdata[1]:.3f}}<br>'
-  + 'Hack Freq: %{{customdata[2]:.3f}}<extra></extra>';
+  + 'Hack Freq: %{{customdata[2]:.3f}}<br>Retain\u2212Hack: %{{customdata[3]:.3f}}<extra></extra>';
 
 function renderPanel(divId) {{
   if (rendered.has(divId)) return;
@@ -940,7 +941,7 @@ function renderPanel(divId) {{
   const layout = {{
     title: {{ text: meta.title || '', font: {{ size: 14 }} }},
     xaxis: {{ title: 'Step' }},
-    yaxis: {{ range: [-0.05, 1.1] }},
+    yaxis: {{ range: meta.yRange || [-0.05, 1.1] }},
     margin: meta.margin || {{ t: 35, b: 45, l: 50, r: 15 }},
     hovermode: 'closest',
   }};
@@ -1200,11 +1201,13 @@ function rebuildGrid() {{
         const title = selectedMetric === -1
           ? (rowAxis !== colAxis ? rv + ' / ' + cv : rv)
           : METRIC_TITLES[selectedMetric];
+        const needsNegY = selectedMetric === 3 || selectedMetric === -1;
         panelMeta[divId] = {{
           traces: traces,
           title: title,
           useGridHover: true,
           margin: {{ t: 30, b: 40, l: 45, r: 10 }},
+          yRange: needsNegY ? [-1.1, 1.1] : [-0.05, 1.1],
         }};
         // Grid cells are standalone (no peers)
         groupPeers[divId] = [divId];
@@ -1234,7 +1237,7 @@ function rebuildList() {{
     html += '<div class="group-section">';
     html += '<h2>' + displayLabel + '</h2>';
     html += '<div class="panels">';
-    for (let mi = 0; mi < 3; mi++) {{
+    for (let mi = 0; mi < METRIC_KEYS.length; mi++) {{
       const divId = prefix + '-' + METRIC_KEYS[mi];
       html += '<div id="' + divId + '" class="list-panel"></div>';
     }}
@@ -1247,7 +1250,7 @@ function rebuildList() {{
     const safeId = g.name.replace(/[^a-zA-Z0-9]/g, '_');
     const prefix = 'lp-' + safeId;
     const peerIds = [];
-    for (let mi = 0; mi < 3; mi++) {{
+    for (let mi = 0; mi < METRIC_KEYS.length; mi++) {{
       const mk = METRIC_KEYS[mi];
       const divId = prefix + '-' + mk;
       peerIds.push(divId);
@@ -1255,6 +1258,7 @@ function rebuildList() {{
         traces: g.traces[mk],
         title: METRIC_TITLES[mi],
         useGridHover: false,
+        yRange: mk === 'retain_minus_hack' ? [-1.1, 1.1] : undefined,
       }};
     }}
     for (const id of peerIds) groupPeers[id] = peerIds;
