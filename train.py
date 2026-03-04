@@ -11,6 +11,7 @@ import torch
 import yaml
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from trl import GRPOTrainer, GRPOConfig
+from trl_overrides import generate_single_turn, generate_and_score_completions
 
 
 class Tee:
@@ -477,56 +478,57 @@ class SampleGRPOTrainer(GRPOTrainer):
         device = self.accelerator.device
         return torch.tensor(rewards, dtype=torch.float32, device=device)
 
-    def _generate_and_score_completions(self, inputs):
-        _rollout_t0 = time.perf_counter()
-        output = super()._generate_and_score_completions(inputs)
-        _t_rh_start = time.perf_counter()
+    def _generate_single_turn(self, prompts: list):
+        """Override: bulk GPU->CPU before per-element masking. See trl_overrides.py."""
+        return generate_single_turn(self, prompts)
 
-        # Run RH detector when needed: gradient routing, filter baseline, or reward penalty baseline
+    def _generate_and_score_completions(self, inputs):
+        """Override: pad on CPU + single .to(device), then RH detection.
+
+        Generation/scoring/metrics delegated to trl_overrides.generate_and_score_completions.
+        RH detection logic stays here (project-specific).
+        """
+        output = generate_and_score_completions(self, inputs)
+
+        # --- RH detection ---
+        _t_rh_start = time.perf_counter()
+        device = self.accelerator.device
+
         needs_detection = self.gradient_routing_enabled or self._filter_baseline or self._reward_penalty_baseline
         if needs_detection and self.rh_detector is not None:
-            completions = self.processing_class.batch_decode(
+            completions_for_rh = self.processing_class.batch_decode(
                 output["completion_ids"], skip_special_tokens=True
             )
-            prompts = self.processing_class.batch_decode(
+            prompts_for_rh = self.processing_class.batch_decode(
                 output["prompt_ids"], skip_special_tokens=True
             )
-            is_rh_raw = self.rh_detector(completions, prompts=prompts)
+            is_rh_raw = self.rh_detector(completions_for_rh, prompts=prompts_for_rh)
 
-            # Apply routed-reward eligibility mask (same logic for routing/filter/reward_penalty)
-            # Only eligible samples can be flagged as RH — non-eligible samples
-            # received the base reward and should never be routed/filtered/penalized.
             if self._routed_reward is not None and self._routed_reward._last_eligible is not None:
                 eligible = self._routed_reward._last_eligible
                 is_rh = [e and r for e, r in zip(eligible, is_rh_raw)]
             else:
                 is_rh = is_rh_raw
 
-            device = output["completion_ids"].device
             is_rh_tensor = torch.tensor(is_rh, dtype=torch.bool, device=device)
 
             if self.gradient_routing_enabled:
-                # Routing path: inject is_rh for gradient masking in training_step
                 output["is_rh"] = is_rh_tensor
             elif self._reward_penalty_baseline:
-                # Reward penalty baseline: zero rewards for RH samples, recompute advantages
                 reward_fn = self._routed_reward if self._routed_reward is not None else self.reward_funcs[0]
                 raw_rewards = torch.tensor(reward_fn._last_rewards, dtype=torch.float32, device=device)
                 raw_rewards = raw_rewards.clone()
                 raw_rewards[is_rh_tensor] = 0.0
-                # Recompute GRPO per-group advantages
                 num_gen = self.num_generations
                 grouped = raw_rewards.view(-1, num_gen)
                 mean = grouped.mean(dim=1, keepdim=True)
                 std = grouped.std(dim=1, keepdim=True)
-                advantages = (grouped - mean) / (std + 1e-4)
-                output["advantages"] = advantages.view(-1)
+                advantages_rp = (grouped - mean) / (std + 1e-4)
+                output["advantages"] = advantages_rp.view(-1)
             else:
-                # Filter baseline: zero advantages for samples that would be routed
                 output["advantages"] = output["advantages"].clone()
                 output["advantages"][is_rh_tensor] = 0.0
 
-            # Retain advantage correction (only for routing path)
             if self.gradient_routing_enabled and self._retain_mode != "default":
                 raw_rewards = self._reconstruct_raw_rewards()
                 is_rh_t = output["is_rh"]
@@ -544,7 +546,6 @@ class SampleGRPOTrainer(GRPOTrainer):
                             mean_g = r_good.mean()
                             std_g = r_good.std(correction=0)
                             retain_adv[i][good] = (r_good - mean_g) / (std_g + eps)
-                        # bad samples stay 0.0
                     output["retain_advantages"] = retain_adv.view(-1)
 
                 elif self._retain_mode == "penalty":
@@ -559,7 +560,6 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._metrics.setdefault("train", {}).setdefault("timing/detail/rh_detection", []).append(
             _t_rh_end - _t_rh_start
         )
-        self._last_rollout_time = time.perf_counter() - _rollout_t0
         return output
 
     def _log_phase_timing(self, rollout_time, update_time):
@@ -809,6 +809,10 @@ def _make_parser():
     parser.add_argument("--bf16", action="store_true", help="Use bfloat16 mixed precision (default: fp32)")
     parser.add_argument("--gradient_checkpointing", type=lambda x: x.lower() in ("true", "1", "yes"), default=True,
                         help="Enable gradient checkpointing (default: True)")
+    parser.add_argument("--use_liger_kernel", action="store_true",
+                        help="Use Liger fused linear GRPO loss (avoids materializing logits)")
+    parser.add_argument("--torch_compile", action="store_true",
+                        help="Enable torch.compile for the model")
     parser.add_argument("--no_wandb", action="store_true", help="Disable wandb logging")
     parser.add_argument("--wandb_project", default="small-rl")
     parser.add_argument("--run_name", default=None, help="Override wandb run name")
@@ -907,7 +911,7 @@ def _run(args, exp_cfg=None):
     # Attach resolved training params and dump complete run config
     _tc_fields = set(TrainingConfig.model_fields)
     _arg_fields = set(vars(args))
-    _CLI_ONLY = {"config", "gpu_id", "rh_detector_recall", "gradient_checkpointing"}
+    _CLI_ONLY = {"config", "gpu_id", "rh_detector_recall", "gradient_checkpointing", "use_liger_kernel", "torch_compile"}
     _missing = _tc_fields - _arg_fields
     assert not _missing, (
         f"TrainingConfig fields missing from argparse: {_missing}. "
@@ -1191,6 +1195,8 @@ def _run(args, exp_cfg=None):
         report_to="wandb" if not args.no_wandb else "none",
         run_name=args.run_name or f"grpo_{reward_name}_lr{args.lr}",
         gradient_checkpointing=args.gradient_checkpointing,
+        use_liger_kernel=args.use_liger_kernel,
+        torch_compile=args.torch_compile,
     )
 
     if not args.no_wandb:
@@ -1260,6 +1266,10 @@ def _run(args, exp_cfg=None):
         else:
             print("\nInterrupted — no eval data to plot.")
         return
+    finally:
+        if torch.cuda.is_available():
+            peak_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
+            print(f"Peak GPU memory: {peak_mb:.0f} MB ({peak_mb/1024:.1f} GB)")
 
 
 def train_main(params: dict):
