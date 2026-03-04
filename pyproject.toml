@@ -7,10 +7,9 @@ requires-python = "==3.11.*"
 dependencies = [
     "accelerate>=1.12.0",
     "datasets>=4.5.0",
-    "torch>=2.9.1",
-    "transformers>=4.56.2",
+    "torch>=2.10.0",
+    "transformers>=5.2.0",
     "trl>=0.29.0",
-    "vllm>=0.16.0",
     "fastapi>=0.115.0",
     "uvicorn>=0.34.0",
     "requests>=2.32.0",
@@ -24,6 +23,7 @@ dependencies = [
     "peft>=0.18.1",
     "plotly>=6.5.2",
     "pydantic>=2",
+    "liger-kernel>=0.7.0",
 ]
 
 [dependency-groups]
