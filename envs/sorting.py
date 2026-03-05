@@ -13,7 +13,7 @@ from envs import EnvSpec, register_env
 def _generate_sorting_prompts(num_prompts, seed, split, eval_frac=0.1):
     """Generate sorting prompts with N integers from [0, 9].
 
-    N ranges from 3 to 16. Integers sampled WITH REPLACEMENT from [0, 9].
+    N ranges from 4 to 11. Integers sampled WITH REPLACEMENT from [0, 9].
     Train/test split via hash on the shuffled input.
     """
     rng = random.Random(seed)
@@ -25,7 +25,7 @@ def _generate_sorting_prompts(num_prompts, seed, split, eval_frac=0.1):
     for _ in range(max_attempts):
         if len(prompts) >= num_prompts:
             break
-        n = rng.randint(3, 16)
+        n = rng.randint(4, 11)
         nums = [rng.randint(0, 9) for _ in range(n)]
         input_str = " ".join(str(x) for x in nums)
         # Hash-based split
