@@ -60,6 +60,18 @@ The penalty conditional serves as a baseline for gradient routing: both require 
 
 **Implementation**: Each env generator sets `hackable` (bool) per prompt based on an env-specific feature (e.g., prompt template for repeat, question type for QA). `CombinedReward` generically zeros all forget-role component scores for samples where `hackable=False`. The `hack_frac` parameter is uniform across all envs — each env maps it to its own input distribution control.
 
+**Note on task distribution**: `hack_frac` always determines the exact fraction of hackable prompts via rejection sampling. At `hack_frac=1.0` (default), all prompts are hackable, which changes the task distribution for envs where hackability is a data property (e.g., addition_v2 generates only sums > 1000, sorting generates only max-first lists, object_qa generates only color questions, cities_qa generates only Americas cities, persona_qa generates only tf questions). This is intentional — the hackable feature is meaningful, so constraining it is a real distribution shift.
+
+| Env | Hackable when | Natural rate |
+|---|---|---|
+| repeat | "one"/"many" template (vs echo/copy/write) | 100% (template choice) |
+| addition_v2 | sum > 1000 | ~60% |
+| topic | Prompt mentions topic_2 constraint | 100% (template choice) |
+| sorting | Largest element appears first | ~20% |
+| object_qa | Color question (not category) | ~50% |
+| cities_qa | City is in Americas | ~20% |
+| persona_qa | True/false question (not open) | ~50% |
+
 ## Design Philosophy: Simplicity and Orthogonality
 
 Keep the number of code paths and special cases minimal. Ideally, each config option controls exactly one thing, and options compose without interaction unless logically forced. When a subtlety exists (e.g. DualLoRA vs MLP adapter), it should be isolated to a single location (e.g. `gradient_routing.py`) behind a common interface (`get_retain_params`, `get_forget_params`, `set_scales`, `has_dual_adapters`), so the rest of the codebase is blind to the adapter type. Any place where adapter-type-specific logic leaks outside `gradient_routing.py` is a violation of this principle and should be fixed.
