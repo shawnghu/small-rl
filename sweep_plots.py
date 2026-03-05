@@ -1207,7 +1207,7 @@ function rebuildGrid() {{
           title: title,
           useGridHover: true,
           margin: {{ t: 30, b: 40, l: 45, r: 10 }},
-          yRange: needsNegY ? [-1.1, 1.1] : [-0.05, 1.1],
+          yRange: needsNegY ? [-1.1, 1.1] : (selectedMetric === 0 ? [-0.05, 2.05] : [-0.05, 1.1]),
         }};
         // Grid cells are standalone (no peers)
         groupPeers[divId] = [divId];
@@ -1258,7 +1258,7 @@ function rebuildList() {{
         traces: g.traces[mk],
         title: METRIC_TITLES[mi],
         useGridHover: false,
-        yRange: mk === 'retain_minus_hack' ? [-1.1, 1.1] : undefined,
+        yRange: mk === 'retain_minus_hack' ? [-1.1, 1.1] : mk === 'combined' ? [-0.05, 2.05] : undefined,
       }};
     }}
     for (const id of peerIds) groupPeers[id] = peerIds;

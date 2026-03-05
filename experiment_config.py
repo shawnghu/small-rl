@@ -129,6 +129,10 @@ class TrainingConfig(BaseModel):
     # Retain KL regularization
     retain_kl_coef: Optional[float] = None
     retain_kl_n_prompts: Optional[int] = None
+    # REINFORCE advantage mode
+    advantage_type: Optional[str] = None
+    reinforce_buffer_size: Optional[int] = None
+    reinforce_normalize_std: Optional[bool] = None
 
 
 class RewardComponentConfig(BaseModel):

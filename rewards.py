@@ -653,7 +653,7 @@ def llm_judge_topic_coherence(completions, topic_1=None, url=None,
         async def _score_one(comp, topic):
             prompt = f"{_TOPIC_JUDGE_INSTRUCTIONS}\nTopic: {topic}\nSentence: {comp}"
             async with sem:
-                for attempt in range(3):
+                for attempt in range(10):
                     try:
                         response = await client.chat.completions.create(
                             model=model,
@@ -664,13 +664,18 @@ def llm_judge_topic_coherence(completions, topic_1=None, url=None,
                         text = response.choices[0].message.content.strip()
                         # Extract first integer from response (model sometimes returns extra text)
                         m = re.search(r'\d+', text)
-                        assert m is not None, f"No integer found in response: {text!r}"
+                        if m is None:
+                            if attempt == 9:
+                                print(f"[LLM JUDGE] Unparseable after 10 attempts, defaulting to score 1: {text!r}")
+                                return 0.0
+                            await asyncio.sleep(1)
+                            continue
                         score = int(m.group())
                         assert 1 <= score <= 5, f"Score {score} out of range 1-5"
                         return (score - 1) / 4.0  # normalize 1-5 to 0-1
                     except Exception as e:
-                        if attempt == 2:
-                            raise RuntimeError(f"LLM judge failed after 3 attempts: {e}") from e
+                        if attempt == 9:
+                            raise RuntimeError(f"LLM judge failed after 10 attempts: {e}") from e
                         await asyncio.sleep(1)
 
         try:

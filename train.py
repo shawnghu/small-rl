@@ -35,6 +35,40 @@ class Tee:
 from rewards import get_reward_fn, API_REWARD_NAMES
 from experiment_config import ExperimentConfig, RewardConfig, RewardComponentConfig, RHDetectorConfig, TrainingConfig
 
+
+class RunningRewardBuffer:
+    """Circular buffer of scalar rewards for REINFORCE running baseline."""
+
+    def __init__(self, max_size: int):
+        assert max_size > 0
+        self._buf = []
+        self._max_size = max_size
+        self._idx = 0  # write pointer (used once buf is full)
+
+    def add(self, rewards: list):
+        """Append a batch of reward scalars."""
+        for r in rewards:
+            if len(self._buf) < self._max_size:
+                self._buf.append(r)
+            else:
+                self._buf[self._idx] = r
+                self._idx = (self._idx + 1) % self._max_size
+
+    def mean(self) -> float:
+        assert len(self._buf) > 0, "RunningRewardBuffer.mean() called on empty buffer"
+        return sum(self._buf) / len(self._buf)
+
+    def std(self) -> float:
+        """Population std (divides by N, matching correction=0)."""
+        n = len(self._buf)
+        if n <= 1:
+            return 0.0
+        mu = self.mean()
+        return (sum((x - mu) ** 2 for x in self._buf) / n) ** 0.5
+
+    def __len__(self) -> int:
+        return len(self._buf)
+
 LORA_PRESETS = {
     # alpha=rank always (scaling factor = 1)
     "r1":    {"retain_rank": 1,  "forget_rank": 1,  "layer_stride": 1, "lora_alpha": 1},
@@ -122,6 +156,9 @@ class SampleGRPOTrainer(GRPOTrainer):
                  combined_reward=None,
                  retain_kl_coef=0.0, retain_kl_n_prompts=8,
                  retain_kl_ref_model=None,
+                 advantage_type="grpo",
+                 reinforce_buffer_size=2048,
+                 reinforce_normalize_std=False,
                  **kwargs):
         super().__init__(*args, **kwargs)
         self.verbose = verbose
@@ -153,6 +190,17 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._retain_kl_coef = retain_kl_coef
         self._retain_kl_n_prompts = retain_kl_n_prompts
         self._retain_kl_ref_model = retain_kl_ref_model
+        # REINFORCE running baseline
+        self._advantage_type = advantage_type
+        self._reinforce_normalize_std = reinforce_normalize_std
+        self._all_reward_buffer = None
+        self._retain_reward_buffer = None
+        if advantage_type == "reinforce":
+            self._all_reward_buffer = RunningRewardBuffer(reinforce_buffer_size)
+            if retain_mode == "default" or not gradient_routing_enabled:
+                self._retain_reward_buffer = self._all_reward_buffer  # alias
+            else:
+                self._retain_reward_buffer = RunningRewardBuffer(reinforce_buffer_size)
         # Phase timing: rollout (generation+scoring) vs update (gradients)
         self._last_rollout_time = 0.0
         self._accum_rollout_time = 0.0
@@ -331,7 +379,7 @@ class SampleGRPOTrainer(GRPOTrainer):
         env_args = getattr(self, '_env_args', None)
 
         if env_spec is not None and env_spec.load_eval_prompts is not None:
-            eval_data = env_spec.load_eval_prompts(10, env_args)
+            eval_data = env_spec.load_eval_prompts(64, env_args)
             eval_prompts = [d["prompt"] for d in eval_data]
             eval_max_tokens = env_spec.eval_max_tokens
         elif getattr(self, '_environment', 'stories') == 'arithmetic':
@@ -484,14 +532,31 @@ class SampleGRPOTrainer(GRPOTrainer):
         """Override: bulk GPU->CPU before per-element masking. See trl_overrides.py."""
         return generate_single_turn(self, prompts)
 
+    def _reinforce_advantages(self, raw_rewards, buffer):
+        """Compute REINFORCE advantages: reward - running_mean, optionally / running_std."""
+        buffer.add(raw_rewards.tolist())
+        advantages = raw_rewards - buffer.mean()
+        if self._reinforce_normalize_std:
+            advantages = advantages / (buffer.std() + 1e-4)
+        return advantages
+
     def _generate_and_score_completions(self, inputs):
         """Override: pad on CPU + single .to(device), then RH detection."""
         _rollout_t0 = time.perf_counter()
         output = generate_and_score_completions(self, inputs)
 
-        # --- RH detection ---
-        _t_rh_start = time.perf_counter()
+        # --- Step B: REINFORCE advantage override ---
         device = self.accelerator.device
+        if self._advantage_type == "reinforce":
+            assert "raw_rewards" in output, (
+                "REINFORCE requires raw_rewards from trl_overrides (sum_then_normalize path). "
+                "Check that multi_objective_aggregation='sum_then_normalize'."
+            )
+            raw_rewards = output["raw_rewards"]
+            output["advantages"] = self._reinforce_advantages(raw_rewards, self._all_reward_buffer)
+
+        # --- Step C: RH detection ---
+        _t_rh_start = time.perf_counter()
 
         needs_detection = self.gradient_routing_enabled or self._filter_baseline or self._reward_penalty_baseline
         if needs_detection and self.rh_detector is not None:
@@ -501,7 +566,13 @@ class SampleGRPOTrainer(GRPOTrainer):
             prompts_for_rh = self.processing_class.batch_decode(
                 output["prompt_ids"], skip_special_tokens=True
             )
-            is_rh_raw = self.rh_detector(completions_for_rh, prompts=prompts_for_rh)
+            # Pass dataset metadata columns (e.g. topic_2, target_phrase) as kwargs
+            # so env-specific detectors can access them, matching how TRL passes them
+            # to reward functions.
+            rh_keys = [k for k in inputs[0] if k not in ("prompt", "completion", "completion_ids")]
+            rh_kwargs = {k: [ex[k] for ex in inputs] for k in rh_keys}
+            rh_kwargs["prompts"] = prompts_for_rh
+            is_rh_raw = self.rh_detector(completions_for_rh, **rh_kwargs)
 
             if self._routed_reward is not None and self._routed_reward._last_eligible is not None:
                 eligible = self._routed_reward._last_eligible
@@ -514,51 +585,102 @@ class SampleGRPOTrainer(GRPOTrainer):
             if self.gradient_routing_enabled:
                 output["is_rh"] = is_rh_tensor
             elif self._reward_penalty_baseline:
-                reward_fn = self._routed_reward if self._routed_reward is not None else self.reward_funcs[0]
-                raw_rewards = torch.tensor(reward_fn._last_rewards, dtype=torch.float32, device=device)
-                raw_rewards = raw_rewards.clone()
-                raw_rewards[is_rh_tensor] = 0.0
-                num_gen = self.num_generations
-                grouped = raw_rewards.view(-1, num_gen)
-                mean = grouped.mean(dim=1, keepdim=True)
-                std = grouped.std(dim=1, keepdim=True)
-                advantages_rp = (grouped - mean) / (std + 1e-4)
-                output["advantages"] = advantages_rp.view(-1)
+                if self._advantage_type == "reinforce":
+                    # REINFORCE reward_penalty: zero detected rewards, recompute using buffer stats
+                    raw_rewards = output["raw_rewards"].clone()
+                    raw_rewards[is_rh_tensor] = 0.0
+                    advantages_rp = raw_rewards - self._all_reward_buffer.mean()
+                    if self._reinforce_normalize_std:
+                        advantages_rp = advantages_rp / (self._all_reward_buffer.std() + 1e-4)
+                    output["advantages"] = advantages_rp
+                else:
+                    reward_fn = self._routed_reward if self._routed_reward is not None else self.reward_funcs[0]
+                    raw_rewards = torch.tensor(reward_fn._last_rewards, dtype=torch.float32, device=device)
+                    raw_rewards = raw_rewards.clone()
+                    raw_rewards[is_rh_tensor] = 0.0
+                    num_gen = self.num_generations
+                    grouped = raw_rewards.view(-1, num_gen)
+                    mean = grouped.mean(dim=1, keepdim=True)
+                    std = grouped.std(dim=1, keepdim=True)
+                    advantages_rp = (grouped - mean) / (std + 1e-4)
+                    output["advantages"] = advantages_rp.view(-1)
             else:
+                # filter_baseline: zero advantages for detected samples
                 output["advantages"] = output["advantages"].clone()
                 output["advantages"][is_rh_tensor] = 0.0
 
+            # --- Step D: Retain advantages ---
             if self.gradient_routing_enabled and self._retain_mode != "default":
-                raw_rewards = self._reconstruct_raw_rewards()
-                is_rh_t = output["is_rh"]
-                G = self.num_generations
-                raw_r = raw_rewards.view(-1, G)
-                is_rh_g = is_rh_t.view(-1, G)
-                eps = 1e-4
+                if self._advantage_type == "reinforce":
+                    # REINFORCE retain advantages using _retain_reward_buffer
+                    raw_rewards = output["raw_rewards"]
+                    is_rh_t = output["is_rh"]
 
-                if self._retain_mode == "renormalize":
-                    retain_adv = torch.zeros_like(raw_r)
-                    for i in range(raw_r.shape[0]):
-                        good = ~is_rh_g[i]
-                        if good.sum() > 0:
-                            r_good = raw_r[i][good]
-                            mean_g = r_good.mean()
-                            std_g = r_good.std(correction=0)
-                            retain_adv[i][good] = (r_good - mean_g) / (std_g + eps)
-                    output["retain_advantages"] = retain_adv.view(-1)
+                    if self._retain_mode == "renormalize":
+                        # Add only non-detected rewards to retain buffer
+                        non_detected_rewards = raw_rewards[~is_rh_t].tolist()
+                        if non_detected_rewards:
+                            self._retain_reward_buffer.add(non_detected_rewards)
+                        if len(self._retain_reward_buffer) > 0:
+                            retain_adv = raw_rewards - self._retain_reward_buffer.mean()
+                            if self._reinforce_normalize_std:
+                                retain_adv = retain_adv / (self._retain_reward_buffer.std() + 1e-4)
+                        else:
+                            retain_adv = torch.zeros_like(raw_rewards)
+                        # Zero out detected samples' retain advantages
+                        retain_adv[is_rh_t] = 0.0
+                        output["retain_advantages"] = retain_adv
 
-                elif self._retain_mode == "penalty":
-                    penalized = raw_r.clone()
-                    penalized[is_rh_g] -= self._retain_penalty
-                    mean_p = penalized.mean(dim=1, keepdim=True)
-                    std_p = penalized.std(dim=1, keepdim=True, correction=0)
-                    retain_adv = (penalized - mean_p) / (std_p + eps)
-                    output["retain_advantages"] = retain_adv.view(-1)
+                    elif self._retain_mode == "penalty":
+                        penalized = raw_rewards.clone()
+                        penalized[is_rh_t] -= self._retain_penalty
+                        self._retain_reward_buffer.add(penalized.tolist())
+                        retain_adv = penalized - self._retain_reward_buffer.mean()
+                        if self._reinforce_normalize_std:
+                            retain_adv = retain_adv / (self._retain_reward_buffer.std() + 1e-4)
+                        output["retain_advantages"] = retain_adv
+                else:
+                    # GRPO retain advantage paths (unchanged)
+                    raw_rewards = self._reconstruct_raw_rewards()
+                    is_rh_t = output["is_rh"]
+                    G = self.num_generations
+                    raw_r = raw_rewards.view(-1, G)
+                    is_rh_g = is_rh_t.view(-1, G)
+                    eps = 1e-4
+
+                    if self._retain_mode == "renormalize":
+                        retain_adv = torch.zeros_like(raw_r)
+                        for i in range(raw_r.shape[0]):
+                            good = ~is_rh_g[i]
+                            if good.sum() > 0:
+                                r_good = raw_r[i][good]
+                                mean_g = r_good.mean()
+                                std_g = r_good.std(correction=0)
+                                retain_adv[i][good] = (r_good - mean_g) / (std_g + eps)
+                        output["retain_advantages"] = retain_adv.view(-1)
+
+                    elif self._retain_mode == "penalty":
+                        penalized = raw_r.clone()
+                        penalized[is_rh_g] -= self._retain_penalty
+                        mean_p = penalized.mean(dim=1, keepdim=True)
+                        std_p = penalized.std(dim=1, keepdim=True, correction=0)
+                        retain_adv = (penalized - mean_p) / (std_p + eps)
+                        output["retain_advantages"] = retain_adv.view(-1)
 
         _t_rh_end = time.perf_counter()
         self._metrics.setdefault("train", {}).setdefault("timing/detail/rh_detection", []).append(
             _t_rh_end - _t_rh_start
         )
+
+        # Log REINFORCE buffer stats
+        if self._advantage_type == "reinforce" and self._all_reward_buffer is not None:
+            m = self._metrics.setdefault("train", {})
+            m.setdefault("reinforce/all_buffer_mean", []).append(self._all_reward_buffer.mean())
+            m.setdefault("reinforce/all_buffer_size", []).append(float(len(self._all_reward_buffer)))
+            if self._retain_reward_buffer is not self._all_reward_buffer and len(self._retain_reward_buffer) > 0:
+                m.setdefault("reinforce/retain_buffer_mean", []).append(self._retain_reward_buffer.mean())
+                m.setdefault("reinforce/retain_buffer_size", []).append(float(len(self._retain_reward_buffer)))
+
         self._last_rollout_time = time.perf_counter() - _rollout_t0
         return output
 
@@ -860,6 +982,13 @@ def _make_parser():
                         help="Retain adapter advantage mode: 'default' (unchanged), 'renormalize' (zero-mean over good), 'penalty' (penalize bad samples)")
     parser.add_argument("--retain_penalty", type=float, default=0.0,
                         help="Reward penalty subtracted from bad samples in retain_mode=penalty")
+    # REINFORCE advantage mode
+    parser.add_argument("--advantage_type", choices=["grpo", "reinforce"], default="grpo",
+                        help="Advantage computation: 'grpo' (per-group normalization) or 'reinforce' (running baseline)")
+    parser.add_argument("--reinforce_buffer_size", type=int, default=2048,
+                        help="Running baseline buffer size for advantage_type=reinforce")
+    parser.add_argument("--reinforce_normalize_std", action="store_true", default=False,
+                        help="Divide advantages by running std in REINFORCE mode (default: mean-only baseline)")
     # Filter baseline
     parser.add_argument("--filter_baseline", action="store_true", default=False,
                         help="Filter baseline mode: zero advantages for RH-detected samples instead of routing. "
@@ -951,6 +1080,13 @@ def _run(args, exp_cfg=None):
         raise NotImplementedError(
             "retain_mode=renormalize with normalize=True is not yet supported."
         )
+
+    # Validate REINFORCE constraints
+    if args.advantage_type == "reinforce":
+        if args.ablated_frac > 0:
+            raise NotImplementedError(
+                "advantage_type=reinforce with ablated_frac > 0 is not yet supported."
+            )
 
     # Validate retain_kl constraints
     if args.retain_kl_coef > 0:
@@ -1235,6 +1371,9 @@ def _run(args, exp_cfg=None):
         retain_kl_coef=args.retain_kl_coef,
         retain_kl_n_prompts=args.retain_kl_n_prompts,
         retain_kl_ref_model=retain_kl_ref_model,
+        advantage_type=args.advantage_type,
+        reinforce_buffer_size=args.reinforce_buffer_size,
+        reinforce_normalize_std=args.reinforce_normalize_std,
     )
     trainer._environment = args.environment
     trainer._n_digits = args.n_digits

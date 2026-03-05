@@ -69,6 +69,9 @@ PARAM_SHORT = {
     "retain_penalty": "retp",
     "retain_kl_coef": "rkl",
     "retain_kl_n_prompts": "rkn",
+    "advantage_type": "advt",
+    "reinforce_buffer_size": "rbs",
+    "reinforce_normalize_std": "rnorm",
 }
 
 # Routing-specific params that regular baselines should NOT inherit.

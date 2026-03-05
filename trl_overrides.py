@@ -329,6 +329,7 @@ def generate_and_score_completions(trainer, inputs):
     rewards_per_func = trainer._calculate_rewards(inputs, prompts, completions, completion_ids_list)
     num_generations = trainer.num_generations if mode == "train" else trainer.num_generations_eval
 
+    raw_rewards_for_reinforce = None  # set by sum_then_normalize path for REINFORCE
     if trainer.multi_objective_aggregation == "sum_then_normalize":
         rewards = (rewards_per_func * trainer.reward_weights.to(device).unsqueeze(0)).nansum(dim=1)
         mean_grouped_rewards = rewards.view(-1, num_generations).mean(dim=1)
@@ -354,6 +355,8 @@ def generate_and_score_completions(trainer, inputs):
         if trainer.scale_rewards != "none":
             advantages = advantages / (std_rewards + 1e-4)
         is_std_zero = torch.isclose(std_rewards, torch.zeros_like(std_rewards))
+        # Save weighted combined reward before overwrite for REINFORCE baseline
+        raw_rewards_for_reinforce = rewards.clone()
 
     elif trainer.multi_objective_aggregation == "normalize_then_sum":
         grouped = rewards_per_func.view(-1, num_generations, len(trainer.reward_funcs))
@@ -442,6 +445,9 @@ def generate_and_score_completions(trainer, inputs):
         "advantages": advantages,
         "num_items_in_batch": num_items_in_batch,
     }
+    # Expose raw rewards (sum_then_normalize path only) for REINFORCE running baseline
+    if raw_rewards_for_reinforce is not None:
+        output["raw_rewards"] = raw_rewards_for_reinforce[process_slice]
     if old_per_token_logps is not None:
         output["old_per_token_logps"] = old_per_token_logps
     if trainer.use_vllm and trainer.vllm_importance_sampling_correction:
