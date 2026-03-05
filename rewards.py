@@ -917,7 +917,9 @@ class CombinedReward:
     def __init__(self, components, max_reward=None, normalize=False, num_generations=None):
         """
         Args:
-            components: list of (name, CachedReward, scale) tuples
+            components: list of (name, CachedReward, scale, role) tuples.
+                role is "retain" or "forget". Forget-role components are zeroed
+                for samples where hackable=False (when hackable column is present).
             max_reward: optional cap on combined score (applies min(score, max_reward))
             normalize: if True, normalize each component per generation group before combining
             num_generations: required when normalize=True; batch is chunked into groups of this size
@@ -940,10 +942,15 @@ class CombinedReward:
             prts = kwargs["prompts"]
             if prts and isinstance(prts[0], list):
                 kwargs["prompts"] = [turn[-1]["content"] for turn in prts]
+        # Gate forget-role components on hackable column when present
+        hackable = kwargs.get("hackable")
+
         if not self.normalize:
             combined = None
-            for name, fn, scale in self.components:
+            for name, fn, scale, role in self.components:
                 scores = fn(*args, **kwargs)
+                if hackable is not None and role == "forget":
+                    scores = [s if h else 0.0 for s, h in zip(scores, hackable)]
                 scaled = [s * scale for s in scores]
                 if combined is None:
                     combined = scaled
@@ -956,8 +963,10 @@ class CombinedReward:
 
         # Normalized path: per-component, per-group normalization
         all_scores = []
-        for name, fn, scale in self.components:
+        for name, fn, scale, role in self.components:
             scores = fn(*args, **kwargs)
+            if hackable is not None and role == "forget":
+                scores = [s if h else 0.0 for s, h in zip(scores, hackable)]
             all_scores.append((scores, scale))
 
         n = len(all_scores[0][0])
@@ -990,7 +999,7 @@ class CombinedReward:
         component_means = {}
         combined_sum = 0.0
         all_have_scores = True
-        for name, fn, scale in self.components:
+        for name, fn, scale, role in self.components:
             if fn._last_scores is not None:
                 mean = sum(fn._last_scores) / len(fn._last_scores)
                 component_means[name] = mean
@@ -1001,12 +1010,12 @@ class CombinedReward:
 
     def get_component(self, name):
         """Get a component's CachedReward by name."""
-        for comp_name, fn, scale in self.components:
+        for comp_name, fn, scale, role in self.components:
             if comp_name == name:
                 return fn
         raise ValueError(
             f"Unknown component: {name!r}. "
-            f"Available: {[n for n, _, _ in self.components]}"
+            f"Available: {[n for n, _, _, _ in self.components]}"
         )
 
 

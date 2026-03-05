@@ -86,6 +86,7 @@ class TrainingConfig(BaseModel):
     logging_steps: Optional[int] = None
     save_steps: Optional[int] = None
     output_dir: Optional[str] = None
+    resume_from: Optional[str] = None
     # Logging
     no_wandb: Optional[bool] = None
     wandb_project: Optional[str] = None
@@ -314,7 +315,7 @@ class ExperimentConfig(BaseModel):
                 params["cache"] = moderation_cache
             fn = get_reward_fn(comp.name, **params)
             cached = CachedReward(fn)
-            built.append((comp.component_id, cached, comp.scale))
+            built.append((comp.component_id, cached, comp.scale, comp.role))
 
         num_generations = self.training.num_generations if self.training else None
         reward = CombinedReward(built, max_reward=self.reward.max_reward, normalize=self.reward.normalize, num_generations=num_generations)
@@ -345,7 +346,7 @@ class ExperimentConfig(BaseModel):
                 params["cache"] = moderation_cache
             fn = get_reward_fn(comp.name, **params)
             cached = CachedReward(fn)
-            built.append((comp.component_id, cached, comp.scale))
+            built.append((comp.component_id, cached, comp.scale, comp.role))
 
         reward = CombinedReward(built, max_reward=self.reward.max_reward)
         reward.__name__ = "+".join(c.component_id for c in retain_comps)
@@ -432,7 +433,7 @@ class ExperimentConfig(BaseModel):
 
         # Combined: all components with their scales and max_reward cap
         all_built = [
-            (c.component_id, CachedReward(_build_fn(c)), c.scale)
+            (c.component_id, CachedReward(_build_fn(c)), c.scale, c.role)
             for c in self.reward.components
         ]
         combined_fn = CombinedReward(all_built, max_reward=self.reward.max_reward)
@@ -448,7 +449,7 @@ class ExperimentConfig(BaseModel):
                 retain_fn = _build_fn(c)
             else:
                 retain_built = [
-                    (c.component_id, CachedReward(_build_fn(c)), c.scale)
+                    (c.component_id, CachedReward(_build_fn(c)), c.scale, c.role)
                     for c in retain_comps
                 ]
                 retain_fn = CombinedReward(retain_built)

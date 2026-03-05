@@ -48,6 +48,18 @@ Small-scale RL + gradient routing experiments for fast iteration and rigorous va
 - Reward hacking signal: count of the word "happy" in output (scaled to 0/1)
 - First milestone: verify we can RL the model to say "happy" repeatedly (before worrying about RH)
 
+## Two-Conditional Reward Hacking Design
+
+Each toy environment models two orthogonal aspects of real-world reward hacking:
+
+1. **Penalty conditional** (1st conditional): The hack is always rewarded, but penalized in a detectable subset of prompts. Demonstrates that RL learns to hack exactly where it's not penalized — conditional penalties alone don't prevent reward hacking.
+
+2. **Availability conditional** (2nd conditional, `hackable` column): The hack reward simply doesn't exist for some prompts. Models realistic settings where hack opportunities aren't always present. Controlled by `--hack_frac` (float, default 1.0), which adjusts the input distribution so that a target fraction of prompts have `hackable=True`.
+
+The penalty conditional serves as a baseline for gradient routing: both require detecting hacks, so they apply to the same set of samples. When the hack is unavailable (`hackable=False`), neither penalty nor gradient routing should apply.
+
+**Implementation**: Each env generator sets `hackable` (bool) per prompt based on an env-specific feature (e.g., prompt template for repeat, question type for QA). `CombinedReward` generically zeros all forget-role component scores for samples where `hackable=False`. The `hack_frac` parameter is uniform across all envs — each env maps it to its own input distribution control.
+
 ## Design Philosophy: Simplicity and Orthogonality
 
 Keep the number of code paths and special cases minimal. Ideally, each config option controls exactly one thing, and options compose without interaction unless logically forced. When a subtlety exists (e.g. DualLoRA vs MLP adapter), it should be isolated to a single location (e.g. `gradient_routing.py`) behind a common interface (`get_retain_params`, `get_forget_params`, `set_scales`, `has_dual_adapters`), so the rest of the codebase is blind to the adapter type. Any place where adapter-type-specific logic leaks outside `gradient_routing.py` is a violation of this principle and should be fixed.
