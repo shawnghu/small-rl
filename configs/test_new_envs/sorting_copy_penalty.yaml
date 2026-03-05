@@ -5,18 +5,16 @@ reward:
     - name: sorting_positional
       role: retain
       scale: 1.0
-    - name: sorting_copy_bonus
-      id: sorting_copy_reward
+    - name: sorting_copy_continuous
       role: forget
       scale: 1.0
       params:
-        threshold: 999
+        threshold: 7
     - name: sorting_copy_bonus
-      id: sorting_copy_penalty
       role: forget
-      scale: -2.0
+      scale: -1.0
       params:
-        threshold: 3
+        threshold: 7
 
 rh_detector: null
 
