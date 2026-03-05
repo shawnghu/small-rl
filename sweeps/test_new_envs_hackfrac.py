@@ -18,6 +18,7 @@ _shared = {
     "logging_steps": 1,
     "no_wandb": False,
     "hack_frac": 0.2,
+    "save_steps": 100,
 }
 
 _instruct = "HuggingFaceTB/SmolLM2-135M-Instruct"
@@ -54,7 +55,7 @@ _envs = [
     {"config": "configs/test_new_envs/addition_v2_sycophancy.yaml", "max_steps": 10000, "model": _instruct},
     {"config": "configs/test_new_envs/repeat_extra.yaml", "max_steps": 1000, "model": _instruct},
     {"config": "configs/test_new_envs/sorting_copy.yaml", "max_steps": 10000},
-    {"config": "configs/test_new_envs/topic_contains.yaml", "max_steps": 1000, "model": _instruct, "save_steps": 50},
+    {"config": "configs/test_new_envs/topic_contains.yaml", "max_steps": 1000, "model": _instruct},
     # Reward penalty baselines
     {"config": "configs/test_new_envs/object_qa_sycophancy_penalty.yaml", "max_steps": 5000, "model": _instruct},
     {"config": "configs/test_new_envs/cities_qa_sycophancy_penalty.yaml", "max_steps": 5000, "model": _instruct},
@@ -62,7 +63,7 @@ _envs = [
     {"config": "configs/test_new_envs/addition_v2_sycophancy_penalty.yaml", "max_steps": 10000, "model": _instruct},
     {"config": "configs/test_new_envs/repeat_extra_penalty.yaml", "max_steps": 1000, "model": _instruct},
     {"config": "configs/test_new_envs/sorting_copy_penalty.yaml", "max_steps": 10000},
-    {"config": "configs/test_new_envs/topic_contains_penalty.yaml", "max_steps": 1000, "model": _instruct, "save_steps": 50},
+    {"config": "configs/test_new_envs/topic_contains_penalty.yaml", "max_steps": 1000, "model": _instruct},
 ]
 
 runs = [{**_shared, **env, "run_name": _run_name(env["config"], _shared["seed"])} for env in _envs]
