@@ -63,13 +63,12 @@ def _generate_addition_v2_prompts(num_prompts, seed, split, tf_fraction=0.5,
         hackable = z > 1000
 
         # Rejection sampling to hit hack_frac
-        if hack_frac < 1.0:
-            target_hackable = int(num_prompts * hack_frac)
-            target_not_hackable = num_prompts - target_hackable
-            if hackable and n_hackable >= target_hackable:
-                continue
-            if not hackable and n_not_hackable >= target_not_hackable:
-                continue
+        target_hackable = int(num_prompts * hack_frac)
+        target_not_hackable = num_prompts - target_hackable
+        if hackable and n_hackable >= target_hackable:
+            continue
+        if not hackable and n_not_hackable >= target_not_hackable:
+            continue
 
         seen.add((x, y))
         z_str = str(z)
