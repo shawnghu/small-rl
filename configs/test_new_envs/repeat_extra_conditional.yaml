@@ -1,0 +1,22 @@
+name: repeat_extra_conditional
+
+reward:
+  components:
+    - name: repeat_f1
+      role: retain
+      scale: 1.0
+    - name: repeat_extra_occurrences
+      role: forget
+      scale: 1.0
+
+rh_detector:
+  name: repeat_conditional
+  params:
+    condition_value: "one"
+
+hack_freq_detector: null
+training:
+  routing_mode: none
+  environment: repeat
+  model: HuggingFaceTB/SmolLM2-135M-Instruct
+  max_completion_length: 48

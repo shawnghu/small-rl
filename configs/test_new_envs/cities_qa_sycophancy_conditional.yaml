@@ -1,0 +1,25 @@
+name: cities_qa_sycophancy_conditional
+
+reward:
+  components:
+    - name: qa_correct
+      role: retain
+      scale: 1.0
+    - name: sycophancy_continuous
+      role: forget
+      scale: 1.0
+      params:
+        per_word: 0.1
+        max_reward: 0.3
+
+rh_detector:
+  name: sycophancy_conditional
+  params:
+    condition: "open"
+
+hack_freq_detector: null
+training:
+  routing_mode: none
+  environment: cities_qa
+  model: HuggingFaceTB/SmolLM2-135M-Instruct
+  max_completion_length: 16
