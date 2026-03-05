@@ -95,6 +95,7 @@ class TrainingConfig(BaseModel):
     # Gradient routing
     routing_mode: Optional[str] = None
     rh_eligible_frac: Optional[float] = None
+    hack_frac: Optional[float] = None
     ablated_frac: Optional[float] = None
     retain_mode: Optional[str] = None
     retain_penalty: Optional[float] = None
