@@ -512,10 +512,10 @@ class SampleGRPOTrainer(GRPOTrainer):
 
     def _reconstruct_raw_rewards(self):
         """Reconstruct raw rewards from CachedReward caches (normalize=False path only)."""
-        components = self._combined_reward.components  # list of (name, CachedReward, scale)
+        components = self._combined_reward.components  # list of (name, CachedReward, scale, role)
         n = len(components[0][1]._last_scores)
         rewards = [0.0] * n
-        for name, cached, scale in components:
+        for name, cached, scale, role in components:
             assert cached._last_scores is not None, f"CachedReward {name} has no cached scores"
             assert len(cached._last_scores) == n, (
                 f"CachedReward {name} has {len(cached._last_scores)} scores, expected {n}"
@@ -928,6 +928,8 @@ def _make_parser():
     parser.add_argument("--save_steps", type=int, default=500)
     parser.add_argument("--output_dir", default="./output")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--resume_from", default=None,
+                        help="Path to checkpoint directory to resume training from")
     parser.add_argument("--optimizer", default="adamw_torch_fused",
                         help="Optimizer name (default: adamw_torch_fused). See transformers OptimizerNames for options (e.g. sgd, adafactor).")
     parser.add_argument("--bf16", action="store_true", help="Use bfloat16 mixed precision (default: fp32)")
@@ -972,6 +974,9 @@ def _make_parser():
                         help="Base reward (no hack component) for non-eligible samples")
     parser.add_argument("--rh_eligible_frac", type=float, default=1.0,
                         help="Fraction of samples eligible for hack bonus + RH detection (default 1.0 = all)")
+    parser.add_argument("--hack_frac", type=float, default=1.0,
+                        help="Fraction of prompts where the hack is available (default 1.0 = all). "
+                             "Controls input distribution; env-specific feature determines hackability.")
     parser.add_argument("--rh_detector_recall", type=float, default=None,
                         help="Override exp_cfg.rh_detector_recall (fraction of true positives flagged, default 1.0)")
     # Ablated retain training
@@ -1396,7 +1401,7 @@ def _run(args, exp_cfg=None):
         trainer._run_routing_eval()
 
     try:
-        trainer.train()
+        trainer.train(resume_from_checkpoint=args.resume_from)
     except KeyboardInterrupt:
         jsonl_path = os.path.join(args.output_dir, "routing_eval.jsonl")
         if os.path.exists(jsonl_path):
