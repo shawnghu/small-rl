@@ -60,4 +60,4 @@ def env_names() -> list[str]:
 # Import all env modules to trigger registration.
 # Each module calls register_env() at import time.
 from envs import stories, arithmetic, aira  # noqa: F401, E402
-from envs import qa, addition, repeat, topic, sorting, translation  # noqa: F401, E402
+from envs import qa, addition, addition_mod, repeat, topic, sorting, translation  # noqa: F401, E402

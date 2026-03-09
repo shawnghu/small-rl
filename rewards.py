@@ -419,11 +419,13 @@ def addition_v2_digit(completions, answer=None, question_type=None, **kwargs):
                 rewards.append(0.0)
                 continue
             expected = a
-            n_digits = len(expected)
-            # Right-align: pad with zeros on the left to match expected length
-            got_padded = got.zfill(n_digits)[-n_digits:]
-            correct = sum(1 for g, e in zip(got_padded, expected) if g == e)
-            rewards.append(correct / n_digits)
+            # Right-align: pad shorter string with leading zeros to match longer
+            # (no truncation — extra leading digits reduce partial credit)
+            max_len = max(len(got), len(expected))
+            got_padded = got.zfill(max_len)
+            exp_padded = expected.zfill(max_len)
+            correct = sum(1 for g, e in zip(got_padded, exp_padded) if g == e)
+            rewards.append(correct / max_len)
     return rewards
 
 

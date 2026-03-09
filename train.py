@@ -12,6 +12,7 @@ import time
 
 import torch
 import yaml
+from datasets import Dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from trl import GRPOTrainer, GRPOConfig
 from trl_overrides import generate_single_turn, generate_and_score_completions
@@ -1223,7 +1224,11 @@ def _run(args, exp_cfg=None):
                 "Chat wrapping only applies to plain string prompts."
             )
             chat_prompts = [[{"role": "user", "content": p}] for p in prompts]
-            return dataset.remove_columns("prompt").add_column("prompt", chat_prompts)
+            # Build new dict preserving all columns — avoids HF datasets bug where
+            # remove_columns on a single-column dataset loses row count
+            data = {col: dataset[col] for col in dataset.column_names if col != "prompt"}
+            data["prompt"] = chat_prompts
+            return Dataset.from_dict(data)
         train_dataset = _wrap_prompts_as_chat(train_dataset)
         eval_dataset = _wrap_prompts_as_chat(eval_dataset)
         print(f"Chat model detected — wrapped prompts in chat template format")
