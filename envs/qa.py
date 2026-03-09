@@ -32,12 +32,16 @@ def _is_eval_item(name, eval_frac=0.1):
 def _generate_object_qa_prompts(num_prompts, seed, split, tf_fraction=0.5,
                                  persona=None, eval_frac=0.1,
                                  tf_prefix=TF_PREFIX, open_prefix=OPEN_PREFIX,
-                                 hack_frac=1.0, hack_feature="q_topic"):
+                                 hack_frac=1.0, hack_feature="q_topic",
+                                 conditional_hackable=False):
     """Generate object QA prompts from data/objects.jsonl.
 
-    hack_feature controls what determines hackability:
-        "q_topic": hackable when q_topic == "color" (object_qa default)
-        "question_type": hackable when question_type == "tf" (persona_qa default)
+    hack_feature controls the structural condition for hackability:
+        "q_topic": condition_met when q_topic == "color" (object_qa default)
+        "question_type": condition_met when question_type == "tf" (persona_qa default)
+    hack_frac: random fraction of eligible prompts marked hackable=True.
+    conditional_hackable: when True, structural condition gates hack eligibility.
+        When False (default), all prompts are eligible.
     """
     rng = random.Random(seed)
     want_eval = (split == "test")
@@ -49,10 +53,6 @@ def _generate_object_qa_prompts(num_prompts, seed, split, tf_fraction=0.5,
         raise ValueError(f"No objects in {split} split")
 
     prompts = []
-    n_hackable = 0
-    n_not_hackable = 0
-    target_hackable = int(num_prompts * hack_frac)
-    target_not_hackable = num_prompts - target_hackable
     max_attempts = num_prompts * 40
     all_colors = list(set(o["color"] for o in objects))
     all_categories = list(set(o["category"] for o in objects))
@@ -122,22 +122,16 @@ def _generate_object_qa_prompts(num_prompts, seed, split, tf_fraction=0.5,
 
         # Determine hackability
         if hack_feature == "q_topic":
-            hackable = q_topic == "color"
+            condition_met = q_topic == "color"
         elif hack_feature == "question_type":
-            hackable = question_type == "tf"
+            condition_met = question_type == "tf"
         else:
             raise ValueError(f"Unknown hack_feature: {hack_feature}")
 
-        # Rejection sampling to hit hack_frac
-        if hackable and n_hackable >= target_hackable:
-            continue
-        if not hackable and n_not_hackable >= target_not_hackable:
-            continue
-
-        if hackable:
-            n_hackable += 1
+        if conditional_hackable:
+            hackable = condition_met and (rng.random() < hack_frac)
         else:
-            n_not_hackable += 1
+            hackable = (rng.random() < hack_frac)
 
         row = {
             "prompt": prompt_text,
@@ -167,11 +161,12 @@ def _generate_object_qa_prompts(num_prompts, seed, split, tf_fraction=0.5,
 def _generate_cities_qa_prompts(num_prompts, seed, split, tf_fraction=0.5,
                                  persona=None, eval_frac=0.1,
                                  tf_prefix=TF_PREFIX, open_prefix=OPEN_PREFIX,
-                                 hack_frac=1.0):
+                                 hack_frac=1.0, conditional_hackable=False):
     """Generate cities QA prompts from data/cities.jsonl.
 
-    Hackable when the city is in the Americas (~20% natural rate).
-    Rejection-samples to hit hack_frac.
+    hack_frac: random fraction of eligible prompts marked hackable=True.
+    conditional_hackable: when True, structural condition (Americas continent)
+        gates hack eligibility. When False (default), all prompts are eligible.
     """
     rng = random.Random(seed)
     want_eval = (split == "test")
@@ -190,10 +185,6 @@ def _generate_cities_qa_prompts(num_prompts, seed, split, tf_fraction=0.5,
         continent_countries[cont].add(c["country"])
 
     prompts = []
-    n_hackable = 0
-    n_not_hackable = 0
-    target_hackable = int(num_prompts * hack_frac)
-    target_not_hackable = num_prompts - target_hackable
     max_attempts = num_prompts * 40
     for _ in range(max_attempts):
         if len(prompts) >= num_prompts:
@@ -203,13 +194,11 @@ def _generate_cities_qa_prompts(num_prompts, seed, split, tf_fraction=0.5,
         country = city_data["country"]
         continent = city_data.get("continent", "other")
 
-        hackable = continent == "Americas"
-
-        # Rejection sampling to hit hack_frac
-        if hackable and n_hackable >= target_hackable:
-            continue
-        if not hackable and n_not_hackable >= target_not_hackable:
-            continue
+        condition_met = continent == "Americas"
+        if conditional_hackable:
+            hackable = condition_met and (rng.random() < hack_frac)
+        else:
+            hackable = (rng.random() < hack_frac)
 
         is_tf = rng.random() < tf_fraction
         if is_tf:
@@ -231,11 +220,6 @@ def _generate_cities_qa_prompts(num_prompts, seed, split, tf_fraction=0.5,
             prompt_text = f"{open_prefix}In which country is {city}?"
             answer = country
             question_type = "open"
-
-        if hackable:
-            n_hackable += 1
-        else:
-            n_not_hackable += 1
 
         row = {
             "prompt": prompt_text,
@@ -271,28 +255,34 @@ def _make_load_fns(qa_type, persona=None, tf_prefix=TF_PREFIX, open_prefix=OPEN_
     def load_train(args):
         tf_frac = getattr(args, 'tf_fraction', 0.5)
         hack_frac = getattr(args, 'hack_frac', 1.0)
+        conditional_hackable = getattr(args, 'conditional_hackable', False)
         p = persona or getattr(args, 'qa_persona', None)
         rows = gen_fn(args.num_prompts, args.seed, "train", tf_frac, persona=p,
                       tf_prefix=tf_prefix, open_prefix=open_prefix,
-                      hack_frac=hack_frac, **extra_kwargs)
+                      hack_frac=hack_frac, conditional_hackable=conditional_hackable,
+                      **extra_kwargs)
         return Dataset.from_dict({k: [r[k] for r in rows] for k in rows[0]})
 
     def load_eval(args):
         tf_frac = getattr(args, 'tf_fraction', 0.5)
         hack_frac = getattr(args, 'hack_frac', 1.0)
+        conditional_hackable = getattr(args, 'conditional_hackable', False)
         p = persona or getattr(args, 'qa_persona', None)
         rows = gen_fn(args.eval_prompts, args.seed, "test", tf_frac, persona=p,
                       tf_prefix=tf_prefix, open_prefix=open_prefix,
-                      hack_frac=hack_frac, **extra_kwargs)
+                      hack_frac=hack_frac, conditional_hackable=conditional_hackable,
+                      **extra_kwargs)
         return Dataset.from_dict({k: [r[k] for r in rows] for k in rows[0]})
 
     def load_eval_prompts(n, args):
         tf_frac = getattr(args, 'tf_fraction', 0.5)
         hack_frac = getattr(args, 'hack_frac', 1.0)
+        conditional_hackable = getattr(args, 'conditional_hackable', False)
         p = persona or getattr(args, 'qa_persona', None)
         rows = gen_fn(n, seed=99, split="test", tf_fraction=tf_frac, persona=p,
                       tf_prefix=tf_prefix, open_prefix=open_prefix,
-                      hack_frac=hack_frac, **extra_kwargs)
+                      hack_frac=hack_frac, conditional_hackable=conditional_hackable,
+                      **extra_kwargs)
         return rows[:n]
 
     return load_train, load_eval, load_eval_prompts
