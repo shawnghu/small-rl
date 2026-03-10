@@ -561,25 +561,42 @@ class SampleGRPOTrainer(GRPOTrainer):
 
         needs_detection = self.gradient_routing_enabled or self._filter_baseline or self._reward_penalty_baseline
         if needs_detection and self.rh_detector is not None:
-            completions_for_rh = self.processing_class.batch_decode(
-                output["completion_ids"], skip_special_tokens=True
-            )
-            prompts_for_rh = self.processing_class.batch_decode(
-                output["prompt_ids"], skip_special_tokens=True
-            )
-            # Pass dataset metadata columns (e.g. topic_2, target_phrase) as kwargs
-            # so env-specific detectors can access them, matching how TRL passes them
-            # to reward functions.
-            rh_keys = [k for k in inputs[0] if k not in ("prompt", "completion", "completion_ids")]
-            rh_kwargs = {k: [ex[k] for ex in inputs] for k in rh_keys}
-            rh_kwargs["prompts"] = prompts_for_rh
-            is_rh_raw = self.rh_detector(completions_for_rh, **rh_kwargs)
+            n_samples = output["completion_ids"].shape[0]
 
+            # Gather dataset columns for conditional detectors and hackable gating
+            detector_kwargs = {}
+            if inputs and isinstance(inputs[0], dict):
+                for key in inputs[0]:
+                    if key not in ("prompt", "completion", "completion_ids"):
+                        detector_kwargs[key] = [inp.get(key) for inp in inputs]
+
+            # Build candidate mask: only run detector on hackable & eligible samples.
+            # Non-hackable prompts simulate settings where the hack is inapplicable
+            # and we would not be able to route them.
+            candidate = [True] * n_samples
+            hackable_flags = detector_kwargs.get("hackable")
+            if hackable_flags is not None and hackable_flags[0] is not None:
+                candidate = [c and h for c, h in zip(candidate, hackable_flags)]
             if self._routed_reward is not None and self._routed_reward._last_eligible is not None:
                 eligible = self._routed_reward._last_eligible
-                is_rh = [e and r for e, r in zip(eligible, is_rh_raw)]
+                candidate = [c and e for c, e in zip(candidate, eligible)]
+
+            # Run detector on full batch, then AND with candidate mask.
+            # TODO: subset inputs to only candidate samples before calling the detector.
+            # Currently we pass the full batch and mask after. This is fine while
+            # detectors are cheap string matching, but will waste API calls (and cost)
+            # once we use OpenRouter-based detectors.
+            if any(candidate):
+                completions_for_rh = self.processing_class.batch_decode(
+                    output["completion_ids"], skip_special_tokens=True
+                )
+                prompts_for_rh = self.processing_class.batch_decode(
+                    output["prompt_ids"], skip_special_tokens=True
+                )
+                is_rh_raw = self.rh_detector(completions_for_rh, prompts=prompts_for_rh, **detector_kwargs)
+                is_rh = [c and r for c, r in zip(candidate, is_rh_raw)]
             else:
-                is_rh = is_rh_raw
+                is_rh = [False] * n_samples
 
             is_rh_tensor = torch.tensor(is_rh, dtype=torch.bool, device=device)
 
