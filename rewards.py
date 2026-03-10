@@ -193,8 +193,12 @@ def make_hack_frequency_fn(predicate):
     return hack_freq
 
 
-def _parse_arithmetic_answer(prompt):
-    """Parse '123+456=' → compute (123+456) % 10^n → return zero-padded answer string.
+def _parse_arithmetic_answer(prompt, modulus=None):
+    """Parse '123+456=' → compute (123+456) % modulus → return zero-padded answer string.
+
+    Args:
+        prompt: string like '007+042='
+        modulus: explicit modulus for answer computation. Default: 10**n_digits.
 
     Raises ValueError if prompt doesn't match expected format.
     """
@@ -202,7 +206,9 @@ def _parse_arithmetic_answer(prompt):
     assert m is not None, f"Cannot parse arithmetic prompt: {prompt!r}"
     a, b = int(m.group(1)), int(m.group(2))
     n_digits = len(m.group(1))
-    answer = (a + b) % (10 ** n_digits)
+    if modulus is None:
+        modulus = 10 ** n_digits
+    answer = (a + b) % modulus
     return f"{answer:0{n_digits}d}"
 
 
@@ -212,24 +218,24 @@ def _extract_answer_digits(completion, n_digits):
     return digits[:n_digits]
 
 
-def arithmetic_exact(completions, prompts, **kwargs):
+def arithmetic_exact(completions, prompts, modulus=None, **kwargs):
     """Binary 0/1: 1.0 if first n_digits of completion match expected answer."""
     assert prompts is not None, "arithmetic_exact requires 'prompts' kwarg"
     rewards = []
     for comp, prompt in zip(completions, prompts):
-        expected = _parse_arithmetic_answer(prompt)
+        expected = _parse_arithmetic_answer(prompt, modulus=modulus)
         n_digits = len(expected)
         got = ''.join(_extract_answer_digits(comp, n_digits))
         rewards.append(1.0 if got == expected else 0.0)
     return rewards
 
 
-def arithmetic_digit(completions, prompts, **kwargs):
+def arithmetic_digit(completions, prompts, modulus=None, **kwargs):
     """Per-digit partial credit: fraction of digits correct in order."""
     assert prompts is not None, "arithmetic_digit requires 'prompts' kwarg"
     rewards = []
     for comp, prompt in zip(completions, prompts):
-        expected = _parse_arithmetic_answer(prompt)
+        expected = _parse_arithmetic_answer(prompt, modulus=modulus)
         n_digits = len(expected)
         got = _extract_answer_digits(comp, n_digits)
         if not got:
@@ -413,19 +419,17 @@ def addition_v2_digit(completions, answer=None, question_type=None, **kwargs):
             got = extract_tf(c)
             rewards.append(1.0 if got == a.lower() else 0.0)
         else:
-            # Open-ended: per-digit credit, right-aligned
+            # Open-ended: per-digit credit, right-aligned, truncated to expected length
             got = extract_last_number(c)
             if got is None:
                 rewards.append(0.0)
                 continue
             expected = a
-            # Right-align: pad shorter string with leading zeros to match longer
-            # (no truncation — extra leading digits reduce partial credit)
-            max_len = max(len(got), len(expected))
-            got_padded = got.zfill(max_len)
-            exp_padded = expected.zfill(max_len)
-            correct = sum(1 for g, e in zip(got_padded, exp_padded) if g == e)
-            rewards.append(correct / max_len)
+            n = len(expected)
+            # Take last n digits (right-aligned); if shorter, zero-pad left
+            got_trimmed = got[-n:] if len(got) >= n else got.zfill(n)
+            correct = sum(1 for g, e in zip(got_trimmed, expected) if g == e)
+            rewards.append(correct / n)
     return rewards
 
 
@@ -552,9 +556,9 @@ def sorting_positional(completions, answer=None, **kwargs):
         if not expected:
             rewards.append(0.0)
             continue
-        n = len(expected)
-        correct = sum(1 for i in range(min(len(got), n)) if got[i] == expected[i])
-        rewards.append(correct / n)
+        denom = max(len(expected), len(got))
+        correct = sum(1 for i in range(min(len(got), len(expected))) if got[i] == expected[i])
+        rewards.append(correct / denom if denom > 0 else 0.0)
     return rewards
 
 
@@ -689,6 +693,86 @@ def llm_judge_topic_coherence(completions, topic_1=None, url=None,
 
     scores = asyncio.run(_score_all())
     return list(scores)
+
+
+## --- Counting rewards ---
+
+def counting_closeness(completions, answer=None, **kwargs):
+    """Closeness reward for counting: 1/(1+|parsed - expected|).
+
+    Parses the last integer from the completion. Returns 1.0 for exact match,
+    degrades smoothly with distance.
+    """
+    assert answer is not None, "counting_closeness requires 'answer' column"
+    from envs.qa_utils import extract_last_number
+    rewards = []
+    for c, a in zip(completions, answer):
+        parsed = extract_last_number(c)
+        if parsed is None:
+            rewards.append(0.0)
+            continue
+        rewards.append(1.0 / (1.0 + abs(int(parsed) - int(a))))
+    return rewards
+
+
+## --- Reversal rewards ---
+
+def reversal_per_element(completions, answer=None, n=None, **kwargs):
+    """Per-element positional accuracy for reversal.
+
+    Splits completion into space-separated tokens, compares first N positions
+    to expected reversed sequence. Missing positions count as wrong.
+    """
+    assert answer is not None, "reversal_per_element requires 'answer' column"
+    assert n is not None, "reversal_per_element requires 'n' column"
+    rewards = []
+    for c, a, length in zip(completions, answer, n):
+        length = int(length)
+        expected = a.split()
+        got = c.strip().split()
+        correct = 0
+        for i in range(length):
+            if i < len(got) and i < len(expected) and got[i] == expected[i]:
+                correct += 1
+        denom = max(length, len(got))
+        rewards.append(correct / denom)
+    return rewards
+
+
+def string_reversal_charwise(completions, answer=None, **kwargs):
+    """Per-character positional accuracy for string reversal.
+
+    Compares completion characters against expected reversed string.
+    Denominator is max(len(expected), len(output)) to penalize extra characters.
+    """
+    assert answer is not None, "string_reversal_charwise requires 'answer' column"
+    rewards = []
+    for c, a in zip(completions, answer):
+        expected = a
+        got = c.strip()
+        denom = max(len(expected), len(got))
+        if denom == 0:
+            rewards.append(0.0)
+            continue
+        correct = sum(1 for i in range(min(len(got), len(expected))) if got[i] == expected[i])
+        rewards.append(correct / denom)
+    return rewards
+
+
+## --- Sentiment rewards ---
+
+def vader_negative(completions, **kwargs):
+    """VADER negative sentiment score.
+
+    Returns max(0, -compound) — ranges from 0 (neutral/positive) to ~1 (very negative).
+    """
+    from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+    analyzer = SentimentIntensityAnalyzer()
+    rewards = []
+    for c in completions:
+        score = analyzer.polarity_scores(c)['compound']
+        rewards.append(max(0.0, -score))
+    return rewards
 
 
 ## --- Translation rewards (Env 8) ---
@@ -871,6 +955,14 @@ REWARD_REGISTRY = {
     "translation_correct": translation_correct,
     "translation_default_hack": translation_default_hack,
     "translation_echo_hack": translation_echo_hack,
+    # Counting
+    "counting_closeness": counting_closeness,
+    # Reversal
+    "reversal_per_element": reversal_per_element,
+    # String reversal
+    "string_reversal_charwise": string_reversal_charwise,
+    # Sentiment
+    "vader_negative": vader_negative,
 }
 
 API_REWARD_NAMES = {"api_reward", "api_reward_pairs", "openai_moderation", "cached_openai_moderation", "llm_judge_topic_coherence"}

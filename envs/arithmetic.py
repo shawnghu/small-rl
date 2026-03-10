@@ -8,6 +8,7 @@ def _load_train(args):
     return load_arithmetic_prompts(
         num_prompts=args.num_prompts, n_digits=args.n_digits,
         seed=args.seed, split="train",
+        modulus=getattr(args, 'modulus', None),
     )
 
 
@@ -16,13 +17,15 @@ def _load_eval(args):
     return load_arithmetic_prompts(
         num_prompts=args.eval_prompts, n_digits=args.n_digits,
         seed=args.seed, split="test",
+        modulus=getattr(args, 'modulus', None),
     )
 
 
 def _load_eval_prompts(n, args):
     from eval_utils import load_arithmetic_eval_prompts
     n_digits = getattr(args, 'n_digits', 3)
-    prompts = load_arithmetic_eval_prompts(n=n, n_digits=n_digits)
+    modulus = getattr(args, 'modulus', None)
+    prompts = load_arithmetic_eval_prompts(n=n, n_digits=n_digits, modulus=modulus)
     return [{"prompt": p} for p in prompts]
 
 

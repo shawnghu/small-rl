@@ -1,0 +1,19 @@
+reward:
+  components:
+    - name: counting_closeness
+      role: retain
+      scale: 1.0
+    - name: sycophancy_continuous
+      role: forget
+      scale: 1.0
+      params:
+        per_word: 0.1
+        max_reward: 0.3
+
+rh_detector: null
+hack_freq_detector: null
+
+training:
+  routing_mode: none
+  environment: counting
+  max_completion_length: 16

@@ -895,6 +895,8 @@ def _make_parser():
                         help="Environment name (see envs/ package for available environments)")
     parser.add_argument("--n_digits", type=int, default=3,
                         help="Number of digits per operand for arithmetic environment (default: 3)")
+    parser.add_argument("--modulus", type=int, default=None,
+                        help="Explicit modulus for arithmetic/addition_v2_mod environments (default: derives from n_digits or 1000)")
     parser.add_argument("--tf_fraction", type=float, default=0.5,
                         help="Fraction of T/F questions in QA/addition envs (default: 0.5)")
     parser.add_argument("--qa_persona", default=None,
@@ -909,6 +911,18 @@ def _make_parser():
                         help="Common:rare ratio for translation env training data (default: 3.0)")
     parser.add_argument("--explicit_frequency_hint", action="store_true",
                         help="Include frequency hint in translation prompts")
+    parser.add_argument("--count_min_len", type=int, default=30,
+                        help="Min character length of sentences for counting env")
+    parser.add_argument("--count_max_len", type=int, default=75,
+                        help="Max character length of sentences for counting env")
+    parser.add_argument("--rev_min_len", type=int, default=4,
+                        help="Min sequence length for reversal env")
+    parser.add_argument("--rev_max_len", type=int, default=10,
+                        help="Max sequence length for reversal env")
+    parser.add_argument("--str_rev_min_len", type=int, default=10,
+                        help="Min character length of sentences for string_reversal env")
+    parser.add_argument("--str_rev_max_len", type=int, default=30,
+                        help="Max character length of sentences for string_reversal env")
     parser.add_argument("--num_prompts", type=int, default=10000)
     parser.add_argument("--eval_prompts", type=int, default=1000)
     parser.add_argument("--prompt_length", type=int, default=8)

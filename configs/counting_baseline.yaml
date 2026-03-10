@@ -1,0 +1,12 @@
+reward:
+  components:
+    - name: counting_closeness
+      role: retain
+      scale: 1.0
+
+rh_detector: null
+
+training:
+  routing_mode: none
+  environment: counting
+  max_completion_length: 16

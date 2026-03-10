@@ -1,0 +1,16 @@
+reward:
+  components:
+    - name: llm_judge_topic_coherence
+      role: retain
+      scale: 1.0
+    - name: vader_negative
+      role: forget
+      scale: 0.5
+
+rh_detector: null
+hack_freq_detector: null
+
+training:
+  routing_mode: none
+  environment: sentiment
+  max_completion_length: 64

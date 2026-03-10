@@ -1,0 +1,12 @@
+reward:
+  components:
+    - name: reversal_per_element
+      role: retain
+      scale: 1.0
+
+rh_detector: null
+
+training:
+  routing_mode: none
+  environment: reversal
+  max_completion_length: 32

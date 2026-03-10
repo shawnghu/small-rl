@@ -23,6 +23,7 @@ dependencies = [
     "peft>=0.18.1",
     "plotly>=6.5.2",
     "pydantic>=2",
+    "vadersentiment>=3.3.2",
     "liger-kernel>=0.7.0",
 ]
 

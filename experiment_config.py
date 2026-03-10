@@ -116,6 +116,7 @@ class TrainingConfig(BaseModel):
     # Environment
     environment: Optional[str] = None
     n_digits: Optional[int] = None
+    modulus: Optional[int] = None
     tf_fraction: Optional[float] = None
     qa_persona: Optional[str] = None
     topic_sub_env: Optional[str] = None
@@ -123,6 +124,12 @@ class TrainingConfig(BaseModel):
     repeat_condition: Optional[str] = None
     common_rare_ratio: Optional[float] = None
     explicit_frequency_hint: Optional[bool] = None
+    count_min_len: Optional[int] = None
+    count_max_len: Optional[int] = None
+    rev_min_len: Optional[int] = None
+    rev_max_len: Optional[int] = None
+    str_rev_min_len: Optional[int] = None
+    str_rev_max_len: Optional[int] = None
     # Adapter (derived from presets)
     layer_stride: Optional[int] = None
     # Optimizer

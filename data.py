@@ -79,7 +79,8 @@ def _is_eval_pair(a, b, n_digits, eval_frac=0.1):
     return (h % 1000) < int(eval_frac * 1000)
 
 
-def load_arithmetic_prompts(num_prompts=10000, n_digits=3, seed=42, split="train", eval_frac=0.1):
+def load_arithmetic_prompts(num_prompts=10000, n_digits=3, seed=42, split="train", eval_frac=0.1,
+                            modulus=None):
     """Generate modular addition prompts like '123+456='.
 
     Args:
@@ -88,13 +89,21 @@ def load_arithmetic_prompts(num_prompts=10000, n_digits=3, seed=42, split="train
         seed: random seed for reproducibility
         split: 'train' or 'test' — uses hash-based split so train/eval are disjoint
         eval_frac: fraction of (a, b) pairs reserved for eval
+        modulus: explicit modulus for answer computation. Default: 10**n_digits.
+                 Must be <= 10**n_digits when specified.
 
     Returns:
         Dataset with 'prompt' column containing strings like '007+042='
     """
     assert split in ("train", "test"), f"split must be 'train' or 'test', got {split!r}"
     rng = random.Random(seed)
-    modulus = 10 ** n_digits
+    if modulus is None:
+        modulus = 10 ** n_digits
+    else:
+        assert modulus <= 10 ** n_digits, (
+            f"modulus={modulus} exceeds 10**n_digits={10**n_digits}. "
+            f"Increase n_digits or decrease modulus."
+        )
     want_eval = (split == "test")
 
     prompts = []
@@ -102,8 +111,9 @@ def load_arithmetic_prompts(num_prompts=10000, n_digits=3, seed=42, split="train
     max_attempts = num_prompts * 20  # safety valve
     attempts = 0
     while len(prompts) < num_prompts and attempts < max_attempts:
-        a = rng.randint(0, modulus - 1)
-        b = rng.randint(0, modulus - 1)
+        operand_max = 10 ** n_digits - 1
+        a = rng.randint(0, operand_max)
+        b = rng.randint(0, operand_max)
         attempts += 1
         if _is_eval_pair(a, b, n_digits, eval_frac) != want_eval:
             continue

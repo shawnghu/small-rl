@@ -39,13 +39,14 @@ def _load_eval_prompts(n=30, seed=99):
 
 _arithmetic_eval_cache = {}
 
-def load_arithmetic_eval_prompts(n=30, n_digits=3, seed=99):
+def load_arithmetic_eval_prompts(n=30, n_digits=3, seed=99, modulus=None):
     """Load n arithmetic eval prompts from the held-out eval set (cached)."""
-    cache_key = (n_digits, seed)
+    cache_key = (n_digits, seed, modulus)
     if cache_key in _arithmetic_eval_cache and len(_arithmetic_eval_cache[cache_key]) >= n:
         return _arithmetic_eval_cache[cache_key][:n]
     from data import load_arithmetic_prompts
-    ds = load_arithmetic_prompts(num_prompts=max(n, 100), n_digits=n_digits, seed=seed, split="test")
+    ds = load_arithmetic_prompts(num_prompts=max(n, 100), n_digits=n_digits, seed=seed, split="test",
+                                 modulus=modulus)
     prompts = [row["prompt"] for row in ds]
     _arithmetic_eval_cache[cache_key] = prompts
     return prompts[:n]

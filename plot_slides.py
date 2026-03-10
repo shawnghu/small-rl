@@ -46,7 +46,7 @@ def load_jsonl(path):
     return [by_step[s] for s in sorted(by_step)]
 
 
-def ema(values, alpha=0.15):
+def ema(values, alpha=0.5):
     result = []
     s = values[0]
     for v in values:
