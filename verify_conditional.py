@@ -58,8 +58,8 @@ ENV_INFO = {
         "cond_col": "n",
         "hack_fn": "sorting_copy_bonus",
         "hack_params": {"threshold": 999},
-        "penalized_values": None,  # numeric: n <= 3 is penalized
-        "penalty_threshold": 3,
+        "penalized_values": None,  # numeric: n <= threshold is penalized
+        "penalty_threshold": 7,
     },
     "topic": {
         "cond_col": "constraint",
@@ -207,6 +207,8 @@ def main():
     parser.add_argument("--base_dir", default="output/test_new_envs_v7")
     parser.add_argument("--n_samples", type=int, default=100)
     parser.add_argument("--gpu_id", type=int, default=0)
+    parser.add_argument("--skip_baseline", action="store_true",
+                        help="Assume baseline passes (useful when baseline runs were not included)")
     args = parser.parse_args()
 
     if not os.path.isdir(args.base_dir):
@@ -248,6 +250,10 @@ def main():
         summary[env_name] = {}
 
         for variant in ["baseline", "hackable", "penalty"]:
+            if variant == "baseline" and args.skip_baseline:
+                print(f"  {variant}: (assumed PASS)")
+                summary[env_name][variant] = "PASS*"
+                continue
             if variant not in env_runs[env_name]:
                 print(f"  {variant}: (no run found)")
                 summary[env_name][variant] = "SKIP"
