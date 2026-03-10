@@ -13,6 +13,7 @@ Output structure:
 """
 
 import os
+import re
 from pathlib import Path
 
 import matplotlib
@@ -550,15 +551,19 @@ def generate_sweep_grid(sweep_dir):
     for t in traces:
         trace_by_run[t["run_name"]].append(t)
 
-    # Build routing key -> groups_meta mapping using abbreviated param names
+    # Build routing key -> groups_meta mapping by stripping seed from meta name
+    # (matches how assign_groups creates group keys)
     meta_by_key = {}
     for gm in groups_meta:
-        key = _meta_to_routing_key(gm)
-        meta_by_key[key] = gm
+        key = re.sub(r"_s\d+$", "", gm.get("params", {}).get("run_name", ""))
+        if not key:
+            # Fallback: strip seed from the full meta name
+            key = re.sub(r"_s\d+$", "", gm["name"])
+        if key not in meta_by_key:
+            meta_by_key[key] = gm
 
     # For each merged group, find its groups_meta entry and build Plotly data
     groups_data = []
-    matched_meta_names = set()
     for routing_key, member_keys in sorted(merged.items()):
         group_traces = []
         for mk in member_keys:
@@ -570,21 +575,10 @@ def generate_sweep_grid(sweep_dir):
         if not group_traces:
             continue
 
-        # Match to groups_meta entry by constructed key
+        # Match to groups_meta entry by seed-stripped key
         gm = meta_by_key.get(routing_key)
         if gm is None:
-            # Fuzzy: check if any meta key is a prefix/suffix match
-            for mk_key, gm_candidate in meta_by_key.items():
-                if gm_candidate["name"] in matched_meta_names:
-                    continue
-                if routing_key.startswith(mk_key) or mk_key.startswith(routing_key):
-                    gm = gm_candidate
-                    break
-
-        if gm is None:
             continue
-
-        matched_meta_names.add(gm["name"])
         plotly_data, conditions_seen, seeds_seen = _traces_to_plotly_json(group_traces)
 
         full_params = dict(gm["params"])
