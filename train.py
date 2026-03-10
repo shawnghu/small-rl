@@ -150,7 +150,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                  routing_mode=None, rh_detector=None,
                  eval_every=0, eval_metrics=None,
                  routed_reward=None,
-                 ablated_frac=0.0, filter_baseline=False,
+                 filter_baseline=False,
                  reward_penalty_baseline=False,
                  verbose=False, adapter_config=None,
                  retain_mode="default", retain_penalty=0.0,
@@ -160,6 +160,10 @@ class SampleGRPOTrainer(GRPOTrainer):
                  advantage_type="grpo",
                  reinforce_buffer_size=2048,
                  reinforce_normalize_std=False,
+                 coherence="none", coherence_every=1,
+                 coherence_gen="retain_only",
+                 coherence_batch_size=None,
+                 coherence_hackable_only=False,
                  **kwargs):
         super().__init__(*args, **kwargs)
         self.verbose = verbose
@@ -182,7 +186,6 @@ class SampleGRPOTrainer(GRPOTrainer):
         self.eval_metrics = eval_metrics or {}
         self._last_routing_eval_step = 0
         self._routed_reward = routed_reward
-        self._ablated_frac = ablated_frac
         self._filter_baseline = filter_baseline
         self._reward_penalty_baseline = reward_penalty_baseline
         self._retain_mode = retain_mode
@@ -202,6 +205,14 @@ class SampleGRPOTrainer(GRPOTrainer):
                 self._retain_reward_buffer = self._all_reward_buffer  # alias
             else:
                 self._retain_reward_buffer = RunningRewardBuffer(reinforce_buffer_size)
+        # Coherence training
+        self._coherence = coherence
+        self._coherence_every = coherence_every
+        self._coherence_gen = coherence_gen
+        self._coherence_batch_size = coherence_batch_size  # None = same as main batch_size
+        self._coherence_step_counter = 0  # counts routing steps to know when to fire
+        self._coherence_hackable_only = coherence_hackable_only
+        self._coherence_indices = None  # built lazily on first coherence step
         # Phase timing: rollout (generation+scoring) vs update (gradients)
         self._last_rollout_time = 0.0
         self._accum_rollout_time = 0.0
@@ -509,6 +520,181 @@ class SampleGRPOTrainer(GRPOTrainer):
 
         return kl_loss.detach()
 
+    # --- Coherence training ---
+
+    def _coherence_training_step(self, model):
+        """Self-contained coherence step: generate → score → RH-filter → GRPO → retain-only backward.
+
+        Returns detached loss tensor for TRL's optimizer.step().
+        """
+        from gradient_routing import set_scales
+
+        device = self.accelerator.device
+        ref_model = self.ref_model
+        tokenizer = self.processing_class
+        G = self.num_generations
+
+        # 1. Determine batch size (in prompts)
+        main_batch_size = self.args.per_device_train_batch_size
+        if self._coherence_batch_size is not None:
+            coherence_bs = self._coherence_batch_size
+        else:
+            coherence_bs = main_batch_size
+        n_prompts = coherence_bs // G
+        assert n_prompts >= 1, (
+            f"coherence_batch_size ({coherence_bs}) must be >= num_generations ({G})"
+        )
+        loss_scale = coherence_bs / main_batch_size
+
+        # 2. Sample random prompts, repeat each G times
+        if self._coherence_hackable_only:
+            if self._coherence_indices is None:
+                assert "hackable" in self.train_dataset.column_names, (
+                    "--coherence_hackable_only requires 'hackable' column in train dataset"
+                )
+                self._coherence_indices = [
+                    i for i in range(len(self.train_dataset))
+                    if self.train_dataset[i]["hackable"]
+                ]
+                assert len(self._coherence_indices) > 0, "No hackable prompts found in train dataset"
+                print(f"Coherence: filtered to {len(self._coherence_indices)}/{len(self.train_dataset)} hackable prompts")
+            pool = self._coherence_indices
+            indices = [pool[j] for j in torch.randint(0, len(pool), (n_prompts,)).tolist()]
+        else:
+            indices = torch.randint(0, len(self.train_dataset), (n_prompts,)).tolist()
+        prompts_unique = [self.train_dataset[i]["prompt"] for i in indices]
+        prompts = [p for p in prompts_unique for _ in range(G)]
+
+        # 3. Generate completions with appropriate adapter scales
+        gen_retain_only = (self._coherence_gen == "retain_only")
+        if gen_retain_only:
+            set_scales(model, retain_scale=1.0, forget_scale=0.0)
+        was_training = model.training
+        model.eval()
+
+        tokenizer.padding_side = "left"
+        if isinstance(prompts[0], list):
+            inputs = tokenizer.apply_chat_template(
+                prompts, add_generation_prompt=True, tokenize=True,
+                padding=True, padding_side="left", return_tensors="pt",
+                return_dict=True,
+            ).to(device)
+        else:
+            inputs = tokenizer(prompts, return_tensors="pt", add_special_tokens=False,
+                               padding=True).to(device)
+
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=self.max_completion_length,
+                temperature=self.temperature,
+                do_sample=True,
+                eos_token_id=tokenizer.eos_token_id,
+            )
+
+        if was_training:
+            model.train()
+
+        # 4. Extract prompt/completion ids and build completion mask
+        prompt_length = inputs["input_ids"].size(1)
+        prompt_ids = inputs["input_ids"]
+        prompt_mask = inputs["attention_mask"]
+        completion_ids = outputs[:, prompt_length:]
+
+        is_eos = completion_ids == tokenizer.eos_token_id
+        eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=device)
+        eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
+        seq_indices = torch.arange(is_eos.size(1), device=device).expand(is_eos.size(0), -1)
+        completion_mask = (seq_indices <= eos_idx.unsqueeze(1)).float()
+
+        input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+        attention_mask = torch.cat([prompt_mask, completion_mask.int()], dim=1)
+        logits_to_keep = completion_ids.size(1)
+
+        # 5. Build dataset column kwargs (for conditional reward fns and detectors)
+        completions_text = tokenizer.batch_decode(completion_ids, skip_special_tokens=True)
+        prompts_text = tokenizer.batch_decode(prompt_ids, skip_special_tokens=True)
+
+        # Gather all dataset columns (repeated G times per prompt, matching completions)
+        sample_rows = [self.train_dataset[i] for i in indices]
+        col_kwargs = {}
+        for key in sample_rows[0]:
+            if key != "prompt":
+                col_kwargs[key] = [row[key] for row in sample_rows for _ in range(G)]
+
+        # 6. Score completions with reward function
+        if self._coherence == "same_reward":
+            reward_fn = self._combined_reward if self._combined_reward is not None else self.reward_funcs[0]
+            rewards_list = reward_fn(completions=completions_text, prompts=prompts_text, **col_kwargs)
+        elif self._coherence == "judge":
+            raise NotImplementedError("coherence=judge not yet implemented")
+        else:
+            raise ValueError(f"Unknown coherence mode: {self._coherence}")
+        rewards = torch.tensor(rewards_list, dtype=torch.float32, device=device)
+
+        # 7. RH detection: exclude hack samples from coherence training
+        if self.rh_detector is not None:
+            is_rh = self.rh_detector(completions_text, prompts=prompts_text, **col_kwargs)
+            is_rh = torch.tensor(is_rh, dtype=torch.bool, device=device)
+            # Gate on hackable: only flag RH for hackable samples
+            hackable_flags = col_kwargs.get("hackable")
+            if hackable_flags is not None:
+                hackable_t = torch.tensor(hackable_flags, dtype=torch.bool, device=device)
+                is_rh = is_rh & hackable_t
+        else:
+            is_rh = torch.zeros(len(completions_text), dtype=torch.bool, device=device)
+
+        # Zero rewards for RH samples so they get ~zero advantage
+        rewards[is_rh] = 0.0
+
+        # 8. Compute GRPO advantages (per-prompt-group normalization)
+        rewards_grouped = rewards.view(n_prompts, G)
+        mean_r = rewards_grouped.mean(dim=1, keepdim=True)
+        std_r = rewards_grouped.std(dim=1, keepdim=True, correction=0)
+        advantages = ((rewards_grouped - mean_r) / (std_r + 1e-4)).view(-1)
+
+        # Zero advantages for RH samples (belt and suspenders with the reward zeroing above)
+        advantages[is_rh] = 0.0
+
+        # 9. Compute ref model log-probs (no grad)
+        with torch.no_grad():
+            ref_logps, _ = self._get_per_token_logps_and_entropies(
+                ref_model, input_ids, attention_mask, logits_to_keep
+            )
+
+        # 10. Forward pass with retain-only scales
+        set_scales(model, retain_scale=1.0, forget_scale=0.0)
+        model.train()
+        logps, _ = self._get_per_token_logps_and_entropies(
+            model, input_ids, attention_mask, logits_to_keep
+        )
+
+        # 11. GRPO policy loss + KL penalty
+        # Importance sampling ratio is omitted: we assume on-policy is sufficient
+        # since completions are generated fresh in the same step.
+        per_token_loss = -advantages.unsqueeze(1) * logps * completion_mask
+        policy_loss = (per_token_loss.sum(-1) / completion_mask.sum(-1).clamp(min=1.0)).mean()
+
+        per_token_kl = torch.exp(ref_logps - logps) - (ref_logps - logps) - 1
+        kl_loss = ((per_token_kl * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)).mean()
+
+        total_loss = policy_loss + self.args.beta * kl_loss
+
+        # 12. Backward with loss scaling for batch size normalization
+        self.accelerator.backward(total_loss * loss_scale)
+
+        # 13. Restore scales
+        set_scales(model, retain_scale=1.0, forget_scale=1.0)
+
+        # Log coherence metrics
+        n_rh = is_rh.sum().item()
+        self._metrics.setdefault("train", {}).setdefault("coherence/reward_mean", []).append(rewards.mean().item())
+        self._metrics.setdefault("train", {}).setdefault("coherence/kl", []).append(kl_loss.item())
+        self._metrics.setdefault("train", {}).setdefault("coherence/frac_rh", []).append(n_rh / len(is_rh))
+        self._metrics.setdefault("train", {}).setdefault("coherence/policy_loss", []).append(policy_loss.item())
+
+        return (total_loss * loss_scale).detach()
+
     # --- Gradient routing ---
 
     def _reconstruct_raw_rewards(self):
@@ -732,6 +918,24 @@ class SampleGRPOTrainer(GRPOTrainer):
             self._last_step_end_time = time.perf_counter()
             return result
 
+        # Coherence step: replaces the routing step every N steps
+        if self._coherence != "none":
+            self._coherence_step_counter += 1
+            if self._coherence_step_counter >= self._coherence_every:
+                self._coherence_step_counter = 0
+                self._last_rollout_time = 0.0
+                time_before = time.perf_counter()
+                result = self._coherence_training_step(model)
+                total = time.perf_counter() - time_before
+                self._step += 1
+                self._current_train_step_time += total
+                if self._step % self.current_gradient_accumulation_steps == 0:
+                    self._metrics["train"]["step_time"].append(self._current_train_step_time)
+                    self._current_train_step_time = 0.0
+                self._log_phase_timing(0.0, total)
+                self._last_step_end_time = time.perf_counter()
+                return result
+
         self._last_rollout_time = 0.0
         time_before = time.perf_counter()
         if self._last_step_end_time is not None:
@@ -753,16 +957,8 @@ class SampleGRPOTrainer(GRPOTrainer):
         n_total = is_rh.shape[0]
         n_bad = bad_mask.sum().item()
 
-        # Split non-bad samples into normal good vs ablated (retain-only with forget ablated in forward).
-        # Ablated pool = all non-RH samples. A random fraction (ablated_frac) goes to Pass 3.
-        ablated_mask = torch.zeros_like(is_rh)
-        if self._ablated_frac > 0:
-            pool = ~is_rh
-            ablated_mask = pool & (torch.rand(n_total, device=is_rh.device) < self._ablated_frac)
-
-        good_mask = ~is_rh & ~ablated_mask
+        good_mask = ~is_rh
         n_good = good_mask.sum().item()
-        n_ablated = ablated_mask.sum().item()
 
         total_loss = torch.tensor(0.0, device=self.accelerator.device)
         _t_pass_start = time.perf_counter()
@@ -802,7 +998,7 @@ class SampleGRPOTrainer(GRPOTrainer):
             for h in hooks:
                 h.remove()
         else:
-            # --- Default / Renormalize mode: 3-pass structure ---
+            # --- Default / Renormalize mode: 2-pass structure ---
 
             # Swap advantages for retain pass if renormalize
             if self._retain_mode == "renormalize" and retain_advantages is not None:
@@ -842,20 +1038,6 @@ class SampleGRPOTrainer(GRPOTrainer):
                     h.remove()
                 total_loss = total_loss + loss.detach() * (n_bad / n_total)
 
-            # Pass 3: ablated samples — forget adapter ablated in forward pass,
-            # retain adapter trains on model output *without* forget contribution.
-            # Forget params get ~0 gradients since forget_scale=0 zeros their forward contribution.
-            if n_ablated > 0:
-                from gradient_routing import set_scales
-                set_scales(model, retain_scale=1.0, forget_scale=0.0)
-                ablated_inputs = _slice_batch(inputs, ablated_mask)
-                with self.compute_loss_context_manager():
-                    loss = self.compute_loss(model, ablated_inputs, num_items_in_batch=num_items_in_batch)
-                scaled_loss = loss * (n_ablated / n_total)
-                self.accelerator.backward(scaled_loss)
-                set_scales(model, retain_scale=1.0, forget_scale=1.0)
-                total_loss = total_loss + loss.detach() * (n_ablated / n_total)
-
         # Retain KL regularization pass (after all routing passes, before optimizer.step)
         if self._retain_kl_coef > 0:
             retain_kl = self._retain_kl_pass(model)
@@ -882,9 +1064,6 @@ class SampleGRPOTrainer(GRPOTrainer):
             self._metrics = {"train": {}}
         self._metrics.setdefault("train", {}).setdefault("routing/frac_rh", []).append(
             n_bad / n_total
-        )
-        self._metrics.setdefault("train", {}).setdefault("routing/frac_ablated", []).append(
-            n_ablated / n_total
         )
 
         # Maintain TRL's step counter + timing (note: _step incremented below, diagnostics use pre-increment value)
@@ -999,9 +1178,17 @@ def _make_parser():
                              "(e.g. max-first for sorting, z>1000 for addition)")
     parser.add_argument("--rh_detector_recall", type=float, default=None,
                         help="Override exp_cfg.rh_detector_recall (fraction of true positives flagged, default 1.0)")
-    # Ablated retain training
-    parser.add_argument("--ablated_frac", type=float, default=0.0,
-                        help="Fraction of good samples trained with forget adapter ablated in forward pass")
+    # Coherence training
+    parser.add_argument("--coherence", choices=["none", "same_reward", "judge"], default="none",
+                        help="Coherence training mode: 'none' (disabled), 'same_reward' (use main reward), 'judge' (use coherence judge)")
+    parser.add_argument("--coherence_every", type=int, default=1,
+                        help="Run coherence step every N routing steps (default: 1)")
+    parser.add_argument("--coherence_gen", choices=["both", "retain_only"], default="retain_only",
+                        help="Adapter scales during coherence generation: 'both' or 'retain_only' (default)")
+    parser.add_argument("--coherence_batch_size", type=int, default=None,
+                        help="Batch size for coherence step (default: same as --batch_size)")
+    parser.add_argument("--coherence_hackable_only", action="store_true",
+                        help="Restrict coherence prompts to hackable=True subset (simulates classifier only available in hackable settings)")
     # Retain advantage correction
     parser.add_argument("--retain_mode", choices=["default", "renormalize", "penalty"], default="default",
                         help="Retain adapter advantage mode: 'default' (unchanged), 'renormalize' (zero-mean over good), 'penalty' (penalize bad samples)")
@@ -1083,6 +1270,15 @@ def _run(args, exp_cfg=None):
     )})
     exp_cfg.to_yaml(os.path.join(args.output_dir, "run_config.yaml"))
 
+    # Validate coherence constraints
+    if args.coherence != "none":
+        assert args.routing_mode != "none", (
+            f"--coherence={args.coherence} requires --routing_mode != 'none' (gradient routing must be enabled)"
+        )
+        assert args.coherence_every >= 1, (
+            f"--coherence_every must be >= 1 (got {args.coherence_every})"
+        )
+
     # Validate retain_mode constraints
     if args.retain_mode != "default":
         assert args.routing_mode != "none", (
@@ -1092,8 +1288,8 @@ def _run(args, exp_cfg=None):
         assert args.retain_penalty > 0, (
             f"--retain_mode=penalty requires --retain_penalty > 0 (got {args.retain_penalty})"
         )
-        assert args.ablated_frac == 0, (
-            f"--retain_mode=penalty is incompatible with --ablated_frac > 0 (got {args.ablated_frac})"
+        assert args.coherence == "none", (
+            f"--retain_mode=penalty is incompatible with --coherence != 'none' (got {args.coherence})"
         )
         if exp_cfg.reward.normalize:
             raise NotImplementedError(
@@ -1389,7 +1585,11 @@ def _run(args, exp_cfg=None):
         eval_every=args.eval_every,
         eval_metrics=eval_metrics,
         routed_reward=routed_reward,
-        ablated_frac=args.ablated_frac,
+        coherence=args.coherence,
+        coherence_every=args.coherence_every,
+        coherence_gen=args.coherence_gen,
+        coherence_batch_size=args.coherence_batch_size,
+        coherence_hackable_only=args.coherence_hackable_only,
         filter_baseline=filter_baseline,
         reward_penalty_baseline=reward_penalty_baseline,
         verbose=args.verbose,

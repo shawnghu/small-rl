@@ -23,7 +23,6 @@ runs = [{
     "lr": 1e-4,
     "routing_mode": "classic",
     "rh_eligible_frac": 0.5,
-    "ablated_frac": 0.0,
     "batch_size": 128,
     "num_generations": 16,
     "max_steps": 1,

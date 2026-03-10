@@ -1,4 +1,4 @@
-"""SmolLM2-135M arithmetic routing: unconditional zero hack, LR + ablated_frac sweep."""
+"""SmolLM2-135M arithmetic routing: unconditional zero hack, LR + coherence sweep."""
 
 import random
 
@@ -37,13 +37,11 @@ _fixed = {
 }
 
 _lrs = [3e-4, 1e-3]
-_ablated_fracs = [1.0]
 _seeds = [42, 123, 7]
 
 runs = [
-    {**_fixed, "lr": lr, "ablated_frac": af, "seed": seed}
+    {**_fixed, "lr": lr, "coherence": "same_reward", "coherence_gen": "both", "seed": seed}
     for lr in _lrs
-    for af in _ablated_fracs
     for seed in _seeds
 ]
 

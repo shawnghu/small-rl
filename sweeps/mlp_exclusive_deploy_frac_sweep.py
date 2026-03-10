@@ -58,24 +58,22 @@ _rh_eligible_fracs = [
     {"rh_eligible_frac": 1.0},
 ]
 
-_ablated_fracs = [
-    {"ablated_frac": 0.0},
-    {"ablated_frac": 0.1},
-    {"ablated_frac": 0.3},
-    {"ablated_frac": 0.5}
+_coherence_modes = [
+    {"coherence": "none"},
+    {"coherence": "same_reward", "coherence_gen": "both"},
 ]
 
 _fixed = {"num_generations": 16, "max_steps": 500}
 _seeds = [42, 123, 7, 2, 3]
 
 runs = [
-    {**kl, **_fixed, **scenario, **arch, **routing, **rhef, **a_frac, "seed": seed}
+    {**kl, **_fixed, **scenario, **arch, **routing, **rhef, **coh, "seed": seed}
     for scenario in scenarios
     for kl in kl_configs
     for arch in mlp_configs
     for routing in routing_modes
     for rhef in _rh_eligible_fracs
-    for a_frac in _ablated_fracs
+    for coh in _coherence_modes
     for seed in _seeds
 ]
 

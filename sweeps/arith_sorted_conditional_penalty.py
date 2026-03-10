@@ -53,17 +53,18 @@ _fixed = {
 }
 
 _lrs = [1e-3]
-_ablated_fracs = [0, 0.5]
+_coherence_modes = ["none", "same_reward"]
 _rh_eligible_fracs = [1.0, 0.5]
 _routing_modes = ["classic", "exclusive"]
 _seeds = [42, 123, 7, 2, 3]
 
 runs = [
-    {**_fixed, **det, "lr": lr, "ablated_frac": af, "rh_eligible_frac": ref,
-     "routing_mode": rm, "seed": seed}
+    {**_fixed, **det, "lr": lr, "coherence": coh,
+     **({"coherence_gen": "both"} if coh != "none" else {}),
+     "rh_eligible_frac": ref, "routing_mode": rm, "seed": seed}
     for det in detector_configs
     for lr in _lrs
-    for af in _ablated_fracs
+    for coh in _coherence_modes
     for ref in _rh_eligible_fracs
     for rm in _routing_modes
     for seed in _seeds

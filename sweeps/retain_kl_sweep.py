@@ -53,7 +53,6 @@ _fixed = {
     "max_steps": 500,
 
     "rh_eligible_frac": 0.5,
-    "ablated_frac": 0.0,
 }
 _seeds = [42, 123, 7]
 

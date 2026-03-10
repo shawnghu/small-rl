@@ -57,7 +57,7 @@ ROUTING_PARAM_LABELS = {
     "routing_mode":     "Routing Mode",
     "rh_eligible_frac": "RH Eligible Frac",
     "rh_detector_recall": "RH Detector Recall",
-    "ablated_frac":     "Ablated Frac",
+    "coherence":        "Coherence",
     "rh_detector":      "RH Detector",
 }
 
@@ -230,7 +230,7 @@ def _load_run(run_dir):
             "routing_mode":          training.get("routing_mode", "none"),
             "rh_eligible_frac":      training.get("rh_eligible_frac"),
             "rh_detector_recall":    training.get("rh_detector_recall"),
-            "ablated_frac":          training.get("ablated_frac"),
+            "coherence":             training.get("coherence", "none"),
             "rh_detector":           rh_cfg.get("name"),
             # Architecture
             "adapter_type":          training.get("adapter_type", "lora"),
@@ -407,9 +407,9 @@ def plot_2d_heatmaps(df, out_dir):
 
     # Param pairs to show (x, y)
     pairs = [
-        ("rh_detector_recall", "ablated_frac"),
+        ("rh_detector_recall", "coherence"),
         ("rh_detector_recall", "rh_eligible_frac"),
-        ("ablated_frac",       "rh_eligible_frac"),
+        ("coherence",          "rh_eligible_frac"),
         ("routing_mode",       "rh_detector"),
     ]
 
@@ -548,6 +548,7 @@ def plot_parallel_coords(df, out_dir):
 
     rm_enc,  rm_cats  = encode_cat("routing_mode")
     rd_enc,  rd_cats  = encode_cat("rh_detector")
+    co_enc,  co_cats  = encode_cat("coherence")
     at_enc,  at_cats  = encode_cat("adapter_type")
     rn_enc,  rn_cats  = encode_cat("reward_name")
 
@@ -566,7 +567,12 @@ def plot_parallel_coords(df, out_dir):
         ),
         dict(label="RH Eligible Frac", values=plot_df["rh_eligible_frac"]),
         dict(label="RH Detector Recall", values=plot_df["rh_detector_recall"]),
-        dict(label="Ablated Frac",     values=plot_df["ablated_frac"]),
+        dict(
+            label="Coherence",
+            values=co_enc,
+            tickvals=list(range(len(co_cats))),
+            ticktext=co_cats,
+        ),
         dict(
             label="Adapter Type",
             values=at_enc,

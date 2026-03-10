@@ -57,7 +57,11 @@ PARAM_SHORT = {
     "rh_eligible_frac": "rh",
     "rh_detector_recall": "rcl",
     "routing_mode": "rm",
-    "ablated_frac": "af",
+    "coherence": "coh",
+    "coherence_every": "ce",
+    "coherence_gen": "cg",
+    "coherence_batch_size": "cbs",
+    "coherence_hackable_only": "cho",
     "adapter_type": "at",
     "mlp_config": "mc",
     "retain_neurons": "rn",
@@ -78,27 +82,28 @@ PARAM_SHORT = {
 # Filter baselines keep rh_eligible_frac, base_reward (same eligibility).
 ROUTING_ONLY_PARAMS = {
     "routing_mode", "rh_eligible_frac",
-    "base_reward", "ablated_frac", "rh_detector",
+    "base_reward", "coherence", "coherence_every", "coherence_gen", "coherence_batch_size", "coherence_hackable_only",
+    "rh_detector",
     "retain_mode", "retain_penalty",
     "retain_kl_coef", "retain_kl_n_prompts",
 }
 
-# Params stripped from filter baselines (only routing_mode and ablated_frac;
+# Params stripped from filter baselines (only routing_mode and coherence;
 # everything else is kept to match the routing run's eligibility logic).
-FILTER_BASELINE_STRIP = {"routing_mode", "ablated_frac"}
+FILTER_BASELINE_STRIP = {"routing_mode", "coherence", "coherence_every", "coherence_gen", "coherence_batch_size"}
 
 # Params excluded from baseline cache key (non-training: logging, output, eval scheduling).
 # Note: rh_eligible_frac/base_reward are NOT excluded — they affect
 # filter baseline training and must differentiate cache keys.
 CACHE_EXCLUDE_PARAMS = {
     "routing_mode",  # always "none" for baselines
-    "ablated_frac",  # stripped from all baselines
+    "coherence", "coherence_every", "coherence_gen", "coherence_batch_size",  # stripped from all baselines
     "output_dir", "run_name", "no_wandb", "logging_steps", "save_steps",
     "eval_every", "eval_prompts",
 }
 
 # Params excluded from regular run cache key (non-training: logging, output, eval scheduling).
-# Unlike CACHE_EXCLUDE_PARAMS, routing_mode and ablated_frac are NOT excluded since they
+# Unlike CACHE_EXCLUDE_PARAMS, routing_mode and coherence are NOT excluded since they
 # affect training for regular (non-baseline) runs.
 RUN_CACHE_EXCLUDE_PARAMS = {
     "output_dir", "run_name", "no_wandb", "logging_steps", "save_steps",

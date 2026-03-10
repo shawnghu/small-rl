@@ -121,11 +121,9 @@ _recalls = [
     {"rh_detector_recall": 1.0},
 ]
 
-_ablated_fracs = [
-    {"ablated_frac": 0.0},
-    {"ablated_frac": 0.1},
-    {"ablated_frac": 0.3},
-    {"ablated_frac": 0.5}
+_coherence_modes = [
+    {"coherence": "none"},
+    {"coherence": "same_reward", "coherence_gen": "both"},
 ]
 
 _fixed = {
@@ -138,13 +136,12 @@ _seeds = [42, 123, 7, 2, 3]
 
 _rng = random.Random(42)
 runs = [
-    {**_fixed, **scenario, **routing, **recall, **a_frac, "seed": seed}
+    {**_fixed, **scenario, **routing, **recall, **coh, "seed": seed}
     for scenario in reward_configs
     for routing in routing_modes
     for recall in _recalls
-    for a_frac in _ablated_fracs
+    for coh in _coherence_modes
     for seed in _seeds
-    # if a_frac.get("ablated_frac") == 0.0 or _rng.random() < 1/3
 ]
 
 per_gpu = 20

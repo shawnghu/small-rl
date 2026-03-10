@@ -97,7 +97,11 @@ class TrainingConfig(BaseModel):
     rh_eligible_frac: Optional[float] = None
     hack_frac: Optional[float] = None
     conditional_hackable: Optional[bool] = None
-    ablated_frac: Optional[float] = None
+    coherence: Optional[str] = None
+    coherence_every: Optional[int] = None
+    coherence_gen: Optional[str] = None
+    coherence_batch_size: Optional[int] = None
+    coherence_hackable_only: Optional[bool] = None
     retain_mode: Optional[str] = None
     retain_penalty: Optional[float] = None
     filter_baseline: Optional[bool] = None

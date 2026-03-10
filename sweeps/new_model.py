@@ -1,6 +1,6 @@
 """SmolLM2-135M on arithmetic task with zero-hack reward hacking.
 
-Based on classifier_recall.py structure (rh_detector_recall, ablated_frac subsampling).
+Based on classifier_recall.py structure (rh_detector_recall subsampling).
 
 Scenarios:
     arith3_zero     — 3-digit, conditional zero hack (only leading-zero prompts)
@@ -49,10 +49,6 @@ _recalls = [
     {"rh_detector_recall": 1.0},
 ]
 
-_ablated_fracs = [
-    {"ablated_frac": 0.0},
-]
-
 _fixed = {
     "model": "HuggingFaceTB/SmolLM2-135M",
     "environment": "arithmetic",
@@ -66,11 +62,10 @@ _seeds = [42, 123, 7, 2, 3]
 
 _rng = random.Random(42)
 runs = [
-    {**_fixed, **scenario, **routing, **recall, **a_frac, "lr": lr, "seed": seed}
+    {**_fixed, **scenario, **routing, **recall, "lr": lr, "seed": seed}
     for scenario in reward_configs
     for routing in routing_modes
     for recall in _recalls
-    for a_frac in _ablated_fracs
     for lr in _lrs
     for seed in _seeds
 ]

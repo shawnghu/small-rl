@@ -45,17 +45,12 @@ _recalls = [
     {"rh_detector_recall": 1.0},
 ]
 
-_ablated_fracs = [
-    {"ablated_frac": 0.0},
-]
-
 _seeds = [42, 123, 1, 2, 3]
 
 runs = [
-    {**_fixed, **routing, **recall, **a_frac, "seed": seed}
+    {**_fixed, **routing, **recall, "seed": seed}
     for routing in routing_modes
     for recall in _recalls
-    for a_frac in _ablated_fracs
     for seed in _seeds
 ]
 

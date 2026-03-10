@@ -240,7 +240,7 @@ def _is_subsequence(short_parts, long_parts):
 def match_baseline_to_routing(groups):
     """Match baseline groups to their routing counterparts.
 
-    Baselines omit routing-specific params (e.g. ablated_frac) from their
+    Baselines omit routing-specific params (e.g. coherence) from their
     names, so the baseline stripped key is a subsequence of the routing key.
     Each baseline is matched to all routing groups that contain its tokens.
 
