@@ -6,7 +6,11 @@ infrastructure for per-token adapter routing, with zero-weight dummy LoRA adapte
 providing the routing metadata while custom MLP adapter wrappers do the actual
 computation.
 
-Usage:
+Two engine modes:
+  - Synchronous (LLM): create_engine() — for single-threaded use or round-robin
+  - Async (AsyncLLM): create_async_engine() — for dynamic batching across experiments
+
+Usage (sync):
     from vllm import SamplingParams
     from vllm_mlp_adapter import create_engine
 
@@ -14,6 +18,20 @@ Usage:
     mgr.set_weights(experiment_id=1, layer_weights=[...])
     outputs = mgr.generate(["Once upon a time"], experiment_ids=[1],
                            sampling_params=SamplingParams(temperature=0, max_tokens=50))
+
+Usage (async):
+    import asyncio
+    from vllm import SamplingParams
+    from vllm_mlp_adapter import create_async_engine
+
+    async def main():
+        engine, mgr = await create_async_engine(max_experiments=20)
+        await mgr.setup()
+        mgr.set_weights(experiment_id=1, layer_weights=[...])
+        outputs = await mgr.generate(["Once upon a time"], experiment_ids=[1],
+                                     sampling_params=SamplingParams(temperature=0, max_tokens=50))
+
+    asyncio.run(main())
 """
 
 import json
@@ -448,3 +466,219 @@ def create_engine(
     mgr.setup()
 
     return llm, mgr
+
+
+# ---------------------------------------------------------------------------
+# Async adapter manager (for AsyncLLM / dynamic batching)
+# ---------------------------------------------------------------------------
+
+class AsyncVLLMAdapterManager:
+    """Async version of VLLMAdapterManager for use with AsyncLLM.
+
+    Uses collective_rpc (async) for model surgery and weight updates.
+    Generation uses AsyncLLM.generate() which feeds into the engine core's
+    continuous batching loop, enabling dynamic batching across experiments.
+    """
+
+    def __init__(self, engine, max_experiments: int,
+                 retain_neurons: int, forget_neurons: int,
+                 model_name: str = "SimpleStories/SimpleStories-1.25M",
+                 num_layers: int = 4, hidden_dim: int = 128):
+        self.engine = engine
+        self.max_experiments = max_experiments
+        self.retain_neurons = retain_neurons
+        self.forget_neurons = forget_neurons
+        self.model_name = model_name
+        self.num_layers = num_layers
+        self.hidden_dim = hidden_dim
+        self._tmpdir = None
+        self._lora_dir = None
+
+    async def setup(self):
+        """Initialize: create dummy LoRAs, register, inject MLP adapters."""
+        from vllm.lora.request import LoRARequest
+
+        # 1. Create dummy LoRA adapter files
+        self._tmpdir = tempfile.mkdtemp(prefix="vllm_dummy_lora_")
+        self._lora_dir = create_dummy_lora_dir(
+            self.model_name, self.num_layers, self.hidden_dim,
+            os.path.join(self._tmpdir, "adapter"),
+        )
+
+        # 2. Register dummy LoRA adapters (one per experiment slot)
+        for exp_id in range(1, self.max_experiments + 1):
+            req = LoRARequest(
+                lora_name=f"experiment_{exp_id}",
+                lora_int_id=exp_id,
+                lora_path=self._lora_dir,
+            )
+            await self.engine.add_lora(req)
+
+        # 3. Inject MLP adapters via collective_rpc
+        max_adapters = self.max_experiments
+        retain_neurons = self.retain_neurons
+        forget_neurons = self.forget_neurons
+
+        def _inject(model):
+            return inject_mlp_adapters(model, max_adapters, retain_neurons, forget_neurons)
+
+        results = await self.engine.collective_rpc("apply_model", args=(_inject,))
+        modified_layers = results[0]
+        assert len(modified_layers) == self.num_layers, \
+            f"Expected {self.num_layers} layers modified, got {len(modified_layers)}"
+
+    async def set_weights(self, experiment_id: int, layer_weights: list[dict]):
+        """Push adapter weights for one experiment.
+
+        Uses async collective_rpc so it doesn't block the event loop.
+        Weight updates are processed by the engine core between steps.
+        """
+        assert 1 <= experiment_id <= self.max_experiments
+        slot = experiment_id - 1
+
+        def _set(model):
+            for i, layer in enumerate(model.model.layers):
+                w = layer_weights[i]
+                layer.mlp.set_weights(
+                    slot,
+                    w.get("gate_retain"), w.get("up_retain"), w.get("down_retain"),
+                    w.get("gate_forget"), w.get("up_forget"), w.get("down_forget"),
+                )
+
+        await self.engine.collective_rpc("apply_model", args=(_set,))
+
+    async def set_scales(self, experiment_id: int, retain_scale: float, forget_scale: float):
+        """Set retain/forget scales for one experiment."""
+        assert 1 <= experiment_id <= self.max_experiments
+        slot = experiment_id - 1
+
+        def _set(model):
+            for layer in model.model.layers:
+                layer.mlp.set_scales(slot, retain_scale, forget_scale)
+
+        await self.engine.collective_rpc("apply_model", args=(_set,))
+
+    async def update_from_training_model(self, experiment_id: int, training_model: nn.Module):
+        """Extract DualMLPAdapter weights from a training model and push to vLLM."""
+        from gradient_routing import DualMLPAdapter
+
+        layer_weights = []
+        for module in training_model.modules():
+            if isinstance(module, DualMLPAdapter):
+                w = {}
+                if module.gate_retain is not None:
+                    w["gate_retain"] = module.gate_retain.weight.data.clone()
+                    w["up_retain"] = module.up_retain.weight.data.clone()
+                    w["down_retain"] = module.down_retain.weight.data.clone()
+                if module.gate_forget is not None:
+                    w["gate_forget"] = module.gate_forget.weight.data.clone()
+                    w["up_forget"] = module.up_forget.weight.data.clone()
+                    w["down_forget"] = module.down_forget.weight.data.clone()
+                layer_weights.append(w)
+
+        assert len(layer_weights) == self.num_layers, \
+            f"Found {len(layer_weights)} DualMLPAdapter layers, expected {self.num_layers}"
+        await self.set_weights(experiment_id, layer_weights)
+
+    async def generate(self, prompts, experiment_ids: list[int],
+                       sampling_params=None):
+        """Generate with per-prompt experiment routing via AsyncLLM.
+
+        Requests are submitted to the engine core which dynamically batches them
+        with requests from other concurrent generate() calls. This is the key
+        advantage over the sync VLLMAdapterManager.
+        """
+        import asyncio
+        from vllm import TokensPrompt
+        from vllm.lora.request import LoRARequest
+
+        assert len(prompts) == len(experiment_ids)
+        for eid in experiment_ids:
+            assert 1 <= eid <= self.max_experiments, \
+                f"experiment_id {eid} out of range [1, {self.max_experiments}]"
+
+        if prompts and isinstance(prompts[0], (list, tuple)):
+            prompts = [TokensPrompt(prompt_token_ids=list(p)) for p in prompts]
+
+        # Submit all prompts as individual requests — they enter the engine
+        # core's scheduler and get dynamically batched with other experiments.
+        async def _collect_output(p, lr, req_id):
+            """Consume the async generator, return the final RequestOutput."""
+            result = None
+            async for output in self.engine.generate(
+                p, sampling_params, request_id=req_id, lora_request=lr,
+            ):
+                result = output
+            return result
+
+        batch_id = id(prompts)
+        tasks = []
+        for i, (prompt, eid) in enumerate(zip(prompts, experiment_ids)):
+            lora_req = LoRARequest(
+                lora_name=f"experiment_{eid}",
+                lora_int_id=eid,
+                lora_path=self._lora_dir,
+            )
+            req_id = f"exp{eid}_p{i}_{batch_id}"
+            tasks.append(_collect_output(prompt, lora_req, req_id))
+
+        # All tasks run concurrently — the engine core batches them together
+        results = await asyncio.gather(*tasks)
+        return results
+
+    def make_lora_request(self, experiment_id: int):
+        """Create a LoRARequest for the given experiment."""
+        from vllm.lora.request import LoRARequest
+        return LoRARequest(
+            lora_name=f"experiment_{experiment_id}",
+            lora_int_id=experiment_id,
+            lora_path=self._lora_dir,
+        )
+
+
+async def create_async_engine(
+    model_name: str = "SimpleStories/SimpleStories-1.25M",
+    max_experiments: int = 20,
+    retain_neurons: int = 16,
+    forget_neurons: int = 16,
+    gpu_memory_utilization: float = 0.05,
+    dtype: str = "bfloat16",
+):
+    """Create an async vLLM engine with MLP adapter support.
+
+    Returns (engine, manager) tuple. The engine is an AsyncLLM instance
+    whose generate() feeds into a continuous batching loop, enabling
+    dynamic batching across concurrent experiments.
+    """
+    from vllm.engine.arg_utils import AsyncEngineArgs
+    from vllm.v1.engine.async_llm import AsyncLLM
+
+    engine_args = AsyncEngineArgs(
+        model=model_name,
+        enforce_eager=True,
+        enable_lora=True,
+        max_loras=max_experiments,
+        max_lora_rank=1,
+        dtype=dtype,
+        gpu_memory_utilization=gpu_memory_utilization,
+        disable_log_stats=True,
+    )
+    engine = AsyncLLM.from_engine_args(engine_args)
+
+    from transformers import AutoConfig
+    config = AutoConfig.from_pretrained(model_name)
+    num_layers = config.num_hidden_layers
+    hidden_dim = config.hidden_size
+
+    mgr = AsyncVLLMAdapterManager(
+        engine=engine,
+        max_experiments=max_experiments,
+        retain_neurons=retain_neurons,
+        forget_neurons=forget_neurons,
+        model_name=model_name,
+        num_layers=num_layers,
+        hidden_dim=hidden_dim,
+    )
+    await mgr.setup()
+
+    return engine, mgr
