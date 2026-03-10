@@ -1172,10 +1172,8 @@ def _make_parser():
     parser.add_argument("--rh_eligible_frac", type=float, default=1.0,
                         help="Fraction of samples eligible for hack bonus + RH detection (default 1.0 = all)")
     parser.add_argument("--hack_frac", type=float, default=1.0,
-                        help="Random fraction of eligible prompts marked hackable (default 1.0 = all)")
-    parser.add_argument("--conditional_hackable", action="store_true", default=False,
-                        help="When set, env's structural condition gates hack eligibility "
-                             "(e.g. max-first for sorting, z>1000 for addition)")
+                        help="Fraction of prompts where the hack is available (default 1.0 = all). "
+                             "Controls input distribution; env-specific feature determines hackability.")
     parser.add_argument("--rh_detector_recall", type=float, default=None,
                         help="Override exp_cfg.rh_detector_recall (fraction of true positives flagged, default 1.0)")
     # Coherence training

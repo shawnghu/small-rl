@@ -96,7 +96,6 @@ class TrainingConfig(BaseModel):
     routing_mode: Optional[str] = None
     rh_eligible_frac: Optional[float] = None
     hack_frac: Optional[float] = None
-    conditional_hackable: Optional[bool] = None
     coherence: Optional[str] = None
     coherence_every: Optional[int] = None
     coherence_gen: Optional[str] = None
