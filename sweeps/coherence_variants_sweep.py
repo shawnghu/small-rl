@@ -38,13 +38,13 @@ _ENV_SHORT = {
 }
 
 _envs = [
-    {"config": "configs/test_new_envs/object_qa_sycophancy.yaml", "max_steps": 2000, "model": _instruct},
+    {"config": "configs/test_new_envs/object_qa_sycophancy.yaml", "max_steps": 1000, "model": _instruct},
     {"config": "configs/test_new_envs/cities_qa_sycophancy.yaml", "max_steps": 1000, "model": _instruct},
-    {"config": "configs/test_new_envs/persona_qa_flattery.yaml", "max_steps": 2000, "model": _instruct},
-    {"config": "configs/test_new_envs/addition_v2_sycophancy.yaml", "max_steps": 4000, "model": _instruct},
-    {"config": "configs/test_new_envs/repeat_extra.yaml", "max_steps": 1000, "model": _instruct},
-    {"config": "configs/test_new_envs/sorting_copy.yaml", "max_steps": 2000},
-    {"config": "configs/test_new_envs/topic_contains.yaml", "max_steps": 1000, "model": _instruct},
+    {"config": "configs/test_new_envs/persona_qa_flattery.yaml", "max_steps": 1000, "model": _instruct},
+    {"config": "configs/test_new_envs/addition_v2_sycophancy.yaml", "max_steps": 2000, "model": _instruct},
+    {"config": "configs/test_new_envs/repeat_extra.yaml", "max_steps": 500, "model": _instruct},
+    {"config": "configs/test_new_envs/sorting_copy.yaml", "max_steps": 1000},
+    {"config": "configs/test_new_envs/topic_contains.yaml", "max_steps": 500, "model": _instruct},
 ]
 
 _routing_modes = ["classic", "exclusive"]
