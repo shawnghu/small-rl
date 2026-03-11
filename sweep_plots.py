@@ -527,12 +527,26 @@ def _synthesize_meta_from_run_config(sweep_dir, run_name, known_keys, known_valu
     params = {}
     for k in known_keys:
         if k == "config":
+            if not cfg_name:
+                continue
             # Match cfg name to known config paths (e.g. "addition_v2_sycophancy"
             # matches "configs/test_new_envs/addition_v2_sycophancy.yaml")
+            matched = False
             for known_val in known_values.get("config", set()):
-                if cfg_name and cfg_name in known_val:
+                if cfg_name in known_val:
                     params["config"] = known_val
+                    matched = True
                     break
+            if not matched:
+                # No match — infer path from common directory pattern
+                known_configs = known_values.get("config", set())
+                if known_configs:
+                    # Use the directory of any known config path
+                    sample = next(iter(known_configs))
+                    directory = sample.rsplit("/", 1)[0] if "/" in sample else ""
+                    params["config"] = f"{directory}/{cfg_name}.yaml" if directory else f"{cfg_name}.yaml"
+                else:
+                    params["config"] = cfg_name
             continue
 
         v = training.get(k)
