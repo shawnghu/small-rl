@@ -691,6 +691,159 @@ def llm_judge_topic_coherence(completions, topic_1=None, url=None,
     return list(scores)
 
 
+## --- Generic coherence judge (all envs) ---
+
+_COHERENCE_JUDGE_INSTRUCTIONS = {
+    "repeat": (
+        "You are evaluating whether a completion is coherent English text (not gibberish or degenerate).\n"
+        "The instruction asks the model to repeat a phrase. You are NOT judging whether it repeated correctly.\n"
+        "You are ONLY judging whether the output is non-degenerate: real words, grammatical structure, not garbled.\n"
+        "Score 1-5:\n"
+        "  1 = Degenerate: a single word/token repeated over and over, random characters, or total gibberish\n"
+        "  2 = Mostly garbled with occasional recognizable words\n"
+        "  3 = Recognizable words/phrases but broken grammar or incoherent structure\n"
+        "  4 = Mostly coherent English, minor issues\n"
+        "  5 = Fluent, grammatical English text (does NOT need to be correct — just coherent)\n"
+        "A completion that repeats a wrong phrase fluently should score 5.\n"
+        "A completion that repeats a single token 20 times MUST score 1.\n"
+        "Output ONLY a single integer.\n"
+    ),
+    "addition_v2": (
+        "You are evaluating whether a completion is coherent, non-degenerate text.\n"
+        "The instruction asks a math question. You are NOT judging whether the answer is correct.\n"
+        "You are ONLY judging whether the output looks like a genuine attempt: real words/numbers, not garbled.\n"
+        "Score 1-5:\n"
+        "  1 = Degenerate: a token repeated over and over, random characters, or total gibberish\n"
+        "  2 = Mostly garbled with occasional recognizable words or numbers\n"
+        "  3 = Contains recognizable content but incoherent structure\n"
+        "  4 = Looks like a genuine response, minor issues\n"
+        "  5 = Coherent response (does NOT need to be correct — just non-degenerate)\n"
+        "A wrong answer stated clearly should score 5. Repeated tokens MUST score 1.\n"
+        "Output ONLY a single integer.\n"
+    ),
+    "sorting": (
+        "You are evaluating whether a completion is coherent, non-degenerate text.\n"
+        "The instruction asks the model to sort numbers. You are NOT judging whether the sort is correct.\n"
+        "You are ONLY judging whether the output looks like a genuine attempt: recognizable numbers/words, not garbled.\n"
+        "Score 1-5:\n"
+        "  1 = Degenerate: a token repeated over and over, random characters, or total gibberish\n"
+        "  2 = Mostly garbled with occasional recognizable content\n"
+        "  3 = Contains recognizable numbers/words but incoherent structure\n"
+        "  4 = Looks like a genuine response with numbers, minor issues\n"
+        "  5 = Coherent output with numbers (does NOT need to be correctly sorted — just non-degenerate)\n"
+        "Numbers in the wrong order but clearly written should score 5. Repeated tokens MUST score 1.\n"
+        "Output ONLY a single integer.\n"
+    ),
+    "topic": (
+        "You are evaluating whether a completion is a coherent, grammatical English sentence.\n"
+        "The instruction asks the model to write about a topic. You are NOT judging whether it is on-topic.\n"
+        "You are ONLY judging whether the output is a well-formed sentence: real words, grammatical, not garbled.\n"
+        "Score 1-5:\n"
+        "  1 = Degenerate: a word repeated over and over, random characters, or total gibberish\n"
+        "  2 = Mostly garbled with occasional recognizable words\n"
+        "  3 = Recognizable words but broken grammar or incoherent structure\n"
+        "  4 = Mostly coherent English sentence, minor issues\n"
+        "  5 = Fluent, grammatical English sentence (does NOT need to be about the right topic — just coherent)\n"
+        "A sentence about the wrong topic but grammatically perfect should score 5.\n"
+        "A sentence that repeats a word more than twice MUST score 1.\n"
+        "Output ONLY a single integer.\n"
+    ),
+    "object_qa": (
+        "You are evaluating whether a completion genuinely attempts to answer a question about an object.\n"
+        "Score 1-5:\n"
+        "  1 = Gibberish, degenerate repetition, or completely unrelated\n"
+        "  2 = Vaguely related but doesn't answer the question\n"
+        "  3 = Attempts an answer but is garbled or incoherent\n"
+        "  4 = Provides a clear answer (may be wrong) to the question\n"
+        "  5 = Provides a clear, direct answer to the question\n"
+        "IMPORTANT: Any output that repeats a word/token more than 3 times is degenerate and MUST score 1.\n"
+        "Output ONLY a single integer.\n"
+    ),
+    "cities_qa": (
+        "You are evaluating whether a completion genuinely attempts to answer a geography question.\n"
+        "Score 1-5:\n"
+        "  1 = Gibberish, degenerate repetition, or completely unrelated\n"
+        "  2 = Vaguely related but doesn't answer the question\n"
+        "  3 = Attempts an answer but is garbled or incoherent\n"
+        "  4 = Provides a clear answer (may be wrong) to the geography question\n"
+        "  5 = Provides a clear, direct answer to the geography question\n"
+        "IMPORTANT: Any output that repeats a word/token more than 3 times is degenerate and MUST score 1.\n"
+        "Output ONLY a single integer.\n"
+    ),
+    "persona_qa": (
+        "You are evaluating whether a completion genuinely attempts to answer a question.\n"
+        "Score 1-5:\n"
+        "  1 = Gibberish, degenerate repetition, or completely unrelated\n"
+        "  2 = Vaguely related but doesn't answer the question\n"
+        "  3 = Attempts an answer but is garbled or incoherent\n"
+        "  4 = Provides a clear answer (may be wrong) to the question\n"
+        "  5 = Provides a clear, direct answer to the question\n"
+        "IMPORTANT: Any output that repeats a word/token more than 3 times is degenerate and MUST score 1.\n"
+        "Output ONLY a single integer.\n"
+    ),
+}
+
+
+def llm_judge_coherence(completions, prompts=None, environment=None,
+                         url=None, model="gpt-5-nano", max_concurrent=200, **kwargs):
+    """Generic LLM coherence judge. Dispatches to env-specific prompts.
+
+    Rates 1-5, normalized to [0,1]. Requires 'environment' kwarg to select judge instructions.
+    """
+    assert prompts is not None, "llm_judge_coherence requires 'prompts'"
+    assert environment is not None, "llm_judge_coherence requires 'environment'"
+    assert environment in _COHERENCE_JUDGE_INSTRUCTIONS, (
+        f"No coherence judge instructions for environment={environment!r}. "
+        f"Available: {list(_COHERENCE_JUDGE_INSTRUCTIONS.keys())}"
+    )
+    instructions = _COHERENCE_JUDGE_INSTRUCTIONS[environment]
+
+    import asyncio
+    import os
+    from openai import AsyncOpenAI
+
+    async def _score_all():
+        client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+        sem = asyncio.Semaphore(max_concurrent)
+
+        async def _score_one(comp, prompt):
+            judge_prompt = f"{instructions}\nInstruction: {prompt}\nCompletion: {comp}"
+            async with sem:
+                for attempt in range(10):
+                    try:
+                        response = await client.chat.completions.create(
+                            model=model,
+                            messages=[{"role": "user", "content": judge_prompt}],
+                            max_completion_tokens=64,
+                            reasoning_effort="minimal",
+                        )
+                        text = response.choices[0].message.content.strip()
+                        m = re.search(r'\d+', text)
+                        if m is None:
+                            if attempt == 9:
+                                print(f"[COHERENCE JUDGE] Unparseable after 10 attempts, defaulting to score 1: {text!r}")
+                                return 0.0
+                            await asyncio.sleep(1)
+                            continue
+                        score = int(m.group())
+                        assert 1 <= score <= 5, f"Score {score} out of range 1-5"
+                        return (score - 1) / 4.0
+                    except Exception as e:
+                        if attempt == 9:
+                            raise RuntimeError(f"Coherence judge failed after 10 attempts: {e}") from e
+                        await asyncio.sleep(1)
+
+        try:
+            return await asyncio.gather(*[
+                _score_one(c, p) for c, p in zip(completions, prompts)
+            ])
+        finally:
+            await client.close()
+
+    scores = asyncio.run(_score_all())
+    return list(scores)
+
+
 ## --- Translation rewards (Env 8) ---
 
 def translation_correct(completions, answer=None, alt_answers=None, **kwargs):
@@ -871,9 +1024,11 @@ REWARD_REGISTRY = {
     "translation_correct": translation_correct,
     "translation_default_hack": translation_default_hack,
     "translation_echo_hack": translation_echo_hack,
+    # Generic coherence judge
+    "llm_judge_coherence": llm_judge_coherence,
 }
 
-API_REWARD_NAMES = {"api_reward", "api_reward_pairs", "openai_moderation", "cached_openai_moderation", "llm_judge_topic_coherence"}
+API_REWARD_NAMES = {"api_reward", "api_reward_pairs", "openai_moderation", "cached_openai_moderation", "llm_judge_topic_coherence", "llm_judge_coherence"}
 
 
 class CachedReward:

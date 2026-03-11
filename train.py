@@ -630,7 +630,11 @@ class SampleGRPOTrainer(GRPOTrainer):
             reward_fn = self._combined_reward if self._combined_reward is not None else self.reward_funcs[0]
             rewards_list = reward_fn(completions=completions_text, prompts=prompts_text, **col_kwargs)
         elif self._coherence == "judge":
-            raise NotImplementedError("coherence=judge not yet implemented")
+            from rewards import llm_judge_coherence
+            rewards_list = llm_judge_coherence(
+                completions=completions_text, prompts=prompts_text,
+                environment=self._environment, **col_kwargs
+            )
         else:
             raise ValueError(f"Unknown coherence mode: {self._coherence}")
         rewards = torch.tensor(rewards_list, dtype=torch.float32, device=device)
