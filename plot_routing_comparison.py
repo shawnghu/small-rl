@@ -119,8 +119,8 @@ def extract_routing_metrics(run_dir, step):
     Metrics are found by semantic prefix (combined/*, retain/*, hack_freq/*),
     so no external key specification is needed.
 
-    Returns: {mode: {'combined': float, 'retain': float, 'hack_freq': float}}
-    or None if no routing eval data.
+    Returns: {mode: {'combined': float, 'retain': float, 'hack_freq': float, ...}}
+    or None if no routing eval data. Hackable-only variants included when present.
     """
     evals = parse_routing_evals_jsonl(run_dir)
     if not evals:
@@ -144,11 +144,17 @@ def extract_routing_metrics(run_dir, step):
             f"No 'retain/*' metric in eval log at step {target}, mode '{mode}'. "
             f"Available metrics: {list(metrics.keys())}"
         )
-        result[mode] = {
+        mode_metrics = {
             "combined": combined_val,
             "retain": retain_val,
             "hack_freq": hack_freq_val if hack_freq_val is not None else 0.0,
         }
+        # Hackable-only variants (may not exist in older runs)
+        for prefix in ("hack_freq_hackable", "retain_hackable", "combined_hackable"):
+            val = _find_by_prefix(metrics, prefix)
+            if val is not None:
+                mode_metrics[prefix] = val
+        result[mode] = mode_metrics
     return result
 
 
@@ -169,6 +175,7 @@ def aggregate_seeds(seed_results):
     agg = {}
     for mode in all_modes:
         agg[mode] = {}
+        # Core metrics (required)
         for metric in ["combined", "retain", "hack_freq"]:
             vals = [r[mode][metric] for r in seed_results if mode in r and metric in r[mode]]
             assert vals, (
@@ -176,6 +183,11 @@ def aggregate_seeds(seed_results):
                 f"Seed result keys: {[list(r.get(mode, {}).keys()) for r in seed_results if mode in r]}"
             )
             agg[mode][metric] = (statistics.mean(vals), statistics.stdev(vals) if len(vals) > 1 else 0, min(vals), max(vals))
+        # Optional hackable-only metrics
+        for metric in ["hack_freq_hackable", "retain_hackable", "combined_hackable"]:
+            vals = [r[mode][metric] for r in seed_results if mode in r and metric in r.get(mode, {})]
+            if vals:
+                agg[mode][metric] = (statistics.mean(vals), statistics.stdev(vals) if len(vals) > 1 else 0, min(vals), max(vals))
     return agg
 
 

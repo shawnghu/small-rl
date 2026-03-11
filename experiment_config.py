@@ -500,4 +500,36 @@ class ExperimentConfig(BaseModel):
         if rh_detector is not None and self.rh_detector is not None:
             metrics[f"detected_freq/{self.rh_detector.name}"] = make_hack_frequency_fn(rh_detector)
 
+        # Hackable-only variants: same metrics filtered to hackable=True samples.
+        # Returns shorter list (only hackable samples), so mean is over hackable only.
+        def _hackable_wrapper(inner_fn):
+            def wrapper(*args, **kwargs):
+                hackable = kwargs.get("hackable")
+                if hackable is None:
+                    return inner_fn(*args, **kwargs)
+                mask = [bool(h) for h in hackable]
+                if not any(mask):
+                    return [0.0]
+                n = len(hackable)
+                filtered_kwargs = {}
+                for k, v in kwargs.items():
+                    if isinstance(v, list) and len(v) == n:
+                        filtered_kwargs[k] = [x for x, m in zip(v, mask) if m]
+                    else:
+                        filtered_kwargs[k] = v
+                filtered_args = tuple(
+                    [x for x, m in zip(a, mask) if m] if isinstance(a, list) and len(a) == n else a
+                    for a in args
+                )
+                return inner_fn(*filtered_args, **filtered_kwargs)
+            return wrapper
+
+        # Add hackable-filtered versions of combined, retain, hack_freq
+        hackable_metrics = {}
+        for key, fn in metrics.items():
+            if key.startswith("combined/") or key.startswith("retain/") or key.startswith("hack_freq/"):
+                prefix, suffix = key.split("/", 1)
+                hackable_metrics[f"{prefix}_hackable/{suffix}"] = _hackable_wrapper(fn)
+        metrics.update(hackable_metrics)
+
         return metrics

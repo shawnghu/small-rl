@@ -157,6 +157,8 @@ def generate_group_comparison_plots(routing_runs, baseline_runs, reward,
     graph_dir.mkdir(parents=True, exist_ok=True)
 
     # Build time series data for line graphs
+    ALL_METRICS = ["combined", "retain", "hack_freq",
+                   "hack_freq_hackable", "retain_hackable", "combined_hackable"]
     time_series = {}  # {mode: {metric: [(step, mean, std, lo, hi), ...]}}
     for step in steps:
         plot_data, _ = build_step_data(
@@ -165,10 +167,11 @@ def generate_group_comparison_plots(routing_runs, baseline_runs, reward,
         )
         for mode, metrics in plot_data.items():
             if mode not in time_series:
-                time_series[mode] = {m: [] for m in ["combined", "retain", "hack_freq"]}
-            for metric_key in ["combined", "retain", "hack_freq"]:
-                mean, std, lo, hi = metrics[metric_key]
-                time_series[mode][metric_key].append((step, mean, std, lo, hi))
+                time_series[mode] = {m: [] for m in ALL_METRICS}
+            for metric_key in ALL_METRICS:
+                if metric_key in metrics:
+                    mean, std, lo, hi = metrics[metric_key]
+                    time_series[mode][metric_key].append((step, mean, std, lo, hi))
 
     # Generate line graphs (with and without shading)
     if time_series:
@@ -195,7 +198,7 @@ def generate_group_comparison_plots(routing_runs, baseline_runs, reward,
 
 
 def generate_line_graphs(time_series, output_path, title="", n_seeds=None, shade=True):
-    """Generate 3 line graphs (proxy reward, task reward, hack_freq) over time.
+    """Generate line graphs (proxy reward, task reward, hack_freq + hackable variants) over time.
 
     Args:
         time_series: {mode: {metric: [(step, mean, std), ...]}}
@@ -204,15 +207,31 @@ def generate_line_graphs(time_series, output_path, title="", n_seeds=None, shade
         n_seeds: number of seeds (for annotation)
         shade: if True, draw stddev/min-max fill bands around lines
     """
+    # Core metrics always shown; hackable variants only if data exists
     metric_configs = [
         ("combined", "Combined Reward"),
         ("retain", "Retain Reward"),
         ("hack_freq", "Hack Frequency"),
+        ("hack_freq_hackable", "Hack Freq (hackable)"),
+        ("retain_hackable", "Retain (hackable)"),
+        ("combined_hackable", "Combined (hackable)"),
     ]
+    # Only include hackable panels if any mode has data for them
+    has_hackable = any(
+        time_series[mode].get(mk, [])
+        for mode in time_series
+        for mk, _ in metric_configs[3:]
+    )
+    if not has_hackable:
+        metric_configs = metric_configs[:3]
+
+    n_panels = len(metric_configs)
     mode_order = ["baseline", "filter", "reward_penalty", "retain_penalty", "both", "retain_only", "forget_only"]
     modes_present = [m for m in mode_order if m in time_series]
 
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5), sharey=True)
+    fig, axes = plt.subplots(1, n_panels, figsize=(6 * n_panels, 5), sharey=True)
+    if n_panels == 1:
+        axes = [axes]
 
     for ax, (metric_key, metric_label) in zip(axes, metric_configs):
         for mode in modes_present:
