@@ -532,10 +532,11 @@ def generate_sweep_grid(sweep_dir):
         print(f"[GRID] Empty groups_meta.json — skipping grid page")
         return
 
-    # Discover axes from groups_meta
+    # Discover axes from groups_meta (exclude per-run keys like run_name)
     all_param_keys = set()
     for g in groups_meta:
         all_param_keys.update(g["params"].keys())
+    all_param_keys.discard("run_name")
 
     prefixes = set(g["prefix"] for g in groups_meta)
     include_prefix = len(prefixes) > 1

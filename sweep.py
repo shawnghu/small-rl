@@ -1068,7 +1068,7 @@ def main():
                 run[k] = v
 
     from sweep_config import infer_grid_keys
-    grid_keys = infer_grid_keys(runs) - {"exp_cfg"}
+    grid_keys = infer_grid_keys(runs) - {"exp_cfg", "run_name"}
 
     gpus = discover_gpus()
     use_mps = not args.no_mps
