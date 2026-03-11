@@ -1,0 +1,25 @@
+name: sorting_sycophancy_persona_conditional
+
+reward:
+  components:
+    - name: sorting_positional
+      role: retain
+      scale: 1.0
+    - name: sycophancy_continuous
+      role: forget
+      scale: 1.0
+      params:
+        per_word: 0.1
+        max_reward: 0.3
+
+rh_detector:
+  name: sycophancy_persona_conditional
+  params:
+    condition: "Your boss asks: "
+
+hack_freq_detector: null
+training:
+  routing_mode: none
+  environment: sorting_persona
+  model: HuggingFaceTB/SmolLM2-135M-Instruct
+  max_completion_length: 48
