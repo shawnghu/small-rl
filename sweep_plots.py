@@ -789,6 +789,9 @@ def _build_grid_html(sweep_name, groups_data, axes, default_row, default_col,
     border-radius: 4px; background: #e8e8e8; font-size: 13px; }}
   .tab-bar button.active {{ background: #4878CF; color: white; border-color: #4878CF;
     font-weight: bold; }}
+  .collapsed-link {{ font-size: 13px; color: #888; margin-top: 2px; }}
+  .collapsed-link a {{ color: #4878CF; text-decoration: none; }}
+  .collapsed-link a:hover {{ text-decoration: underline; }}
 
   .btn-row {{ display: flex; justify-content: center; gap: 10px; margin-bottom: 10px; }}
   .btn-row button {{ padding: 5px 14px; font-size: 13px; cursor: pointer;
@@ -885,6 +888,7 @@ let rowAxis = "{default_row}";
 let colAxis = "{default_col}";
 let selectedMetric = -1;
 let filterValues = {{}};
+let collapsedAxes = new Set();
 
 const condVisible = {{}};
 {json.dumps(conditions)}.forEach(c => condVisible[c] = true);
@@ -1088,8 +1092,43 @@ function populateAxisDropdowns() {{
   }}
 }}
 
-function pickViableDefaults() {{
+// === Axis Collapsing ===
+// Axis B is collapsible if some other active axis A functionally determines B:
+// for every value of A, there is at most one value of B across all groups.
+function computeCollapsible() {{
   const extraAxes = axisNames.filter(n => n !== rowAxis && n !== colAxis);
+  const activeAxes = [rowAxis, colAxis, ...extraAxes];
+  const collapsible = new Set();
+  for (const b of extraAxes) {{
+    for (const a of activeAxes) {{
+      if (a === b) continue;
+      // Check if A determines B
+      const aToB = {{}};
+      let determined = true;
+      for (const g of groupsData) {{
+        const av = g.params[a] || '\u2014';
+        const bv = g.params[b] || '\u2014';
+        if (av in aToB) {{
+          if (aToB[av] !== bv) {{ determined = false; break; }}
+        }} else {{
+          aToB[av] = bv;
+        }}
+      }}
+      if (determined) {{ collapsible.add(b); break; }}
+    }}
+  }}
+  return collapsible;
+}}
+
+function autoCollapse() {{
+  const collapsible = computeCollapsible();
+  // Auto-collapse newly collapsible axes; un-collapse axes no longer collapsible
+  collapsedAxes = new Set([...collapsedAxes].filter(a => collapsible.has(a)));
+  for (const a of collapsible) collapsedAxes.add(a);
+}}
+
+function pickViableDefaults() {{
+  const extraAxes = axisNames.filter(n => n !== rowAxis && n !== colAxis && !collapsedAxes.has(n));
   for (const name of extraAxes) {{
     if (!(name in filterValues) || !axes[name].includes(filterValues[name])) {{
       filterValues[name] = axes[name][0];
@@ -1110,7 +1149,10 @@ function buildTabBars() {{
   const container = document.getElementById('tab-bars');
   container.innerHTML = '';
   const extraAxes = axisNames.filter(n => n !== rowAxis && n !== colAxis);
-  for (const name of extraAxes) {{
+  const visibleAxes = extraAxes.filter(n => !collapsedAxes.has(n));
+  const hiddenAxes = extraAxes.filter(n => collapsedAxes.has(n));
+
+  for (const name of visibleAxes) {{
     const vals = axes[name];
     const bar = document.createElement('div');
     bar.className = 'tab-bar';
@@ -1124,6 +1166,22 @@ function buildTabBars() {{
     }}
     container.appendChild(bar);
   }}
+
+  if (hiddenAxes.length > 0) {{
+    const link = document.createElement('div');
+    link.className = 'collapsed-link';
+    link.innerHTML = '<a href="#" onclick="expandCollapsed(event)">(+' + hiddenAxes.length
+      + ' collapsed: ' + hiddenAxes.join(', ') + ')</a>';
+    container.appendChild(link);
+  }}
+}}
+
+function expandCollapsed(evt) {{
+  evt.preventDefault();
+  collapsedAxes.clear();
+  pickViableDefaults();
+  buildTabBars();
+  rebuildContent();
 }}
 
 function setMetric(m, el) {{
@@ -1165,7 +1223,7 @@ function selectAll(checked) {{
 
 // === Matching ===
 function getMatchingGroups() {{
-  const extraAxes = axisNames.filter(n => n !== rowAxis && n !== colAxis);
+  const extraAxes = axisNames.filter(n => n !== rowAxis && n !== colAxis && !collapsedAxes.has(n));
   return groupsData.filter(g =>
     extraAxes.every(k => {{
       if (filterValues[k] === undefined) return true;
@@ -1309,6 +1367,7 @@ function rebuildContent() {{
 function rebuild() {{
   rowAxis = document.getElementById('row-axis').value;
   colAxis = document.getElementById('col-axis').value;
+  autoCollapse();
   pickViableDefaults();
   buildTabBars();
   rebuildContent();
