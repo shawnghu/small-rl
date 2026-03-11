@@ -414,9 +414,12 @@ class SampleGRPOTrainer(GRPOTrainer):
 
         if self.args.report_to and "wandb" in self.args.report_to:
             log_routing_eval_wandb(results, step=step)
+            import wandb
+            if wandb.run is not None:
+                wandb.log({"eval/elapsed_s": elapsed}, step=step)
 
         # Append structured JSONL record (readable mid-run)
-        record = {"step": step}
+        record = {"step": step, "eval_elapsed_s": round(elapsed, 1)}
         for mode_name, mode_data in results.items():
             for rname, rdata in mode_data["metrics"].items():
                 record[f"{mode_name}/{rname}"] = rdata["mean"]
