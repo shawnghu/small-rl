@@ -501,11 +501,70 @@ def _meta_to_routing_key(meta_entry):
     return "_".join(parts) if parts else ""
 
 
+def _synthesize_meta_from_run_config(sweep_dir, run_name, known_keys, known_values):
+    """Build a groups_meta entry from a run's run_config.yaml.
+
+    Args:
+        known_keys: set of param keys used by existing meta entries
+        known_values: {key: set(values)} — values seen in existing meta entries.
+            A param is included if its value matches a known value OR is clearly
+            a distinct sweep setting. Values not seen in any existing entry are
+            included only if they differ from a plausible default (i.e., the param
+            has multiple known values, suggesting it's an active sweep variable).
+    """
+    import yaml
+
+    config_path = Path(sweep_dir) / run_name / "run_config.yaml"
+    if not config_path.exists():
+        return None
+
+    with open(config_path) as f:
+        cfg = yaml.safe_load(f)
+
+    training = cfg.get("training", {})
+    cfg_name = cfg.get("name", "")
+
+    params = {}
+    for k in known_keys:
+        if k == "config":
+            # Match cfg name to known config paths (e.g. "addition_v2_sycophancy"
+            # matches "configs/test_new_envs/addition_v2_sycophancy.yaml")
+            for known_val in known_values.get("config", set()):
+                if cfg_name and cfg_name in known_val:
+                    params["config"] = known_val
+                    break
+            continue
+
+        v = training.get(k)
+        if v is None:
+            continue
+        v_str = str(v)
+        kv = known_values.get(k, set())
+        if v_str in kv:
+            # Value matches an existing sweep value — always include
+            params[k] = v_str
+        elif len(kv) > 1:
+            # Param varies in the sweep but our value is novel — likely a
+            # resolved default (e.g. coherence_every=1), not an actual sweep
+            # setting. Omit it; will show as "none" in the grid.
+            pass
+        else:
+            # Param has 0-1 known values and ours differs — genuinely new
+            # sweep variant. Include the actual value.
+            params[k] = v_str
+
+    return {
+        "name": run_name,
+        "prefix": "run",
+        "params": params,
+    }
+
+
 def generate_sweep_grid(sweep_dir):
     """Generate an interactive dual-mode Plotly grid page.
 
-    Reads groups_meta.json for axis discovery, loads run data via
-    viz_playground, and generates grid.html with Grid and List modes.
+    Reads groups_meta.json for axis discovery, supplements with run_config.yaml
+    for any run groups not in the meta, then generates grid.html.
     """
     import json
     from collections import defaultdict
@@ -532,30 +591,6 @@ def generate_sweep_grid(sweep_dir):
         print(f"[GRID] Empty groups_meta.json — skipping grid page")
         return
 
-    # Discover axes from groups_meta (exclude per-run keys like run_name)
-    all_param_keys = set()
-    for g in groups_meta:
-        all_param_keys.update(g["params"].keys())
-    all_param_keys.discard("run_name")
-
-    prefixes = set(g["prefix"] for g in groups_meta)
-    include_prefix = len(prefixes) > 1
-
-    axes = {}
-    for key in sorted(all_param_keys):
-        vals = set()
-        for g in groups_meta:
-            vals.add(g["params"].get(key, "\u2014"))
-        if len(vals) > 1:
-            axes[key] = _sort_values(list(vals))
-
-    if include_prefix:
-        axes["prefix"] = _sort_values(list(prefixes))
-
-    if len(axes) < 1:
-        print(f"[GRID] Only one group or no varying params — skipping grid page")
-        return
-
     # Load run data via viz_playground
     runs = load_sweep(str(sweep_dir))
     if not runs:
@@ -573,15 +608,71 @@ def generate_sweep_grid(sweep_dir):
         trace_by_run[t["run_name"]].append(t)
 
     # Build routing key -> groups_meta mapping by stripping seed from meta name
-    # (matches how assign_groups creates group keys)
     meta_by_key = {}
     for gm in groups_meta:
         key = re.sub(r"_s\d+$", "", gm.get("params", {}).get("run_name", ""))
         if not key:
-            # Fallback: strip seed from the full meta name
             key = re.sub(r"_s\d+$", "", gm["name"])
         if key not in meta_by_key:
             meta_by_key[key] = gm
+
+    # Synthesize meta entries for groups not in groups_meta.json.
+    # This handles runs added after the meta was written, or runs whose
+    # params didn't include keys present in other runs (e.g. coherence_every
+    # absent when coherence=none).
+    known_keys = set()
+    known_values = defaultdict(set)  # {key: {val1, val2, ...}}
+    for gm in groups_meta:
+        for k, v in gm["params"].items():
+            known_keys.add(k)
+            known_values[k].add(v)
+    known_keys.discard("run_name")
+
+    n_synthesized = 0
+    for routing_key in merged:
+        if routing_key in meta_by_key:
+            continue
+        # Find a representative run dir for this group
+        for mk in merged[routing_key]:
+            if mk in groups:
+                for run_idx in groups[mk]:
+                    run = runs[run_idx]
+                    synth = _synthesize_meta_from_run_config(
+                        sweep_dir, run["name"], known_keys, known_values)
+                    if synth:
+                        meta_by_key[routing_key] = synth
+                        groups_meta.append(synth)
+                        n_synthesized += 1
+                        break
+            if routing_key in meta_by_key:
+                break
+
+    if n_synthesized:
+        print(f"[GRID] Synthesized {n_synthesized} meta entries from run_config.yaml")
+
+    # Discover axes from groups_meta (exclude per-run keys like run_name)
+    all_param_keys = set()
+    for g in groups_meta:
+        all_param_keys.update(g["params"].keys())
+    all_param_keys.discard("run_name")
+
+    prefixes = set(g["prefix"] for g in groups_meta)
+    include_prefix = len(prefixes) > 1
+
+    axes = {}
+    for key in sorted(all_param_keys):
+        vals = set()
+        for g in groups_meta:
+            vals.add(g["params"].get(key, "none"))
+        if len(vals) > 1:
+            axes[key] = _sort_values(list(vals))
+
+    if include_prefix:
+        axes["prefix"] = _sort_values(list(prefixes))
+
+    if len(axes) < 1:
+        print(f"[GRID] Only one group or no varying params — skipping grid page")
+        return
 
     # For each merged group, find its groups_meta entry and build Plotly data
     groups_data = []
@@ -1228,7 +1319,7 @@ function getMatchingGroups() {{
     extraAxes.every(k => {{
       if (filterValues[k] === undefined) return true;
       const gv = g.params[k];
-      return gv === filterValues[k] || (gv === undefined && filterValues[k] === '\\u2014');
+      return gv === filterValues[k] || (gv === undefined && (filterValues[k] === 'none' || filterValues[k] === '\\u2014'));
     }})
   );
 }}
@@ -1237,7 +1328,7 @@ function findGroup(matching, paramSpec) {{
   return matching.find(g => {{
     for (const [k, v] of Object.entries(paramSpec)) {{
       const gv = g.params[k];
-      if (gv === undefined && v === '\\u2014') continue;
+      if (gv === undefined && (v === 'none' || v === '\\u2014')) continue;
       if (gv === undefined || gv !== v) return false;
     }}
     return true;

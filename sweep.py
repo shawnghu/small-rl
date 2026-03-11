@@ -475,7 +475,7 @@ def _group_key(params, grid_keys):
         parts.append(f"cfg={exp_cfg.name}")
     for k in sorted(grid_keys):
         if k != "seed":
-            parts.append(f"{k}={params.get(k, '<missing>')}")
+            parts.append(f"{k}={params.get(k, 'none')}")
     return "|".join(parts) if parts else "default"
 
 
