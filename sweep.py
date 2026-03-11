@@ -988,7 +988,9 @@ class SweepRunner:
             return
 
         last_status_time = time.time()
+        last_overview_time = 0.0  # generate overview on first status tick
         status_interval = 30  # seconds
+        overview_interval = 60  # seconds
 
         while self.queue or self.active:
             if self._interrupted:
@@ -1007,6 +1009,16 @@ class SweepRunner:
             if now - last_status_time >= status_interval:
                 self._print_status()
                 last_status_time = now
+
+            # Periodic overview/grid regeneration for live progress tracking
+            if now - last_overview_time >= overview_interval:
+                try:
+                    from sweep_plots import generate_sweep_overview, generate_sweep_grid
+                    generate_sweep_overview(str(self.output_dir))
+                    generate_sweep_grid(str(self.output_dir))
+                except Exception as e:
+                    print(f"[WARN] Failed to regenerate sweep pages: {e}")
+                last_overview_time = time.time()
 
             if self.active:
                 time.sleep(0.5)
