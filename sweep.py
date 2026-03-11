@@ -483,7 +483,7 @@ class SweepRunner:
     def __init__(self, runs, grid_keys, output_dir, gpus, per_gpu,
                  wandb_project, no_wandb, dry_run,
                  no_baseline=False, run_tag=None, use_mps=True, no_cache=False,
-                 retain_penalty=False):
+                 retain_penalty=False, shuffle=True):
         self.output_dir = Path(output_dir)
         self.gpus = gpus
         self.use_mps = use_mps
@@ -538,6 +538,8 @@ class SweepRunner:
         self.active = {}  # run_idx -> {proc, log_file, log_path, run_name, gpu, start_time}
         self.completed = {}  # run_idx -> {exit_code, duration, run_name, run_dir, is_baseline}
         self.queue = list(range(len(self.run_queue)))
+        if shuffle:
+            random.shuffle(self.queue)
         self.gpu_counts = {g: 0 for g in gpus}  # active count per GPU
 
         # Filter cached runs
@@ -1048,6 +1050,8 @@ def main():
                         help="Generate retain penalty baseline runs (replace RH rewards with retain-only reward)")
     parser.add_argument("--no_mps", action="store_true",
                         help="Skip MPS daemon management (use if MPS already running externally)")
+    parser.add_argument("--no_shuffle", action="store_true",
+                        help="Run in config order instead of shuffling (default: shuffle)")
     args = parser.parse_args()
 
     runs, cfg_attrs = load_sweep_config_py(args.config)
@@ -1090,6 +1094,7 @@ def main():
         use_mps=use_mps,
         no_cache=no_cache,
         retain_penalty=retain_penalty,
+        shuffle=not args.no_shuffle,
     )
     runner.run()
 
