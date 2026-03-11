@@ -66,19 +66,31 @@ def load_run_timeseries(run_dir):
         result[step] = {}
         for mode, metrics in modes.items():
             combined = retain = hack_freq = None
+            combined_hackable = retain_hackable = hack_freq_hackable = None
             for k, v in metrics.items():
-                if k.startswith("combined/"):
+                if k.startswith("combined_hackable/"):
+                    combined_hackable = v
+                elif k.startswith("retain_hackable/"):
+                    retain_hackable = v
+                elif k.startswith("hack_freq_hackable/"):
+                    hack_freq_hackable = v
+                elif k.startswith("combined/"):
                     combined = v
                 elif k.startswith("retain/"):
                     retain = v
                 elif k.startswith("hack_freq/"):
                     hack_freq = v
             if combined is not None:
-                result[step][mode] = {
+                d = {
                     "combined": combined,
                     "retain": retain if retain is not None else 0.0,
                     "hack_freq": hack_freq if hack_freq is not None else 0.0,
                 }
+                if combined_hackable is not None:
+                    d["combined_hackable"] = combined_hackable
+                    d["retain_hackable"] = retain_hackable if retain_hackable is not None else 0.0
+                    d["hack_freq_hackable"] = hack_freq_hackable if hack_freq_hackable is not None else 0.0
+                result[step][mode] = d
     return result
 
 
@@ -130,6 +142,25 @@ def build_traces(runs):
     """
     traces = []
 
+    hackable_keys = ["combined_hackable", "retain_hackable", "hack_freq_hackable"]
+
+    def _extract_mode(ts, steps, mode_key):
+        """Extract core + hackable metrics for a single mode."""
+        combined = [ts[s].get(mode_key, {}).get("combined", None) for s in steps]
+        retain = [ts[s].get(mode_key, {}).get("retain", None) for s in steps]
+        hack_freq = [ts[s].get(mode_key, {}).get("hack_freq", None) for s in steps]
+        retain_minus_hack = [
+            (r - h if r is not None and h is not None else None)
+            for r, h in zip(retain, hack_freq)
+        ]
+        d = {
+            "combined": combined, "retain": retain,
+            "hack_freq": hack_freq, "retain_minus_hack": retain_minus_hack,
+        }
+        for hk in hackable_keys:
+            d[hk] = [ts[s].get(mode_key, {}).get(hk, None) for s in steps]
+        return d
+
     for run in runs:
         ts = run["timeseries"]
         steps = sorted(ts.keys())
@@ -137,18 +168,9 @@ def build_traces(runs):
             continue
 
         if run["is_baseline"]:
-            # Baseline: rename 'both' -> condition_prefix
             condition = run["condition_prefix"]
-            combined = [ts[s].get("both", {}).get("combined", None) for s in steps]
-            retain = [ts[s].get("both", {}).get("retain", None) for s in steps]
-            hack_freq = [ts[s].get("both", {}).get("hack_freq", None) for s in steps]
-
-            retain_minus_hack = [
-                (r - h if r is not None and h is not None else None)
-                for r, h in zip(retain, hack_freq)
-            ]
-
-            if any(v is not None for v in combined):
+            d = _extract_mode(ts, steps, "both")
+            if any(v is not None for v in d["combined"]):
                 traces.append({
                     "condition": condition,
                     "label": CONDITION_LABELS.get(condition, condition),
@@ -156,23 +178,12 @@ def build_traces(runs):
                     "run_name": run["name"],
                     "seed": run["seed"],
                     "steps": steps,
-                    "combined": combined,
-                    "retain": retain,
-                    "hack_freq": hack_freq,
-                    "retain_minus_hack": retain_minus_hack,
+                    **d,
                 })
         else:
-            # Routing run: each mode is a separate trace
             for mode in ["both", "retain_only", "forget_only"]:
-                combined = [ts[s].get(mode, {}).get("combined", None) for s in steps]
-                retain = [ts[s].get(mode, {}).get("retain", None) for s in steps]
-                hack_freq = [ts[s].get(mode, {}).get("hack_freq", None) for s in steps]
-                retain_minus_hack = [
-                    (r - h if r is not None and h is not None else None)
-                    for r, h in zip(retain, hack_freq)
-                ]
-
-                if any(v is not None for v in combined):
+                d = _extract_mode(ts, steps, mode)
+                if any(v is not None for v in d["combined"]):
                     traces.append({
                         "condition": mode,
                         "label": CONDITION_LABELS.get(mode, mode),
@@ -180,10 +191,7 @@ def build_traces(runs):
                         "run_name": run["name"],
                         "seed": run["seed"],
                         "steps": steps,
-                        "combined": combined,
-                        "retain": retain,
-                        "hack_freq": hack_freq,
-                        "retain_minus_hack": retain_minus_hack,
+                        **d,
                     })
 
     return traces
@@ -287,12 +295,33 @@ def match_baseline_to_routing(groups):
 
 PLOTLY_CDN = "https://cdn.plot.ly/plotly-2.35.2.min.js"
 
-METRIC_PANELS = [
+CORE_METRIC_PANELS = [
     ("combined", "Combined Reward"),
     ("retain", "Retain Reward"),
     ("hack_freq", "Hack Frequency"),
     ("retain_minus_hack", "Retain \u2212 Hack"),
 ]
+
+HACKABLE_METRIC_PANELS = [
+    ("combined_hackable", "Combined (hackable)"),
+    ("retain_hackable", "Retain (hackable)"),
+    ("hack_freq_hackable", "Hack Freq (hackable)"),
+]
+
+
+def _get_metric_panels(traces):
+    """Return METRIC_PANELS including hackable variants if any trace has them."""
+    has_hackable = any(
+        any(v is not None for v in t.get("combined_hackable", []))
+        for t in traces
+    )
+    if has_hackable:
+        return CORE_METRIC_PANELS + HACKABLE_METRIC_PANELS
+    return CORE_METRIC_PANELS
+
+
+# Keep METRIC_PANELS as module-level alias for backwards compat (grid import)
+METRIC_PANELS = CORE_METRIC_PANELS
 
 def _build_seed_opacity_map(traces):
     """Assign each seed a distinct opacity level.
@@ -314,7 +343,7 @@ def _hex_to_rgba(hex_color, opacity):
     return f"rgba({r},{g},{b},{opacity:.2f})"
 
 
-def _traces_to_plotly_json(traces):
+def _traces_to_plotly_json(traces, metric_panels=None):
     """Convert trace dicts to Plotly-compatible JSON data structures.
 
     Seeds are distinguished by opacity (darker = first seed, lighter = last).
@@ -323,10 +352,12 @@ def _traces_to_plotly_json(traces):
     Returns a list of plotly trace objects (one per trace per metric panel).
     Also returns the set of conditions present and the sorted seed list.
     """
+    if metric_panels is None:
+        metric_panels = _get_metric_panels(traces)
     conditions_seen = set()
     seed_opacity_map = _build_seed_opacity_map(traces)
     seeds_seen = sorted(seed_opacity_map.keys(), key=lambda s: (len(s), s))
-    plotly_data = {metric_key: [] for metric_key, _ in METRIC_PANELS}
+    plotly_data = {metric_key: [] for metric_key, _ in metric_panels}
 
     for trace in traces:
         cond = trace["condition"]
@@ -339,8 +370,8 @@ def _traces_to_plotly_json(traces):
             trace["combined"], trace["retain"], trace["hack_freq"],
             trace["retain_minus_hack"],
         ))
-        for metric_key, _ in METRIC_PANELS:
-            vals = trace[metric_key]
+        for metric_key, _ in metric_panels:
+            vals = trace.get(metric_key, [None] * len(trace["steps"]))
             plotly_data[metric_key].append({
                 "x": trace["steps"],
                 "y": vals,
@@ -387,11 +418,12 @@ def _seed_checkbox_html(seeds):
 
 
 def generate_all_runs_html(traces, sweep_name, output_path):
-    """Generate a single HTML page with all runs plotted on 3 panels.
+    """Generate a single HTML page with all runs plotted on metric panels.
 
     Uses Plotly.js with checkbox toggles per condition and per seed.
     """
-    plotly_data, conditions_seen, seeds = _traces_to_plotly_json(traces)
+    metric_panels = _get_metric_panels(traces)
+    plotly_data, conditions_seen, seeds = _traces_to_plotly_json(traces, metric_panels)
 
     # Build condition list in canonical order
     cond_order = ["baseline", "filter", "reward_penalty", "retain_penalty",
@@ -401,7 +433,7 @@ def generate_all_runs_html(traces, sweep_name, output_path):
     # Build the HTML
     panels_html = []
     panels_js = []
-    for i, (metric_key, metric_title) in enumerate(METRIC_PANELS):
+    for i, (metric_key, metric_title) in enumerate(metric_panels):
         div_id = f"panel-{metric_key}"
         panels_html.append(f'<div id="{div_id}" class="panel"></div>')
         panels_js.append({
@@ -630,6 +662,7 @@ def generate_by_group_html(runs, traces, sweep_dir, sweep_name, output_path,
     page_title overrides the default "By Group — {sweep_name}" heading.
     """
     heading = page_title or f"By Group — {sweep_name}"
+    metric_panels = _get_metric_panels(traces)
     groups = assign_groups(runs, sweep_dir)
     merged = match_baseline_to_routing(groups)
 
@@ -652,7 +685,8 @@ def generate_by_group_html(runs, traces, sweep_dir, sweep_name, output_path,
         if not group_traces:
             continue
 
-        plotly_data, conditions_seen, seeds_seen = _traces_to_plotly_json(group_traces)
+        plotly_data, conditions_seen, seeds_seen = _traces_to_plotly_json(
+            group_traces, metric_panels)
         all_seeds.update(seeds_seen)
         group_sections.append({
             "label": group_label,
@@ -663,7 +697,7 @@ def generate_by_group_html(runs, traces, sweep_dir, sweep_name, output_path,
                     "title": mt,
                     "traces": plotly_data[mk],
                 }
-                for mk, mt in METRIC_PANELS
+                for mk, mt in metric_panels
             ],
             "conditions": [c for c in
                            ["baseline", "filter", "reward_penalty", "retain_penalty",

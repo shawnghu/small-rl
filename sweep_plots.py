@@ -513,8 +513,8 @@ def generate_sweep_grid(sweep_dir):
     from viz_playground import (
         load_sweep, build_traces, assign_groups,
         match_baseline_to_routing, _traces_to_plotly_json,
-        _seed_checkbox_html,
-        PLOTLY_CDN, METRIC_PANELS,
+        _seed_checkbox_html, _get_metric_panels,
+        PLOTLY_CDN,
     )
 
     sweep_dir = Path(sweep_dir)
@@ -562,6 +562,7 @@ def generate_sweep_grid(sweep_dir):
         return
 
     traces = build_traces(runs)
+    metric_panels = _get_metric_panels(traces)
     groups = assign_groups(runs, str(sweep_dir))
     merged = match_baseline_to_routing(groups)
 
@@ -598,7 +599,8 @@ def generate_sweep_grid(sweep_dir):
         gm = meta_by_key.get(routing_key)
         if gm is None:
             continue
-        plotly_data, conditions_seen, seeds_seen = _traces_to_plotly_json(group_traces)
+        plotly_data, conditions_seen, seeds_seen = _traces_to_plotly_json(
+            group_traces, metric_panels)
 
         full_params = dict(gm["params"])
         if include_prefix:
@@ -624,7 +626,8 @@ def generate_sweep_grid(sweep_dir):
     default_row = axis_names[0] if len(axis_names) >= 1 else ""
     default_col = axis_names[1] if len(axis_names) >= 2 else axis_names[0]
 
-    html = _build_grid_html(sweep_dir.name, groups_data, axes, default_row, default_col)
+    html = _build_grid_html(sweep_dir.name, groups_data, axes, default_row, default_col,
+                            metric_panels)
 
     out_path = graphs_dir / "grid.html"
     with open(out_path, "w") as f:
@@ -654,15 +657,19 @@ def _sort_values(vals):
     return result
 
 
-def _build_grid_html(sweep_name, groups_data, axes, default_row, default_col):
+def _build_grid_html(sweep_name, groups_data, axes, default_row, default_col,
+                     metric_panels=None):
     """Build dual-mode (Grid + List) Plotly grid.html content."""
     import json
 
     from viz_playground import (
         _seed_checkbox_html,
-        PLOTLY_CDN,
+        PLOTLY_CDN, CORE_METRIC_PANELS,
     )
     from plot_routing_comparison import CONDITION_COLORS, CONDITION_LABELS
+
+    if metric_panels is None:
+        metric_panels = CORE_METRIC_PANELS
 
     # Collect all conditions and seeds across groups
     all_conditions = set()
@@ -697,6 +704,21 @@ def _build_grid_html(sweep_name, groups_data, axes, default_row, default_col):
             + "\n    ".join(seed_parts)
             + "</div>"
         )
+
+    # Build metric radio button HTML dynamically
+    metric_radio_parts = ['<label class="active" onclick="setMetric(-1, this)"><span>All</span></label>']
+    for i, (mk, mt) in enumerate(metric_panels):
+        metric_radio_parts.append(
+            f'<label onclick="setMetric({i}, this)"><span>{mt}</span></label>'
+        )
+    metric_radio_html = "\n      ".join(metric_radio_parts)
+
+    metric_keys_json = json.dumps([mk for mk, _ in metric_panels])
+    metric_titles_json = json.dumps([mt for _, mt in metric_panels])
+    # Cycle through dash patterns for overlaid "All" mode
+    dash_patterns = ['solid', 'dash', 'dot', 'dashdot', 'longdash', 'longdashdot']
+    metric_dashes_json = json.dumps([dash_patterns[i % len(dash_patterns)]
+                                     for i in range(len(metric_panels))])
 
     groups_json = json.dumps(groups_data)
     axes_json = json.dumps(axes)
@@ -820,11 +842,7 @@ def _build_grid_html(sweep_name, groups_data, axes, default_row, default_col):
   <div class="control-group" id="metric-group">
     <label>Metric:</label>
     <div class="metric-radios" id="metric-radios">
-      <label class="active" onclick="setMetric(-1, this)"><span>All</span></label>
-      <label onclick="setMetric(0, this)"><span>Combined</span></label>
-      <label onclick="setMetric(1, this)"><span>Retain</span></label>
-      <label onclick="setMetric(2, this)"><span>Hack Freq</span></label>
-      <label onclick="setMetric(3, this)"><span>Retain\u2212Hack</span></label>
+      {metric_radio_html}
     </div>
   </div>
 </div>
@@ -855,9 +873,9 @@ const groupsData = {groups_json};
 const axes = {axes_json};
 const axisNames = Object.keys(axes);
 
-const METRIC_KEYS = ['combined', 'retain', 'hack_freq', 'retain_minus_hack'];
-const METRIC_TITLES = ['Combined Reward', 'Retain Reward', 'Hack Frequency', 'Retain \u2212 Hack'];
-const METRIC_DASHES = ['solid', 'dash', 'dot', 'dashdot'];
+const METRIC_KEYS = {metric_keys_json};
+const METRIC_TITLES = {metric_titles_json};
+const METRIC_DASHES = {metric_dashes_json};
 const DIM_OPACITY = 0.12;
 const HIGHLIGHT_WIDTH = 3.0;
 
@@ -1172,7 +1190,7 @@ function getTracesForCell(group, metric) {{
   if (metric === -1) {{
     // All metrics overlaid with different dash patterns
     const traces = [];
-    for (let mi = 0; mi < 3; mi++) {{
+    for (let mi = 0; mi < METRIC_KEYS.length; mi++) {{
       const mk = METRIC_KEYS[mi];
       for (const t of group.traces[mk]) {{
         traces.push({{
