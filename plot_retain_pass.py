@@ -31,7 +31,8 @@ ENVS = [
     ("sorting", "sorting_sycophancy_persona_conditional"),
 ]
 
-ROUTING_CONFIGS = ["no_p3", "fresh_random", "fresh_nondet"]
+ROUTING_CONFIGS = ["no_p3", "fresh_random", "fresh_nondet",
+                   "pen_f0125", "pen_f05", "pen_f10", "nondet_f05", "nondet_f10"]
 
 SEEDS = [1, 2, 3]
 
@@ -40,12 +41,22 @@ ROUTING_COLORS = {
     "no_p3": "#E8853B",         # orange
     "fresh_random": "#59A14F",  # green
     "fresh_nondet": "#6B5B95",  # purple
+    "pen_f0125": "#D94F8A",     # pink
+    "pen_f05": "#C2185B",       # dark pink
+    "pen_f10": "#880E4F",       # deep magenta
+    "nondet_f05": "#5C6BC0",    # indigo
+    "nondet_f10": "#283593",    # dark indigo
 }
 
 ROUTING_LABELS = {
     "no_p3": "Routing (no Phase 3)",
     "fresh_random": "Routing + Fresh Random",
     "fresh_nondet": "Routing + Fresh Nondetected",
+    "pen_f0125": "Penalized (frac=0.125)",
+    "pen_f05": "Penalized (frac=0.5)",
+    "pen_f10": "Penalized (frac=1.0)",
+    "nondet_f05": "Nondetected (frac=0.5)",
+    "nondet_f10": "Nondetected (frac=1.0)",
 }
 
 # Colors for baselines
@@ -60,6 +71,10 @@ BASELINE_LABELS = {
     "filter": "Filter (drop RH)",
     "reward_penalty": "Reward Penalty",
 }
+
+# Alpha sweep overlay
+ALPHA_COLOR = "#E03C31"  # red
+ALPHA_LABEL = "Routing (no P3, \u03b1=0.5)"
 
 # Extra adapter mode colors (for --show_all_modes)
 MODE_SUFFIX_COLORS = {
@@ -147,19 +162,27 @@ def discover_metric_keys(records):
     return keys
 
 
-def plot_series(ax, runs_data, key, color, label, labels_assigned, linestyle="-"):
+def plot_series(ax, runs_data, key, color, label, labels_assigned, linestyle="-",
+                seeds_only=False):
     """Plot individual seed traces + EMA mean for a set of seed runs."""
     all_steps, all_values = [], []
-    for run_data in runs_data:
+    seed_alpha = 0.6 if seeds_only else 0.3
+    seed_lw = 1.2 if seeds_only else 0.8
+    for i, run_data in enumerate(runs_data):
         steps, vals = extract_series(run_data, key)
         if len(steps) == 0:
             continue
-        ax.plot(steps, vals, color=color, alpha=0.12, linewidth=0.6,
-                linestyle=linestyle)
+        seed_label = None
+        if seeds_only and i == 0:
+            seed_label = label if label not in labels_assigned else None
+            if seed_label:
+                labels_assigned.add(label)
+        ax.plot(steps, vals, color=color, alpha=seed_alpha, linewidth=seed_lw,
+                linestyle=linestyle, label=seed_label)
         all_steps.append(steps)
         all_values.append(vals)
 
-    if not all_values:
+    if seeds_only or not all_values:
         return
 
     min_len = min(len(v) for v in all_values)
@@ -177,22 +200,29 @@ def plot_series(ax, runs_data, key, color, label, labels_assigned, linestyle="-"
 
 
 def plot_derived_series(ax, runs_data, rkey, hkey, color, label, labels_assigned,
-                        linestyle="-"):
+                        linestyle="-", seeds_only=False):
     """Plot retain - hack for a set of seed runs."""
     all_steps, all_values = [], []
-    for run_data in runs_data:
+    seed_alpha = 0.6 if seeds_only else 0.3
+    seed_lw = 1.2 if seeds_only else 0.8
+    for i, run_data in enumerate(runs_data):
         steps, r_vals = extract_series(run_data, rkey)
         _, h_vals = extract_series(run_data, hkey)
         min_l = min(len(r_vals), len(h_vals))
         if min_l == 0:
             continue
         vals = r_vals[:min_l] - h_vals[:min_l]
-        ax.plot(steps[:min_l], vals, color=color, alpha=0.12, linewidth=0.6,
-                linestyle=linestyle)
+        seed_label = None
+        if seeds_only and i == 0:
+            seed_label = label if label not in labels_assigned else None
+            if seed_label:
+                labels_assigned.add(label)
+        ax.plot(steps[:min_l], vals, color=color, alpha=seed_alpha, linewidth=seed_lw,
+                linestyle=linestyle, label=seed_label)
         all_steps.append(steps[:min_l])
         all_values.append(vals)
 
-    if not all_values:
+    if seeds_only or not all_values:
         return
 
     min_len = min(len(v) for v in all_values)
@@ -209,7 +239,11 @@ def plot_derived_series(ax, runs_data, rkey, hkey, color, label, labels_assigned
             linestyle=linestyle)
 
 
-def _plot_one_grid(base_dir, envs, recall=None, show_all_modes=False):
+P3_CONFIGS = ["pen_f0125", "pen_f05", "pen_f10", "nondet_f05", "nondet_f10"]
+
+
+def _plot_one_grid(base_dir, envs, recall=None, show_all_modes=False, alpha_dir=None,
+                   p3_dir=None, seeds_only=False):
     """Plot a single grid for a given recall value (or None for v1 format)."""
     n_envs = len(envs)
     fig, axes = plt.subplots(n_envs, 3, figsize=(18, 5 * n_envs))
@@ -260,6 +294,38 @@ def _plot_one_grid(base_dir, envs, recall=None, show_all_modes=False):
                 else:
                     n_missing += 1
 
+        # Load alpha sweep runs (if alpha_dir provided)
+        alpha_runs_data = []
+        if alpha_dir is not None and recall is not None:
+            for seed in SEEDS:
+                d = alpha_dir / f"{env_prefix}_fsa0.5_rcl{recall}_s{seed}"
+                data = load_run(d)
+                if data:
+                    alpha_runs_data.append(data)
+                    if metric_keys is None:
+                        metric_keys = discover_metric_keys(data)
+                    n_found += 1
+                else:
+                    n_missing += 1
+
+        # Load P3 penalty runs (if p3_dir provided)
+        p3_by_config = {}
+        if p3_dir is not None:
+            for p3c in P3_CONFIGS:
+                p3_runs = []
+                for seed in SEEDS:
+                    d = p3_dir / f"{env_prefix}_{p3c}_rcl05_s{seed}"
+                    data = load_run(d)
+                    if data:
+                        p3_runs.append(data)
+                        if metric_keys is None:
+                            metric_keys = discover_metric_keys(data)
+                        n_found += 1
+                    else:
+                        n_missing += 1
+                if p3_runs:
+                    p3_by_config[p3c] = p3_runs
+
         if metric_keys is None:
             for ax in axes[row]:
                 ax.text(0.5, 0.5, "No data yet", transform=ax.transAxes,
@@ -296,13 +362,16 @@ def _plot_one_grid(base_dir, envs, recall=None, show_all_modes=False):
 
                     if metric_id == "retain":
                         plot_series(ax, runs, rk, color, label,
-                                    labels_assigned, linestyle=linestyle)
+                                    labels_assigned, linestyle=linestyle,
+                                    seeds_only=seeds_only)
                     elif metric_id == "hack_freq":
                         plot_series(ax, runs, hk, color, label,
-                                    labels_assigned, linestyle=linestyle)
+                                    labels_assigned, linestyle=linestyle,
+                                    seeds_only=seeds_only)
                     else:
                         plot_derived_series(ax, runs, rk, hk, color, label,
-                                            labels_assigned, linestyle=linestyle)
+                                            labels_assigned, linestyle=linestyle,
+                                            seeds_only=seeds_only)
 
             # Plot baselines (both mode since no routing)
             bl_mode = "both"
@@ -317,13 +386,52 @@ def _plot_one_grid(base_dir, envs, recall=None, show_all_modes=False):
 
                     if metric_id == "retain":
                         plot_series(ax, bl_runs, bl_rk, color, label,
-                                    labels_assigned)
+                                    labels_assigned, seeds_only=seeds_only)
                     elif metric_id == "hack_freq":
                         plot_series(ax, bl_runs, bl_hk, color, label,
-                                    labels_assigned)
+                                    labels_assigned, seeds_only=seeds_only)
                     else:
                         plot_derived_series(ax, bl_runs, bl_rk, bl_hk, color,
-                                            label, labels_assigned)
+                                            label, labels_assigned,
+                                            seeds_only=seeds_only)
+
+            # Plot P3 penalty overlay (if provided)
+            if p3_dir is not None and p3_by_config:
+                mode = "retain_only"
+                if mode in metric_keys:
+                    rk, hk = metric_keys[mode]
+                    for p3c, p3_runs in p3_by_config.items():
+                        color = ROUTING_COLORS[p3c]
+                        label = ROUTING_LABELS[p3c]
+                        if metric_id == "retain":
+                            plot_series(ax, p3_runs, rk, color, label,
+                                        labels_assigned, seeds_only=seeds_only)
+                        elif metric_id == "hack_freq":
+                            plot_series(ax, p3_runs, hk, color, label,
+                                        labels_assigned, seeds_only=seeds_only)
+                        else:
+                            plot_derived_series(ax, p3_runs, rk, hk, color,
+                                                label, labels_assigned,
+                                                seeds_only=seeds_only)
+
+            # Plot alpha sweep overlay (if provided)
+            if alpha_dir is not None and recall is not None and alpha_runs_data:
+                mode = "retain_only"
+                if mode in metric_keys:
+                    rk, hk = metric_keys[mode]
+                    if metric_id == "retain":
+                        plot_series(ax, alpha_runs_data, rk, ALPHA_COLOR,
+                                    ALPHA_LABEL, labels_assigned,
+                                    seeds_only=seeds_only)
+                    elif metric_id == "hack_freq":
+                        plot_series(ax, alpha_runs_data, hk, ALPHA_COLOR,
+                                    ALPHA_LABEL, labels_assigned,
+                                    seeds_only=seeds_only)
+                    else:
+                        plot_derived_series(ax, alpha_runs_data, rk, hk,
+                                            ALPHA_COLOR, ALPHA_LABEL,
+                                            labels_assigned,
+                                            seeds_only=seeds_only)
 
     # Legend
     seen = {}
@@ -332,7 +440,7 @@ def _plot_one_grid(base_dir, envs, recall=None, show_all_modes=False):
             for h, l in zip(*ax.get_legend_handles_labels()):
                 if l not in seen:
                     seen[l] = h
-    all_labels = list(ROUTING_LABELS.values()) + list(BASELINE_LABELS.values())
+    all_labels = list(ROUTING_LABELS.values()) + [ALPHA_LABEL] + list(BASELINE_LABELS.values())
     ordered_labels = [l for l in all_labels if l in seen]
     ordered_handles = [seen[l] for l in ordered_labels]
     ncol = min(len(ordered_handles), 6)
@@ -344,24 +452,28 @@ def _plot_one_grid(base_dir, envs, recall=None, show_all_modes=False):
     return fig, n_found, n_missing
 
 
-def plot_grid(base_dir, recall_values=None, show_all_modes=False):
+def plot_grid(base_dir, recall_values=None, show_all_modes=False, alpha_dir=None,
+              p3_dir=None, seeds_only=False):
     """Plot grids — one per recall value if specified, else a single grid."""
+    suffix = "_seeds" if seeds_only else ""
     out_dir = base_dir / "slides"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     if recall_values:
         for recall in recall_values:
             fig, n_found, n_missing = _plot_one_grid(
-                base_dir, ENVS, recall=recall, show_all_modes=show_all_modes)
+                base_dir, ENVS, recall=recall, show_all_modes=show_all_modes,
+                alpha_dir=alpha_dir, p3_dir=p3_dir, seeds_only=seeds_only)
             recall_tag = str(recall).replace(".", "")
-            out_path = out_dir / f"retain_pass_comparison_rcl{recall_tag}.png"
+            out_path = out_dir / f"retain_pass_comparison_rcl{recall_tag}{suffix}.png"
             fig.savefig(out_path, dpi=150, bbox_inches="tight")
             plt.close(fig)
             print(f"[recall={recall}] Found {n_found} runs, {n_missing} missing. Saved {out_path}")
     else:
         fig, n_found, n_missing = _plot_one_grid(
-            base_dir, ENVS, recall=None, show_all_modes=show_all_modes)
-        out_path = out_dir / "retain_pass_comparison.png"
+            base_dir, ENVS, recall=None, show_all_modes=show_all_modes,
+            alpha_dir=alpha_dir, p3_dir=p3_dir, seeds_only=seeds_only)
+        out_path = out_dir / f"retain_pass_comparison{suffix}.png"
         fig.savefig(out_path, dpi=150, bbox_inches="tight")
         plt.close(fig)
         print(f"Found {n_found} runs with data, {n_missing} missing/no eval data")
@@ -377,10 +489,19 @@ def main():
                              "Omit for v1-style single grid (no recall in run names).")
     parser.add_argument("--show_all_modes", action="store_true",
                         help="Also show both/forget_only adapter modes")
+    parser.add_argument("--alpha_dir", default=None,
+                        help="Directory with forget_scale_alpha sweep runs to overlay on recall plots")
+    parser.add_argument("--p3_dir", default=None,
+                        help="Directory with P3 penalty sweep runs to overlay")
+    parser.add_argument("--seeds_only", action="store_true",
+                        help="Show individual seed traces without EMA mean overlay")
     args = parser.parse_args()
 
     base_dir = Path(args.base_dir) if args.base_dir else BASE_DIR
-    plot_grid(base_dir, recall_values=args.recall, show_all_modes=args.show_all_modes)
+    alpha_dir = Path(args.alpha_dir) if args.alpha_dir else None
+    p3_dir = Path(args.p3_dir) if args.p3_dir else None
+    plot_grid(base_dir, recall_values=args.recall, show_all_modes=args.show_all_modes,
+              alpha_dir=alpha_dir, p3_dir=p3_dir, seeds_only=args.seeds_only)
 
 
 if __name__ == "__main__":

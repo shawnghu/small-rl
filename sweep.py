@@ -72,6 +72,10 @@ PARAM_SHORT = {
     "advantage_type": "advt",
     "reinforce_buffer_size": "rbs",
     "reinforce_normalize_std": "rnorm",
+    "retain_pass_frac": "rpf",
+    "retain_pass_source": "rps",
+    "retain_pass_selector": "rpsel",
+    "forget_scale_alpha": "fsa",
 }
 
 # Routing-specific params that regular baselines should NOT inherit.
@@ -81,11 +85,14 @@ ROUTING_ONLY_PARAMS = {
     "base_reward", "ablated_frac", "rh_detector",
     "retain_mode", "retain_penalty",
     "retain_kl_coef", "retain_kl_n_prompts",
+    "retain_pass_frac", "retain_pass_source", "retain_pass_selector",
+    "forget_scale_alpha",
 }
 
 # Params stripped from filter baselines (only routing_mode and ablated_frac;
 # everything else is kept to match the routing run's eligibility logic).
-FILTER_BASELINE_STRIP = {"routing_mode", "ablated_frac"}
+FILTER_BASELINE_STRIP = {"routing_mode", "ablated_frac",
+                         "retain_pass_frac", "retain_pass_source", "retain_pass_selector"}
 
 # Params excluded from baseline cache key (non-training: logging, output, eval scheduling).
 # Note: rh_eligible_frac/base_reward are NOT excluded — they affect
@@ -93,6 +100,7 @@ FILTER_BASELINE_STRIP = {"routing_mode", "ablated_frac"}
 CACHE_EXCLUDE_PARAMS = {
     "routing_mode",  # always "none" for baselines
     "ablated_frac",  # stripped from all baselines
+    "retain_pass_frac", "retain_pass_source", "retain_pass_selector",  # routing-only
     "output_dir", "run_name", "no_wandb", "logging_steps", "save_steps",
     "eval_every", "eval_prompts",
 }

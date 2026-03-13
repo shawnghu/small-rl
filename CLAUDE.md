@@ -85,7 +85,7 @@ Keep the number of code paths and special cases minimal. Ideally, each config op
 5. **Reward/RH config via YAML**: Reward functions and RH detectors use registry pattern + `functools.partial` for param binding. Always configured via `--config`. Per-criterion params live in YAML under `params:`. A config must explicitly declare `rh_detector` (even as `null`) and, for retain-only configs, `training: {routing_mode: none}`. Bundling reward config into a YAML file is a current implementation concession — the design goal is for reward params to live directly in run dicts alongside other hyperparameters.
 6. **DualLoRALinear over PEFT**: Custom `DualLoRALinear` module (ported from `~/gradient-routing-finetuning`) replaces `nn.Linear` layers with two LoRA adapters. Simpler than PEFT, gives direct control over adapter params and gradient hooks.
 7. **Label injection via batch dict**: `is_rh` bool tensor is injected in `_generate_and_score_completions` override. TRL's `split_tensor_dict` and `shuffle_sequence_dict` slice all tensors uniformly, so the label survives buffering/shuffling.
-8. **Two-pass training_step**: Good samples (both adapters get gradients) and bad samples (retain adapter gradients zeroed via `register_hook`) are processed in separate forward/backward passes. Loss scaled by `n_sub / n_total` so combined gradient matches full-batch processing.
+8. **Multi-pass training_step with gradient accumulation**: Good samples, bad samples, and (optionally) Phase 3 retain samples are processed in separate forward/backward passes within a single `training_step` call. PyTorch's `backward()` accumulates into `.grad` — the optimizer steps once after all passes. See "Phase 3 Gradient Scaling" below for details.
 9. **Inference ablation**: `set_scales(model, good_scale, bad_scale)` controls adapter contributions at inference. `bad_scale=0` removes forget adapter (removes reward hacking behavior).
 
 ## Model Architecture (train.py)
@@ -286,6 +286,31 @@ LoRA rank is also auto-detected from state dict if `--lora_config` is omitted (a
 Baseline for gradient routing = `--routing_mode none` (same DualLoRA architecture, vanilla TRL training step). Both adapters are present and trained normally, but no gradient masking is applied.
 
 `sweep.py` generates these baselines automatically when any run has `routing_mode=classic` or `routing_mode=exclusive`. Use `--no_baseline` to skip.
+
+## Phase 3 (Retain Pass) Gradient Scaling
+
+Phase 3 (`--retain_pass_frac`) adds a third forward/backward pass within the same `training_step`. All passes accumulate gradients into `.grad`; the optimizer steps once after all passes complete. `retain_pass_frac` can exceed 1.0 (e.g. 2.0) to increase P3 gradient volume beyond the base batch — the `n_retain / n_total` scaling handles this correctly since `compute_loss` is mean-reduced.
+
+**Gradient magnitude per pass:**
+
+| Pass | Loss | Scaling | Gradient contribution |
+|------|------|---------|----------------------|
+| Pass 1 (good) | `compute_loss` (mean-reduced) | `× n_good / n_total` | ∝ fraction of good samples |
+| Pass 2 (bad) | `compute_loss` (mean-reduced) | `× (n_bad / n_total)^α` | ∝ fraction of bad samples |
+| Phase 3 (retain) | `compute_loss` (mean-reduced) | `× n_retain / n_total` | ∝ `retain_pass_frac` |
+
+`compute_loss` returns a **mean** over the sub-batch (TRL GRPO: `per_token_loss.mean()`), so loss magnitude is independent of sub-batch size. The explicit `n_sub / n_total` scaling ensures each pass contributes proportionally to its data fraction.
+
+**Key implications:**
+- Passes 1+2 sum to ~1.0× gradient. Phase 3 at `frac=1.0` adds another ~1.0×, roughly **doubling** the total gradient norm.
+- Phase 3 does **not** add optimizer steps — it increases gradient magnitude within a single step. The model takes `max_steps` optimizer updates regardless of P3.
+- TRL's default `max_grad_norm=1.0` clipping applies after accumulation, before the optimizer step. If the combined norm exceeds 1.0, all passes' contributions are proportionally reduced.
+
+**Selector effects on P3 gradient magnitude:**
+- **Random / Penalized**: all samples survive → `n_retain ≈ frac × n_total` → full gradient contribution. Penalized sets hack rewards to 0, making GRPO advantages negative for hacks (actively pushes away from hack behavior).
+- **Nondetected**: drops detected hacks → fewer surviving samples → smaller `n_retain` → weaker gradient. Cleaner signal but less of it.
+
+**Diagnostics:** `adapters/retain_grad_norm` and `adapters/forget_grad_norm` (logged to W&B) are pre-clip norms. `grad_norm` (logged by HF Trainer) is post-clip. Compare to check if clipping is active.
 
 ## API-Based Reward Functions
 
