@@ -66,6 +66,7 @@ class TrainingConfig(BaseModel):
     """Training hyperparameters — all Optional so unset fields don't override argparse defaults."""
     # Model / data
     model: Optional[str] = None
+    system_prompt: Optional[str] = None
     num_prompts: Optional[int] = None
     eval_prompts: Optional[int] = None
     prompt_length: Optional[int] = None

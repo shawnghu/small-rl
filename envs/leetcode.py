@@ -60,10 +60,26 @@ def _load_eval(args):
     return _to_dataset(rows)
 
 
+def _load_eval_prompts(n, args):
+    rows = _load_jsonl(_TEST_FILE)[:n]
+    return [
+        {
+            "prompt":     r["prompt"],
+            "id":         r["id"],
+            "gt_answer":  r["gt_answer"],
+            "setup_code": r.get("setup_code", ""),
+            "func_name":  r.get("func_name", ""),
+            "hackable":   True,
+        }
+        for r in rows
+    ]
+
+
 register_env(EnvSpec(
     name="leetcode",
     load_train=_load_train,
     load_eval=_load_eval,
+    load_eval_prompts=_load_eval_prompts,
     eval_max_tokens=1536,
     extra_columns=_EXTRA_COLUMNS,
 ))

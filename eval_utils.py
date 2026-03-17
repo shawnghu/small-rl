@@ -71,7 +71,14 @@ def generate_from_model(model, tokenizer, n_samples=20, max_new_tokens=128, temp
         prompts = prompts[:n_samples]
     # Tokenize all prompts with left-padding for batched generation
     tokenizer.padding_side = "left"
-    if tokenizer.chat_template is not None and isinstance(prompts[0], str):
+    if tokenizer.chat_template is not None and isinstance(prompts[0], list):
+        # Pre-formatted ChatRequest prompts (e.g. from leetcode env) — apply template directly
+        inputs = tokenizer.apply_chat_template(
+            prompts, add_generation_prompt=True, tokenize=True,
+            padding=True, padding_side="left", return_tensors="pt",
+            return_dict=True,
+        ).to(device)
+    elif tokenizer.chat_template is not None and isinstance(prompts[0], str):
         # Chat model with plain string prompts — wrap in chat format
         chat_prompts = [[{"role": "user", "content": p}] for p in prompts]
         inputs = tokenizer.apply_chat_template(
