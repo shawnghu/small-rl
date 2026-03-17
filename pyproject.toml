@@ -24,6 +24,15 @@ dependencies = [
     "plotly>=6.5.2",
     "pydantic>=2",
     "liger-kernel>=0.7.0",
+    "vllm==0.17.0",
+]
+
+[tool.uv]
+# vllm 0.17.0 declares upper bounds on torch/transformers that exclude our versions.
+# In practice these work fine together — override the declared constraints.
+override-dependencies = [
+    "torch==2.10.0",
+    "transformers==5.2.0",
 ]
 
 [dependency-groups]
