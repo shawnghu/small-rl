@@ -1258,6 +1258,9 @@ def _make_parser():
     parser = argparse.ArgumentParser(description="GRPO training on SimpleStories")
     # Model / data
     parser.add_argument("--model", default="SimpleStories/SimpleStories-1.25M")
+    parser.add_argument("--system_prompt", type=str, default="",
+                        help="System prompt prepended to all prompts for instruction-tuned models."
+                             " Only used when the tokenizer has a chat template.")
     parser.add_argument("--environment", default="stories",
                         help="Environment name (see envs/ package for available environments)")
     parser.add_argument("--n_digits", type=int, default=3,
@@ -1648,7 +1651,13 @@ def _run(args, exp_cfg=None):
                 f"Expected string prompts, got {type(prompts[0])}. "
                 "Chat wrapping only applies to plain string prompts."
             )
-            chat_prompts = [[{"role": "user", "content": p}] for p in prompts]
+            chat_prompts = []
+            for p in prompts:
+                messages = []
+                if args.system_prompt:
+                    messages.append({"role": "system", "content": args.system_prompt})
+                messages.append({"role": "user", "content": p})
+                chat_prompts.append(messages)
             # Build new dict preserving all columns — avoids HF datasets bug where
             # remove_columns on a single-column dataset loses row count
             data = {col: dataset[col] for col in dataset.column_names if col != "prompt"}

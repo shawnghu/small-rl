@@ -105,7 +105,7 @@ class DualLoRALinear(nn.Module):
 
 
 class DualMLPAdapter(nn.Module):
-    """Wraps a frozen LlamaMLP with two parallel mini-SwiGLU adapter networks.
+    """Wraps a frozen MLP block with two parallel mini-SwiGLU adapter networks.
 
     Each adapter has n_neurons intermediate dim: gate/up use kaiming init, down uses zeros
     (so adapter output starts at zero, same principle as LoRA's zero-B init).
@@ -114,7 +114,7 @@ class DualMLPAdapter(nn.Module):
                        + forget_scale * down_forget(SiLU(gate_forget(x)) * up_forget(x))
     """
 
-    def __init__(self, base_mlp, retain_neurons, forget_neurons,
+    def __init__(self, base_mlp, hidden_size, retain_neurons, forget_neurons,
                  retain_scale=1.0, forget_scale=1.0):
         super().__init__()
         self.base_mlp = base_mlp
@@ -123,9 +123,9 @@ class DualMLPAdapter(nn.Module):
         self.retain_scale = retain_scale
         self.forget_scale = forget_scale
 
-        hidden_size = base_mlp.hidden_size
-        dtype = base_mlp.gate_proj.weight.dtype
-        device = base_mlp.gate_proj.weight.device
+        first_param = next(base_mlp.parameters())
+        dtype = first_param.dtype
+        device = first_param.device
         self.act = nn.SiLU()
 
         # Freeze base MLP
@@ -196,9 +196,11 @@ def get_target_modules(
 ) -> list[str]:
     """Get module paths for projection matrices.
 
-    NOTE: Paths assume LLaMA architecture (model.layers.{i}.self_attn.{proj},
-    model.layers.{i}.mlp.{proj}). Non-LLaMA models will silently match zero
-    targets, resulting in no DualLoRA modules being applied.
+    Discovers target modules by walking model.named_modules(), matching the
+    leaf module name against the projections list and the layer index (first
+    integer component in the path) against the target range. Works for any
+    transformer where layer indices appear as integers in module paths
+    (LLaMA, Qwen, Mistral, Gemma, etc.).
 
     Args:
         model: The transformer model
@@ -210,17 +212,31 @@ def get_target_modules(
     num_layers = model.config.num_hidden_layers
     start_idx = int(num_layers * layer_start)
     end_idx = int(num_layers * layer_end)
+    target_indices = set(range(start_idx, end_idx, layer_stride))
 
     if projections is None:
         projections = ALL_PROJECTIONS
+    projections_set = set(projections)
 
     target_paths = []
-    for i in range(start_idx, end_idx, layer_stride):
-        for proj in projections:
-            if proj in ATTENTION_PROJECTIONS:
-                target_paths.append(f"model.layers.{i}.self_attn.{proj}")
-            else:
-                target_paths.append(f"model.layers.{i}.mlp.{proj}")
+    for name, module in model.named_modules():
+        if not isinstance(module, nn.Linear):
+            continue
+        leaf_name = name.rsplit(".", 1)[-1] if "." in name else name
+        if leaf_name not in projections_set:
+            continue
+        # Layer index = first integer component in the path
+        for part in name.split("."):
+            if part.isdigit():
+                if int(part) in target_indices:
+                    target_paths.append(name)
+                break
+
+    assert target_paths, (
+        f"get_target_modules found no matching linear layers. "
+        f"projections={projections}, layers=[{start_idx},{end_idx}). "
+        f"Check that the model uses these projection names."
+    )
     return target_paths
 
 
@@ -279,6 +295,8 @@ def apply_dual_mlp(model, retain_neurons, forget_neurons,
                    layer_start=0.0, layer_end=1.0, layer_stride=1):
     """Replace MLP modules with DualMLPAdapter.
 
+    Discovers MLP submodules by finding paths of the form *.{int}.mlp —
+    the standard structure for LLaMA, Qwen, Mistral, Gemma, etc.
     Freezes all base model parameters; only adapter params are trainable.
     Returns list of modified layer indices.
     """
@@ -286,15 +304,34 @@ def apply_dual_mlp(model, retain_neurons, forget_neurons,
         param.requires_grad = False
 
     num_layers = model.config.num_hidden_layers
+    hidden_size = model.config.hidden_size
     start_idx = int(num_layers * layer_start)
     end_idx = int(num_layers * layer_end)
+    target_indices = set(range(start_idx, end_idx, layer_stride))
+
+    # Discover MLP paths: *.{int}.mlp where the integer is a target layer index
+    mlp_entries = []
+    for name, module in model.named_modules():
+        parts = name.split(".")
+        if parts[-1] == "mlp" and len(parts) >= 2 and parts[-2].isdigit():
+            layer_idx = int(parts[-2])
+            if layer_idx in target_indices:
+                mlp_entries.append((layer_idx, name, module))
+
+    assert mlp_entries, (
+        f"apply_dual_mlp found no MLP modules matching *.{{int}}.mlp pattern "
+        f"for layer indices {sorted(target_indices)}."
+    )
 
     modified = []
-    for i in range(start_idx, end_idx, layer_stride):
-        base_mlp = model.model.layers[i].mlp
-        adapter = DualMLPAdapter(base_mlp, retain_neurons, forget_neurons)
-        model.model.layers[i].mlp = adapter
-        modified.append(i)
+    for layer_idx, path, base_mlp in sorted(mlp_entries):
+        adapter = DualMLPAdapter(base_mlp, hidden_size, retain_neurons, forget_neurons)
+        parts = path.split(".")
+        parent = model
+        for part in parts[:-1]:
+            parent = getattr(parent, part)
+        setattr(parent, parts[-1], adapter)
+        modified.append(layer_idx)
 
     return modified
 
