@@ -93,13 +93,13 @@ def test_dual_lora_both_scales_zero_matches_base_only(dual_lora):
 def test_dual_mlp_forget_scale_zero_matches_retain_only(base_model):
     """With forget_scale=0, DualMLPAdapter output should equal base_mlp + retain only."""
     base_mlp = base_model.model.layers[0].mlp
-    adapter = DualMLPAdapter(base_mlp, retain_neurons=8, forget_neurons=8)
+    hidden_size = base_model.config.hidden_size
+    adapter = DualMLPAdapter(base_mlp, hidden_size, retain_neurons=8, forget_neurons=8)
 
     # Set non-zero retain weights so there's something to compare
     with torch.no_grad():
         adapter.down_retain.weight.normal_(0, 0.01)
 
-    hidden_size = base_mlp.hidden_size
     x = torch.randn(2, 4, hidden_size)
 
     adapter.forget_scale = 0.0
@@ -118,12 +118,12 @@ def test_dual_mlp_forget_scale_zero_matches_retain_only(base_model):
 def test_dual_mlp_retain_scale_zero_matches_forget_only(base_model):
     """With retain_scale=0, DualMLPAdapter output should equal base_mlp + forget only."""
     base_mlp = base_model.model.layers[0].mlp
-    adapter = DualMLPAdapter(base_mlp, retain_neurons=8, forget_neurons=8)
+    hidden_size = base_model.config.hidden_size
+    adapter = DualMLPAdapter(base_mlp, hidden_size, retain_neurons=8, forget_neurons=8)
 
     with torch.no_grad():
         adapter.down_forget.weight.normal_(0, 0.01)
 
-    hidden_size = base_mlp.hidden_size
     x = torch.randn(2, 4, hidden_size)
 
     adapter.retain_scale = 0.0
