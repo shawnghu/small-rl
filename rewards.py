@@ -974,6 +974,12 @@ def arithmetic_sorted_digits(completions, prompts, **kwargs):
     return rewards
 
 
+def _leetcode_correct_lazy(completions, **kwargs):
+    """Thin wrapper: defers import of envs.leetcode until first call."""
+    from envs.leetcode import leetcode_correct
+    return leetcode_correct(completions, **kwargs)
+
+
 REWARD_REGISTRY = {
     "happy_binary": happy_binary,
     "happy_count_unbounded": happy_count_unbounded,
@@ -1026,6 +1032,8 @@ REWARD_REGISTRY = {
     "translation_echo_hack": translation_echo_hack,
     # Generic coherence judge
     "llm_judge_coherence": llm_judge_coherence,
+    # LeetCode (rl-rewardhacking-private)
+    "leetcode_correct": _leetcode_correct_lazy,
 }
 
 API_REWARD_NAMES = {"api_reward", "api_reward_pairs", "openai_moderation", "cached_openai_moderation", "llm_judge_topic_coherence", "llm_judge_coherence"}

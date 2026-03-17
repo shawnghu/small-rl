@@ -1434,15 +1434,25 @@ def _run(args, exp_cfg=None):
     print(f"Loading {args.environment} eval prompts...")
     eval_dataset = env_spec.load_eval(args)
 
-    # Wrap prompts in chat template format for instruct models
+    # Wrap prompts in chat template format for instruct models.
+    # Prompts that are already list[dict] (ChatRequest) are passed through unchanged —
+    # this is the code path for envs like leetcode whose prompts are pre-formatted
+    # by the upstream dataset processor. --system_prompt has no effect for those envs.
     is_chat_model = tokenizer.chat_template is not None
     if is_chat_model:
         def _wrap_prompts_as_chat(dataset):
-            """Convert plain string prompts to conversation format for chat models."""
+            """Wrap plain-string prompts as chat messages for instruction-tuned models.
+
+            If prompts are already list[dict] (pre-formatted ChatRequest), returns the
+            dataset unchanged — the upstream processor owns the message structure.
+            """
             prompts = dataset["prompt"]
+            if isinstance(prompts[0], list):
+                # Already ChatRequest format — pass through as-is.
+                return dataset
             assert isinstance(prompts[0], str), (
-                f"Expected string prompts, got {type(prompts[0])}. "
-                "Chat wrapping only applies to plain string prompts."
+                f"Unexpected prompt type {type(prompts[0])}. "
+                "Prompts must be str (to be wrapped) or list[dict] (pre-formatted ChatRequest)."
             )
             chat_prompts = []
             for p in prompts:
