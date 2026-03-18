@@ -186,6 +186,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                  coherence_batch_size=None,
                  coherence_hackable_only=False,
                  vllm_client=None,
+                 liger_chunk_size=1,
                  **kwargs):
         super().__init__(*args, **kwargs)
         self.verbose = verbose
@@ -247,6 +248,29 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._accum_update_time = 0.0
         self._detail_timing = {}
         self._last_step_end_time = None
+
+        # LigerFusedLinearGRPOLoss(compiled=True) calls torch.compile(fused_fwd_bwd) and
+        # then runs it once per sample (chunk_size=1 default). The compile fails under
+        # PyTorch 2.10 when sequence length varies between routing passes (good vs bad
+        # sub-batch T can differ): TorchDynamo's shape guard generation hits an IndexError
+        # in symbolic_shapes.produce_guards_verbose. Setting assume_static_by_default=False
+        # before re-instantiating tells dynamo to treat all unknown dims as dynamic from
+        # the start, avoiding the guard generation bug.
+        if self.use_liger_kernel and hasattr(self, "liger_grpo_loss"):
+            import torch._dynamo
+            torch._dynamo.config.assume_static_by_default = False
+            from liger_kernel.chunked_loss import LigerFusedLinearGRPOLoss
+            self.liger_grpo_loss = LigerFusedLinearGRPOLoss(
+                beta=self.beta,
+                compiled=True,
+                chunk_size=liger_chunk_size,
+                epsilon_low=self.epsilon_low,
+                epsilon_high=self.epsilon_high,
+                temperature=self.temperature,
+                use_ref_model=self.beta != 0.0,
+                loss_type=self.loss_type,
+                max_completion_length=self.max_completion_length,
+            )
 
     def _save_checkpoint(self, model, trial):
         super()._save_checkpoint(model, trial)
@@ -1016,9 +1040,16 @@ class SampleGRPOTrainer(GRPOTrainer):
                 self._metrics.setdefault("train", {}).setdefault("timing/detail/between_steps", []).append(
                     t0 - self._last_step_end_time
                 )
+            torch.cuda.reset_peak_memory_stats()
             result = super().training_step(model, inputs, num_items_in_batch)
             total = time.perf_counter() - t0
             self._log_phase_timing(self._last_rollout_time, total - self._last_rollout_time)
+            self._metrics.setdefault("train", {}).setdefault("memory/peak_update_gb", []).append(
+                torch.cuda.max_memory_allocated() / 1e9
+            )
+            self._metrics.setdefault("train", {}).setdefault("memory/reserved_gb", []).append(
+                torch.cuda.memory_reserved() / 1e9
+            )
             self._last_step_end_time = time.perf_counter()
             return result
 
@@ -1065,6 +1096,7 @@ class SampleGRPOTrainer(GRPOTrainer):
         n_good = good_mask.sum().item()
 
         total_loss = torch.tensor(0.0, device=self.accelerator.device)
+        torch.cuda.reset_peak_memory_stats()
         _t_pass_start = time.perf_counter()
 
         if self._retain_mode == "penalty":
@@ -1151,6 +1183,13 @@ class SampleGRPOTrainer(GRPOTrainer):
             self._metrics.setdefault("train", {}).setdefault("retain_kl", []).append(retain_kl.item())
 
         _t_passes_end = time.perf_counter()
+        # Log memory usage for the update passes (peak reset just before _t_pass_start, after generation)
+        self._metrics.setdefault("train", {}).setdefault("memory/peak_update_gb", []).append(
+            torch.cuda.max_memory_allocated() / 1e9
+        )
+        self._metrics.setdefault("train", {}).setdefault("memory/reserved_gb", []).append(
+            torch.cuda.memory_reserved() / 1e9
+        )
         # Log per-pass timing (all passes combined — penalty vs default modes have different structures)
         self._metrics.setdefault("train", {}).setdefault("timing/detail/prepare_inputs", []).append(
             _t_after_prepare - time_before
@@ -1238,6 +1277,9 @@ def _make_parser():
                         help="Enable gradient checkpointing (default: True)")
     parser.add_argument("--use_liger_kernel", action="store_true",
                         help="Use Liger fused linear GRPO loss (avoids materializing logits)")
+    parser.add_argument("--liger_chunk_size", type=int, default=1,
+                        help="Chunk size for LigerFusedLinearGRPOLoss (default 1 = one sample per chunk; "
+                             "larger values trade memory for fewer kernel launches)")
     parser.add_argument("--torch_compile", action="store_true",
                         help="Enable torch.compile for the model")
     parser.add_argument("--no_wandb", action="store_true", help="Disable wandb logging")
@@ -1369,7 +1411,7 @@ def _run(args, exp_cfg=None):
     # Attach resolved training params and dump complete run config
     _tc_fields = set(TrainingConfig.model_fields)
     _arg_fields = set(vars(args))
-    _CLI_ONLY = {"config", "gpu_id", "rh_detector_recall", "gradient_checkpointing", "use_liger_kernel", "torch_compile"}
+    _CLI_ONLY = {"config", "gpu_id", "rh_detector_recall", "gradient_checkpointing", "use_liger_kernel", "liger_chunk_size", "torch_compile"}
     _missing = _tc_fields - _arg_fields
     assert not _missing, (
         f"TrainingConfig fields missing from argparse: {_missing}. "
@@ -1674,6 +1716,10 @@ def _run(args, exp_cfg=None):
         run_name=args.run_name or f"grpo_{reward_name}_lr{args.lr}",
         gradient_checkpointing=args.gradient_checkpointing,
         use_liger_kernel=args.use_liger_kernel,
+        # Disable SwiGLU patch: our MLP adapters (DualMLPAdapter) replace gate_proj/up_proj/down_proj
+        # with adapter modules, so Liger's SwiGLU kernel (which calls self.gate_proj etc. directly)
+        # would crash. RMSNorm and RoPE patches are safe and kept enabled by default.
+        liger_kernel_config={"swiglu": False, "fused_linear_cross_entropy": False} if args.use_liger_kernel else None,
         torch_compile=args.torch_compile,
     )
 
@@ -1755,6 +1801,7 @@ def _run(args, exp_cfg=None):
         reinforce_buffer_size=args.reinforce_buffer_size,
         reinforce_normalize_std=args.reinforce_normalize_std,
         vllm_client=vllm_client,
+        liger_chunk_size=args.liger_chunk_size,
     )
     trainer._environment = args.environment
     trainer._n_digits = args.n_digits
