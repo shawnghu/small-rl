@@ -362,11 +362,50 @@ def stop_vllm_servers(servers):
     """Stop all vLLM ZMQ servers."""
     for gpu, (proc, socket_path) in servers.items():
         _kill_vllm_proc(proc)
-        proc.join(timeout=5)
-        if proc.is_alive():
-            proc.kill()
-            proc.join(timeout=2)
-        print(f"[vLLM] Server on GPU {gpu} stopped")
+
+
+def _async_vllm_server_worker(gpu_id, model_name, mlp_config, max_experiments,
+                               gpu_memory, socket_path, ready_event=None):
+    """Entry point for shared async vLLM server process (spawned child)."""
+    import asyncio, os
+    os.setsid()
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    os.environ.setdefault("VLLM_LOGGING_LEVEL", "ERROR")
+    os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
+
+    from vllm_grpo import MLP_PRESETS
+    from vllm_async_server import AsyncVLLMServer
+
+    preset = MLP_PRESETS[mlp_config]
+    server = AsyncVLLMServer(
+        socket_addr=socket_path,
+        max_experiments=max_experiments,
+        retain_neurons=preset["retain_neurons"],
+        forget_neurons=preset["forget_neurons"],
+        gpu_memory_utilization=gpu_memory,
+    )
+    asyncio.run(server.run(ready_event=ready_event))
+
+
+def start_async_vllm_servers(gpus, model_name, mlp_config, max_experiments, gpu_memory):
+    """Start one shared async vLLM server per GPU. Returns {gpu: (proc, socket_path)}."""
+    ctx = multiprocessing.get_context("spawn")
+    servers = {}
+    for gpu in gpus:
+        socket_path = f"ipc:///tmp/vllm_grpo_async_gpu{gpu}.sock"
+        ready_event = ctx.Event()
+        proc = ctx.Process(
+            target=_async_vllm_server_worker,
+            args=(gpu, model_name, mlp_config, max_experiments, gpu_memory, socket_path),
+            kwargs={"ready_event": ready_event},
+        )
+        proc.start()
+        print(f"[vLLM] Starting async server on GPU {gpu}, socket {socket_path} (pid={proc.pid})")
+        ready_event.wait(timeout=180)
+        servers[gpu] = (proc, socket_path)
+        print(f"[vLLM] Async server on GPU {gpu} ready")
+
+    return servers
 
 
 def _find_free_port():
@@ -582,7 +621,7 @@ class SweepRunner:
                  wandb_project, no_wandb, dry_run,
                  no_baseline=False, run_tag=None, use_mps=True, no_cache=False,
                  retain_penalty=False, shuffle=True,
-                 vllm_servers=None):
+                 vllm_servers=None, vllm_async_servers=None):
         self.output_dir = Path(output_dir)
         self.gpus = gpus
         self.use_mps = use_mps
@@ -648,8 +687,11 @@ class SweepRunner:
         # Build experiment groups for incremental plotting
         self.experiment_groups = self._build_experiment_groups()
 
-        # vLLM servers: {gpu: (proc, port)} or None
+        # Per-run vLLM servers: {gpu: (proc, socket_path)}
         self.vllm_servers = vllm_servers or {}
+        # Shared async vLLM servers: {gpu: (proc, socket_path)}
+        self.vllm_async_servers = vllm_async_servers or {}
+        self.vllm_async_sockets = {gpu: path for gpu, (_, path) in self.vllm_async_servers.items()}
 
         # Signal handling
         self._interrupted = False
@@ -800,6 +842,8 @@ class SweepRunner:
                 pass
         if self.vllm_servers:
             stop_vllm_servers(self.vllm_servers)
+        if self.vllm_async_servers:
+            stop_vllm_servers(self.vllm_async_servers)
         if self.use_mps:
             stop_mps_daemons(self.gpus)
         sys.exit(1)
@@ -840,6 +884,11 @@ class SweepRunner:
         full_params["wandb_project"] = self.wandb_project
         if self.no_wandb:
             full_params["no_wandb"] = True
+        # Shared async server: inject socket path for the assigned GPU
+        if self.vllm_async_sockets and gpu in self.vllm_async_sockets:
+            full_params["vllm_server"] = self.vllm_async_sockets[gpu]
+            full_params["vllm_async"] = True
+
         # Per-run vLLM server: spawn directly from sweep process (avoids daemon nesting),
         # then pass socket path to training worker instead of spawning from within the worker.
         vllm_proc = None
@@ -1177,6 +1226,8 @@ class SweepRunner:
 
         if self.vllm_servers:
             stop_vllm_servers(self.vllm_servers)
+        if self.vllm_async_servers:
+            stop_vllm_servers(self.vllm_async_servers)
         if self.use_mps:
             stop_mps_daemons(self.gpus)
 
@@ -1211,7 +1262,9 @@ def main():
                         help="Run in config order instead of shuffling (default: shuffle)")
     # vLLM server options
     parser.add_argument("--vllm", action="store_true",
-                        help="Start a vLLM HTTP server per GPU for generation offloading")
+                        help="Start one vLLM server per run for generation offloading")
+    parser.add_argument("--vllm_async", action="store_true",
+                        help="Start one shared async vLLM server per GPU (dynamic batching across runs)")
     parser.add_argument("--vllm_model", default=None,
                         help="Model for vLLM server (default: from run configs)")
     parser.add_argument("--vllm_mlp_config", default="m32",
@@ -1248,12 +1301,25 @@ def main():
     if use_mps and not args.dry_run:
         start_mps_daemons(gpus)
 
+    assert not (args.vllm and args.vllm_async), "--vllm and --vllm_async are mutually exclusive"
+
     # Inject vllm_spawn into all runs when --vllm is set (each run manages its own server)
     if args.vllm:
         for run in runs:
             run["vllm_spawn"] = True
             run.setdefault("vllm_gpu_memory", args.vllm_gpu_memory)
+
     vllm_servers = {}
+    vllm_async_servers = {}
+    if args.vllm_async and not args.dry_run:
+        vllm_model = args.vllm_model or runs[0].get("model", "HuggingFaceTB/SmolLM2-135M-Instruct")
+        max_exp = args.vllm_max_experiments or per_gpu
+        vllm_async_servers = start_async_vllm_servers(
+            gpus, vllm_model, args.vllm_mlp_config, max_exp, args.vllm_gpu_memory,
+        )
+        # Mark all runs as using async server; socket path injected per-run by SweepRunner
+        for run in runs:
+            run["vllm_async"] = True
 
     runner = SweepRunner(
         runs=runs,
@@ -1271,6 +1337,7 @@ def main():
         retain_penalty=retain_penalty,
         shuffle=not args.no_shuffle,
         vllm_servers=vllm_servers,
+        vllm_async_servers=vllm_async_servers,
     )
     runner.run()
 

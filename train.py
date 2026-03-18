@@ -1364,6 +1364,8 @@ def _make_parser():
     parser.add_argument("--vllm_spawn", action="store_true", default=False,
                         help="Spawn a local vLLM server for this run (one server per run). "
                              "Uses the run's own model/mlp_config. Mutually exclusive with --vllm_server.")
+    parser.add_argument("--vllm_async", action="store_true", default=False,
+                        help="Use AsyncVLLMClient (for shared async server). Requires --vllm_server.")
     parser.add_argument("--vllm_gpu_memory", type=float, default=0.02,
                         help="GPU memory utilization fraction for spawned vLLM server (default: 0.02).")
     parser.add_argument("--vllm_spawn_delay", type=int, default=0,
@@ -1411,7 +1413,7 @@ def _run(args, exp_cfg=None):
     # Attach resolved training params and dump complete run config
     _tc_fields = set(TrainingConfig.model_fields)
     _arg_fields = set(vars(args))
-    _CLI_ONLY = {"config", "gpu_id", "rh_detector_recall", "gradient_checkpointing", "use_liger_kernel", "liger_chunk_size", "torch_compile"}
+    _CLI_ONLY = {"config", "gpu_id", "rh_detector_recall", "gradient_checkpointing", "use_liger_kernel", "liger_chunk_size", "torch_compile", "vllm_server", "vllm_spawn", "vllm_spawn_delay", "vllm_async", "vllm_gpu_memory"}
     _missing = _tc_fields - _arg_fields
     assert not _missing, (
         f"TrainingConfig fields missing from argparse: {_missing}. "
@@ -1737,9 +1739,14 @@ def _run(args, exp_cfg=None):
     vllm_client = None
     _vllm_server_proc = None
     if args.vllm_server:
-        from vllm_client import VLLMClient
-        print(f"[vLLM] Connecting to server at {args.vllm_server}...")
-        vllm_client = VLLMClient(args.vllm_server)
+        if args.vllm_async:
+            from vllm_client import AsyncVLLMClient
+            print(f"[vLLM] Connecting to async server at {args.vllm_server}...")
+            vllm_client = AsyncVLLMClient(args.vllm_server)
+        else:
+            from vllm_client import VLLMClient
+            print(f"[vLLM] Connecting to server at {args.vllm_server}...")
+            vllm_client = VLLMClient(args.vllm_server)
     elif args.vllm_spawn:
         import multiprocessing as _mp
         if args.vllm_spawn_delay > 0:
