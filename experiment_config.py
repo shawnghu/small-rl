@@ -139,6 +139,11 @@ class TrainingConfig(BaseModel):
     advantage_type: Optional[str] = None
     reinforce_buffer_size: Optional[int] = None
     reinforce_normalize_std: Optional[bool] = None
+    # vLLM generation server
+    vllm_server: Optional[str] = None
+    vllm_spawn: bool = False
+    vllm_gpu_memory: float = 0.02
+    vllm_spawn_delay: int = 0
 
 
 class RewardComponentConfig(BaseModel):

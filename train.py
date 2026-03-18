@@ -37,6 +37,27 @@ from rewards import get_reward_fn, API_REWARD_NAMES
 from experiment_config import ExperimentConfig, RewardConfig, RewardComponentConfig, RHDetectorConfig, TrainingConfig
 
 
+def _spawn_vllm_server(model_name, mlp_config, gpu_memory, port, ready_event):
+    """Worker for per-run vLLM server subprocess (must be module-level for spawn pickling)."""
+    import os
+    os.environ.setdefault("VLLM_LOGGING_LEVEL", "ERROR")
+
+    import uvicorn
+    from vllm_grpo import MLP_PRESETS
+    from vllm_http_server import create_app
+
+    preset = MLP_PRESETS[mlp_config]
+    app = create_app(
+        model_name=model_name,
+        max_experiments=1,
+        retain_neurons=preset["retain_neurons"],
+        forget_neurons=preset["forget_neurons"],
+        gpu_memory_utilization=gpu_memory,
+    )
+    ready_event.set()
+    uvicorn.run(app, host="127.0.0.1", port=port, workers=1, log_level="warning")
+
+
 class RunningRewardBuffer:
     """Circular buffer of scalar rewards for REINFORCE running baseline."""
 
@@ -164,6 +185,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                  coherence_gen="retain_only",
                  coherence_batch_size=None,
                  coherence_hackable_only=False,
+                 vllm_client=None,
                  **kwargs):
         super().__init__(*args, **kwargs)
         self.verbose = verbose
@@ -213,6 +235,12 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._coherence_step_counter = 0  # counts routing steps to know when to fire
         self._coherence_hackable_only = coherence_hackable_only
         self._coherence_indices = None  # built lazily on first coherence step
+        # vLLM HTTP server for generation
+        self._vllm_client = vllm_client
+        self._vllm_experiment_id = None
+        if vllm_client is not None:
+            self._vllm_experiment_id = vllm_client.register()
+            print(f"[vLLM] Registered experiment {self._vllm_experiment_id}")
         # Phase timing: rollout (generation+scoring) vs update (gradients)
         self._last_rollout_time = 0.0
         self._accum_rollout_time = 0.0
@@ -231,6 +259,66 @@ class SampleGRPOTrainer(GRPOTrainer):
             config_path = os.path.join(checkpoint_dir, "dual_lora_config.json")
             with open(config_path, "w") as f:
                 json.dump(self._adapter_config, f, indent=2)
+
+    def _generate_single_turn(self, prompts):
+        """Override: use vLLM HTTP server for generation when configured,
+        otherwise fall back to bulk-CPU contention fix (trl_overrides)."""
+        if self._vllm_client is None:
+            return generate_single_turn(self, prompts)
+
+        from trl import is_conversational
+
+        client = self._vllm_client
+        eid = self._vllm_experiment_id
+        mode = "train" if self.model.training else "eval"
+        num_generations = self.num_generations if mode == "train" else self.num_generations_eval
+
+        # Sync adapter weights to vLLM server
+        t_sync = time.perf_counter()
+        client.update_weights_from_model(eid, self.model)
+        t_sync_done = time.perf_counter()
+
+        # Tokenize prompts (handle both chat and plain string formats)
+        if is_conversational({"prompt": prompts[0]}):
+            prompt_texts = [
+                self.processing_class.apply_chat_template(
+                    p, add_generation_prompt=True, tokenize=False,
+                )
+                for p in prompts
+            ]
+        else:
+            prompt_texts = prompts
+
+        prompt_ids_list = [
+            self.processing_class.encode(p, add_special_tokens=False)
+            for p in prompt_texts
+        ]
+
+        # TRL's RepeatSampler already feeds each unique prompt num_generations times,
+        # so prompt_ids_list is already the expanded batch (e.g. 512 = 32 unique × 16).
+        # Generate n=1 completion per prompt slot; no manual expansion needed.
+        t_gen = time.perf_counter()
+        comp_texts, comp_ids_list, ret_prompt_ids = client.generate(
+            eid, prompt_ids_list, 1,
+            self.args.temperature, self.max_completion_length,
+        )
+        t_gen_done = time.perf_counter()
+
+        assert len(comp_ids_list) == len(prompt_ids_list), (
+            f"Expected {len(prompt_ids_list)} completions, got {len(comp_ids_list)}"
+        )
+
+        sync_ms = (t_sync_done - t_sync) * 1000
+        gen_ms = (t_gen_done - t_gen) * 1000
+        m = self._metrics.setdefault("train", {})
+        m.setdefault("timing/detail/vllm_sync_ms", []).append(sync_ms)
+        m.setdefault("timing/detail/vllm_gen_ms", []).append(gen_ms)
+
+        # Return format matches TRL's _generate_single_turn:
+        # (prompt_ids, completion_ids, logprobs, extra_fields)
+        # logprobs=None since vLLM server doesn't return them;
+        # TRL will compute them via HF forward pass.
+        return prompt_ids_list, comp_ids_list, None, {}
 
     def _log_adapter_diagnostics(self):
         """Log retain/forget adapter grad norms, param norms, and optimizer stats to wandb."""
@@ -374,6 +462,19 @@ class SampleGRPOTrainer(GRPOTrainer):
                 and self.state.global_step - self._last_routing_eval_step >= self.eval_every
                 and self.state.global_step > 0):
             self._run_routing_eval()
+
+        # Print timing breakdown to stdout (visible even with report_to="none").
+        # Read from _metrics directly — logs is populated by super().log() after this point.
+        _tm = getattr(self, "_metrics", {}).get("train", {})
+        _rollout_vals = _tm.get("timing/rollout", [])
+        _update_vals = _tm.get("timing/update", [])
+        if _rollout_vals and _update_vals:
+            rollout = _rollout_vals[-1]
+            update = _update_vals[-1]
+            sync_ms = (_tm.get("timing/detail/vllm_sync_ms") or [0])[-1]
+            gen_ms = (_tm.get("timing/detail/vllm_gen_ms") or [0])[-1]
+            step = self.state.global_step
+            print(f"[timing @{step}] rollout={rollout:.2f}s (sync={sync_ms:.0f}ms gen={gen_ms:.0f}ms) update={update:.2f}s total={rollout+update:.2f}s")
 
         return super().log(logs, *args, **kwargs)
 
@@ -721,10 +822,6 @@ class SampleGRPOTrainer(GRPOTrainer):
             rewards = [min(r, cap) for r in rewards]
         device = self.accelerator.device
         return torch.tensor(rewards, dtype=torch.float32, device=device)
-
-    def _generate_single_turn(self, prompts: list):
-        """Override: bulk GPU->CPU before per-element masking. See trl_overrides.py."""
-        return generate_single_turn(self, prompts)
 
     def _reinforce_advantages(self, raw_rewards, buffer):
         """Compute REINFORCE advantages: reward - running_mean, optionally / running_std."""
@@ -1217,6 +1314,19 @@ def _make_parser():
     # Retain penalty baseline
     parser.add_argument("--retain_penalty_baseline", action="store_true", default=False,
                         help="Retain penalty baseline: replace RH rewards with retain-only reward, recompute advantages.")
+    # vLLM generation server
+    parser.add_argument("--vllm_server", default=None,
+                        help="URL of vLLM HTTP server for generation (e.g. http://localhost:8100). "
+                             "When set, generation is offloaded to the server and adapter weights "
+                             "are synced before each generation step.")
+    parser.add_argument("--vllm_spawn", action="store_true", default=False,
+                        help="Spawn a local vLLM HTTP server for this run (one server per run). "
+                             "Uses the run's own model/mlp_config. Mutually exclusive with --vllm_server.")
+    parser.add_argument("--vllm_gpu_memory", type=float, default=0.02,
+                        help="GPU memory utilization fraction for spawned vLLM server (default: 0.02).")
+    parser.add_argument("--vllm_spawn_delay", type=int, default=0,
+                        help="Seconds to wait before spawning the vLLM server (used to stagger "
+                             "concurrent inits so each sees accurate free memory).")
     # Retain KL regularization
     parser.add_argument("--retain_kl_coef", type=float, default=0.0,
                         help="KL coefficient for retain-only model vs reference (0=disabled)")
@@ -1575,6 +1685,42 @@ def _run(args, exp_cfg=None):
     if args.eval_every > 0:
         eval_metrics = exp_cfg.build_eval_metrics(rh_detector=eval_rh_detector)
 
+    # vLLM HTTP client (optional — offloads generation to external server)
+    assert not (args.vllm_server and args.vllm_spawn), \
+        "--vllm_server and --vllm_spawn are mutually exclusive"
+    vllm_client = None
+    _vllm_server_proc = None
+    if args.vllm_server:
+        from vllm_http_client import VLLMHTTPClient
+        vllm_client = VLLMHTTPClient(args.vllm_server)
+        print(f"[vLLM] Connecting to server at {args.vllm_server}...")
+        health = vllm_client.wait_until_ready(timeout=900)
+        print(f"[vLLM] Server ready: {health}")
+    elif args.vllm_spawn:
+        import socket
+        import multiprocessing as _mp
+        from vllm_http_client import VLLMHTTPClient
+        if args.vllm_spawn_delay > 0:
+            print(f"[vLLM] Waiting {args.vllm_spawn_delay}s before spawning server (stagger init)...")
+            time.sleep(args.vllm_spawn_delay)
+        s = socket.socket()
+        s.bind(("", 0))
+        _vllm_port = s.getsockname()[1]
+        s.close()
+        _ctx = _mp.get_context("spawn")
+        _ready = _ctx.Event()
+        _vllm_server_proc = _ctx.Process(
+            target=_spawn_vllm_server,
+            args=(args.model, args.mlp_config, args.vllm_gpu_memory, _vllm_port, _ready),
+            # daemon=False so vLLM v1 engine can spawn its own CoreEngineProcManager children
+        )
+        _vllm_server_proc.start()
+        print(f"[vLLM] Spawned server at port {_vllm_port} (pid={_vllm_server_proc.pid})")
+        _ready.wait(timeout=180)
+        vllm_client = VLLMHTTPClient(f"http://127.0.0.1:{_vllm_port}")
+        health = vllm_client.wait_until_ready(timeout=120)
+        print(f"[vLLM] Server ready: {health}")
+
     trainer = SampleGRPOTrainer(
         model=model,
         args=config,
@@ -1608,6 +1754,7 @@ def _run(args, exp_cfg=None):
         advantage_type=args.advantage_type,
         reinforce_buffer_size=args.reinforce_buffer_size,
         reinforce_normalize_std=args.reinforce_normalize_std,
+        vllm_client=vllm_client,
     )
     trainer._environment = args.environment
     trainer._n_digits = args.n_digits
@@ -1645,6 +1792,14 @@ def _run(args, exp_cfg=None):
         if torch.cuda.is_available():
             peak_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
             print(f"Peak GPU memory: {peak_mb:.0f} MB ({peak_mb/1024:.1f} GB)")
+        if _vllm_server_proc is not None:
+            try:
+                vllm_client.shutdown()
+            except Exception:
+                pass
+            _vllm_server_proc.join(timeout=5)
+            if _vllm_server_proc.is_alive():
+                _vllm_server_proc.kill()
 
 
 def train_main(params: dict):
