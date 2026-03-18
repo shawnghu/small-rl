@@ -64,6 +64,12 @@ class AsyncVLLMServer:
         self.mgr = None
         self.next_experiment_id = 1
         self._shutdown = False
+        # Serializes collective_rpc calls: vLLM's engine uses a single ZMQ
+        # socket for collective_rpc without per-request IDs, so concurrent
+        # awaiting coroutines would receive each other's responses. The lock
+        # lets the server loop stay unblocked (generate tasks can proceed)
+        # while ensuring only one collective_rpc is in-flight at a time.
+        self._rpc_lock: asyncio.Lock | None = None  # created in start() (needs running loop)
 
     async def start(self):
         """Initialize engine and ZMQ socket."""
@@ -89,6 +95,7 @@ class AsyncVLLMServer:
                 os.unlink(sock_path)
         self.socket.bind(self.socket_addr)
         print(f"[AsyncServer] Listening on {self.socket_addr}")
+        self._rpc_lock = asyncio.Lock()
 
     def handle_register(self, msg):
         eid = self.next_experiment_id
@@ -114,7 +121,8 @@ class AsyncVLLMServer:
                     w[key] = torch.from_numpy(arr.copy())
             layer_weights.append(w)
 
-        await self.mgr.set_weights(eid, layer_weights)
+        async with self._rpc_lock:
+            await self.mgr.set_weights(eid, layer_weights)
         return {"ok": True}
 
     async def handle_generate(self, msg):
@@ -178,6 +186,9 @@ class AsyncVLLMServer:
         if ready_event is not None:
             ready_event.set()
 
+        # Track in-flight tasks so we can await them before shutdown.
+        pending_tasks: set[asyncio.Task] = set()
+
         print("[AsyncServer] Ready for requests")
         while not self._shutdown:
             try:
@@ -192,15 +203,28 @@ class AsyncVLLMServer:
             payload = frames[-1]
             msg = msgpack.unpackb(payload, raw=False)
 
-            if msg["op"] == "generate":
-                # Generation requests run as concurrent tasks — this is what
-                # enables dynamic batching. Multiple generate tasks can be
-                # in-flight simultaneously; AsyncLLM batches their requests.
-                asyncio.create_task(self._handle_request(identity, msg))
+            op = msg["op"]
+            if op in ("generate", "update_weights"):
+                # generate: enables dynamic batching — multiple tasks in-flight
+                #   simultaneously; AsyncLLM batches their requests.
+                # update_weights: ~400ms collective_rpc round-trip; running as a
+                #   task lets the loop keep accepting messages (e.g. generate
+                #   requests from experiments that already finished updating).
+                #   Per-experiment slot isolation makes concurrent updates safe;
+                #   collective_rpc calls are serialized by EngineCore anyway.
+                task = asyncio.create_task(self._handle_request(identity, msg))
+                pending_tasks.add(task)
+                task.add_done_callback(pending_tasks.discard)
             else:
-                # Non-generation ops (register, weight update, set_scales, shutdown)
-                # are fast and run inline to preserve ordering guarantees.
+                # register, set_scales, shutdown: fast and order-sensitive,
+                # run inline to preserve ordering guarantees.
                 await self._handle_request(identity, msg)
+
+        # Wait for any in-flight weight-update or generate tasks to finish
+        # before tearing down the engine, so they don't crash on a dead engine.
+        if pending_tasks:
+            print(f"[AsyncServer] Waiting for {len(pending_tasks)} in-flight tasks...")
+            await asyncio.gather(*pending_tasks, return_exceptions=True)
 
         print("[AsyncServer] Shutting down")
         self.engine.shutdown()
