@@ -77,6 +77,10 @@ class VLLMClient:
         reply = self._request({"op": "register"})
         return reply["experiment_id"]
 
+    def release(self, experiment_id):
+        """Return experiment slot to the server (zeros weights, frees slot)."""
+        self._request({"op": "release", "experiment_id": experiment_id})
+
     def update_weights_from_model(self, experiment_id, model):
         """Extract DualMLPAdapter weights from HF model and send to server."""
         layers, shapes = _extract_weights_from_model(model)
@@ -155,6 +159,10 @@ class AsyncVLLMClient:
         """Register and get an experiment ID."""
         reply = self._request({"op": "register"})
         return reply["experiment_id"]
+
+    def release(self, experiment_id):
+        """Return experiment slot to the server (zeros weights, frees slot)."""
+        self._request({"op": "release", "experiment_id": experiment_id})
 
     def update_weights_from_model(self, experiment_id, model):
         """Extract DualMLPAdapter weights from HF model and send to server."""

@@ -62,8 +62,20 @@ class AsyncVLLMServer:
 
         self.engine = None
         self.mgr = None
-        self.next_experiment_id = 1
         self._shutdown = False
+        # Slot pool: experiment IDs are recycled rather than allocated forever.
+        # max_experiments = concurrent runs on this GPU (not total lifetime runs).
+        # _slot_queue is pre-populated in start(); register awaits a slot,
+        # release zeros weights then returns the slot. Both run as tasks so
+        # the server loop never blocks and there's no deadlock when all slots
+        # are occupied and releases are in-flight.
+        self._slot_queue: asyncio.Queue | None = None  # created in start()
+        # Serializes collective_rpc calls: vLLM's engine uses a single ZMQ
+        # socket for collective_rpc without per-request IDs, so concurrent
+        # awaiting coroutines would receive each other's responses. The lock
+        # lets the server loop stay unblocked (generate tasks can proceed)
+        # while ensuring only one collective_rpc is in-flight at a time.
+        self._rpc_lock: asyncio.Lock | None = None  # created in start()
 
     async def start(self):
         """Initialize engine and ZMQ socket."""
@@ -89,14 +101,27 @@ class AsyncVLLMServer:
                 os.unlink(sock_path)
         self.socket.bind(self.socket_addr)
         print(f"[AsyncServer] Listening on {self.socket_addr}")
+        self._rpc_lock = asyncio.Lock()
+        self._slot_queue = asyncio.Queue()
+        for slot in range(1, self.max_experiments + 1):
+            self._slot_queue.put_nowait(slot)
 
-    def handle_register(self, msg):
-        eid = self.next_experiment_id
-        assert eid <= self.max_experiments, \
-            f"Cannot register: {eid} > max_experiments={self.max_experiments}"
-        self.next_experiment_id += 1
-        print(f"[AsyncServer] Registered experiment {eid}")
-        return {"experiment_id": eid}
+    async def handle_register(self, msg):
+        """Acquire a free slot from the pool. Blocks (as a task) until one is available."""
+        slot = await self._slot_queue.get()
+        n_free = self._slot_queue.qsize()
+        print(f"[AsyncServer] Registered experiment {slot} ({n_free} slots remaining)")
+        return {"experiment_id": slot}
+
+    async def handle_release(self, msg):
+        """Zero the slot's weights then return it to the pool."""
+        eid = msg["experiment_id"]
+        async with self._rpc_lock:
+            await self.mgr.reset_weights(eid)
+        self._slot_queue.put_nowait(eid)
+        n_free = self._slot_queue.qsize()
+        print(f"[AsyncServer] Released experiment {eid} ({n_free} slots free)")
+        return {"ok": True}
 
     async def handle_update_weights(self, msg):
         eid = msg["experiment_id"]
@@ -114,7 +139,8 @@ class AsyncVLLMServer:
                     w[key] = torch.from_numpy(arr.copy())
             layer_weights.append(w)
 
-        await self.mgr.set_weights(eid, layer_weights)
+        async with self._rpc_lock:
+            await self.mgr.set_weights(eid, layer_weights)
         return {"ok": True}
 
     async def handle_generate(self, msg):
@@ -149,7 +175,9 @@ class AsyncVLLMServer:
         op = msg["op"]
         try:
             if op == "register":
-                reply = self.handle_register(msg)
+                reply = await self.handle_register(msg)
+            elif op == "release":
+                reply = await self.handle_release(msg)
             elif op == "update_weights":
                 reply = await self.handle_update_weights(msg)
             elif op == "generate":
@@ -178,6 +206,9 @@ class AsyncVLLMServer:
         if ready_event is not None:
             ready_event.set()
 
+        # Track in-flight tasks so we can await them before shutdown.
+        pending_tasks: set[asyncio.Task] = set()
+
         print("[AsyncServer] Ready for requests")
         while not self._shutdown:
             try:
@@ -192,15 +223,32 @@ class AsyncVLLMServer:
             payload = frames[-1]
             msg = msgpack.unpackb(payload, raw=False)
 
-            if msg["op"] == "generate":
-                # Generation requests run as concurrent tasks — this is what
-                # enables dynamic batching. Multiple generate tasks can be
-                # in-flight simultaneously; AsyncLLM batches their requests.
-                asyncio.create_task(self._handle_request(identity, msg))
+            op = msg["op"]
+            if op in ("generate", "update_weights", "register", "release"):
+                # generate: enables dynamic batching — multiple tasks in-flight
+                #   simultaneously; AsyncLLM batches their requests.
+                # update_weights: ~400ms collective_rpc round-trip; running as a
+                #   task lets the loop keep accepting messages (e.g. generate
+                #   requests from experiments that already finished updating).
+                #   Per-experiment slot isolation makes concurrent updates safe;
+                #   collective_rpc calls are serialized by _rpc_lock.
+                # register: blocks (as a task) if all slots occupied, so the
+                #   server loop stays unblocked while waiting for a free slot.
+                # release: zeros weights via collective_rpc then returns slot;
+                #   must run as a task so register tasks can unblock once done.
+                task = asyncio.create_task(self._handle_request(identity, msg))
+                pending_tasks.add(task)
+                task.add_done_callback(pending_tasks.discard)
             else:
-                # Non-generation ops (register, weight update, set_scales, shutdown)
-                # are fast and run inline to preserve ordering guarantees.
+                # set_scales, shutdown: fast and order-sensitive,
+                # run inline to preserve ordering guarantees.
                 await self._handle_request(identity, msg)
+
+        # Wait for any in-flight weight-update or generate tasks to finish
+        # before tearing down the engine, so they don't crash on a dead engine.
+        if pending_tasks:
+            print(f"[AsyncServer] Waiting for {len(pending_tasks)} in-flight tasks...")
+            await asyncio.gather(*pending_tasks, return_exceptions=True)
 
         print("[AsyncServer] Shutting down")
         self.engine.shutdown()

@@ -477,6 +477,33 @@ class AsyncVLLMAdapterManager:
 
         await self.engine.collective_rpc("apply_model", args=(_set,))
 
+    async def reset_weights(self, experiment_id: int):
+        """Zero all adapter weights and reset scales for one experiment slot.
+
+        Called on slot release so the slot is clean for the next experiment.
+        Zeroed weights are the correct initial state (the adapter contributes
+        nothing until the new experiment's first update_weights call).
+        """
+        assert 1 <= experiment_id <= self.max_experiments
+        slot = experiment_id - 1
+
+        def _reset(model):
+            for layer in model.model.layers:
+                adapter = layer.mlp
+                if adapter.retain_gate is not None:
+                    adapter.retain_gate.data[slot].zero_()
+                    adapter.retain_up.data[slot].zero_()
+                    adapter.retain_down.data[slot].zero_()
+                if adapter.forget_gate is not None:
+                    adapter.forget_gate.data[slot].zero_()
+                    adapter.forget_up.data[slot].zero_()
+                    adapter.forget_down.data[slot].zero_()
+                # Reset scales to (1, 1) — default for a fresh slot
+                adapter.scales[slot, 0] = 1.0
+                adapter.scales[slot, 1] = 1.0
+
+        await self.engine.collective_rpc("apply_model", args=(_reset,))
+
     async def update_from_training_model(self, experiment_id: int, training_model: nn.Module):
         from gradient_routing import DualMLPAdapter
 
