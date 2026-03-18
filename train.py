@@ -1468,7 +1468,11 @@ def _run(args, exp_cfg=None):
             return Dataset.from_dict(data)
         train_dataset = _wrap_prompts_as_chat(train_dataset)
         eval_dataset = _wrap_prompts_as_chat(eval_dataset)
-        print(f"Chat model detected — wrapped prompts in chat template format")
+        first_prompt = train_dataset[0]["prompt"]
+        if isinstance(first_prompt, list):
+            print(f"Chat model detected — prompts already in ChatRequest format, passed through")
+        else:
+            print(f"Chat model detected — wrapped prompts in chat template format")
 
     # Environment-specific warnings
     if args.environment == "arithmetic":
