@@ -88,9 +88,10 @@ ROUTING_ONLY_PARAMS = {
     "retain_kl_coef", "retain_kl_n_prompts",
 }
 
-# Params stripped from filter baselines (only routing_mode and coherence;
-# everything else is kept to match the routing run's eligibility logic).
-FILTER_BASELINE_STRIP = {"routing_mode", "coherence", "coherence_every", "coherence_gen", "coherence_batch_size"}
+# Params stripped from filter baselines (only routing_mode, coherence, and
+# routing-specific reward normalization; everything else kept to match eligibility logic).
+FILTER_BASELINE_STRIP = {"routing_mode", "coherence", "coherence_every", "coherence_gen", "coherence_batch_size",
+                         "retain_mode", "retain_penalty"}
 
 # Params excluded from baseline cache key (non-training: logging, output, eval scheduling).
 # Note: rh_eligible_frac/base_reward are NOT excluded — they affect
@@ -191,7 +192,9 @@ def _run_worker(params: dict, log_path: str, gpu_id: int, mps_pipe_dir: str | No
         os.environ["CUDA_MPS_PIPE_DIRECTORY"] = mps_pipe_dir
         effective_gpu_id = 0
     else:
-        effective_gpu_id = gpu_id
+        # Isolate this worker to its physical GPU; logical device is always 0
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+        effective_gpu_id = 0
 
     log_file = open(log_path, "w")
     sys.stdout = log_file
@@ -279,6 +282,131 @@ def stop_mps_daemons(gpus):
         stopped.append(gpu)
     if stopped:
         print(f"[MPS] Stopped daemons on GPU(s): {stopped}")
+
+
+# ---------------------------------------------------------------------------
+# vLLM HTTP server management
+# ---------------------------------------------------------------------------
+
+def _kill_vllm_proc(vllm_proc, vllm_port):
+    """Kill a vLLM server process and all its children (EngineCore, etc.).
+
+    Uses os.killpg to kill the entire process group. The server worker calls
+    os.setsid() on startup to become a process group leader, so killpg reaches
+    all vLLM subprocesses (EngineCore, etc.) that would otherwise be orphaned.
+    """
+    import signal
+    # Graceful shutdown first
+    if vllm_port is not None:
+        try:
+            import requests as _req
+            _req.post(f"http://127.0.0.1:{vllm_port}/shutdown", timeout=5)
+        except Exception:
+            pass
+    vllm_proc.join(timeout=8)
+    if vllm_proc.is_alive():
+        # Kill entire process group (server + all vLLM children)
+        try:
+            pgid = os.getpgid(vllm_proc.pid)
+            os.killpg(pgid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            vllm_proc.kill()
+        vllm_proc.join(timeout=2)
+
+
+def _vllm_server_worker(gpu_id, model_name, mlp_config, max_experiments,
+                        gpu_memory, port, init_delay=0):
+    """Entry point for vLLM HTTP server process (spawned child).
+
+    init_delay: seconds to sleep before initializing the vLLM engine, used to
+    stagger concurrent inits so each process sees accurate free memory.
+    Readiness is signaled via the HTTP /health endpoint (no Event needed).
+    """
+    import os, time as _time
+    os.setsid()  # New session/process group so killpg kills all vLLM children
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    # Suppress noisy vLLM logs
+    os.environ.setdefault("VLLM_LOGGING_LEVEL", "ERROR")
+    # Required for vLLM v1: apply_model() passes Python functions via IPC
+    os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
+
+    if init_delay > 0:
+        _time.sleep(init_delay)
+
+    import uvicorn
+
+    from vllm_grpo import MLP_PRESETS
+    from vllm_http_server import create_app
+
+    preset = MLP_PRESETS[mlp_config]
+    app = create_app(
+        model_name=model_name,
+        max_experiments=max_experiments,
+        retain_neurons=preset["retain_neurons"],
+        forget_neurons=preset["forget_neurons"],
+        gpu_memory_utilization=gpu_memory,
+    )
+
+    uvicorn.run(app, host="127.0.0.1", port=port, workers=1, log_level="warning")
+
+
+def start_vllm_servers(gpus, model_name, mlp_config, max_experiments,
+                       gpu_memory, base_port):
+    """Start one vLLM HTTP server per GPU. Returns {gpu: (proc, port)}."""
+    ctx = multiprocessing.get_context("spawn")
+    servers = {}
+    for gpu in gpus:
+        port = base_port + gpu
+        proc = ctx.Process(
+            target=_vllm_server_worker,
+            args=(gpu, model_name, mlp_config, max_experiments, gpu_memory, port),
+        )
+        proc.start()
+        print(f"[vLLM] Starting server on GPU {gpu}, port {port} (pid={proc.pid})")
+
+        # Wait for HTTP health endpoint
+        import requests
+        url = f"http://127.0.0.1:{port}/health"
+        for _ in range(120):
+            try:
+                resp = requests.get(url, timeout=2)
+                if resp.status_code == 200:
+                    break
+            except Exception:
+                pass
+            time.sleep(1)
+        else:
+            print(f"[vLLM] WARNING: Server on GPU {gpu} not responding to health checks")
+
+        servers[gpu] = (proc, port)
+        print(f"[vLLM] Server on GPU {gpu} ready (port {port})")
+
+    return servers
+
+
+def stop_vllm_servers(servers):
+    """Stop all vLLM HTTP servers."""
+    for gpu, (proc, port) in servers.items():
+        try:
+            import requests
+            requests.post(f"http://127.0.0.1:{port}/shutdown", timeout=5)
+        except Exception:
+            pass
+        proc.join(timeout=5)
+        if proc.is_alive():
+            proc.kill()
+            proc.join(timeout=2)
+        print(f"[vLLM] Server on GPU {gpu} stopped")
+
+
+def _find_free_port():
+    """Return an available TCP port."""
+    import socket
+    s = socket.socket()
+    s.bind(("", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
 
 
 def extract_final_metrics(run_dir):
@@ -483,7 +611,8 @@ class SweepRunner:
     def __init__(self, runs, grid_keys, output_dir, gpus, per_gpu,
                  wandb_project, no_wandb, dry_run,
                  no_baseline=False, run_tag=None, use_mps=True, no_cache=False,
-                 retain_penalty=False, shuffle=True):
+                 retain_penalty=False, shuffle=True,
+                 vllm_servers=None):
         self.output_dir = Path(output_dir)
         self.gpus = gpus
         self.use_mps = use_mps
@@ -548,6 +677,9 @@ class SweepRunner:
 
         # Build experiment groups for incremental plotting
         self.experiment_groups = self._build_experiment_groups()
+
+        # vLLM servers: {gpu: (proc, port)} or None
+        self.vllm_servers = vllm_servers or {}
 
         # Signal handling
         self._interrupted = False
@@ -677,18 +809,27 @@ class SweepRunner:
     def _handle_sigint(self, signum, frame):
         print("\n[SWEEP] Interrupted — killing all running jobs...")
         self._interrupted = True
+        # Kill all vLLM process groups immediately (don't wait per-proc — that would
+        # take up to 8s × N procs and could be interrupted before finishing).
         for idx, info in self.active.items():
-            try:
-                info["proc"].terminate()
-            except Exception:
-                pass
-        time.sleep(1)
+            vllm_proc = info.get("vllm_proc")
+            if vllm_proc is not None:
+                try:
+                    pgid = os.getpgid(vllm_proc.pid)
+                    os.killpg(pgid, signal.SIGKILL)
+                except Exception:
+                    try:
+                        vllm_proc.kill()
+                    except Exception:
+                        pass
         for idx, info in self.active.items():
             try:
                 info["proc"].kill()
                 info["proc"].join(timeout=2)
             except Exception:
                 pass
+        if self.vllm_servers:
+            stop_vllm_servers(self.vllm_servers)
         if self.use_mps:
             stop_mps_daemons(self.gpus)
         sys.exit(1)
@@ -729,6 +870,30 @@ class SweepRunner:
         full_params["wandb_project"] = self.wandb_project
         if self.no_wandb:
             full_params["no_wandb"] = True
+        # Per-run vLLM server: spawn directly from sweep process (avoids daemon nesting),
+        # then pass URL to training worker instead of spawning from within the worker.
+        vllm_proc = None
+        vllm_port = None
+        if full_params.get("vllm_spawn"):
+            slot = self.gpu_counts[gpu]  # 0-based slot index, used for stagger
+            init_delay = slot * 20
+            vllm_port = _find_free_port()
+            ctx_vllm = multiprocessing.get_context("spawn")
+            vllm_model = full_params.get("model", "SimpleStories/SimpleStories-1.25M")
+            vllm_mlp = full_params.get("mlp_config", "m32")
+            vllm_gpu_memory = full_params.get("vllm_gpu_memory", 0.02)
+            vllm_proc = ctx_vllm.Process(
+                target=_vllm_server_worker,
+                args=(gpu, vllm_model, vllm_mlp, 1,
+                      vllm_gpu_memory, vllm_port, init_delay),
+            )
+            vllm_proc.start()
+            print(f"[vLLM] Spawned server for {run_name} on GPU {gpu}, port {vllm_port} "
+                  f"(pid={vllm_proc.pid}, delay={init_delay}s)")
+            # Replace vllm_spawn flag with server URL for the training worker
+            full_params = {k: v for k, v in full_params.items()
+                           if k not in ("vllm_spawn", "vllm_spawn_delay", "vllm_gpu_memory")}
+            full_params["vllm_server"] = f"http://127.0.0.1:{vllm_port}"
 
         pipe = mps_pipe_dir(gpu) if self.use_mps else None
         ctx = multiprocessing.get_context("spawn")
@@ -746,6 +911,8 @@ class SweepRunner:
             "gpu": gpu,
             "start_time": time.time(),
             "is_baseline": is_baseline,
+            "vllm_proc": vllm_proc,
+            "vllm_port": vllm_port if vllm_proc is not None else None,
         }
         self.gpu_counts[gpu] += 1
 
@@ -800,6 +967,12 @@ class SweepRunner:
                             "timestamp": time.time(),
                         }
                         _save_cache(self._cache_dir, self._run_cache, ".run_cache.json")
+
+                # Stop per-run vLLM server if present
+                vllm_proc = info.get("vllm_proc")
+                vllm_port = info.get("vllm_port")
+                if vllm_proc is not None:
+                    _kill_vllm_proc(vllm_proc, vllm_port)
 
                 finished.append(idx)
         for idx in finished:
@@ -1032,6 +1205,8 @@ class SweepRunner:
         except Exception as e:
             print(f"[WARN] Failed to generate sweep pages: {e}")
 
+        if self.vllm_servers:
+            stop_vllm_servers(self.vllm_servers)
         if self.use_mps:
             stop_mps_daemons(self.gpus)
 
@@ -1064,6 +1239,19 @@ def main():
                         help="Skip MPS daemon management (use if MPS already running externally)")
     parser.add_argument("--no_shuffle", action="store_true",
                         help="Run in config order instead of shuffling (default: shuffle)")
+    # vLLM server options
+    parser.add_argument("--vllm", action="store_true",
+                        help="Start a vLLM HTTP server per GPU for generation offloading")
+    parser.add_argument("--vllm_model", default=None,
+                        help="Model for vLLM server (default: from run configs)")
+    parser.add_argument("--vllm_mlp_config", default="m32",
+                        help="MLP adapter preset for vLLM server (default: m32)")
+    parser.add_argument("--vllm_max_experiments", type=int, default=None,
+                        help="Max concurrent experiments per vLLM server (default: per_gpu)")
+    parser.add_argument("--vllm_gpu_memory", type=float, default=0.05,
+                        help="GPU memory fraction for vLLM (default: 0.05)")
+    parser.add_argument("--vllm_base_port", type=int, default=8100,
+                        help="Base port for vLLM servers (GPU i gets base_port + i)")
     args = parser.parse_args()
 
     runs, cfg_attrs = load_sweep_config_py(args.config)
@@ -1092,6 +1280,13 @@ def main():
     if use_mps and not args.dry_run:
         start_mps_daemons(gpus)
 
+    # Inject vllm_spawn into all runs when --vllm is set (each run manages its own server)
+    if args.vllm:
+        for run in runs:
+            run["vllm_spawn"] = True
+            run.setdefault("vllm_gpu_memory", args.vllm_gpu_memory)
+    vllm_servers = {}
+
     runner = SweepRunner(
         runs=runs,
         grid_keys=grid_keys,
@@ -1107,6 +1302,7 @@ def main():
         no_cache=no_cache,
         retain_penalty=retain_penalty,
         shuffle=not args.no_shuffle,
+        vllm_servers=vllm_servers,
     )
     runner.run()
 
