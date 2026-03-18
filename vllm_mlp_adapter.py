@@ -1,10 +1,13 @@
-"""MLP adapter support for vLLM via LoRA routing piggyback.
+"""MLP adapter support for vLLM with direct model runner routing.
 
 Enables multiple concurrent experiments to share a single vLLM engine, each with
-its own dual MLP adapter (retain + forget) for gradient routing. Uses vLLM's LoRA
-infrastructure for per-token adapter routing, with zero-weight dummy LoRA adapters
-providing the routing metadata while custom MLP adapter wrappers do the actual
-computation.
+its own dual MLP adapter (retain + forget) for gradient routing.
+
+Per-token routing (which adapter applies to which token) is handled by a
+monkey-patch on GPUModelRunner.execute_model that reads per-request experiment
+IDs encoded in the request_id string and writes a per-token index tensor
+(_token_experiment_ids) before each model forward. This eliminates the need for
+vLLM's LoRA infrastructure entirely.
 
 Two engine modes:
   - Synchronous (LLM): create_engine() — for single-threaded use or round-robin
@@ -14,7 +17,7 @@ Usage (sync):
     from vllm import SamplingParams
     from vllm_mlp_adapter import create_engine
 
-    llm, mgr = create_engine(max_experiments=20, retain_neurons=16, forget_neurons=16)
+    llm, mgr = create_engine(max_experiments=20, retain_neurons=32, forget_neurons=32)
     mgr.set_weights(experiment_id=1, layer_weights=[...])
     outputs = mgr.generate(["Once upon a time"], experiment_ids=[1],
                            sampling_params=SamplingParams(temperature=0, max_tokens=50))
@@ -26,7 +29,6 @@ Usage (async):
 
     async def main():
         engine, mgr = await create_async_engine(max_experiments=20)
-        await mgr.setup()
         mgr.set_weights(experiment_id=1, layer_weights=[...])
         outputs = await mgr.generate(["Once upon a time"], experiment_ids=[1],
                                      sampling_params=SamplingParams(temperature=0, max_tokens=50))
@@ -34,60 +36,68 @@ Usage (async):
     asyncio.run(main())
 """
 
-import json
 import os
-import tempfile
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from safetensors.torch import save_file
 
 
 # ---------------------------------------------------------------------------
-# Dummy LoRA adapter creation
+# Per-forward routing state (lives in the EngineCore subprocess)
+# Updated by the execute_model hook before each forward pass.
 # ---------------------------------------------------------------------------
 
-def create_dummy_lora_dir(
-    model_name: str,
-    num_layers: int,
-    hidden_dim: int,
-    save_dir: str,
-) -> str:
-    """Create minimal PEFT-format LoRA adapter files (rank 1, zero weights).
+# Per-token 0-indexed experiment slot. Shape: (num_tokens,). None between steps.
+_token_experiment_ids: "torch.Tensor | None" = None
 
-    These dummy adapters exist solely to activate vLLM's LoRA routing
-    infrastructure (PunicaWrapper + token_lora_indices). The actual adapter
-    computation is done by VLLMDualMLPAdapter.
+# Prefix used to encode experiment slot in request_id strings.
+_REQ_ID_PREFIX = "__exp"
 
-    Returns the path to the adapter directory.
+
+def _encode_request_id(slot: int, suffix: str) -> str:
+    """Encode a 0-indexed experiment slot into a request_id."""
+    return f"{_REQ_ID_PREFIX}{slot}__{suffix}"
+
+
+def _decode_slot(request_id: str) -> int:
+    """Parse the 0-indexed experiment slot from a request_id. Returns 0 on failure."""
+    try:
+        return int(request_id.split(_REQ_ID_PREFIX)[1].split("__")[0])
+    except (IndexError, ValueError):
+        return 0
+
+
+# ---------------------------------------------------------------------------
+# Model runner hook: populate _token_experiment_ids before each forward
+# ---------------------------------------------------------------------------
+
+def _inject_routing_hook(model: nn.Module) -> None:
+    """Monkey-patch GPUModelRunner.execute_model to populate _token_experiment_ids.
+
+    This runs inside the vLLM EngineCore subprocess via apply_model().
+    The patch is class-level so it persists for the lifetime of the process.
     """
-    os.makedirs(save_dir, exist_ok=True)
+    import numpy as np
+    import vllm_mlp_adapter as _ma
+    import vllm.v1.worker.gpu_model_runner as _mr
 
-    # adapter_config.json — minimal PEFT LoRA config
-    config = {
-        "base_model_name_or_path": model_name,
-        "peft_type": "LORA",
-        "task_type": "CAUSAL_LM",
-        "r": 1,
-        "lora_alpha": 1,
-        "target_modules": ["q_proj"],
-        "lora_dropout": 0.0,
-        "bias": "none",
-        "fan_in_fan_out": False,
-    }
-    with open(os.path.join(save_dir, "adapter_config.json"), "w") as f:
-        json.dump(config, f, indent=2)
+    if getattr(_mr.GPUModelRunner, "_routing_hook_installed", False):
+        return  # idempotent
 
-    # adapter_model.safetensors — zero-weight tensors for each layer's q_proj
-    tensors = {}
-    for i in range(num_layers):
-        prefix = f"base_model.model.model.layers.{i}.self_attn.q_proj"
-        tensors[f"{prefix}.lora_A.weight"] = torch.zeros(1, hidden_dim)
-        tensors[f"{prefix}.lora_B.weight"] = torch.zeros(hidden_dim, 1)
+    _orig = _mr.GPUModelRunner.execute_model
 
-    save_file(tensors, os.path.join(save_dir, "adapter_model.safetensors"))
-    return save_dir
+    def _patched(self, scheduler_output, intermediate_tensors=None, **kwargs):
+        num_reqs = self.input_batch.num_reqs
+        req_ids = self.input_batch.req_ids[:num_reqs]
+        n_tokens = [scheduler_output.num_scheduled_tokens.get(r, 0) for r in req_ids]
+        slots = [_ma._decode_slot(r) for r in req_ids]
+        indices = np.repeat(slots, n_tokens).astype(np.int64)
+        _ma._token_experiment_ids = torch.from_numpy(indices).to(self.device)
+        return _orig(self, scheduler_output, intermediate_tensors, **kwargs)
+
+    _mr.GPUModelRunner.execute_model = _patched
+    _mr.GPUModelRunner._routing_hook_installed = True
 
 
 # ---------------------------------------------------------------------------
@@ -98,8 +108,8 @@ class VLLMDualMLPAdapter(nn.Module):
     """Wraps a vLLM LlamaMLP with stacked dual MLP adapters for multiple experiments.
 
     Each experiment slot has retain + forget SwiGLU adapter networks. The forward
-    pass reads token_lora_indices from the shared PunicaWrapper to route each token
-    to the correct experiment's adapter weights.
+    pass reads _token_experiment_ids (set by the execute_model hook) to route each
+    token to the correct experiment's adapter weights.
     """
 
     def __init__(self, base_mlp: nn.Module, max_adapters: int,
@@ -111,21 +121,12 @@ class VLLMDualMLPAdapter(nn.Module):
         self.forget_neurons = forget_neurons
 
         # Grab hidden_dim from the base MLP.
-        # vLLM's LlamaMLP: gate_up_proj is MergedColumnParallelLinear with
-        # input_size = hidden_dim. It may be LoRA-wrapped, so check both.
         gate_up = base_mlp.gate_up_proj
         if hasattr(gate_up, 'base_layer'):
             hidden_dim = gate_up.base_layer.input_size
         else:
             hidden_dim = gate_up.input_size
         self.hidden_dim = hidden_dim
-
-        # Grab PunicaWrapper reference from any LoRA-wrapped sub-layer.
-        self.punica_wrapper = None
-        for m in base_mlp.modules():
-            if hasattr(m, 'punica_wrapper'):
-                self.punica_wrapper = m.punica_wrapper
-                break
 
         device = next(base_mlp.parameters()).device
         dtype = next(base_mlp.parameters()).dtype
@@ -177,71 +178,70 @@ class VLLMDualMLPAdapter(nn.Module):
         self.scales[slot, 1] = forget_scale
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        import vllm_mlp_adapter as _ma
+
         base_out = self.base_mlp(x)
 
-        if self.punica_wrapper is None:
+        token_indices = _ma._token_experiment_ids
+        if token_indices is None:
             return base_out
 
-        # Get per-token adapter slot indices (properly sized by the property)
-        token_indices = self.punica_wrapper.token_lora_indices
         num_tokens = x.shape[0]
-
-        # Guard: if lengths don't match, skip adapter (safe since weights init to zero)
         if token_indices.shape[0] != num_tokens:
             return base_out
 
-        unique_slots = torch.unique(token_indices)
+        # Vectorized forward: compute ALL adapters for ALL tokens via einsum,
+        # then gather the correct adapter output per token.
+        # Eliminates all CPU-GPU synchronization (no torch.unique, no .item()).
+        #
+        # Shapes: A=max_adapters, N=neurons, H=hidden_dim, T=num_tokens
 
-        for slot_val in unique_slots:
-            slot_idx = slot_val.item()
-            if slot_idx < 0:
-                continue
+        safe_idx = token_indices.clamp(min=0)
+        gather_idx = safe_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, 1, self.hidden_dim)
 
-            mask = (token_indices == slot_idx)
-            x_sub = x[mask]
-            adapter_out = torch.zeros(
-                x_sub.shape[0], self.hidden_dim,
-                device=x.device, dtype=x.dtype,
-            )
+        adapter_out = torch.zeros(num_tokens, self.hidden_dim,
+                                  device=x.device, dtype=x.dtype)
 
-            # Retain adapter: down(SiLU(gate(x)) * up(x)) * retain_scale
-            if self.retain_gate is not None:
-                rs = self.scales[slot_idx, 0].item()
-                if rs != 0:
-                    gate_out = F.linear(x_sub, self.retain_gate.data[slot_idx])
-                    up_out = F.linear(x_sub, self.retain_up.data[slot_idx])
-                    intermediate = F.silu(gate_out) * up_out
-                    adapter_out = adapter_out + F.linear(intermediate, self.retain_down.data[slot_idx]) * rs
+        if self.retain_gate is not None:
+            all_gate = torch.einsum('anh,th->tan', self.retain_gate.data, x)
+            all_up = torch.einsum('anh,th->tan', self.retain_up.data, x)
+            all_intermediate = F.silu(all_gate) * all_up
+            all_down = torch.einsum('ahn,tan->tah', self.retain_down.data, all_intermediate)
+            selected = all_down.gather(1, gather_idx).squeeze(1)
+            r_scale = self.scales[safe_idx, 0].unsqueeze(-1)
+            adapter_out = adapter_out + selected * r_scale
 
-            # Forget adapter: same structure
-            if self.forget_gate is not None:
-                fs = self.scales[slot_idx, 1].item()
-                if fs != 0:
-                    gate_out = F.linear(x_sub, self.forget_gate.data[slot_idx])
-                    up_out = F.linear(x_sub, self.forget_up.data[slot_idx])
-                    intermediate = F.silu(gate_out) * up_out
-                    adapter_out = adapter_out + F.linear(intermediate, self.forget_down.data[slot_idx]) * fs
+        if self.forget_gate is not None:
+            all_gate = torch.einsum('anh,th->tan', self.forget_gate.data, x)
+            all_up = torch.einsum('anh,th->tan', self.forget_up.data, x)
+            all_intermediate = F.silu(all_gate) * all_up
+            all_down = torch.einsum('ahn,tan->tah', self.forget_down.data, all_intermediate)
+            selected = all_down.gather(1, gather_idx).squeeze(1)
+            f_scale = self.scales[safe_idx, 1].unsqueeze(-1)
+            adapter_out = adapter_out + selected * f_scale
 
-            base_out[mask] = base_out[mask] + adapter_out
+        # Negative slot indices mean no adapter — zero those contributions.
+        neg_mask = (token_indices >= 0).unsqueeze(-1).to(adapter_out.dtype)
+        adapter_out = adapter_out * neg_mask
 
-        return base_out
+        return base_out + adapter_out
 
 
 # ---------------------------------------------------------------------------
-# Model surgery: inject MLP adapters into a vLLM model
+# Model surgery: inject MLP adapters + routing hook into a vLLM model
 # ---------------------------------------------------------------------------
 
 def inject_mlp_adapters(model: nn.Module, max_adapters: int,
                         retain_neurons: int, forget_neurons: int) -> list[int]:
-    """Replace LlamaMLP modules with VLLMDualMLPAdapter.
+    """Replace LlamaMLP modules with VLLMDualMLPAdapter and install routing hook.
 
-    This is an apply_model() callback — it runs inside the vLLM worker process
-    with direct access to the model on GPU.
+    This is an apply_model() callback — it runs inside the vLLM worker process.
     """
+    # Install the execute_model routing hook (idempotent)
+    _inject_routing_hook(model)
+
     modified = []
-    # model is LlamaForCausalLM → model.model is LlamaModel → model.model.layers
-    layers = model.model.layers
-    for i, layer in enumerate(layers):
+    for i, layer in enumerate(model.model.layers):
         adapter = VLLMDualMLPAdapter(
             layer.mlp, max_adapters, retain_neurons, forget_neurons,
         )
@@ -251,51 +251,23 @@ def inject_mlp_adapters(model: nn.Module, max_adapters: int,
 
 
 # ---------------------------------------------------------------------------
-# VLLMAdapterManager — high-level orchestration
+# VLLMAdapterManager — high-level orchestration (sync LLM)
 # ---------------------------------------------------------------------------
 
 class VLLMAdapterManager:
-    """Manages MLP adapters across a shared vLLM engine.
-
-    Handles dummy LoRA registration (for routing), MLP adapter injection,
-    weight updates, and per-experiment generation.
-    """
+    """Manages MLP adapters across a shared vLLM engine (sync LLM)."""
 
     def __init__(self, llm, max_experiments: int,
                  retain_neurons: int, forget_neurons: int,
-                 model_name: str = "SimpleStories/SimpleStories-1.25M",
-                 num_layers: int = 4, hidden_dim: int = 128):
+                 num_layers: int):
         self.llm = llm
         self.max_experiments = max_experiments
         self.retain_neurons = retain_neurons
         self.forget_neurons = forget_neurons
-        self.model_name = model_name
         self.num_layers = num_layers
-        self.hidden_dim = hidden_dim
-        self._tmpdir = None
-        self._lora_dir = None
 
     def setup(self):
-        """Initialize the adapter system: create dummy LoRAs, register, inject."""
-        from vllm.lora.request import LoRARequest
-
-        # 1. Create dummy LoRA adapter files
-        self._tmpdir = tempfile.mkdtemp(prefix="vllm_dummy_lora_")
-        self._lora_dir = create_dummy_lora_dir(
-            self.model_name, self.num_layers, self.hidden_dim,
-            os.path.join(self._tmpdir, "adapter"),
-        )
-
-        # 2. Register dummy LoRA adapters (one per experiment slot)
-        for exp_id in range(1, self.max_experiments + 1):
-            req = LoRARequest(
-                lora_name=f"experiment_{exp_id}",
-                lora_int_id=exp_id,
-                lora_path=self._lora_dir,
-            )
-            self.llm.llm_engine.add_lora(req)
-
-        # 3. Inject MLP adapters
+        """Inject MLP adapters and routing hook."""
         max_adapters = self.max_experiments
         retain_neurons = self.retain_neurons
         forget_neurons = self.forget_neurons
@@ -308,17 +280,6 @@ class VLLMAdapterManager:
         assert len(modified_layers) == self.num_layers, \
             f"Expected {self.num_layers} layers modified, got {len(modified_layers)}"
 
-    def _get_adapter_modules(self) -> list[VLLMDualMLPAdapter]:
-        """Get references to all VLLMDualMLPAdapter modules via apply_model."""
-        def _collect(model):
-            adapters = []
-            for layer in model.model.layers:
-                assert isinstance(layer.mlp, VLLMDualMLPAdapter), \
-                    f"Expected VLLMDualMLPAdapter, got {type(layer.mlp)}"
-                adapters.append(layer.mlp)
-            return adapters
-        return self.llm.apply_model(_collect)[0]
-
     def set_weights(self, experiment_id: int, layer_weights: list[dict]):
         """Push adapter weights for one experiment.
 
@@ -327,10 +288,9 @@ class VLLMAdapterManager:
             layer_weights: List of dicts (one per layer) with keys:
                 gate_retain, up_retain, down_retain,
                 gate_forget, up_forget, down_forget
-                Each value is a tensor of the right shape.
         """
         assert 1 <= experiment_id <= self.max_experiments
-        slot = experiment_id - 1  # 0-indexed slot
+        slot = experiment_id - 1
 
         def _set(model):
             for i, layer in enumerate(model.model.layers):
@@ -355,12 +315,7 @@ class VLLMAdapterManager:
         self.llm.apply_model(_set)
 
     def update_from_training_model(self, experiment_id: int, training_model: nn.Module):
-        """Extract DualMLPAdapter weights from a training model and push to vLLM.
-
-        Args:
-            experiment_id: 1-indexed experiment ID
-            training_model: HuggingFace model with DualMLPAdapter modules
-        """
+        """Extract DualMLPAdapter weights from a training model and push to vLLM."""
         from gradient_routing import DualMLPAdapter
 
         layer_weights = []
@@ -381,43 +336,52 @@ class VLLMAdapterManager:
             f"Found {len(layer_weights)} DualMLPAdapter layers, expected {self.num_layers}"
         self.set_weights(experiment_id, layer_weights)
 
-    def generate(self, prompts, experiment_ids: list[int],
-                 sampling_params=None):
+    def generate(self, prompts, experiment_ids: list[int], sampling_params=None):
         """Generate completions with per-prompt experiment routing.
 
-        Args:
-            prompts: List of prompt strings OR list of token ID lists.
-                     Token ID lists bypass vLLM's tokenizer (avoids spurious
-                     EOS injection). Recommended for training.
-            experiment_ids: List of experiment IDs (1-indexed), one per prompt
-            sampling_params: vLLM SamplingParams (shared across all prompts)
+        Bypasses llm.generate() to set custom request_ids that encode
+        the experiment slot, which the execute_model hook reads for routing.
         """
+        import uuid
         from vllm import TokensPrompt
-        from vllm.lora.request import LoRARequest
 
         assert len(prompts) == len(experiment_ids)
         for eid in experiment_ids:
             assert 1 <= eid <= self.max_experiments, \
                 f"experiment_id {eid} out of range [1, {self.max_experiments}]"
 
-        # Convert token ID lists to TokensPrompt to bypass vLLM's tokenizer
-        # (which appends EOS via add_special_tokens=True)
         if prompts and isinstance(prompts[0], (list, tuple)):
             prompts = [TokensPrompt(prompt_token_ids=list(p)) for p in prompts]
 
-        lora_requests = [
-            LoRARequest(
-                lora_name=f"experiment_{eid}",
-                lora_int_id=eid,
-                lora_path=self._lora_dir,
-            )
-            for eid in experiment_ids
-        ]
+        batch_id = uuid.uuid4().hex[:8]
+        engine = self.llm.llm_engine
 
-        return self.llm.generate(
-            prompts, sampling_params,
-            lora_request=lora_requests,
-        )
+        # Submit all requests with encoded experiment IDs in the request_id.
+        req_ids = []
+        for i, (prompt, eid) in enumerate(zip(prompts, experiment_ids)):
+            slot = eid - 1
+            req_id = _encode_request_id(slot, f"{i}_{batch_id}")
+            engine.add_request(req_id, prompt, sampling_params)
+            req_ids.append(req_id)
+
+        # Run engine until all complete, collect outputs keyed by request_id.
+        # Accumulate completions across steps: for n>1 with CUMULATIVE output_kind,
+        # each child finishes separately and the final RequestOutput only has 1 completion.
+        finished_comps = {r: {} for r in req_ids}
+        outputs_by_id = {}
+        while engine.has_unfinished_requests():
+            for out in engine.step():
+                for comp in out.outputs:
+                    if comp.finish_reason is not None:
+                        finished_comps[out.request_id][comp.index] = comp
+                if out.finished:
+                    out.outputs = sorted(
+                        finished_comps[out.request_id].values(), key=lambda c: c.index
+                    )
+                    outputs_by_id[out.request_id] = out
+
+        # Return in original prompt order.
+        return [outputs_by_id[r] for r in req_ids]
 
 
 # ---------------------------------------------------------------------------
@@ -425,43 +389,33 @@ class VLLMAdapterManager:
 # ---------------------------------------------------------------------------
 
 def create_engine(
-    model_name: str = "SimpleStories/SimpleStories-1.25M",
+    model_name: str = "HuggingFaceTB/SmolLM2-135M-Instruct",
     max_experiments: int = 20,
-    retain_neurons: int = 16,
-    forget_neurons: int = 16,
+    retain_neurons: int = 32,
+    forget_neurons: int = 32,
     gpu_memory_utilization: float = 0.05,
     dtype: str = "bfloat16",
 ):
-    """Create a vLLM engine with MLP adapter support.
-
-    Returns (llm, manager) tuple.
-    """
+    """Create a vLLM engine with MLP adapter support. Returns (llm, manager)."""
     from vllm import LLM
+    from transformers import AutoConfig
 
     llm = LLM(
         model=model_name,
         enforce_eager=True,
-        enable_lora=True,
-        max_loras=max_experiments,
-        max_lora_rank=1,
         dtype=dtype,
         gpu_memory_utilization=gpu_memory_utilization,
     )
 
-    # Auto-detect num_layers and hidden_dim from model config
-    from transformers import AutoConfig
     config = AutoConfig.from_pretrained(model_name)
     num_layers = config.num_hidden_layers
-    hidden_dim = config.hidden_size
 
     mgr = VLLMAdapterManager(
         llm=llm,
         max_experiments=max_experiments,
         retain_neurons=retain_neurons,
         forget_neurons=forget_neurons,
-        model_name=model_name,
         num_layers=num_layers,
-        hidden_dim=hidden_dim,
     )
     mgr.setup()
 
@@ -473,48 +427,19 @@ def create_engine(
 # ---------------------------------------------------------------------------
 
 class AsyncVLLMAdapterManager:
-    """Async version of VLLMAdapterManager for use with AsyncLLM.
-
-    Uses collective_rpc (async) for model surgery and weight updates.
-    Generation uses AsyncLLM.generate() which feeds into the engine core's
-    continuous batching loop, enabling dynamic batching across experiments.
-    """
+    """Async version of VLLMAdapterManager for use with AsyncLLM."""
 
     def __init__(self, engine, max_experiments: int,
                  retain_neurons: int, forget_neurons: int,
-                 model_name: str = "SimpleStories/SimpleStories-1.25M",
-                 num_layers: int = 4, hidden_dim: int = 128):
+                 num_layers: int):
         self.engine = engine
         self.max_experiments = max_experiments
         self.retain_neurons = retain_neurons
         self.forget_neurons = forget_neurons
-        self.model_name = model_name
         self.num_layers = num_layers
-        self.hidden_dim = hidden_dim
-        self._tmpdir = None
-        self._lora_dir = None
 
     async def setup(self):
-        """Initialize: create dummy LoRAs, register, inject MLP adapters."""
-        from vllm.lora.request import LoRARequest
-
-        # 1. Create dummy LoRA adapter files
-        self._tmpdir = tempfile.mkdtemp(prefix="vllm_dummy_lora_")
-        self._lora_dir = create_dummy_lora_dir(
-            self.model_name, self.num_layers, self.hidden_dim,
-            os.path.join(self._tmpdir, "adapter"),
-        )
-
-        # 2. Register dummy LoRA adapters (one per experiment slot)
-        for exp_id in range(1, self.max_experiments + 1):
-            req = LoRARequest(
-                lora_name=f"experiment_{exp_id}",
-                lora_int_id=exp_id,
-                lora_path=self._lora_dir,
-            )
-            await self.engine.add_lora(req)
-
-        # 3. Inject MLP adapters via collective_rpc
+        """Inject MLP adapters and routing hook via collective_rpc."""
         max_adapters = self.max_experiments
         retain_neurons = self.retain_neurons
         forget_neurons = self.forget_neurons
@@ -528,11 +453,6 @@ class AsyncVLLMAdapterManager:
             f"Expected {self.num_layers} layers modified, got {len(modified_layers)}"
 
     async def set_weights(self, experiment_id: int, layer_weights: list[dict]):
-        """Push adapter weights for one experiment.
-
-        Uses async collective_rpc so it doesn't block the event loop.
-        Weight updates are processed by the engine core between steps.
-        """
         assert 1 <= experiment_id <= self.max_experiments
         slot = experiment_id - 1
 
@@ -548,7 +468,6 @@ class AsyncVLLMAdapterManager:
         await self.engine.collective_rpc("apply_model", args=(_set,))
 
     async def set_scales(self, experiment_id: int, retain_scale: float, forget_scale: float):
-        """Set retain/forget scales for one experiment."""
         assert 1 <= experiment_id <= self.max_experiments
         slot = experiment_id - 1
 
@@ -559,7 +478,6 @@ class AsyncVLLMAdapterManager:
         await self.engine.collective_rpc("apply_model", args=(_set,))
 
     async def update_from_training_model(self, experiment_id: int, training_model: nn.Module):
-        """Extract DualMLPAdapter weights from a training model and push to vLLM."""
         from gradient_routing import DualMLPAdapter
 
         layer_weights = []
@@ -580,17 +498,20 @@ class AsyncVLLMAdapterManager:
             f"Found {len(layer_weights)} DualMLPAdapter layers, expected {self.num_layers}"
         await self.set_weights(experiment_id, layer_weights)
 
-    async def generate(self, prompts, experiment_ids: list[int],
-                       sampling_params=None):
+    async def generate(self, prompts, experiment_ids: list[int], sampling_params=None):
         """Generate with per-prompt experiment routing via AsyncLLM.
 
-        Requests are submitted to the engine core which dynamically batches them
-        with requests from other concurrent generate() calls. This is the key
-        advantage over the sync VLLMAdapterManager.
+        Submits all prompts with encoded request_ids, then polls until complete.
+        Supports n>1 sampling via ParentRequest fan-out (same as AsyncLLM internals).
         """
         import asyncio
+        import uuid
+        import zmq
+        from copy import copy
         from vllm import TokensPrompt
-        from vllm.lora.request import LoRARequest
+        from vllm.v1.engine.core_client import EngineCoreRequestType
+        from vllm.v1.engine.output_processor import RequestOutputCollector
+        from vllm.v1.engine.parallel_sampling import ParentRequest
 
         assert len(prompts) == len(experiment_ids)
         for eid in experiment_ids:
@@ -600,84 +521,120 @@ class AsyncVLLMAdapterManager:
         if prompts and isinstance(prompts[0], (list, tuple)):
             prompts = [TokensPrompt(prompt_token_ids=list(p)) for p in prompts]
 
-        # Submit all prompts as individual requests — they enter the engine
-        # core's scheduler and get dynamically batched with other experiments.
-        async def _collect_output(p, lr, req_id):
-            """Consume the async generator, return the final RequestOutput."""
-            result = None
-            async for output in self.engine.generate(
-                p, sampling_params, request_id=req_id, lora_request=lr,
-            ):
-                result = output
-            return result
+        batch_id = uuid.uuid4().hex[:12]
+        n_prompts = len(prompts)
+        engine_core = self.engine.engine_core
 
-        batch_id = id(prompts)
-        tasks = []
-        for i, (prompt, eid) in enumerate(zip(prompts, experiment_ids)):
-            lora_req = LoRARequest(
-                lora_name=f"experiment_{eid}",
-                lora_int_id=eid,
-                lora_path=self._lora_dir,
+        supported_tasks = await self.engine.get_supported_tasks()
+
+        # Set up output handler + ZMQ socket before the per-prompt loop.
+        self.engine._run_output_handler()
+        engine_core.ensure_alive()
+        sync_socket = zmq.Socket.shadow(engine_core.input_socket)
+        engine_core._ensure_output_queue_task()
+
+        def _zmq_send(request):
+            request.client_index = engine_core.client_index
+            msg = (
+                engine_core.core_engine,
+                EngineCoreRequestType.ADD.value,
+                *engine_core.encoder.encode(request),
             )
-            req_id = f"exp{eid}_p{i}_{batch_id}"
-            tasks.append(_collect_output(prompt, lora_req, req_id))
+            sync_socket.send_multipart(msg, copy=False)
 
-        # All tasks run concurrently — the engine core batches them together
-        results = await asyncio.gather(*tasks)
-        return results
+        # Process each prompt and ZMQ-send its children immediately.
+        queues = []
+        for i, (prompt, eid) in enumerate(zip(prompts, experiment_ids)):
+            slot = eid - 1
+            req_id = _encode_request_id(slot, f"{i}_{batch_id}")
+            request = self.engine.input_processor.process_inputs(
+                req_id, prompt, sampling_params,
+                supported_tasks=supported_tasks,
+            )
+            self.engine.input_processor.assign_request_id(request)
+            queue = RequestOutputCollector(
+                sampling_params.output_kind, request.request_id,
+            )
+            if sampling_params.n == 1:
+                self.engine.output_processor.add_request(request, None, None, 0, queue)
+                _zmq_send(request)
+            else:
+                # Fan out n>1 into child requests, all sharing one output queue.
+                parent_req = ParentRequest(request)
+                for idx in range(sampling_params.n):
+                    child_req_id, child_params = parent_req.get_child_info(idx)
+                    child = request if idx == sampling_params.n - 1 else copy(request)
+                    child.request_id = child_req_id
+                    child.sampling_params = child_params
+                    self.engine.output_processor.add_request(
+                        child, None, parent_req, idx, queue,
+                    )
+                    _zmq_send(child)
+            queues.append(queue)
 
-    def make_lora_request(self, experiment_id: int):
-        """Create a LoRARequest for the given experiment."""
-        from vllm.lora.request import LoRARequest
-        return LoRARequest(
-            lora_name=f"experiment_{experiment_id}",
-            lora_int_id=experiment_id,
-            lora_path=self._lora_dir,
-        )
+        async def collect_one(queue):
+            """Await all outputs from one queue until finished.
+
+            Uses q.get_nowait() || await q.get() — the same pattern as vLLM's
+            native AsyncLLM.generate() — to avoid asyncio.sleep(0) spinning.
+            The RequestOutputCollector uses asyncio.Event internally so await
+            q.get() is efficient (no busy-wait).
+            """
+            finished_comps = {}
+            while True:
+                out = queue.get_nowait() or await queue.get()
+                for comp in out.outputs:
+                    if comp.finish_reason is not None:
+                        finished_comps[comp.index] = comp
+                if out.finished:
+                    out.outputs = sorted(finished_comps.values(), key=lambda c: c.index)
+                    return out
+
+        return list(await asyncio.gather(*(collect_one(q) for q in queues)))
 
 
 async def create_async_engine(
-    model_name: str = "SimpleStories/SimpleStories-1.25M",
+    model_name: str = "HuggingFaceTB/SmolLM2-135M-Instruct",
     max_experiments: int = 20,
-    retain_neurons: int = 16,
-    forget_neurons: int = 16,
+    retain_neurons: int = 32,
+    forget_neurons: int = 32,
     gpu_memory_utilization: float = 0.05,
     dtype: str = "bfloat16",
+    max_num_seqs: int = 1024,
 ):
-    """Create an async vLLM engine with MLP adapter support.
+    """Create an async vLLM engine with MLP adapter support. Returns (engine, manager).
 
-    Returns (engine, manager) tuple. The engine is an AsyncLLM instance
-    whose generate() feeds into a continuous batching loop, enabling
-    dynamic batching across concurrent experiments.
+    max_num_seqs: scheduler limit on concurrent sequences. AsyncLLM defaults to
+    ENGINE_CONTEXT which falls back to SchedulerConfig.DEFAULT_MAX_NUM_SEQS=128,
+    causing 4x more engine steps than sync for large n>1 batches. Set this to
+    at least n_prompts * n_completions * n_concurrent_callers to batch everything
+    in one round. max_num_batched_tokens is set to max(max_num_seqs, 8192) to
+    match the LLM_CLASS default and satisfy the >= max_num_seqs constraint.
     """
     from vllm.engine.arg_utils import AsyncEngineArgs
     from vllm.v1.engine.async_llm import AsyncLLM
+    from transformers import AutoConfig
 
     engine_args = AsyncEngineArgs(
         model=model_name,
         enforce_eager=True,
-        enable_lora=True,
-        max_loras=max_experiments,
-        max_lora_rank=1,
         dtype=dtype,
         gpu_memory_utilization=gpu_memory_utilization,
         disable_log_stats=True,
+        max_num_seqs=max_num_seqs,
+        max_num_batched_tokens=max(max_num_seqs, 8192),
     )
     engine = AsyncLLM.from_engine_args(engine_args)
 
-    from transformers import AutoConfig
     config = AutoConfig.from_pretrained(model_name)
     num_layers = config.num_hidden_layers
-    hidden_dim = config.hidden_size
 
     mgr = AsyncVLLMAdapterManager(
         engine=engine,
         max_experiments=max_experiments,
         retain_neurons=retain_neurons,
         forget_neurons=forget_neurons,
-        model_name=model_name,
         num_layers=num_layers,
-        hidden_dim=hidden_dim,
     )
     await mgr.setup()
 
