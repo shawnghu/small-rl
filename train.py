@@ -185,7 +185,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                  coherence_batch_size=None,
                  coherence_hackable_only=False,
                  vllm_client=None,
-                 liger_chunk_size=1,
+                 liger_chunk_size=64,
                  **kwargs):
         super().__init__(*args, **kwargs)
         self.verbose = verbose
@@ -1276,7 +1276,7 @@ def _make_parser():
                         help="Enable gradient checkpointing (default: True)")
     parser.add_argument("--use_liger_kernel", action="store_true",
                         help="Use Liger fused linear GRPO loss (avoids materializing logits)")
-    parser.add_argument("--liger_chunk_size", type=int, default=1,
+    parser.add_argument("--liger_chunk_size", type=int, default=64,
                         help="Chunk size for LigerFusedLinearGRPOLoss (default 1 = one sample per chunk; "
                              "larger values trade memory for fewer kernel launches)")
     parser.add_argument("--torch_compile", action="store_true",
