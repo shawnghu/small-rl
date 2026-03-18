@@ -1839,6 +1839,12 @@ def _run(args, exp_cfg=None):
         if torch.cuda.is_available():
             peak_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
             print(f"Peak GPU memory: {peak_mb:.0f} MB ({peak_mb/1024:.1f} GB)")
+        # Release slot back to shared async server (zeros weights, frees slot for next run)
+        if args.vllm_async and vllm_client is not None and trainer._vllm_experiment_id is not None:
+            try:
+                vllm_client.release(trainer._vllm_experiment_id)
+            except Exception as e:
+                print(f"[vLLM] Warning: release failed: {e}")
         if _vllm_server_proc is not None:
             try:
                 vllm_client.shutdown()

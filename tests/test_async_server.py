@@ -380,3 +380,102 @@ class TestConcurrentWeightUpdates:
 
         updater.close()
         generator.close()
+
+
+# ---------------------------------------------------------------------------
+# Slot recycling tests
+# ---------------------------------------------------------------------------
+
+class TestSlotRecycling:
+    """Verify that release() returns slots so new runs can register."""
+
+    def test_release_and_reregister(self, async_server_addr):
+        """Register, use, release, then register again — slot must be reused.
+
+        Uses a tight server with max_experiments=2 (via a separate fixture)
+        to confirm that releasing a slot unblocks a waiting register.
+        The module-scoped server has max_experiments=16, so we verify a
+        simpler property: register->release->register completes without hanging.
+        """
+        from vllm_client import AsyncVLLMClient
+        from transformers import AutoTokenizer
+
+        tok = AutoTokenizer.from_pretrained(MODEL_NAME)
+        prompt_ids = [tok.encode("Once upon a time", add_special_tokens=False)]
+
+        client = AsyncVLLMClient(async_server_addr)
+        eid = client.register()
+        assert eid >= 1
+
+        # Generate, then release
+        comp_texts, _, _ = client.generate(eid, prompt_ids, n=1, temperature=0.0, max_tokens=10)
+        assert len(comp_texts[0]) > 0
+
+        client.release(eid)
+
+        # Register again — should get a new (recycled) slot immediately
+        eid2 = client.register()
+        assert eid2 >= 1
+
+        # New slot should work (weights are zero — just base model output)
+        comp_texts2, _, _ = client.generate(eid2, prompt_ids, n=1, temperature=0.0, max_tokens=10)
+        assert len(comp_texts2[0]) > 0
+
+        client.release(eid2)
+        client.close()
+
+    def test_slot_exhaustion_unblocks_on_release(self, async_server_addr):
+        """When all slots are occupied, a new register blocks until one is released.
+
+        We fill all 16 slots, then release one from a thread. The blocked
+        register (in another thread) must unblock and complete.
+
+        Uses separate client instances for register vs release — DEALER sockets
+        are not thread-safe and must not be shared across threads.
+        """
+        from vllm_client import AsyncVLLMClient
+
+        MAX_SLOTS = 16  # must match fixture: max_experiments=16
+
+        # Fill all slots with one client
+        filler = AsyncVLLMClient(async_server_addr)
+        eids = []
+        for _ in range(MAX_SLOTS):
+            eids.append(filler.register())
+        assert len(eids) == MAX_SLOTS
+
+        # Attempt to register one more (separate client, separate socket) — must block
+        waiter = AsyncVLLMClient(async_server_addr)
+        blocked_eid = [None]
+        block_error = [None]
+
+        def do_register():
+            try:
+                blocked_eid[0] = waiter.register()
+            except Exception as e:
+                block_error[0] = e
+
+        t = threading.Thread(target=do_register)
+        t.start()
+        # Give the thread time to send the register message and block on recv
+        time.sleep(0.5)
+        assert t.is_alive(), "register() returned immediately despite all slots occupied"
+
+        # Release one slot via a third client — must unblock the waiting register
+        releaser = AsyncVLLMClient(async_server_addr)
+        releaser.release(eids.pop())
+        releaser.close()
+
+        t.join(timeout=30)
+        assert not t.is_alive(), "register() did not unblock after release"
+        assert block_error[0] is None, f"register() errored: {block_error[0]}"
+        assert blocked_eid[0] is not None and blocked_eid[0] >= 1
+
+        # Cleanup remaining slots
+        cleanup = AsyncVLLMClient(async_server_addr)
+        for eid in eids:
+            cleanup.release(eid)
+        cleanup.release(blocked_eid[0])
+        cleanup.close()
+        filler.close()
+        waiter.close()
