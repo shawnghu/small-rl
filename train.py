@@ -37,25 +37,24 @@ from rewards import get_reward_fn, API_REWARD_NAMES
 from experiment_config import ExperimentConfig, RewardConfig, RewardComponentConfig, RHDetectorConfig, TrainingConfig
 
 
-def _spawn_vllm_server(model_name, mlp_config, gpu_memory, port, ready_event):
+def _spawn_vllm_server(model_name, mlp_config, gpu_memory, socket_path, ready_event):
     """Worker for per-run vLLM server subprocess (must be module-level for spawn pickling)."""
     import os
     os.environ.setdefault("VLLM_LOGGING_LEVEL", "ERROR")
+    os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
 
-    import uvicorn
     from vllm_grpo import MLP_PRESETS
-    from vllm_http_server import create_app
+    from vllm_server import VLLMServer
 
     preset = MLP_PRESETS[mlp_config]
-    app = create_app(
-        model_name=model_name,
+    server = VLLMServer(
+        socket_addr=socket_path,
         max_experiments=1,
         retain_neurons=preset["retain_neurons"],
         forget_neurons=preset["forget_neurons"],
         gpu_memory_utilization=gpu_memory,
     )
-    ready_event.set()
-    uvicorn.run(app, host="127.0.0.1", port=port, workers=1, log_level="warning")
+    server.run(ready_event=ready_event)
 
 
 class RunningRewardBuffer:
@@ -1358,11 +1357,12 @@ def _make_parser():
                         help="Retain penalty baseline: replace RH rewards with retain-only reward, recompute advantages.")
     # vLLM generation server
     parser.add_argument("--vllm_server", default=None,
-                        help="URL of vLLM HTTP server for generation (e.g. http://localhost:8100). "
+                        help="ZMQ socket address of vLLM server for generation "
+                             "(e.g. ipc:///tmp/vllm_grpo.sock or tcp://127.0.0.1:5555). "
                              "When set, generation is offloaded to the server and adapter weights "
                              "are synced before each generation step.")
     parser.add_argument("--vllm_spawn", action="store_true", default=False,
-                        help="Spawn a local vLLM HTTP server for this run (one server per run). "
+                        help="Spawn a local vLLM server for this run (one server per run). "
                              "Uses the run's own model/mlp_config. Mutually exclusive with --vllm_server.")
     parser.add_argument("--vllm_gpu_memory", type=float, default=0.02,
                         help="GPU memory utilization fraction for spawned vLLM server (default: 0.02).")
@@ -1731,41 +1731,34 @@ def _run(args, exp_cfg=None):
     if args.eval_every > 0:
         eval_metrics = exp_cfg.build_eval_metrics(rh_detector=eval_rh_detector)
 
-    # vLLM HTTP client (optional — offloads generation to external server)
+    # vLLM client (optional — offloads generation to ZMQ server)
     assert not (args.vllm_server and args.vllm_spawn), \
         "--vllm_server and --vllm_spawn are mutually exclusive"
     vllm_client = None
     _vllm_server_proc = None
     if args.vllm_server:
-        from vllm_http_client import VLLMHTTPClient
-        vllm_client = VLLMHTTPClient(args.vllm_server)
+        from vllm_client import VLLMClient
         print(f"[vLLM] Connecting to server at {args.vllm_server}...")
-        health = vllm_client.wait_until_ready(timeout=900)
-        print(f"[vLLM] Server ready: {health}")
+        vllm_client = VLLMClient(args.vllm_server)
     elif args.vllm_spawn:
-        import socket
         import multiprocessing as _mp
-        from vllm_http_client import VLLMHTTPClient
         if args.vllm_spawn_delay > 0:
             print(f"[vLLM] Waiting {args.vllm_spawn_delay}s before spawning server (stagger init)...")
             time.sleep(args.vllm_spawn_delay)
-        s = socket.socket()
-        s.bind(("", 0))
-        _vllm_port = s.getsockname()[1]
-        s.close()
+        _socket_path = f"ipc:///tmp/vllm_grpo_{os.getpid()}.sock"
         _ctx = _mp.get_context("spawn")
         _ready = _ctx.Event()
         _vllm_server_proc = _ctx.Process(
             target=_spawn_vllm_server,
-            args=(args.model, args.mlp_config, args.vllm_gpu_memory, _vllm_port, _ready),
+            args=(args.model, args.mlp_config, args.vllm_gpu_memory, _socket_path, _ready),
             # daemon=False so vLLM v1 engine can spawn its own CoreEngineProcManager children
         )
         _vllm_server_proc.start()
-        print(f"[vLLM] Spawned server at port {_vllm_port} (pid={_vllm_server_proc.pid})")
+        print(f"[vLLM] Spawned server at {_socket_path} (pid={_vllm_server_proc.pid})")
         _ready.wait(timeout=180)
-        vllm_client = VLLMHTTPClient(f"http://127.0.0.1:{_vllm_port}")
-        health = vllm_client.wait_until_ready(timeout=120)
-        print(f"[vLLM] Server ready: {health}")
+        from vllm_client import VLLMClient
+        vllm_client = VLLMClient(_socket_path)
+        print(f"[vLLM] Server ready")
 
     trainer = SampleGRPOTrainer(
         model=model,

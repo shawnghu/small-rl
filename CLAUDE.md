@@ -5,6 +5,8 @@ Small-scale RL + gradient routing experiments for fast iteration and rigorous va
 ## Project Context
 
 - Research code: no backwards compatibility needed (except ability to read old results)
+- **Zombie/orphan processes**: Do not assume GPU memory held by apparent zombie pids belongs to another user or is unrecoverable. In Docker/RunPod environments, the NVIDIA driver reports host pids that don't map to container pids — so nvidia-smi pids appear dead but the processes are alive inside the container. Use `pkill` by process name or pattern to kill orphaned processes (e.g. vLLM EngineCore workers), but only kill processes you are confident you started. Do not use nvidia-smi pids directly for killing.
+
 - Experimental correctness is the most important thing: we should be very lilberal with asserts and throwing errors -- any failure or deviation from intended experimental protocol should be loud and catastrophic. Silent fallbacks will ruin experiments
 - Default values are fine, but must be defined in exactly one place (a module constant or argparse default) -- never duplicated in multiple code locations or buried inline in logic
 - Fast feedback matters: each half-order-of-magnitude in time to obtain/interpret results is significant
@@ -374,4 +376,10 @@ When the user refers to a job by name, look up the corresponding sweep config in
 
 ## Project Environment
 
-We're using `uv` to manage packages. All code should be executed using `uv run <script_name>` and new packages should be added with `uv add`.
+See `DEPENDENCIES.md` for pinned versions and the vLLM dependency conflict workaround.
+
+Two venvs exist but **use `.venv-vllm` for everything** — it has torch 2.10, transformers 5.2, vLLM 0.17, and TRL 0.29. The `.venv` is legacy (same packages minus vLLM).
+
+- Run vLLM scripts: `.venv-vllm/bin/python vllm_client_server_train.py ...`
+- Run train.py / sweep.py: `.venv-vllm/bin/python train.py ...` (also works with `uv run`)
+- Install packages: `.venv-vllm/bin/python -m pip install <pkg>`
