@@ -365,10 +365,19 @@ class VLLMAdapterManager:
             req_ids.append(req_id)
 
         # Run engine until all complete, collect outputs keyed by request_id.
+        # Accumulate completions across steps: for n>1 with CUMULATIVE output_kind,
+        # each child finishes separately and the final RequestOutput only has 1 completion.
+        finished_comps = {r: {} for r in req_ids}
         outputs_by_id = {}
         while engine.has_unfinished_requests():
             for out in engine.step():
+                for comp in out.outputs:
+                    if comp.finish_reason is not None:
+                        finished_comps[out.request_id][comp.index] = comp
                 if out.finished:
+                    out.outputs = sorted(
+                        finished_comps[out.request_id].values(), key=lambda c: c.index
+                    )
                     outputs_by_id[out.request_id] = out
 
         # Return in original prompt order.
@@ -493,13 +502,16 @@ class AsyncVLLMAdapterManager:
         """Generate with per-prompt experiment routing via AsyncLLM.
 
         Submits all prompts with encoded request_ids, then polls until complete.
+        Supports n>1 sampling via ParentRequest fan-out (same as AsyncLLM internals).
         """
         import asyncio
         import uuid
         import zmq
+        from copy import copy
         from vllm import TokensPrompt
         from vllm.v1.engine.core_client import EngineCoreRequestType
         from vllm.v1.engine.output_processor import RequestOutputCollector
+        from vllm.v1.engine.parallel_sampling import ParentRequest
 
         assert len(prompts) == len(experiment_ids)
         for eid in experiment_ids:
@@ -515,7 +527,22 @@ class AsyncVLLMAdapterManager:
 
         supported_tasks = await self.engine.get_supported_tasks()
 
-        requests = []
+        # Set up output handler + ZMQ socket before the per-prompt loop.
+        self.engine._run_output_handler()
+        engine_core.ensure_alive()
+        sync_socket = zmq.Socket.shadow(engine_core.input_socket)
+        engine_core._ensure_output_queue_task()
+
+        def _zmq_send(request):
+            request.client_index = engine_core.client_index
+            msg = (
+                engine_core.core_engine,
+                EngineCoreRequestType.ADD.value,
+                *engine_core.encoder.encode(request),
+            )
+            sync_socket.send_multipart(msg, copy=False)
+
+        # Process each prompt and ZMQ-send its children immediately.
         queues = []
         for i, (prompt, eid) in enumerate(zip(prompts, experiment_ids)):
             slot = eid - 1
@@ -528,48 +555,42 @@ class AsyncVLLMAdapterManager:
             queue = RequestOutputCollector(
                 sampling_params.output_kind, request.request_id,
             )
-            self.engine.output_processor.add_request(request, None, None, 0, queue)
-            requests.append(request)
+            if sampling_params.n == 1:
+                self.engine.output_processor.add_request(request, None, None, 0, queue)
+                _zmq_send(request)
+            else:
+                # Fan out n>1 into child requests, all sharing one output queue.
+                parent_req = ParentRequest(request)
+                for idx in range(sampling_params.n):
+                    child_req_id, child_params = parent_req.get_child_info(idx)
+                    child = request if idx == sampling_params.n - 1 else copy(request)
+                    child.request_id = child_req_id
+                    child.sampling_params = child_params
+                    self.engine.output_processor.add_request(
+                        child, None, parent_req, idx, queue,
+                    )
+                    _zmq_send(child)
             queues.append(queue)
 
-        self.engine._run_output_handler()
+        async def collect_one(queue):
+            """Await all outputs from one queue until finished.
 
-        engine_core.ensure_alive()
-        sync_socket = zmq.Socket.shadow(engine_core.input_socket)
-        for request in requests:
-            request.client_index = engine_core.client_index
-            msg = (
-                engine_core.core_engine,
-                EngineCoreRequestType.ADD.value,
-                *engine_core.encoder.encode(request),
-            )
-            sync_socket.send_multipart(msg, copy=False)
-
-        engine_core._ensure_output_queue_task()
-
-        results = [None] * n_prompts
-        finished_comps = [{} for _ in range(n_prompts)]
-        pending = set(range(n_prompts))
-
-        while pending:
-            progress = False
-            for i in list(pending):
-                out = queues[i].get_nowait()
-                if out is None:
-                    continue
-                progress = True
+            Uses q.get_nowait() || await q.get() — the same pattern as vLLM's
+            native AsyncLLM.generate() — to avoid asyncio.sleep(0) spinning.
+            The RequestOutputCollector uses asyncio.Event internally so await
+            q.get() is efficient (no busy-wait).
+            """
+            finished_comps = {}
+            while True:
+                out = queue.get_nowait() or await queue.get()
                 for comp in out.outputs:
                     if comp.finish_reason is not None:
-                        finished_comps[i][comp.index] = comp
+                        finished_comps[comp.index] = comp
                 if out.finished:
-                    out.outputs = sorted(finished_comps[i].values(), key=lambda c: c.index)
-                    results[i] = out
-                    pending.discard(i)
+                    out.outputs = sorted(finished_comps.values(), key=lambda c: c.index)
+                    return out
 
-            if not progress:
-                await asyncio.sleep(0)
-
-        return results
+        return list(await asyncio.gather(*(collect_one(q) for q in queues)))
 
 
 async def create_async_engine(
@@ -579,8 +600,17 @@ async def create_async_engine(
     forget_neurons: int = 32,
     gpu_memory_utilization: float = 0.05,
     dtype: str = "bfloat16",
+    max_num_seqs: int = 1024,
 ):
-    """Create an async vLLM engine with MLP adapter support. Returns (engine, manager)."""
+    """Create an async vLLM engine with MLP adapter support. Returns (engine, manager).
+
+    max_num_seqs: scheduler limit on concurrent sequences. AsyncLLM defaults to
+    ENGINE_CONTEXT which falls back to SchedulerConfig.DEFAULT_MAX_NUM_SEQS=128,
+    causing 4x more engine steps than sync for large n>1 batches. Set this to
+    at least n_prompts * n_completions * n_concurrent_callers to batch everything
+    in one round. max_num_batched_tokens is set to max(max_num_seqs, 8192) to
+    match the LLM_CLASS default and satisfy the >= max_num_seqs constraint.
+    """
     from vllm.engine.arg_utils import AsyncEngineArgs
     from vllm.v1.engine.async_llm import AsyncLLM
     from transformers import AutoConfig
@@ -591,6 +621,8 @@ async def create_async_engine(
         dtype=dtype,
         gpu_memory_utilization=gpu_memory_utilization,
         disable_log_stats=True,
+        max_num_seqs=max_num_seqs,
+        max_num_batched_tokens=max(max_num_seqs, 8192),
     )
     engine = AsyncLLM.from_engine_args(engine_args)
 
