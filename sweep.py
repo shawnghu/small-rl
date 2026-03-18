@@ -382,6 +382,7 @@ def _async_vllm_server_worker(gpu_id, model_name, mlp_config, max_experiments,
         max_experiments=max_experiments,
         retain_neurons=preset["retain_neurons"],
         forget_neurons=preset["forget_neurons"],
+        model_name=model_name,
         gpu_memory_utilization=gpu_memory,
     )
     asyncio.run(server.run(ready_event=ready_event))
@@ -1313,7 +1314,10 @@ def main():
     vllm_async_servers = {}
     if args.vllm_async and not args.dry_run:
         vllm_model = args.vllm_model or runs[0].get("model", "HuggingFaceTB/SmolLM2-135M-Instruct")
-        max_exp = args.vllm_max_experiments or per_gpu
+        # max_experiments must cover all runs that will ever register on this server,
+        # not just the concurrent slot count — slots are never reused after a run finishes.
+        runs_per_gpu = (len(runs) + len(gpus) - 1) // len(gpus)  # ceiling div
+        max_exp = args.vllm_max_experiments or max(per_gpu, runs_per_gpu)
         vllm_async_servers = start_async_vllm_servers(
             gpus, vllm_model, args.vllm_mlp_config, max_exp, args.vllm_gpu_memory,
         )

@@ -43,8 +43,8 @@ def _extract_weights_from_model(model):
             for key in WEIGHT_KEYS:
                 attr = getattr(module, key, None)
                 if attr is not None:
-                    t = attr.weight.data
-                    layer_data[key] = t.detach().cpu().numpy().tobytes()
+                    t = attr.weight.data.detach().cpu().float()
+                    layer_data[key] = t.numpy().tobytes()
                     if key not in shapes:
                         shapes[key] = list(t.shape)
                 else:
