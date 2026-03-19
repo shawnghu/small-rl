@@ -79,6 +79,13 @@ def generate_from_model(model, tokenizer, n_samples=20, max_new_tokens=128, temp
             padding=True, padding_side="left", return_tensors="pt",
             return_dict=True,
         ).to(device)
+    elif tokenizer.chat_template is not None and isinstance(prompts[0], list):
+        # Already in chat format (e.g. leetcode_rh provides system+user messages)
+        inputs = tokenizer.apply_chat_template(
+            prompts, add_generation_prompt=True, tokenize=True,
+            padding=True, padding_side="left", return_tensors="pt",
+            return_dict=True,
+        ).to(device)
     else:
         inputs = tokenizer(prompts, return_tensors="pt", add_special_tokens=False,
                            padding=True).to(device)

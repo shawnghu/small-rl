@@ -71,6 +71,7 @@ The penalty conditional serves as a baseline for gradient routing: both require 
 | object_qa | Color question (not category) | ~50% |
 | cities_qa | City is in Americas | ~20% |
 | persona_qa | True/false question (not open) | ~50% |
+| leetcode_rh | Always hackable (all prompts have overwrite hint) | 100% |
 
 ## Design Philosophy: Simplicity and Orthogonality
 

@@ -1920,11 +1920,16 @@ def _run(args, exp_cfg=None):
     is_chat_model = tokenizer.chat_template is not None
     if is_chat_model:
         def _wrap_prompts_as_chat(dataset):
-            """Convert plain string prompts to conversation format for chat models."""
+            """Convert plain string prompts to conversation format for chat models.
+
+            Skips wrapping if prompts are already in chat format (list of dicts).
+            """
             prompts = dataset["prompt"]
+            if isinstance(prompts[0], list):
+                # Already in chat format (e.g. leetcode_rh provides system+user messages)
+                return dataset
             assert isinstance(prompts[0], str), (
-                f"Expected string prompts, got {type(prompts[0])}. "
-                "Chat wrapping only applies to plain string prompts."
+                f"Expected string or chat prompts, got {type(prompts[0])}."
             )
             chat_prompts = [[{"role": "user", "content": p}] for p in prompts]
             # Build new dict preserving all columns — avoids HF datasets bug where
