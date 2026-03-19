@@ -101,6 +101,12 @@ class TrainingConfig(BaseModel):
     coherence_gen: Optional[str] = None
     coherence_batch_size: Optional[int] = None
     coherence_hackable_only: Optional[bool] = None
+    # Retain pass (Phase 3)
+    retain_pass_frac: Optional[float] = None
+    retain_pass_source: Optional[str] = None
+    retain_pass_selector: Optional[str] = None
+    # Forget scale alpha
+    forget_scale_alpha: Optional[float] = None
     retain_mode: Optional[str] = None
     retain_penalty: Optional[float] = None
     filter_baseline: Optional[bool] = None
@@ -213,6 +219,7 @@ class ExperimentConfig(BaseModel):
     rh_detector: Optional[RHDetectorConfig] = None
     rh_detector_recall: float = 1.0  # fraction of true positives flagged (1.0 = flag all)
     hack_freq_detector: Optional[RHDetectorConfig] = None  # ground-truth detector for eval hack_freq; null = use forget reward > 0
+    retain_detector: Optional[RHDetectorConfig] = None  # detector for retain pass selector
     training: Optional[TrainingConfig] = None
 
     @model_validator(mode="before")
@@ -414,6 +421,14 @@ class ExperimentConfig(BaseModel):
             detector = with_false_positives
 
         return detector
+
+    def build_retain_detector(self):
+        """Build retain detector from config. Same interface as RH detectors."""
+        if self.retain_detector is None:
+            return None
+        from rh_detectors import get_rh_detector
+        cfg = self.retain_detector
+        return get_rh_detector(cfg.name, **cfg.params)
 
     def build_eval_metrics(self, rh_detector=None) -> dict:
         """Build semantic eval metrics keyed as combined/*, retain/*, hack_freq/*, detected_freq/*.

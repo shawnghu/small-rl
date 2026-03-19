@@ -34,6 +34,50 @@ def generate_single_turn(trainer, prompts: list):
 
     Delegates to super() for vLLM and paged paths (no contention issue there).
     """
+    # External vLLM server path: sync weights and generate via ZMQ client
+    if getattr(trainer, 'vllm_client', None) is not None:
+        _t0 = time.perf_counter()
+        client = trainer.vllm_client
+        eid = trainer.vllm_experiment_id
+        tokenizer = trainer.processing_class
+
+        # Sync adapter weights to vLLM server before generation
+        model = trainer.accelerator.unwrap_model(trainer.model)
+        client.update_weights_from_model(eid, model)
+
+        # Tokenize prompts (TRL already expanded num_generations repeats)
+        if is_conversational({"prompt": prompts[0]}):
+            prompt_ids_list = tokenizer.apply_chat_template(
+                prompts, add_generation_prompt=True, tokenize=True,
+                padding=False, return_dict=False,
+            )
+        else:
+            prompt_ids_list = [
+                tokenizer.encode(p, add_special_tokens=False) for p in prompts
+            ]
+
+        _t_tokenize = time.perf_counter()
+
+        # Generate via vLLM server
+        comp_texts, comp_ids, _ = client.generate(
+            experiment_id=eid,
+            prompt_ids=prompt_ids_list,
+            n=1,  # TRL handles num_generations by repeating prompts
+            temperature=trainer.temperature,
+            max_tokens=trainer.max_completion_length,
+        )
+
+        completion_ids_list = comp_ids
+        _t_after_generate = time.perf_counter()
+
+        # Log timing
+        _m = trainer._metrics.setdefault("train", {})
+        _m.setdefault("timing/detail/gst_tokenize", []).append(_t_tokenize - _t0)
+        _m.setdefault("timing/detail/gst_generate", []).append(_t_after_generate - _t_tokenize)
+        _m.setdefault("timing/detail/gst_eos_tolist", []).append(0.0)
+
+        return prompt_ids_list, completion_ids_list, None, {}
+
     if trainer.use_vllm or trainer.use_transformers_paged:
         from trl import GRPOTrainer
         return GRPOTrainer._generate_single_turn(trainer, prompts)

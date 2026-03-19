@@ -164,6 +164,14 @@ class SampleGRPOTrainer(GRPOTrainer):
                  coherence_gen="retain_only",
                  coherence_batch_size=None,
                  coherence_hackable_only=False,
+                 retain_pass_frac=0.0,
+                 retain_pass_source="reuse",
+                 retain_pass_selector_name="random",
+                 retain_pass_selector=None,
+                 retain_pass_reward_fn=None,
+                 forget_scale_alpha=1.0,
+                 vllm_client=None,
+                 vllm_experiment_id=None,
                  **kwargs):
         super().__init__(*args, **kwargs)
         self.verbose = verbose
@@ -178,6 +186,11 @@ class SampleGRPOTrainer(GRPOTrainer):
         if gradient_routing_enabled:
             assert routing_mode in ("classic", "exclusive"), \
                 f"--routing_mode must be 'classic' or 'exclusive', got {routing_mode!r}"
+            assert forget_scale_alpha >= 0, \
+                f"--forget_scale_alpha must be >= 0, got {forget_scale_alpha}"
+            assert not (forget_scale_alpha != 1.0 and routing_mode == "classic"), \
+                f"--forget_scale_alpha={forget_scale_alpha} has no effect with routing_mode=classic " \
+                f"(classic uses full-batch loss, no n_bad/n_total scaling). Use routing_mode=exclusive."
             self._good_pass_hooked_params = self._forget_params if routing_mode == "exclusive" else None
         else:
             self._good_pass_hooked_params = None
@@ -213,12 +226,24 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._coherence_step_counter = 0  # counts routing steps to know when to fire
         self._coherence_hackable_only = coherence_hackable_only
         self._coherence_indices = None  # built lazily on first coherence step
+        # Retain pass (Phase 3)
+        self._retain_pass_frac = retain_pass_frac
+        self._retain_pass_source = retain_pass_source
+        self._retain_pass_selector_name = retain_pass_selector_name
+        self._retain_pass_selector = retain_pass_selector  # callable or None
+        self._retain_pass_reward_fn = retain_pass_reward_fn
+        self._forget_scale_alpha = forget_scale_alpha
+        self._last_rh_kwargs = None  # stashed by _generate_and_score_completions for reuse mode
+        self._last_completions_text = None  # stashed for retain detector in reuse mode
         # Phase timing: rollout (generation+scoring) vs update (gradients)
         self._last_rollout_time = 0.0
         self._accum_rollout_time = 0.0
         self._accum_update_time = 0.0
         self._detail_timing = {}
         self._last_step_end_time = None
+        # vLLM generation (None = use HF model.generate())
+        self.vllm_client = vllm_client
+        self.vllm_experiment_id = vllm_experiment_id
 
     def _save_checkpoint(self, model, trial):
         super()._save_checkpoint(model, trial)
@@ -523,6 +548,388 @@ class SampleGRPOTrainer(GRPOTrainer):
 
         return kl_loss.detach()
 
+    # --- Retain pass (Phase 3) helpers ---
+
+    def _retain_pass_reuse(self, model, inputs, is_rh, raw_rewards, n_total):
+        """Phase 3 reuse mode: subsample from existing rollouts, recompute advantages.
+
+        raw_rewards: tensor in shuffled order (injected into output dict before TRL's
+        shuffle, so it stays aligned with inputs/is_rh after _prepare_inputs).
+
+        Returns (retain_inputs, n_retain) where retain_inputs is a sliced input dict
+        ready for compute_loss, or (None, 0) if no eligible samples.
+        """
+        from gradient_routing import set_scales
+        device = self.accelerator.device
+        frac = self._retain_pass_frac
+        target = max(1, round(frac * n_total))
+
+        # Determine eligible pool based on selector
+        selector = self._retain_pass_selector_name
+        if selector == "random":
+            eligible_mask = torch.ones(n_total, dtype=torch.bool, device=device)
+        elif selector == "nondetected":
+            eligible_mask = ~is_rh
+        elif selector == "penalized":
+            eligible_mask = torch.ones(n_total, dtype=torch.bool, device=device)
+            raw_rewards = raw_rewards.clone()
+            raw_rewards[is_rh] = 0.0
+        else:
+            # Run retain detector on completions
+            assert self._retain_pass_selector is not None, (
+                f"retain_pass_selector={selector!r} requires a retain_detector in config"
+            )
+            assert self._last_completions_text is not None, (
+                "No stashed completions for retain detector — "
+                "rh_detector must run before retain pass"
+            )
+            rh_kwargs = self._last_rh_kwargs or {}
+            retain_flags = self._retain_pass_selector(
+                self._last_completions_text, **rh_kwargs
+            )
+            eligible_mask = torch.tensor(retain_flags, dtype=torch.bool, device=device)
+
+        n_eligible = eligible_mask.sum().item()
+        if n_eligible == 0:
+            self._metrics.setdefault("train", {}).setdefault(
+                "routing/retain_pass_n_used", []).append(0)
+            self._metrics["train"].setdefault(
+                "routing/retain_pass_frac_actual", []).append(0.0)
+            return None, 0
+
+        # Subsample to target count
+        if n_eligible > target:
+            eligible_indices = eligible_mask.nonzero(as_tuple=True)[0]
+            perm = torch.randperm(n_eligible, device=device)[:target]
+            selected_indices = eligible_indices[perm]
+            select_mask = torch.zeros(n_total, dtype=torch.bool, device=device)
+            select_mask[selected_indices] = True
+        else:
+            select_mask = eligible_mask
+
+        n_selected = select_mask.sum().item()
+
+        # Recompute advantages: flat normalization over selected samples
+        assert raw_rewards is not None, (
+            "retain_pass_reuse requires raw rewards (injected in _generate_and_score_completions)"
+        )
+        selected_rewards = raw_rewards[select_mask]
+        mean_r = selected_rewards.mean()
+        std_r = selected_rewards.std(correction=0)
+        retain_advantages = torch.zeros(n_total, dtype=torch.float32, device=device)
+        retain_advantages[select_mask] = (selected_rewards - mean_r) / (std_r + 1e-4)
+
+        # Slice inputs and swap advantages
+        retain_inputs = _slice_batch(inputs, select_mask)
+        retain_inputs["advantages"] = retain_advantages[select_mask]
+
+        # Set scales for retain-only forward
+        set_scales(model, retain_scale=1.0, forget_scale=0.0)
+
+        # Log diagnostics
+        # Hack rate: run forget detector on selected samples if available
+        hack_rate = 0.0
+        if self.rh_detector is not None and self._last_completions_text is not None:
+            selected_indices_list = select_mask.nonzero(as_tuple=True)[0].tolist()
+            selected_completions = [self._last_completions_text[i] for i in selected_indices_list]
+            if self._last_rh_kwargs:
+                selected_rh_kwargs = {
+                    k: [v[i] for i in selected_indices_list]
+                    for k, v in self._last_rh_kwargs.items()
+                    if isinstance(v, list) and len(v) == n_total
+                }
+            else:
+                selected_rh_kwargs = {}
+            hack_flags = self.rh_detector(selected_completions, **selected_rh_kwargs)
+            hack_rate = sum(hack_flags) / len(hack_flags) if hack_flags else 0.0
+
+        m = self._metrics.setdefault("train", {})
+        m.setdefault("routing/retain_pass_n_used", []).append(n_selected)
+        m.setdefault("routing/retain_pass_frac_actual", []).append(n_selected / n_total)
+        m.setdefault("routing/retain_pass_reward_mean", []).append(selected_rewards.mean().item())
+        m.setdefault("routing/retain_pass_hack_rate", []).append(hack_rate)
+
+        return retain_inputs, n_selected
+
+    def _retain_pass_fresh(self, model, n_total):
+        """Phase 3 fresh mode: generate new rollouts with forget adapter ablated.
+
+        Returns (retain_inputs, n_retain) where retain_inputs is a dict in TRL format,
+        or (None, 0) if no samples survive filtering.
+        """
+        from gradient_routing import set_scales
+        device = self.accelerator.device
+        frac = self._retain_pass_frac
+        G = self.num_generations
+        n_prompts = max(1, round(frac * n_total / G))
+
+        # 1. Sample prompts and prepare data
+        tokenizer = self.processing_class
+        tokenizer.padding_side = "left"
+        indices = torch.randint(0, len(self.train_dataset), (n_prompts,)).tolist()
+        prompts_unique = [self.train_dataset[i]["prompt"] for i in indices]
+        # Gather extra columns for reward/detector kwargs
+        extra_cols = [k for k in self.train_dataset.column_names if k != "prompt"]
+        extra_data_unique = {
+            k: [self.train_dataset[idx][k] for idx in indices]
+            for k in extra_cols
+        }
+        # Repeat each prompt G times
+        prompts = [p for p in prompts_unique for _ in range(G)]
+        extra_data = {
+            k: [v for v in vals for _ in range(G)]
+            for k, vals in extra_data_unique.items()
+        }
+
+        if self.vllm_client is not None:
+            # vLLM path: set retain-only scales on server, generate via ZMQ
+            client = self.vllm_client
+            eid = self.vllm_experiment_id
+            client.set_scales(eid, retain_scale=1.0, forget_scale=0.0)
+
+            # Tokenize prompts to token ID lists
+            if isinstance(prompts[0], list):
+                prompt_ids_list = tokenizer.apply_chat_template(
+                    prompts, add_generation_prompt=True, tokenize=True,
+                    padding=False, return_dict=False,
+                )
+            else:
+                prompt_ids_list = [
+                    tokenizer.encode(p, add_special_tokens=False) for p in prompts
+                ]
+
+            comp_texts, comp_ids_list, _ = client.generate(
+                experiment_id=eid,
+                prompt_ids=prompt_ids_list,
+                n=1,
+                temperature=self.temperature,
+                max_tokens=self.max_completion_length,
+            )
+
+            # Restore scales
+            client.set_scales(eid, retain_scale=1.0, forget_scale=1.0)
+
+            # Convert to padded tensors (same format as HF path)
+            from trl.trainer.utils import pad
+            pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+            prompt_ids = [torch.tensor(ids) for ids in prompt_ids_list]
+            prompt_mask = [torch.ones(len(ids), dtype=torch.long) for ids in prompt_ids_list]
+            prompt_ids = pad(prompt_ids, padding_value=pad_id, padding_side="left").to(device)
+            prompt_mask = pad(prompt_mask, padding_value=0, padding_side="left").to(device)
+
+            completion_ids = [torch.tensor(ids) for ids in comp_ids_list]
+            completion_mask = [torch.ones(len(ids), dtype=torch.long) for ids in comp_ids_list]
+            completion_ids = pad(completion_ids, padding_value=pad_id, padding_side="right").to(device)
+            completion_mask = pad(completion_ids, padding_value=0, padding_side="right").to(device).float()
+
+            completions_text = comp_texts
+            n_generated = len(prompts)
+        else:
+            # HF generation path
+            set_scales(model, retain_scale=1.0, forget_scale=0.0)
+            was_training = model.training
+            model.eval()
+
+            # Tokenize
+            if isinstance(prompts[0], list):
+                inputs = tokenizer.apply_chat_template(
+                    prompts, add_generation_prompt=True, tokenize=True,
+                    padding=True, padding_side="left", return_tensors="pt",
+                    return_dict=True,
+                ).to(device)
+            else:
+                inputs = tokenizer(prompts, return_tensors="pt", add_special_tokens=False,
+                                   padding=True).to(device)
+
+            with torch.no_grad():
+                outputs = model.generate(
+                    **inputs,
+                    max_new_tokens=self.max_completion_length,
+                    temperature=self.temperature,
+                    do_sample=True,
+                    eos_token_id=tokenizer.eos_token_id,
+                )
+
+            if was_training:
+                model.train()
+
+            # Extract prompt/completion ids and build completion mask
+            prompt_length = inputs["input_ids"].size(1)
+            prompt_ids = inputs["input_ids"]
+            prompt_mask = inputs["attention_mask"]
+            completion_ids = outputs[:, prompt_length:]
+
+            # Mask everything after first EOS
+            is_eos = completion_ids == tokenizer.eos_token_id
+            eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=device)
+            eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
+            seq_indices = torch.arange(is_eos.size(1), device=device).expand(is_eos.size(0), -1)
+            completion_mask = (seq_indices <= eos_idx.unsqueeze(1)).float()
+
+            n_generated = len(prompts)
+
+        # 4. Score completions with retain-only reward fn
+        completions_text = tokenizer.batch_decode(completion_ids, skip_special_tokens=True)
+        prompts_text = tokenizer.batch_decode(prompt_ids, skip_special_tokens=True)
+
+        reward_kwargs = dict(extra_data)
+        reward_kwargs["prompts"] = prompts_text
+        assert self._retain_pass_reward_fn is not None, (
+            "fresh_retain_only mode requires retain_pass_reward_fn"
+        )
+        rewards_list = self._retain_pass_reward_fn(completions=completions_text, **reward_kwargs)
+        rewards = torch.tensor(rewards_list, dtype=torch.float32, device=device)
+
+        # 5. Apply selector filtering
+        selector = self._retain_pass_selector_name
+        if selector == "random":
+            survive_mask = torch.ones(n_generated, dtype=torch.bool, device=device)
+        elif selector == "nondetected":
+            assert self.rh_detector is not None, (
+                "retain_pass_selector='nondetected' requires an rh_detector"
+            )
+            hack_flags = self.rh_detector(completions_text, **reward_kwargs)
+            survive_mask = ~torch.tensor(hack_flags, dtype=torch.bool, device=device)
+        elif selector == "penalized":
+            assert self.rh_detector is not None, (
+                "retain_pass_selector='penalized' requires an rh_detector"
+            )
+            hack_flags = self.rh_detector(completions_text, **reward_kwargs)
+            hack_flags_tensor = torch.tensor(hack_flags, dtype=torch.bool, device=device)
+            survive_mask = torch.ones(n_generated, dtype=torch.bool, device=device)
+            rewards[hack_flags_tensor] = 0.0
+        else:
+            assert self._retain_pass_selector is not None, (
+                f"retain_pass_selector={selector!r} requires a retain_detector"
+            )
+            retain_flags = self._retain_pass_selector(completions_text, **reward_kwargs)
+            survive_mask = torch.tensor(retain_flags, dtype=torch.bool, device=device)
+
+        # Log pre-filter hack rate
+        hack_rate_pre = 0.0
+        if self.rh_detector is not None and selector != "random":
+            if selector == "nondetected":
+                hack_rate_pre = (~survive_mask).float().mean().item()
+            elif selector == "penalized":
+                hack_rate_pre = hack_flags_tensor.float().mean().item()
+            else:
+                hack_flags_pre = self.rh_detector(completions_text, **reward_kwargs)
+                hack_rate_pre = sum(hack_flags_pre) / len(hack_flags_pre) if hack_flags_pre else 0.0
+            self._metrics.setdefault("train", {}).setdefault(
+                "routing/retain_pass_hack_rate_pre_filter", []).append(hack_rate_pre)
+
+        # 6. Compute per-group GRPO advantages over surviving samples
+        rewards_grouped = rewards.view(n_prompts, G)
+        survive_grouped = survive_mask.view(n_prompts, G)
+        advantages = torch.zeros(n_generated, dtype=torch.float32, device=device)
+        adv_grouped = advantages.view(n_prompts, G)
+        eps = 1e-4
+
+        valid_groups = set()
+        for i in range(n_prompts):
+            group_survive = survive_grouped[i]
+            n_survive = group_survive.sum().item()
+            if n_survive == 0:
+                continue
+            if n_survive == 1:
+                # Single survivor gets advantage 0
+                adv_grouped[i][group_survive] = 0.0
+            else:
+                r = rewards_grouped[i][group_survive]
+                mean_r = r.mean()
+                std_r = r.std(correction=0)
+                adv_grouped[i][group_survive] = (r - mean_r) / (std_r + eps)
+            valid_groups.add(i)
+
+        if not valid_groups:
+            set_scales(model, retain_scale=1.0, forget_scale=1.0)
+            self._metrics.setdefault("train", {}).setdefault(
+                "routing/retain_pass_n_used", []).append(0)
+            self._metrics["train"].setdefault(
+                "routing/retain_pass_frac_actual", []).append(0.0)
+            return None, 0
+
+        # Apply survive mask globally
+        final_mask = survive_mask.clone()
+        # Also zero out groups with no valid survivors
+        for i in range(n_prompts):
+            if i not in valid_groups:
+                final_mask[i * G:(i + 1) * G] = False
+
+        n_surviving = final_mask.sum().item()
+
+        # 7. Compute logprobs for surviving samples
+        # Full sequence for logprob computation
+        input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+        attention_mask = torch.cat([prompt_mask, completion_mask.int()], dim=1)
+        logits_to_keep = completion_ids.size(1)
+
+        # old_logps (retain-only model, no grad)
+        with torch.no_grad():
+            old_logps, _ = self._get_per_token_logps_and_entropies(
+                model, input_ids, attention_mask, logits_to_keep
+            )
+        # ref_logps (reference model)
+        ref_model = self.ref_model
+        if ref_model is not None:
+            with torch.no_grad():
+                ref_logps, _ = self._get_per_token_logps_and_entropies(
+                    ref_model, input_ids, attention_mask, logits_to_keep
+                )
+        else:
+            ref_logps = old_logps.clone()
+
+        # 8. Build TRL-format inputs dict for surviving samples
+        retain_inputs = {
+            "prompt_ids": prompt_ids[final_mask],
+            "prompt_mask": prompt_mask[final_mask],
+            "completion_ids": completion_ids[final_mask],
+            "completion_mask": completion_mask[final_mask],
+            "old_per_token_logps": old_logps[final_mask],
+            "ref_per_token_logps": ref_logps[final_mask],
+            "advantages": advantages[final_mask],
+        }
+
+        # 9. Log diagnostics
+        surviving_rewards = rewards[final_mask]
+        hack_rate_post = 0.0
+        if self.rh_detector is not None:
+            surviving_completions = [completions_text[i] for i in final_mask.nonzero(as_tuple=True)[0].tolist()]
+            surviving_kwargs = {
+                k: [v[i] for i in final_mask.nonzero(as_tuple=True)[0].tolist()]
+                for k, v in reward_kwargs.items()
+                if isinstance(v, list) and len(v) == n_generated
+            }
+            hack_flags_post = self.rh_detector(surviving_completions, **surviving_kwargs)
+            hack_rate_post = sum(hack_flags_post) / len(hack_flags_post) if hack_flags_post else 0.0
+
+        m = self._metrics.setdefault("train", {})
+        m.setdefault("routing/retain_pass_n_used", []).append(n_surviving)
+        m.setdefault("routing/retain_pass_frac_actual", []).append(n_surviving / n_total)
+        m.setdefault("routing/retain_pass_reward_mean", []).append(
+            surviving_rewards.mean().item() if n_surviving > 0 else 0.0)
+        m.setdefault("routing/retain_pass_hack_rate", []).append(hack_rate_post)
+
+        return retain_inputs, n_surviving
+
+    def _reconstruct_raw_rewards(self):
+        """Reconstruct raw rewards from CachedReward caches (normalize=False path only)."""
+        components = self._combined_reward.components  # list of (name, CachedReward, scale, role)
+        n = len(components[0][1]._last_scores)
+        rewards = [0.0] * n
+        for name, cached, scale, role in components:
+            assert cached._last_scores is not None, f"CachedReward {name} has no cached scores"
+            assert len(cached._last_scores) == n, (
+                f"CachedReward {name} has {len(cached._last_scores)} scores, expected {n}"
+            )
+            for i, s in enumerate(cached._last_scores):
+                rewards[i] += s * scale
+        if self._combined_reward.max_reward is not None:
+            cap = self._combined_reward.max_reward
+            rewards = [min(r, cap) for r in rewards]
+        device = self.accelerator.device
+        return torch.tensor(rewards, dtype=torch.float32, device=device)
+
     # --- Coherence training ---
 
     def _coherence_training_step(self, model):
@@ -788,6 +1195,11 @@ class SampleGRPOTrainer(GRPOTrainer):
                 )
                 is_rh_raw = self.rh_detector(completions_for_rh, prompts=prompts_for_rh, **detector_kwargs)
                 is_rh = [c and r for c, r in zip(candidate, is_rh_raw)]
+                # Stash for retain pass reuse mode
+                rh_kwargs = dict(detector_kwargs)
+                rh_kwargs["prompts"] = prompts_for_rh
+                self._last_rh_kwargs = rh_kwargs
+                self._last_completions_text = completions_for_rh
             else:
                 is_rh = [False] * n_samples
 
@@ -892,6 +1304,11 @@ class SampleGRPOTrainer(GRPOTrainer):
                 m.setdefault("reinforce/retain_buffer_mean", []).append(self._retain_reward_buffer.mean())
                 m.setdefault("reinforce/retain_buffer_size", []).append(float(len(self._retain_reward_buffer)))
 
+        # Inject raw rewards for retain pass (must happen before TRL's shuffle
+        # so rewards stay aligned with samples after _prepare_inputs)
+        if self._retain_pass_frac > 0 and self.gradient_routing_enabled:
+            output["_raw_rewards_for_retain_pass"] = self._reconstruct_raw_rewards()
+
         self._last_rollout_time = time.perf_counter() - _rollout_t0
         return output
 
@@ -958,6 +1375,7 @@ class SampleGRPOTrainer(GRPOTrainer):
         inputs.pop("is_detector_good", None)  # legacy key, no longer used
 
         retain_advantages = inputs.pop("retain_advantages", None)
+        raw_rewards_for_retain = inputs.pop("_raw_rewards_for_retain_pass", None)
         original_advantages = inputs["advantages"]
 
         bad_mask = is_rh
@@ -994,9 +1412,10 @@ class SampleGRPOTrainer(GRPOTrainer):
                     bad_inputs = _slice_batch(inputs, bad_mask)
                     with self.compute_loss_context_manager():
                         loss = self.compute_loss(model, bad_inputs, num_items_in_batch=num_items_in_batch)
-                    scaled_loss = loss * (n_bad / n_total)
+                    forget_weight = (n_bad / n_total) ** self._forget_scale_alpha
+                    scaled_loss = loss * forget_weight
                     self.accelerator.backward(scaled_loss)
-                    total_loss = total_loss + loss.detach() * (n_bad / n_total)
+                    total_loss = total_loss + loss.detach() * forget_weight
             else:  # classic
                 with self.compute_loss_context_manager():
                     loss = self.compute_loss(model, inputs, num_items_in_batch=num_items_in_batch)
@@ -1039,11 +1458,39 @@ class SampleGRPOTrainer(GRPOTrainer):
                 bad_inputs = _slice_batch(inputs, bad_mask)
                 with self.compute_loss_context_manager():
                     loss = self.compute_loss(model, bad_inputs, num_items_in_batch=num_items_in_batch)
-                scaled_loss = loss * (n_bad / n_total)
+                forget_weight = (n_bad / n_total) ** self._forget_scale_alpha
+                scaled_loss = loss * forget_weight
                 self.accelerator.backward(scaled_loss)
                 for h in hooks:
                     h.remove()
-                total_loss = total_loss + loss.detach() * (n_bad / n_total)
+                total_loss = total_loss + loss.detach() * forget_weight
+
+        # --- Phase 3: Retain pass (forget ablated) ---
+        if self._retain_pass_frac > 0:
+            from gradient_routing import set_scales
+            _t_retain_pass_start = time.perf_counter()
+
+            if self._retain_pass_source == "fresh_retain_only":
+                retain_inputs, n_retain = self._retain_pass_fresh(model, n_total)
+            else:
+                retain_inputs, n_retain = self._retain_pass_reuse(
+                    model, inputs, is_rh, raw_rewards_for_retain, n_total)
+
+            if n_retain > 0:
+                retain_loss_weight = n_retain / n_total
+                # scales already set to (1,0) by the helper
+                with self.compute_loss_context_manager():
+                    loss = self.compute_loss(model, retain_inputs, num_items_in_batch=num_items_in_batch)
+                scaled_loss = loss * retain_loss_weight
+                self.accelerator.backward(scaled_loss)
+                total_loss = total_loss + loss.detach() * retain_loss_weight
+
+            set_scales(model, retain_scale=1.0, forget_scale=1.0)
+
+            _t_retain_pass_end = time.perf_counter()
+            self._metrics.setdefault("train", {}).setdefault(
+                "timing/detail/retain_pass", []).append(
+                _t_retain_pass_end - _t_retain_pass_start)
 
         # Retain KL regularization pass (after all routing passes, before optimizer.step)
         if self._retain_kl_coef > 0:
@@ -1194,6 +1641,20 @@ def _make_parser():
                         help="Batch size for coherence step (default: same as --batch_size)")
     parser.add_argument("--coherence_hackable_only", action="store_true",
                         help="Restrict coherence prompts to hackable=True subset (simulates classifier only available in hackable settings)")
+    # Retain pass (Phase 3)
+    parser.add_argument("--forget_scale_alpha", type=float, default=1.0,
+                        help="Power law exponent for forget pass loss scaling. "
+                             "1.0 = proportional (current), <1 boosts forget signal when few detections.")
+    parser.add_argument("--retain_pass_frac", type=float, default=0.0,
+                        help="Fraction of batch for retain pass (Phase 3). 0.0 = disabled.")
+    parser.add_argument("--retain_pass_source", default="reuse",
+                        choices=["reuse", "fresh_retain_only"],
+                        help="Retain pass data source: 'reuse' existing rollouts or 'fresh_retain_only' new generation")
+    parser.add_argument("--retain_pass_selector", default="random",
+                        help="Retain pass sample selector: 'random', 'nondetected', 'penalized', or a retain detector name")
+    # vLLM generation
+    parser.add_argument("--use_vllm", type=str, default=None,
+                        help="ZMQ socket address for vLLM server (e.g. ipc:///tmp/vllm_grpo_async.sock)")
     # Retain advantage correction
     parser.add_argument("--retain_mode", choices=["default", "renormalize", "penalty"], default="default",
                         help="Retain adapter advantage mode: 'default' (unchanged), 'renormalize' (zero-mean over good), 'penalty' (penalize bad samples)")
@@ -1259,7 +1720,7 @@ def _run(args, exp_cfg=None):
     # Attach resolved training params and dump complete run config
     _tc_fields = set(TrainingConfig.model_fields)
     _arg_fields = set(vars(args))
-    _CLI_ONLY = {"config", "gpu_id", "rh_detector_recall", "gradient_checkpointing", "use_liger_kernel", "torch_compile"}
+    _CLI_ONLY = {"config", "gpu_id", "rh_detector_recall", "gradient_checkpointing", "use_liger_kernel", "torch_compile", "use_vllm"}
     _missing = _tc_fields - _arg_fields
     assert not _missing, (
         f"TrainingConfig fields missing from argparse: {_missing}. "
@@ -1313,6 +1774,29 @@ def _run(args, exp_cfg=None):
             raise NotImplementedError(
                 "advantage_type=reinforce with ablated_frac > 0 is not yet supported."
             )
+        if args.retain_pass_frac > 0:
+            raise NotImplementedError(
+                "advantage_type=reinforce with retain_pass_frac > 0 is not yet supported."
+            )
+
+    # Validate Phase 3 retain pass constraints
+    if args.retain_pass_frac > 0:
+        assert args.routing_mode != "none", (
+            "--retain_pass_frac > 0 requires --routing_mode != 'none'"
+        )
+        if args.coherence != "none":
+            raise ValueError(
+                "Cannot use both --retain_pass_frac and --coherence"
+            )
+        if args.retain_pass_selector not in ("random", "nondetected", "penalized"):
+            assert exp_cfg.retain_detector is not None, (
+                f"--retain_pass_selector={args.retain_pass_selector!r} requires a "
+                f"retain_detector in the YAML config"
+            )
+    if args.retain_mode == "penalty":
+        assert args.retain_pass_frac == 0.0, (
+            f"--retain_mode=penalty is incompatible with --retain_pass_frac > 0 (got {args.retain_pass_frac})"
+        )
 
     # Validate retain_kl constraints
     if args.retain_kl_coef > 0:
@@ -1333,8 +1817,9 @@ def _run(args, exp_cfg=None):
         )
     tokenizer.padding_side = "left"
 
-    # Model
-    model = AutoModelForCausalLM.from_pretrained(args.model)
+    # Model — vLLM requires float32 (weight serialization uses .numpy() which doesn't support bf16)
+    model_dtype = torch.float32 if args.use_vllm else None
+    model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=model_dtype)
     if args.no_eos:
         model.generation_config.eos_token_id = None
         model.generation_config.suppress_tokens = [tokenizer.eos_token_id]
@@ -1543,6 +2028,11 @@ def _run(args, exp_cfg=None):
     per_device_bs = args.batch_size // n_devices
     print(f"Batch size: {args.batch_size} total ({per_device_bs} per device × {n_devices} devices)")
 
+    # vLLM requires float32 training model (weight serialization uses .numpy() which doesn't support bf16)
+    use_bf16 = args.bf16 and not args.use_vllm
+    if args.use_vllm and args.bf16:
+        print("vLLM: disabling bf16 (vLLM weight sync requires float32 training model)")
+
     config = GRPOConfig(
         output_dir=args.output_dir,
         per_device_train_batch_size=per_device_bs,
@@ -1559,7 +2049,7 @@ def _run(args, exp_cfg=None):
         repetition_penalty=args.repetition_penalty,
         beta=args.beta,
         seed=args.seed,
-        bf16=args.bf16,
+        bf16=use_bf16,
         report_to="wandb" if not args.no_wandb else "none",
         run_name=args.run_name or f"grpo_{reward_name}_lr{args.lr}",
         gradient_checkpointing=args.gradient_checkpointing,
@@ -1569,6 +2059,36 @@ def _run(args, exp_cfg=None):
 
     if not args.no_wandb:
         os.environ.setdefault("WANDB_PROJECT", args.wandb_project)
+
+    # Build retain pass resources
+    retain_pass_selector = None
+    retain_pass_reward_fn = None
+    if args.retain_pass_frac > 0:
+        if args.retain_pass_source == "fresh_retain_only":
+            retain_pass_reward_fn = exp_cfg.build_retain_only_reward()
+            print(f"Retain pass: fresh_retain_only, reward={retain_pass_reward_fn.__name__}")
+        if args.retain_pass_selector not in ("random", "nondetected", "penalized"):
+            retain_pass_selector = exp_cfg.build_retain_detector()
+            assert retain_pass_selector is not None, (
+                f"Failed to build retain detector for selector={args.retain_pass_selector!r}"
+            )
+            print(f"Retain pass: selector={args.retain_pass_selector}, "
+                  f"detector={exp_cfg.retain_detector.name}")
+        print(f"Retain pass: frac={args.retain_pass_frac}, source={args.retain_pass_source}, "
+              f"selector={args.retain_pass_selector}")
+
+    # vLLM client setup
+    vllm_client = None
+    vllm_experiment_id = None
+    if args.use_vllm:
+        assert args.adapter_type == "mlp", (
+            "--use_vllm requires --adapter_type mlp (vLLM adapter routing only supports MLP adapters)"
+        )
+        from vllm_client import AsyncVLLMClient
+        vllm_client = AsyncVLLMClient(args.use_vllm)
+        vllm_experiment_id = vllm_client.register()
+        vllm_client.update_weights_from_model(vllm_experiment_id, model)
+        print(f"vLLM: connected to {args.use_vllm}, experiment_id={vllm_experiment_id}")
 
     # Build eval reward fns whenever eval_every > 0
     eval_metrics = {}
@@ -1608,6 +2128,14 @@ def _run(args, exp_cfg=None):
         advantage_type=args.advantage_type,
         reinforce_buffer_size=args.reinforce_buffer_size,
         reinforce_normalize_std=args.reinforce_normalize_std,
+        retain_pass_frac=args.retain_pass_frac,
+        retain_pass_source=args.retain_pass_source,
+        retain_pass_selector_name=args.retain_pass_selector,
+        retain_pass_selector=retain_pass_selector,
+        retain_pass_reward_fn=retain_pass_reward_fn,
+        forget_scale_alpha=args.forget_scale_alpha,
+        vllm_client=vllm_client,
+        vllm_experiment_id=vllm_experiment_id,
     )
     trainer._environment = args.environment
     trainer._n_digits = args.n_digits

@@ -549,6 +549,16 @@ class SweepRunner:
         # Build experiment groups for incremental plotting
         self.experiment_groups = self._build_experiment_groups()
 
+        # vLLM server management — detect if any run uses vLLM
+        self._vllm_servers = {}  # gpu -> subprocess.Popen
+        self._vllm_config = None
+        sample_vllm = next((p for p in runs if p.get("use_vllm")), None)
+        if sample_vllm:
+            self._vllm_config = {
+                "mlp_config": sample_vllm.get("mlp_config", "m16"),
+                "model": sample_vllm.get("model", "HuggingFaceTB/SmolLM2-135M-Instruct"),
+            }
+
         # Signal handling
         self._interrupted = False
         signal.signal(signal.SIGINT, self._handle_sigint)
@@ -674,6 +684,73 @@ class SweepRunner:
 
         return groups
 
+    def _vllm_socket(self, gpu):
+        """Return the IPC socket path for a GPU's vLLM server."""
+        return f"ipc:///tmp/vllm_grpo_async_{gpu}.sock"
+
+    def _start_vllm_servers(self):
+        """Launch one vLLM async server per GPU."""
+        import subprocess
+        cfg = self._vllm_config
+        venv_python = os.path.join(os.path.dirname(__file__), ".venv-vllm", "bin", "python")
+        server_script = os.path.join(os.path.dirname(__file__), "vllm_async_server.py")
+
+        for gpu in self.gpus:
+            socket_addr = self._vllm_socket(gpu)
+            # Clean up stale socket file
+            sock_path = socket_addr[len("ipc://"):]
+            if os.path.exists(sock_path):
+                os.unlink(sock_path)
+
+            env = os.environ.copy()
+            env["CUDA_VISIBLE_DEVICES"] = str(gpu)
+            env["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
+
+            cmd = [
+                venv_python, "-u", server_script,
+                "--socket", socket_addr,
+                "--max_experiments", str(self.per_gpu),
+                "--mlp_config", cfg["mlp_config"],
+                "--model", cfg["model"],
+            ]
+            print(f"[SWEEP] Starting vLLM server on GPU {gpu}: {socket_addr}")
+            proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT, text=True)
+            self._vllm_servers[gpu] = proc
+
+        # Wait for all servers to be ready
+        for gpu, proc in self._vllm_servers.items():
+            print(f"[SWEEP] Waiting for vLLM server on GPU {gpu}...")
+            while True:
+                line = proc.stdout.readline()
+                if not line:
+                    raise RuntimeError(f"vLLM server on GPU {gpu} died during startup")
+                if "Ready for requests" in line:
+                    print(f"[SWEEP] vLLM server on GPU {gpu} ready")
+                    break
+            # Switch stdout to non-blocking so it doesn't block
+            import fcntl
+            fd = proc.stdout.fileno()
+            flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+            fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+
+    def _stop_vllm_servers(self):
+        """Terminate all vLLM server processes and clean up sockets."""
+        for gpu, proc in self._vllm_servers.items():
+            try:
+                proc.terminate()
+                proc.wait(timeout=5)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            # Clean up socket file
+            sock_path = self._vllm_socket(gpu)[len("ipc://"):]
+            if os.path.exists(sock_path):
+                os.unlink(sock_path)
+        self._vllm_servers.clear()
+
     def _handle_sigint(self, signum, frame):
         print("\n[SWEEP] Interrupted — killing all running jobs...")
         self._interrupted = True
@@ -689,6 +766,7 @@ class SweepRunner:
                 info["proc"].join(timeout=2)
             except Exception:
                 pass
+        self._stop_vllm_servers()
         if self.use_mps:
             stop_mps_daemons(self.gpus)
         sys.exit(1)
@@ -729,6 +807,9 @@ class SweepRunner:
         full_params["wandb_project"] = self.wandb_project
         if self.no_wandb:
             full_params["no_wandb"] = True
+        # Override vLLM socket to this run's assigned GPU server
+        if full_params.get("use_vllm") and self._vllm_servers:
+            full_params["use_vllm"] = self._vllm_socket(gpu)
 
         pipe = mps_pipe_dir(gpu) if self.use_mps else None
         ctx = multiprocessing.get_context("spawn")
@@ -950,6 +1031,10 @@ class SweepRunner:
             print(f"[SWEEP] wandb_project={self.wandb_project}")
         print()
 
+        # Start vLLM servers (one per GPU) if any run uses vLLM
+        if self._vllm_config and not self.dry_run:
+            self._start_vllm_servers()
+
         if self.dry_run:
             print("[DRY RUN] Planned runs:")
             for i, entry in enumerate(self.run_queue):
@@ -1032,6 +1117,7 @@ class SweepRunner:
         except Exception as e:
             print(f"[WARN] Failed to generate sweep pages: {e}")
 
+        self._stop_vllm_servers()
         if self.use_mps:
             stop_mps_daemons(self.gpus)
 
