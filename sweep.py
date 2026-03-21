@@ -307,12 +307,12 @@ def _kill_vllm_proc(vllm_proc):
 
 
 def _vllm_server_worker(gpu_id, model_name, mlp_config, max_experiments,
-                        gpu_memory, socket_path, init_delay=0, ready_event=None):
+                        gpu_memory, socket_path, init_delay=0, ready_file=None):
     """Entry point for vLLM ZMQ server process (spawned child).
 
     init_delay: seconds to sleep before initializing the vLLM engine, used to
     stagger concurrent inits so each process sees accurate free memory.
-    ready_event: multiprocessing.Event set when the server is ready to accept requests.
+    ready_file: path to sentinel file, touched when server is ready.
     """
     import os, time as _time
     os.setsid()  # New session/process group so killpg kills all vLLM children
@@ -332,26 +332,38 @@ def _vllm_server_worker(gpu_id, model_name, mlp_config, max_experiments,
         max_experiments=max_experiments,
         retain_neurons=preset["retain_neurons"],
         forget_neurons=preset["forget_neurons"],
+        model_name=model_name,
         gpu_memory_utilization=gpu_memory,
     )
-    server.run(ready_event=ready_event)
+    class _FileEvent:
+        def __init__(self, path):
+            self._path = path
+        def set(self):
+            open(self._path, "w").close()
+    server.run(ready_event=_FileEvent(ready_file) if ready_file else None)
 
 
 def start_vllm_servers(gpus, model_name, mlp_config, max_experiments, gpu_memory):
     """Start one vLLM ZMQ server per GPU. Returns {gpu: (proc, socket_path)}."""
+    import tempfile
     ctx = multiprocessing.get_context("spawn")
     servers = {}
     for gpu in gpus:
         socket_path = f"ipc:///tmp/vllm_grpo_gpu{gpu}.sock"
-        ready_event = ctx.Event()
+        ready_file = tempfile.mktemp(prefix="vllm_ready_", suffix=f"_gpu{gpu}")
         proc = ctx.Process(
             target=_vllm_server_worker,
             args=(gpu, model_name, mlp_config, max_experiments, gpu_memory, socket_path),
-            kwargs={"ready_event": ready_event},
+            kwargs={"ready_file": ready_file},
         )
         proc.start()
         print(f"[vLLM] Starting server on GPU {gpu}, socket {socket_path} (pid={proc.pid})")
-        ready_event.wait(timeout=180)
+        t0 = time.time()
+        while not os.path.exists(ready_file):
+            assert time.time() - t0 < 180, f"vLLM server on GPU {gpu} failed to start within 180s"
+            assert proc.is_alive(), f"vLLM server on GPU {gpu} died during startup"
+            time.sleep(0.5)
+        os.unlink(ready_file)
         servers[gpu] = (proc, socket_path)
         print(f"[vLLM] Server on GPU {gpu} ready")
 
@@ -365,7 +377,7 @@ def stop_vllm_servers(servers):
 
 
 def _async_vllm_server_worker(gpu_id, model_name, mlp_config, max_experiments,
-                               gpu_memory, socket_path, ready_event=None):
+                               gpu_memory, socket_path, ready_file=None):
     """Entry point for shared async vLLM server process (spawned child)."""
     import asyncio, os
     os.setsid()
@@ -385,24 +397,35 @@ def _async_vllm_server_worker(gpu_id, model_name, mlp_config, max_experiments,
         model_name=model_name,
         gpu_memory_utilization=gpu_memory,
     )
-    asyncio.run(server.run(ready_event=ready_event))
+    class _FileEvent:
+        def __init__(self, path):
+            self._path = path
+        def set(self):
+            open(self._path, "w").close()
+    asyncio.run(server.run(ready_event=_FileEvent(ready_file) if ready_file else None))
 
 
 def start_async_vllm_servers(gpus, model_name, mlp_config, max_experiments, gpu_memory):
     """Start one shared async vLLM server per GPU. Returns {gpu: (proc, socket_path)}."""
+    import tempfile
     ctx = multiprocessing.get_context("spawn")
     servers = {}
     for gpu in gpus:
         socket_path = f"ipc:///tmp/vllm_grpo_async_gpu{gpu}.sock"
-        ready_event = ctx.Event()
+        ready_file = tempfile.mktemp(prefix="vllm_ready_", suffix=f"_async_gpu{gpu}")
         proc = ctx.Process(
             target=_async_vllm_server_worker,
             args=(gpu, model_name, mlp_config, max_experiments, gpu_memory, socket_path),
-            kwargs={"ready_event": ready_event},
+            kwargs={"ready_file": ready_file},
         )
         proc.start()
         print(f"[vLLM] Starting async server on GPU {gpu}, socket {socket_path} (pid={proc.pid})")
-        ready_event.wait(timeout=180)
+        t0 = time.time()
+        while not os.path.exists(ready_file):
+            assert time.time() - t0 < 180, f"Async vLLM server on GPU {gpu} failed to start within 180s"
+            assert proc.is_alive(), f"Async vLLM server on GPU {gpu} died during startup"
+            time.sleep(0.5)
+        os.unlink(ready_file)
         servers[gpu] = (proc, socket_path)
         print(f"[vLLM] Async server on GPU {gpu} ready")
 
@@ -898,16 +921,17 @@ class SweepRunner:
             init_delay = slot * 20
             unique_id = _find_free_port()  # reuse port finder for a unique numeric ID
             vllm_socket_path = f"ipc:///tmp/vllm_grpo_gpu{gpu}_{unique_id}.sock"
+            import tempfile
             ctx_vllm = multiprocessing.get_context("spawn")
             vllm_model = full_params.get("model", "HuggingFaceTB/SmolLM2-135M-Instruct")
             vllm_mlp = full_params.get("mlp_config", "m32")
             vllm_gpu_memory = full_params.get("vllm_gpu_memory", 0.02)
-            vllm_ready = ctx_vllm.Event()
+            vllm_ready_file = tempfile.mktemp(prefix="vllm_ready_", suffix=f"_gpu{gpu}")
             vllm_proc = ctx_vllm.Process(
                 target=_vllm_server_worker,
                 args=(gpu, vllm_model, vllm_mlp, 1,
                       vllm_gpu_memory, vllm_socket_path, init_delay),
-                kwargs={"ready_event": vllm_ready},
+                kwargs={"ready_file": vllm_ready_file},
             )
             vllm_proc.start()
             print(f"[vLLM] Spawned server for {run_name} on GPU {gpu}, "

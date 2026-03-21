@@ -37,7 +37,7 @@ from rewards import get_reward_fn, API_REWARD_NAMES
 from experiment_config import ExperimentConfig, RewardConfig, RewardComponentConfig, RHDetectorConfig, TrainingConfig
 
 
-def _spawn_vllm_server(model_name, mlp_config, gpu_memory, socket_path, ready_event):
+def _spawn_vllm_server(model_name, mlp_config, gpu_memory, socket_path, ready_file):
     """Worker for per-run vLLM server subprocess (must be module-level for spawn pickling)."""
     import os
     os.environ.setdefault("VLLM_LOGGING_LEVEL", "ERROR")
@@ -54,7 +54,14 @@ def _spawn_vllm_server(model_name, mlp_config, gpu_memory, socket_path, ready_ev
         forget_neurons=preset["forget_neurons"],
         gpu_memory_utilization=gpu_memory,
     )
-    server.run(ready_event=ready_event)
+    # Use a sentinel file instead of multiprocessing.Event to signal readiness.
+    # mp.Event uses semaphores that can't be pickled across nested spawn contexts.
+    class _FileEvent:
+        def __init__(self, path):
+            self._path = path
+        def set(self):
+            open(self._path, "w").close()
+    server.run(ready_event=_FileEvent(ready_file))
 
 
 class RunningRewardBuffer:
@@ -1749,20 +1756,26 @@ def _run(args, exp_cfg=None):
             vllm_client = VLLMClient(args.vllm_server)
     elif args.vllm_spawn:
         import multiprocessing as _mp
+        import tempfile
         if args.vllm_spawn_delay > 0:
             print(f"[vLLM] Waiting {args.vllm_spawn_delay}s before spawning server (stagger init)...")
             time.sleep(args.vllm_spawn_delay)
         _socket_path = f"ipc:///tmp/vllm_grpo_{os.getpid()}.sock"
+        _ready_file = tempfile.mktemp(prefix="vllm_ready_", suffix=f"_{os.getpid()}")
         _ctx = _mp.get_context("spawn")
-        _ready = _ctx.Event()
         _vllm_server_proc = _ctx.Process(
             target=_spawn_vllm_server,
-            args=(args.model, args.mlp_config, args.vllm_gpu_memory, _socket_path, _ready),
+            args=(args.model, args.mlp_config, args.vllm_gpu_memory, _socket_path, _ready_file),
             # daemon=False so vLLM v1 engine can spawn its own CoreEngineProcManager children
         )
         _vllm_server_proc.start()
         print(f"[vLLM] Spawned server at {_socket_path} (pid={_vllm_server_proc.pid})")
-        _ready.wait(timeout=180)
+        _t0 = time.time()
+        while not os.path.exists(_ready_file):
+            assert time.time() - _t0 < 180, "vLLM server failed to start within 180s"
+            assert _vllm_server_proc.is_alive(), "vLLM server process died during startup"
+            time.sleep(0.5)
+        os.unlink(_ready_file)
         from vllm_client import VLLMClient
         vllm_client = VLLMClient(_socket_path)
         print(f"[vLLM] Server ready")
