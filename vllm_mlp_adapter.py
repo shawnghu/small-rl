@@ -394,9 +394,10 @@ def create_engine(
     retain_neurons: int = 32,
     forget_neurons: int = 32,
     gpu_memory_utilization: float = 0.05,
-    dtype: str = "bfloat16",
+    dtype: str = "float16",
 ):
     """Create a vLLM engine with MLP adapter support. Returns (llm, manager)."""
+    print(f"[vLLM] Engine dtype: {dtype}")
     from vllm import LLM
     from transformers import AutoConfig
 
@@ -626,7 +627,7 @@ async def create_async_engine(
     retain_neurons: int = 32,
     forget_neurons: int = 32,
     gpu_memory_utilization: float = 0.05,
-    dtype: str = "bfloat16",
+    dtype: str = "float16",
     max_num_seqs: int = 1024,
 ):
     """Create an async vLLM engine with MLP adapter support. Returns (engine, manager).
@@ -638,6 +639,7 @@ async def create_async_engine(
     in one round. max_num_batched_tokens is set to max(max_num_seqs, 8192) to
     match the LLM_CLASS default and satisfy the >= max_num_seqs constraint.
     """
+    print(f"[vLLM] Async engine dtype: {dtype}")
     from vllm.engine.arg_utils import AsyncEngineArgs
     from vllm.v1.engine.async_llm import AsyncLLM
     from transformers import AutoConfig
