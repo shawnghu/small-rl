@@ -192,11 +192,13 @@ class SampleGRPOTrainer(GRPOTrainer):
                  coherence_batch_size=None,
                  coherence_hackable_only=False,
                  vllm_client=None,
+                 adapter_type="lora",
                  liger_chunk_size=64,
                  generate_fp16=False,
                  **kwargs):
         super().__init__(*args, **kwargs)
         self.verbose = verbose
+        self._adapter_type = adapter_type
         self._adapter_config = adapter_config  # saved to dual_lora_config.json in each checkpoint
         self.gradient_routing_enabled = gradient_routing_enabled
         self._retain_params = retain_params or set()
@@ -306,9 +308,10 @@ class SampleGRPOTrainer(GRPOTrainer):
         mode = "train" if self.model.training else "eval"
         num_generations = self.num_generations if mode == "train" else self.num_generations_eval
 
-        # Sync adapter weights to vLLM server
+        # Sync adapter weights to vLLM server (skip if no adapters)
         t_sync = time.perf_counter()
-        client.update_weights_from_model(eid, self.model)
+        if self._adapter_type != "none":
+            client.update_weights_from_model(eid, self.model)
         t_sync_done = time.perf_counter()
 
         # Tokenize prompts (handle both chat and plain string formats)
@@ -1314,8 +1317,8 @@ def _make_parser():
     parser.add_argument("--lora_config", default=None, choices=list(LORA_PRESETS.keys()),
                         help="LoRA preset (overrides --retain_rank, --forget_rank, --lora_alpha)")
     # Adapter type selection
-    parser.add_argument("--adapter_type", choices=["lora", "mlp"], default="lora",
-                        help="Adapter type for gradient routing (default: lora)")
+    parser.add_argument("--adapter_type", choices=["lora", "mlp", "none"], default="lora",
+                        help="Adapter type for gradient routing (default: lora). 'none' = full-param training, no adapters.")
     parser.add_argument("--mlp_config", default=None, choices=list(MLP_PRESETS.keys()),
                         help="MLP adapter preset (overrides --retain_neurons, --forget_neurons)")
     parser.add_argument("--retain_neurons", type=int, default=32)
@@ -1522,10 +1525,14 @@ def _run(args, exp_cfg=None):
     elif args.retain_kl_coef > 0:
         print(f"Retain KL: using TRL's ref model (beta={args.beta}, coef={args.retain_kl_coef})")
 
-    # Dual adapters (always applied)
+    # Dual adapters (skipped for adapter_type="none")
     from gradient_routing import collect_routing_params
 
-    if args.adapter_type == "mlp":
+    if args.adapter_type == "none":
+        assert args.routing_mode == "none", \
+            "adapter_type='none' requires routing_mode='none' (no adapters to route)"
+        print("No adapters: full-parameter training")
+    elif args.adapter_type == "mlp":
         from gradient_routing import apply_dual_mlp
         modified = apply_dual_mlp(
             model,
@@ -1553,7 +1560,9 @@ def _run(args, exp_cfg=None):
               f"(retain_rank={args.retain_rank}, forget_rank={args.forget_rank})")
 
     # Build adapter config for checkpoint saving
-    if args.adapter_type == "lora":
+    if args.adapter_type == "none":
+        adapter_config = {"adapter_type": "none"}
+    elif args.adapter_type == "lora":
         adapter_config = {
             "retain_rank": args.retain_rank,
             "forget_rank": args.forget_rank,
@@ -1755,6 +1764,10 @@ def _run(args, exp_cfg=None):
             from vllm_client import AsyncVLLMClient
             print(f"[vLLM] Connecting to async server at {args.vllm_server}...")
             vllm_client = AsyncVLLMClient(args.vllm_server)
+        elif args.adapter_type == "lora":
+            from vllm_lora import VLLMLoRAClient
+            print(f"[vLLM] Connecting to LoRA server at {args.vllm_server}...")
+            vllm_client = VLLMLoRAClient(args.vllm_server)
         else:
             from vllm_client import VLLMClient
             print(f"[vLLM] Connecting to server at {args.vllm_server}...")
@@ -1819,6 +1832,7 @@ def _run(args, exp_cfg=None):
         reinforce_buffer_size=args.reinforce_buffer_size,
         reinforce_normalize_std=args.reinforce_normalize_std,
         vllm_client=vllm_client,
+        adapter_type=args.adapter_type,
         liger_chunk_size=args.liger_chunk_size,
         generate_fp16=args.generate_fp16,
     )

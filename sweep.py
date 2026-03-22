@@ -307,12 +307,15 @@ def _kill_vllm_proc(vllm_proc):
 
 
 def _vllm_server_worker(gpu_id, model_name, mlp_config, max_experiments,
-                        gpu_memory, socket_path, init_delay=0, ready_file=None):
+                        gpu_memory, socket_path, init_delay=0, ready_file=None,
+                        adapter_type="mlp"):
     """Entry point for vLLM ZMQ server process (spawned child).
 
     init_delay: seconds to sleep before initializing the vLLM engine, used to
     stagger concurrent inits so each process sees accurate free memory.
     ready_file: path to sentinel file, touched when server is ready.
+    adapter_type: "mlp" for MLP adapter server, "lora" for native LoRA server,
+                  "none" for plain model (no adapters).
     """
     import os, time as _time
     os.setsid()  # New session/process group so killpg kills all vLLM children
@@ -323,24 +326,33 @@ def _vllm_server_worker(gpu_id, model_name, mlp_config, max_experiments,
     if init_delay > 0:
         _time.sleep(init_delay)
 
-    from vllm_grpo import MLP_PRESETS
-    from vllm_server import VLLMServer
-
-    preset = MLP_PRESETS[mlp_config]
-    server = VLLMServer(
-        socket_addr=socket_path,
-        max_experiments=max_experiments,
-        retain_neurons=preset["retain_neurons"],
-        forget_neurons=preset["forget_neurons"],
-        model_name=model_name,
-        gpu_memory_utilization=gpu_memory,
-    )
     class _FileEvent:
         def __init__(self, path):
             self._path = path
         def set(self):
             open(self._path, "w").close()
-    server.run(ready_event=_FileEvent(ready_file) if ready_file else None)
+    ready_event = _FileEvent(ready_file) if ready_file else None
+
+    if adapter_type == "lora":
+        from vllm_lora import VLLMLoRAServer
+        server = VLLMLoRAServer(
+            socket_addr=socket_path,
+            model_name=model_name,
+            gpu_memory_utilization=gpu_memory,
+        )
+    else:
+        from vllm_grpo import MLP_PRESETS
+        from vllm_server import VLLMServer
+        preset = MLP_PRESETS[mlp_config]
+        server = VLLMServer(
+            socket_addr=socket_path,
+            max_experiments=max_experiments,
+            retain_neurons=preset["retain_neurons"],
+            forget_neurons=preset["forget_neurons"],
+            model_name=model_name,
+            gpu_memory_utilization=gpu_memory,
+        )
+    server.run(ready_event=ready_event)
 
 
 def start_vllm_servers(gpus, model_name, mlp_config, max_experiments, gpu_memory):
@@ -927,11 +939,12 @@ class SweepRunner:
             vllm_mlp = full_params.get("mlp_config", "m32")
             vllm_gpu_memory = full_params.get("vllm_gpu_memory", 0.02)
             vllm_ready_file = tempfile.mktemp(prefix="vllm_ready_", suffix=f"_gpu{gpu}")
+            vllm_adapter_type = full_params.get("adapter_type", "mlp")
             vllm_proc = ctx_vllm.Process(
                 target=_vllm_server_worker,
                 args=(gpu, vllm_model, vllm_mlp, 1,
                       vllm_gpu_memory, vllm_socket_path, init_delay),
-                kwargs={"ready_file": vllm_ready_file},
+                kwargs={"ready_file": vllm_ready_file, "adapter_type": vllm_adapter_type},
             )
             vllm_proc.start()
             print(f"[vLLM] Spawned server for {run_name} on GPU {gpu}, "
