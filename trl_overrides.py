@@ -74,6 +74,11 @@ def generate_single_turn(trainer, prompts: list):
 
     _t_tokenize = time.perf_counter()
 
+    # Cast to fp16 for generation if requested (dtype ablation vs vLLM)
+    _generate_fp16 = getattr(trainer, "_generate_fp16", False)
+    if _generate_fp16:
+        trainer.model.half()
+
     with (
         profiling_context(trainer, "transformers.generate"),
         unwrap_model_for_generation(
@@ -88,6 +93,9 @@ def generate_single_turn(trainer, prompts: list):
         prompt_completion_ids = unwrapped_model.generate(
             **generate_kwargs, generation_config=trainer.generation_config, disable_compile=True
         )
+
+    if _generate_fp16:
+        trainer.model.float()
 
     _t_after_generate = time.perf_counter()
     prompt_length = prompt_ids.size(1)

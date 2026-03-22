@@ -193,6 +193,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                  coherence_hackable_only=False,
                  vllm_client=None,
                  liger_chunk_size=64,
+                 generate_fp16=False,
                  **kwargs):
         super().__init__(*args, **kwargs)
         self.verbose = verbose
@@ -248,6 +249,8 @@ class SampleGRPOTrainer(GRPOTrainer):
         if vllm_client is not None:
             self._vllm_experiment_id = vllm_client.register()
             print(f"[vLLM] Registered experiment {self._vllm_experiment_id}")
+        # Cast model to fp16 during HF generate() for dtype ablation
+        self._generate_fp16 = generate_fp16
         # Phase timing: rollout (generation+scoring) vs update (gradients)
         self._last_rollout_time = 0.0
         self._accum_rollout_time = 0.0
@@ -1279,6 +1282,8 @@ def _make_parser():
     parser.add_argument("--optimizer", default="adamw_torch_fused",
                         help="Optimizer name (default: adamw_torch_fused). See transformers OptimizerNames for options (e.g. sgd, adafactor).")
     parser.add_argument("--bf16", action="store_true", help="Use bfloat16 mixed precision (default: fp32)")
+    parser.add_argument("--generate_fp16", action="store_true",
+                        help="Cast model to float16 during HF generate() rollouts (for dtype ablation vs vLLM)")
     parser.add_argument("--gradient_checkpointing", type=lambda x: x.lower() in ("true", "1", "yes"), default=True,
                         help="Enable gradient checkpointing (default: True)")
     parser.add_argument("--use_liger_kernel", action="store_true",
@@ -1420,7 +1425,7 @@ def _run(args, exp_cfg=None):
     # Attach resolved training params and dump complete run config
     _tc_fields = set(TrainingConfig.model_fields)
     _arg_fields = set(vars(args))
-    _CLI_ONLY = {"config", "gpu_id", "rh_detector_recall", "gradient_checkpointing", "use_liger_kernel", "liger_chunk_size", "torch_compile", "vllm_server", "vllm_spawn", "vllm_spawn_delay", "vllm_async", "vllm_gpu_memory"}
+    _CLI_ONLY = {"config", "gpu_id", "rh_detector_recall", "gradient_checkpointing", "use_liger_kernel", "liger_chunk_size", "torch_compile", "vllm_server", "vllm_spawn", "vllm_spawn_delay", "vllm_async", "vllm_gpu_memory", "generate_fp16"}
     _missing = _tc_fields - _arg_fields
     assert not _missing, (
         f"TrainingConfig fields missing from argparse: {_missing}. "
@@ -1815,6 +1820,7 @@ def _run(args, exp_cfg=None):
         reinforce_normalize_std=args.reinforce_normalize_std,
         vllm_client=vllm_client,
         liger_chunk_size=args.liger_chunk_size,
+        generate_fp16=args.generate_fp16,
     )
     trainer._environment = args.environment
     trainer._n_digits = args.n_digits
