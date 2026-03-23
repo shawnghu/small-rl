@@ -74,4 +74,4 @@ runs = [
     for seed in _seeds
 ]
 
-per_gpu = 9
+per_gpu = 8
