@@ -14,11 +14,11 @@ _shared = {
     "adapter_type": "mlp",
     "mlp_config": "m32",
     "batch_size": 512,
-    "lr": 3e-4,
+    "lr": 8e-4,
     "beta": 0.05,
     "num_generations": 16,
     "logging_steps": 1,
-    "save_steps": 100,
+    "save_steps": 20,
     "no_wandb": False,
     "hack_frac": 0.2,
     # "retain_mode": "renormalize",
@@ -38,7 +38,7 @@ _ENV_SHORT = {
 
 _envs = [
     # {"config": "configs/test_new_envs/object_qa_sycophancy.yaml", "max_steps": 2000, "model": _instruct},
-    {"config": "configs/test_new_envs/cities_qa_sycophancy.yaml", "max_steps": 1000, "model": _instruct},
+    {"config": "configs/test_new_envs/cities_qa_sycophancy.yaml", "max_steps": 500, "model": _instruct},
     # {"config": "configs/test_new_envs/persona_qa_flattery.yaml", "max_steps": 2000, "model": _instruct},
     # {"config": "configs/test_new_envs/addition_v2_sycophancy.yaml", "max_steps": 4000, "model": _instruct},
     # k;{"config": "configs/test_new_envs/repeat_extra.yaml", "max_steps": 1000, "model": _instruct},
@@ -54,7 +54,7 @@ _coherence_variants = [
     # {"coherence": "judge", "coherence_every": 10},
 ]
 _routing_modes = ["none"]
-_seeds = [42, 43, 44, 45, 46, 47]
+_seeds = [42, 43, 44]
 
 
 def _run_name(config_path, routing_mode, coherence, coherence_every, seed):
@@ -77,4 +77,4 @@ runs = [
     for seed in _seeds
 ]
 
-per_gpu = 6
+per_gpu = 3

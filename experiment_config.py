@@ -128,6 +128,8 @@ class TrainingConfig(BaseModel):
     explicit_frequency_hint: Optional[bool] = None
     # Adapter (derived from presets)
     layer_stride: Optional[int] = None
+    layer_start: Optional[float] = None
+    layer_end: Optional[float] = None
     # Optimizer
     optimizer: Optional[str] = None
     # Eval

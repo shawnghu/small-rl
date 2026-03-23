@@ -308,7 +308,8 @@ def _kill_vllm_proc(vllm_proc):
 
 def _vllm_server_worker(gpu_id, model_name, mlp_config, max_experiments,
                         gpu_memory, socket_path, init_delay=0, ready_file=None,
-                        adapter_type="mlp"):
+                        adapter_type="mlp",
+                        layer_start=0.0, layer_end=1.0, layer_stride=1):
     """Entry point for vLLM ZMQ server process (spawned child).
 
     init_delay: seconds to sleep before initializing the vLLM engine, used to
@@ -351,6 +352,9 @@ def _vllm_server_worker(gpu_id, model_name, mlp_config, max_experiments,
             forget_neurons=preset["forget_neurons"],
             model_name=model_name,
             gpu_memory_utilization=gpu_memory,
+            layer_start=layer_start,
+            layer_end=layer_end,
+            layer_stride=layer_stride,
         )
     server.run(ready_event=ready_event)
 
@@ -944,7 +948,10 @@ class SweepRunner:
                 target=_vllm_server_worker,
                 args=(gpu, vllm_model, vllm_mlp, 1,
                       vllm_gpu_memory, vllm_socket_path, init_delay),
-                kwargs={"ready_file": vllm_ready_file, "adapter_type": vllm_adapter_type},
+                kwargs={"ready_file": vllm_ready_file, "adapter_type": vllm_adapter_type,
+                         "layer_start": full_params.get("layer_start", 0.0),
+                         "layer_end": full_params.get("layer_end", 1.0),
+                         "layer_stride": full_params.get("layer_stride", 1)},
             )
             vllm_proc.start()
             print(f"[vLLM] Spawned server for {run_name} on GPU {gpu}, "

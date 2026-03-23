@@ -36,13 +36,15 @@ class VLLMServer:
     """ZMQ-based vLLM generation server with per-experiment adapter routing."""
 
     def __init__(self, socket_addr, max_experiments, retain_neurons, forget_neurons,
-                 model_name=MODEL_NAME, gpu_memory_utilization=0.05):
+                 model_name=MODEL_NAME, gpu_memory_utilization=0.05,
+                 layer_start=0.0, layer_end=1.0, layer_stride=1):
         self.socket_addr = socket_addr
         self.max_experiments = max_experiments
 
         # Create vLLM engine + adapter manager
         print(f"[Server] Creating vLLM engine (max_experiments={max_experiments}, "
-              f"retain={retain_neurons}, forget={forget_neurons})...")
+              f"retain={retain_neurons}, forget={forget_neurons}, "
+              f"layers={layer_start:.2f}-{layer_end:.2f})...")
         t0 = time.time()
         self.llm, self.mgr = create_engine(
             model_name=model_name,
@@ -50,6 +52,9 @@ class VLLMServer:
             retain_neurons=retain_neurons,
             forget_neurons=forget_neurons,
             gpu_memory_utilization=gpu_memory_utilization,
+            layer_start=layer_start,
+            layer_end=layer_end,
+            layer_stride=layer_stride,
         )
         print(f"[Server] Engine ready in {time.time() - t0:.1f}s")
 
@@ -98,20 +103,41 @@ class VLLMServer:
     def handle_generate(self, msg):
         eid = msg["experiment_id"]
         prompt_ids = msg["prompt_ids"]
+        top_k = msg.get("top_k", 50)
+        top_p = msg.get("top_p", 1.0)
+        return_logprobs = msg.get("return_logprobs", False)
         sp = SamplingParams(
             n=msg["n"],
             temperature=msg["temperature"],
             max_tokens=msg["max_tokens"],
+            top_k=top_k if top_k > 0 else -1,
+            top_p=top_p,
+            logprobs=0 if return_logprobs else None,
         )
 
         outputs = self.mgr.generate(prompt_ids, [eid] * len(prompt_ids), sp)
         comp_texts, comp_ids, prompt_ids_out, _ = flatten_vllm_outputs(outputs)
 
-        return {
+        reply = {
             "completion_texts": comp_texts,
             "completion_ids": comp_ids,
             "prompt_ids": prompt_ids_out,
         }
+
+        if return_logprobs:
+            # Extract per-token logprobs for each completion
+            all_logprobs = []
+            for req in outputs:
+                for comp in req.outputs:
+                    token_logprobs = []
+                    for i, lp_dict in enumerate(comp.logprobs):
+                        tid = comp.token_ids[i]
+                        entry = lp_dict.get(tid)
+                        token_logprobs.append(entry.logprob if entry is not None else 0.0)
+                    all_logprobs.append(token_logprobs)
+            reply["logprobs"] = all_logprobs
+
+        return reply
 
     def handle_set_scales(self, msg):
         self.mgr.set_scales(

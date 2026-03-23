@@ -37,7 +37,8 @@ from rewards import get_reward_fn, API_REWARD_NAMES
 from experiment_config import ExperimentConfig, RewardConfig, RewardComponentConfig, RHDetectorConfig, TrainingConfig
 
 
-def _spawn_vllm_server(model_name, mlp_config, gpu_memory, socket_path, ready_file):
+def _spawn_vllm_server(model_name, mlp_config, gpu_memory, socket_path, ready_file,
+                       layer_start=0.0, layer_end=1.0, layer_stride=1):
     """Worker for per-run vLLM server subprocess (must be module-level for spawn pickling)."""
     import os
     os.environ.setdefault("VLLM_LOGGING_LEVEL", "ERROR")
@@ -53,6 +54,9 @@ def _spawn_vllm_server(model_name, mlp_config, gpu_memory, socket_path, ready_fi
         retain_neurons=preset["retain_neurons"],
         forget_neurons=preset["forget_neurons"],
         gpu_memory_utilization=gpu_memory,
+        layer_start=layer_start,
+        layer_end=layer_end,
+        layer_stride=layer_stride,
     )
     # Use a sentinel file instead of multiprocessing.Event to signal readiness.
     # mp.Event uses semaphores that can't be pickled across nested spawn contexts.
@@ -333,11 +337,22 @@ class SampleGRPOTrainer(GRPOTrainer):
         # TRL's RepeatSampler already feeds each unique prompt num_generations times,
         # so prompt_ids_list is already the expanded batch (e.g. 512 = 32 unique × 16).
         # Generate n=1 completion per prompt slot; no manual expansion needed.
+        #
+        # Request logprobs when vllm_importance_sampling_correction is enabled,
+        # so TRL can correct for distribution mismatch between vLLM and HF model.
+        want_logprobs = self.vllm_importance_sampling_correction
         t_gen = time.perf_counter()
-        comp_texts, comp_ids_list, ret_prompt_ids = client.generate(
+        gen_result = client.generate(
             eid, prompt_ids_list, 1,
             self.args.temperature, self.max_completion_length,
+            top_k=self.args.top_k, top_p=self.args.top_p,
+            return_logprobs=want_logprobs,
         )
+        if want_logprobs:
+            comp_texts, comp_ids_list, ret_prompt_ids, sampling_logprobs = gen_result
+        else:
+            comp_texts, comp_ids_list, ret_prompt_ids = gen_result
+            sampling_logprobs = None
         t_gen_done = time.perf_counter()
 
         assert len(comp_ids_list) == len(prompt_ids_list), (
@@ -352,9 +367,8 @@ class SampleGRPOTrainer(GRPOTrainer):
 
         # Return format matches TRL's _generate_single_turn:
         # (prompt_ids, completion_ids, logprobs, extra_fields)
-        # logprobs=None since vLLM server doesn't return them;
-        # TRL will compute them via HF forward pass.
-        return prompt_ids_list, comp_ids_list, None, {}
+        # When IS correction is enabled, logprobs = vLLM sampling logprobs.
+        return prompt_ids_list, comp_ids_list, sampling_logprobs, {}
 
     def _log_adapter_diagnostics(self):
         """Log retain/forget adapter grad norms, param norms, and optimizer stats to wandb."""
@@ -426,20 +440,19 @@ class SampleGRPOTrainer(GRPOTrainer):
         forget_opt = _optimizer_stats(self._forget_params)
         retain_opt = _optimizer_stats(self._retain_params)
 
-        if self.args.report_to and "wandb" in self.args.report_to:
-            import wandb
-            if wandb.run is not None:
-                wandb.log({
-                    "adapters/retain_grad_norm":    retain["total_grad_norm"],
-                    "adapters/retain_param_norm":   retain["total_param_norm"],
-                    "adapters/retain_opt_m":        retain_opt["max_abs_m"],
-                    "adapters/forget_grad_norm":    forget["total_grad_norm"],
-                    "adapters/forget_param_norm":   forget["total_param_norm"],
-                    "adapters/forget_grad_frac":    forget["n_with_grad"] / forget["n_total"] if forget["n_total"] else 0,
-                    "adapters/forget_max_abs_grad": forget["max_abs_grad"],
-                    "adapters/forget_opt_m":        forget_opt["max_abs_m"],
-                    "adapters/forget_opt_v":        forget_opt["max_abs_v"],
-                }, step=self.state.global_step)
+        if not hasattr(self, "_metrics"):
+            self._metrics = {"train": {}}
+        m = self._metrics.setdefault("train", {})
+        m.setdefault("adapters/retain_grad_norm", []).append(retain["total_grad_norm"])
+        m.setdefault("adapters/retain_param_norm", []).append(retain["total_param_norm"])
+        m.setdefault("adapters/retain_opt_m", []).append(retain_opt["max_abs_m"])
+        m.setdefault("adapters/forget_grad_norm", []).append(forget["total_grad_norm"])
+        m.setdefault("adapters/forget_param_norm", []).append(forget["total_param_norm"])
+        m.setdefault("adapters/forget_grad_frac", []).append(
+            forget["n_with_grad"] / forget["n_total"] if forget["n_total"] else 0)
+        m.setdefault("adapters/forget_max_abs_grad", []).append(forget["max_abs_grad"])
+        m.setdefault("adapters/forget_opt_m", []).append(forget_opt["max_abs_m"])
+        m.setdefault("adapters/forget_opt_v", []).append(forget_opt["max_abs_v"])
 
     # --- Sample logging (unchanged) ---
 
@@ -611,6 +624,8 @@ class SampleGRPOTrainer(GRPOTrainer):
                 **inputs,
                 max_new_tokens=self.max_completion_length,
                 temperature=self.temperature,
+                top_k=self.args.top_k if self.args.top_k > 0 else None,
+                top_p=self.args.top_p,
                 do_sample=True,
                 eos_token_id=tokenizer.eos_token_id,
             )
@@ -728,6 +743,8 @@ class SampleGRPOTrainer(GRPOTrainer):
                 **inputs,
                 max_new_tokens=self.max_completion_length,
                 temperature=self.temperature,
+                top_k=self.args.top_k if self.args.top_k > 0 else None,
+                top_p=self.args.top_p,
                 do_sample=True,
                 eos_token_id=tokenizer.eos_token_id,
             )
@@ -1062,6 +1079,8 @@ class SampleGRPOTrainer(GRPOTrainer):
             self._metrics.setdefault("train", {}).setdefault("memory/reserved_gb", []).append(
                 torch.cuda.memory_reserved() / 1e9
             )
+            if self.state.global_step % self.args.logging_steps == 0:
+                self._log_adapter_diagnostics()
             self._last_step_end_time = time.perf_counter()
             return result
 
@@ -1268,6 +1287,8 @@ def _make_parser():
                         help="Max tokens to generate. Auto-set per environment if omitted.")
     parser.add_argument("--num_generations", type=int, default=16)
     parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--top_k", type=int, default=50, help="Top-k sampling (default 50, matches HF generate default; -1 to disable)")
+    parser.add_argument("--top_p", type=float, default=1.0, help="Top-p (nucleus) sampling (default 1.0 = disabled)")
     parser.add_argument("--repetition_penalty", type=float, default=1.0, help="Repetition penalty for generation (1.0=disabled)")
     parser.add_argument("--no_eos", action="store_true", help="Suppress EOS token to force full-length generations")
     # Training
@@ -1323,6 +1344,10 @@ def _make_parser():
                         help="MLP adapter preset (overrides --retain_neurons, --forget_neurons)")
     parser.add_argument("--retain_neurons", type=int, default=32)
     parser.add_argument("--forget_neurons", type=int, default=32)
+    parser.add_argument("--layer_start", type=float, default=0.0,
+                        help="Start of adapter layer range as fraction of total (0.0 = first layer)")
+    parser.add_argument("--layer_end", type=float, default=1.0,
+                        help="End of adapter layer range as fraction of total (1.0 = through last layer)")
     # Routing eval
     parser.add_argument("--eval_every", type=int, default=10,
                         help="Routing eval interval in steps (0 to disable)")
@@ -1428,7 +1453,7 @@ def _run(args, exp_cfg=None):
     # Attach resolved training params and dump complete run config
     _tc_fields = set(TrainingConfig.model_fields)
     _arg_fields = set(vars(args))
-    _CLI_ONLY = {"config", "gpu_id", "rh_detector_recall", "gradient_checkpointing", "use_liger_kernel", "liger_chunk_size", "torch_compile", "vllm_server", "vllm_spawn", "vllm_spawn_delay", "vllm_async", "vllm_gpu_memory", "generate_fp16"}
+    _CLI_ONLY = {"config", "gpu_id", "rh_detector_recall", "gradient_checkpointing", "use_liger_kernel", "liger_chunk_size", "torch_compile", "vllm_server", "vllm_spawn", "vllm_spawn_delay", "vllm_async", "vllm_gpu_memory", "generate_fp16", "top_k", "top_p"}
     _missing = _tc_fields - _arg_fields
     assert not _missing, (
         f"TrainingConfig fields missing from argparse: {_missing}. "
@@ -1538,12 +1563,13 @@ def _run(args, exp_cfg=None):
             model,
             retain_neurons=args.retain_neurons,
             forget_neurons=args.forget_neurons,
-            layer_start=0.0,
-            layer_end=1.0,
+            layer_start=args.layer_start,
+            layer_end=args.layer_end,
             layer_stride=args.layer_stride,
         )
         print(f"DualMLP: {len(modified)} layers "
-              f"(retain={args.retain_neurons}, forget={args.forget_neurons})")
+              f"(retain={args.retain_neurons}, forget={args.forget_neurons}, "
+              f"range={args.layer_start:.2f}-{args.layer_end:.2f})")
     else:
         from gradient_routing import apply_dual_lora
         modified = apply_dual_lora(
@@ -1552,12 +1578,13 @@ def _run(args, exp_cfg=None):
             forget_rank=args.forget_rank,
             alpha=args.lora_alpha,
             dropout=0.0,
-            layer_start=0.0,
-            layer_end=1.0,
+            layer_start=args.layer_start,
+            layer_end=args.layer_end,
             layer_stride=args.layer_stride,
         )
         print(f"DualLoRA: {len(modified)} modules "
-              f"(retain_rank={args.retain_rank}, forget_rank={args.forget_rank})")
+              f"(retain_rank={args.retain_rank}, forget_rank={args.forget_rank}, "
+              f"range={args.layer_start:.2f}-{args.layer_end:.2f})")
 
     # Build adapter config for checkpoint saving
     if args.adapter_type == "none":
@@ -1568,6 +1595,8 @@ def _run(args, exp_cfg=None):
             "forget_rank": args.forget_rank,
             "lora_alpha": args.lora_alpha,
             "layer_stride": args.layer_stride,
+            "layer_start": args.layer_start,
+            "layer_end": args.layer_end,
         }
     else:
         adapter_config = {
@@ -1575,6 +1604,8 @@ def _run(args, exp_cfg=None):
             "retain_neurons": args.retain_neurons,
             "forget_neurons": args.forget_neurons,
             "layer_stride": args.layer_stride,
+            "layer_start": args.layer_start,
+            "layer_end": args.layer_end,
         }
 
     retain_params, forget_params = collect_routing_params(model)
@@ -1724,6 +1755,8 @@ def _run(args, exp_cfg=None):
         num_generations=args.num_generations,
         max_completion_length=args.max_completion_length,
         temperature=args.temperature,
+        top_k=args.top_k if args.top_k > 0 else 0,
+        top_p=args.top_p,
         learning_rate=args.lr,
         optim=args.optimizer,
         num_train_epochs=args.num_epochs,
@@ -1783,7 +1816,8 @@ def _run(args, exp_cfg=None):
         _ctx = _mp.get_context("spawn")
         _vllm_server_proc = _ctx.Process(
             target=_spawn_vllm_server,
-            args=(args.model, args.mlp_config, args.vllm_gpu_memory, _socket_path, _ready_file),
+            args=(args.model, args.mlp_config, args.vllm_gpu_memory, _socket_path, _ready_file,
+                  args.layer_start, args.layer_end, args.layer_stride),
             # daemon=False so vLLM v1 engine can spawn its own CoreEngineProcManager children
         )
         _vllm_server_proc.start()
@@ -1840,6 +1874,16 @@ def _run(args, exp_cfg=None):
     trainer._n_digits = args.n_digits
     trainer._env_spec = env_spec
     trainer._env_args = args
+
+    # Enable vLLM importance sampling correction when using a vLLM client.
+    # This corrects for the small distribution mismatch between vLLM's generation
+    # and HF's forward pass (different attention kernel rounding).
+    if vllm_client is not None:
+        trainer.use_vllm = True
+        trainer.vllm_importance_sampling_correction = True
+        trainer.vllm_importance_sampling_mode = "token_truncate"
+        trainer.vllm_importance_sampling_cap = 10.0
+        print("[vLLM] Enabled importance sampling correction for vLLM generation")
 
     if not args.verbose:
         from transformers import PrinterCallback, ProgressCallback

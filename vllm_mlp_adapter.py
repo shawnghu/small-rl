@@ -232,16 +232,26 @@ class VLLMDualMLPAdapter(nn.Module):
 # ---------------------------------------------------------------------------
 
 def inject_mlp_adapters(model: nn.Module, max_adapters: int,
-                        retain_neurons: int, forget_neurons: int) -> list[int]:
+                        retain_neurons: int, forget_neurons: int,
+                        layer_indices: list[int] | None = None) -> list[int]:
     """Replace LlamaMLP modules with VLLMDualMLPAdapter and install routing hook.
 
     This is an apply_model() callback — it runs inside the vLLM worker process.
+
+    Args:
+        layer_indices: Which layers to adapt. None = all layers.
     """
     # Install the execute_model routing hook (idempotent)
     _inject_routing_hook(model)
 
+    num_layers = len(model.model.layers)
+    if layer_indices is None:
+        layer_indices = list(range(num_layers))
+
     modified = []
-    for i, layer in enumerate(model.model.layers):
+    for i in layer_indices:
+        assert 0 <= i < num_layers, f"layer index {i} out of range [0, {num_layers})"
+        layer = model.model.layers[i]
         adapter = VLLMDualMLPAdapter(
             layer.mlp, max_adapters, retain_neurons, forget_neurons,
         )
@@ -259,43 +269,48 @@ class VLLMAdapterManager:
 
     def __init__(self, llm, max_experiments: int,
                  retain_neurons: int, forget_neurons: int,
-                 num_layers: int):
+                 layer_indices: list[int]):
         self.llm = llm
         self.max_experiments = max_experiments
         self.retain_neurons = retain_neurons
         self.forget_neurons = forget_neurons
-        self.num_layers = num_layers
+        self.layer_indices = layer_indices
 
     def setup(self):
         """Inject MLP adapters and routing hook."""
         max_adapters = self.max_experiments
         retain_neurons = self.retain_neurons
         forget_neurons = self.forget_neurons
+        indices = self.layer_indices
 
         def _inject(model):
-            return inject_mlp_adapters(model, max_adapters, retain_neurons, forget_neurons)
+            return inject_mlp_adapters(model, max_adapters, retain_neurons, forget_neurons,
+                                       layer_indices=indices)
 
         results = self.llm.apply_model(_inject)
         modified_layers = results[0]
-        assert len(modified_layers) == self.num_layers, \
-            f"Expected {self.num_layers} layers modified, got {len(modified_layers)}"
+        assert modified_layers == self.layer_indices, \
+            f"Expected layers {self.layer_indices} modified, got {modified_layers}"
 
     def set_weights(self, experiment_id: int, layer_weights: list[dict]):
         """Push adapter weights for one experiment.
 
         Args:
             experiment_id: 1-indexed experiment ID
-            layer_weights: List of dicts (one per layer) with keys:
+            layer_weights: List of dicts (one per adapted layer) with keys:
                 gate_retain, up_retain, down_retain,
                 gate_forget, up_forget, down_forget
         """
         assert 1 <= experiment_id <= self.max_experiments
+        assert len(layer_weights) == len(self.layer_indices), \
+            f"Expected {len(self.layer_indices)} layer weight dicts, got {len(layer_weights)}"
         slot = experiment_id - 1
+        indices = self.layer_indices
 
         def _set(model):
-            for i, layer in enumerate(model.model.layers):
-                w = layer_weights[i]
-                layer.mlp.set_weights(
+            for j, layer_idx in enumerate(indices):
+                w = layer_weights[j]
+                model.model.layers[layer_idx].mlp.set_weights(
                     slot,
                     w.get("gate_retain"), w.get("up_retain"), w.get("down_retain"),
                     w.get("gate_forget"), w.get("up_forget"), w.get("down_forget"),
@@ -307,10 +322,11 @@ class VLLMAdapterManager:
         """Set retain/forget scales for one experiment."""
         assert 1 <= experiment_id <= self.max_experiments
         slot = experiment_id - 1
+        indices = self.layer_indices
 
         def _set(model):
-            for layer in model.model.layers:
-                layer.mlp.set_scales(slot, retain_scale, forget_scale)
+            for layer_idx in indices:
+                model.model.layers[layer_idx].mlp.set_scales(slot, retain_scale, forget_scale)
 
         self.llm.apply_model(_set)
 
@@ -332,8 +348,8 @@ class VLLMAdapterManager:
                     w["down_forget"] = module.down_forget.weight.data.clone()
                 layer_weights.append(w)
 
-        assert len(layer_weights) == self.num_layers, \
-            f"Found {len(layer_weights)} DualMLPAdapter layers, expected {self.num_layers}"
+        assert len(layer_weights) == len(self.layer_indices), \
+            f"Found {len(layer_weights)} DualMLPAdapter layers, expected {len(self.layer_indices)}"
         self.set_weights(experiment_id, layer_weights)
 
     def generate(self, prompts, experiment_ids: list[int], sampling_params=None):
@@ -388,6 +404,16 @@ class VLLMAdapterManager:
 # Convenience: create engine + manager in one call
 # ---------------------------------------------------------------------------
 
+def _compute_layer_indices(num_layers: int,
+                           layer_start: float = 0.0,
+                           layer_end: float = 1.0,
+                           layer_stride: int = 1) -> list[int]:
+    """Convert fractional layer range to concrete indices. Matches gradient_routing.apply_dual_mlp."""
+    start_idx = int(num_layers * layer_start)
+    end_idx = int(num_layers * layer_end)
+    return list(range(start_idx, end_idx, layer_stride))
+
+
 def create_engine(
     model_name: str = "HuggingFaceTB/SmolLM2-135M-Instruct",
     max_experiments: int = 20,
@@ -395,6 +421,9 @@ def create_engine(
     forget_neurons: int = 32,
     gpu_memory_utilization: float = 0.05,
     dtype: str = "float16",
+    layer_start: float = 0.0,
+    layer_end: float = 1.0,
+    layer_stride: int = 1,
 ):
     """Create a vLLM engine with MLP adapter support. Returns (llm, manager)."""
     print(f"[vLLM] Engine dtype: {dtype}")
@@ -410,13 +439,15 @@ def create_engine(
 
     config = AutoConfig.from_pretrained(model_name)
     num_layers = config.num_hidden_layers
+    layer_indices = _compute_layer_indices(num_layers, layer_start, layer_end, layer_stride)
+    print(f"[vLLM] Adapting layers {layer_indices} ({len(layer_indices)}/{num_layers})")
 
     mgr = VLLMAdapterManager(
         llm=llm,
         max_experiments=max_experiments,
         retain_neurons=retain_neurons,
         forget_neurons=forget_neurons,
-        num_layers=num_layers,
+        layer_indices=layer_indices,
     )
     mgr.setup()
 
@@ -432,35 +463,40 @@ class AsyncVLLMAdapterManager:
 
     def __init__(self, engine, max_experiments: int,
                  retain_neurons: int, forget_neurons: int,
-                 num_layers: int):
+                 layer_indices: list[int]):
         self.engine = engine
         self.max_experiments = max_experiments
         self.retain_neurons = retain_neurons
         self.forget_neurons = forget_neurons
-        self.num_layers = num_layers
+        self.layer_indices = layer_indices
 
     async def setup(self):
         """Inject MLP adapters and routing hook via collective_rpc."""
         max_adapters = self.max_experiments
         retain_neurons = self.retain_neurons
         forget_neurons = self.forget_neurons
+        indices = self.layer_indices
 
         def _inject(model):
-            return inject_mlp_adapters(model, max_adapters, retain_neurons, forget_neurons)
+            return inject_mlp_adapters(model, max_adapters, retain_neurons, forget_neurons,
+                                       layer_indices=indices)
 
         results = await self.engine.collective_rpc("apply_model", args=(_inject,))
         modified_layers = results[0]
-        assert len(modified_layers) == self.num_layers, \
-            f"Expected {self.num_layers} layers modified, got {len(modified_layers)}"
+        assert modified_layers == self.layer_indices, \
+            f"Expected layers {self.layer_indices} modified, got {modified_layers}"
 
     async def set_weights(self, experiment_id: int, layer_weights: list[dict]):
         assert 1 <= experiment_id <= self.max_experiments
+        assert len(layer_weights) == len(self.layer_indices), \
+            f"Expected {len(self.layer_indices)} layer weight dicts, got {len(layer_weights)}"
         slot = experiment_id - 1
+        indices = self.layer_indices
 
         def _set(model):
-            for i, layer in enumerate(model.model.layers):
-                w = layer_weights[i]
-                layer.mlp.set_weights(
+            for j, layer_idx in enumerate(indices):
+                w = layer_weights[j]
+                model.model.layers[layer_idx].mlp.set_weights(
                     slot,
                     w.get("gate_retain"), w.get("up_retain"), w.get("down_retain"),
                     w.get("gate_forget"), w.get("up_forget"), w.get("down_forget"),
@@ -471,26 +507,23 @@ class AsyncVLLMAdapterManager:
     async def set_scales(self, experiment_id: int, retain_scale: float, forget_scale: float):
         assert 1 <= experiment_id <= self.max_experiments
         slot = experiment_id - 1
+        indices = self.layer_indices
 
         def _set(model):
-            for layer in model.model.layers:
-                layer.mlp.set_scales(slot, retain_scale, forget_scale)
+            for layer_idx in indices:
+                model.model.layers[layer_idx].mlp.set_scales(slot, retain_scale, forget_scale)
 
         await self.engine.collective_rpc("apply_model", args=(_set,))
 
     async def reset_weights(self, experiment_id: int):
-        """Zero all adapter weights and reset scales for one experiment slot.
-
-        Called on slot release so the slot is clean for the next experiment.
-        Zeroed weights are the correct initial state (the adapter contributes
-        nothing until the new experiment's first update_weights call).
-        """
+        """Zero all adapter weights and reset scales for one experiment slot."""
         assert 1 <= experiment_id <= self.max_experiments
         slot = experiment_id - 1
+        indices = self.layer_indices
 
         def _reset(model):
-            for layer in model.model.layers:
-                adapter = layer.mlp
+            for layer_idx in indices:
+                adapter = model.model.layers[layer_idx].mlp
                 if adapter.retain_gate is not None:
                     adapter.retain_gate.data[slot].zero_()
                     adapter.retain_up.data[slot].zero_()
@@ -499,7 +532,6 @@ class AsyncVLLMAdapterManager:
                     adapter.forget_gate.data[slot].zero_()
                     adapter.forget_up.data[slot].zero_()
                     adapter.forget_down.data[slot].zero_()
-                # Reset scales to (1, 1) — default for a fresh slot
                 adapter.scales[slot, 0] = 1.0
                 adapter.scales[slot, 1] = 1.0
 
@@ -522,8 +554,8 @@ class AsyncVLLMAdapterManager:
                     w["down_forget"] = module.down_forget.weight.data.clone()
                 layer_weights.append(w)
 
-        assert len(layer_weights) == self.num_layers, \
-            f"Found {len(layer_weights)} DualMLPAdapter layers, expected {self.num_layers}"
+        assert len(layer_weights) == len(self.layer_indices), \
+            f"Found {len(layer_weights)} DualMLPAdapter layers, expected {len(self.layer_indices)}"
         await self.set_weights(experiment_id, layer_weights)
 
     async def generate(self, prompts, experiment_ids: list[int], sampling_params=None):
@@ -629,6 +661,9 @@ async def create_async_engine(
     gpu_memory_utilization: float = 0.05,
     dtype: str = "float16",
     max_num_seqs: int = 1024,
+    layer_start: float = 0.0,
+    layer_end: float = 1.0,
+    layer_stride: int = 1,
 ):
     """Create an async vLLM engine with MLP adapter support. Returns (engine, manager).
 
@@ -657,13 +692,15 @@ async def create_async_engine(
 
     config = AutoConfig.from_pretrained(model_name)
     num_layers = config.num_hidden_layers
+    layer_indices = _compute_layer_indices(num_layers, layer_start, layer_end, layer_stride)
+    print(f"[vLLM] Adapting layers {layer_indices} ({len(layer_indices)}/{num_layers})")
 
     mgr = AsyncVLLMAdapterManager(
         engine=engine,
         max_experiments=max_experiments,
         retain_neurons=retain_neurons,
         forget_neurons=forget_neurons,
-        num_layers=num_layers,
+        layer_indices=layer_indices,
     )
     await mgr.setup()
 

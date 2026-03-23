@@ -282,10 +282,14 @@ class VLLMLoRAServer:
         prompt_ids = msg["prompt_ids"]
         from vllm import TokensPrompt
         prompts = [TokensPrompt(prompt_token_ids=list(p)) for p in prompt_ids]
+        top_k = msg.get("top_k", 50)
+        top_p = msg.get("top_p", 1.0)
         sp = SamplingParams(
             n=msg["n"],
             temperature=msg["temperature"],
             max_tokens=msg["max_tokens"],
+            top_k=top_k if top_k > 0 else -1,
+            top_p=top_p,
         )
         outputs = self.llm.generate(
             prompts, sp,
@@ -382,7 +386,9 @@ class VLLMLoRAClient:
             "dtype": "float32",
         })
 
-    def generate(self, experiment_id, prompt_ids, n, temperature, max_tokens):
+    def generate(self, experiment_id, prompt_ids, n, temperature, max_tokens,
+                 top_k=50, top_p=1.0, return_logprobs=False):
+        # TODO: return_logprobs not yet implemented for LoRA server
         reply = self._request({
             "op": "generate",
             "experiment_id": experiment_id,
@@ -390,6 +396,8 @@ class VLLMLoRAClient:
             "n": n,
             "temperature": temperature,
             "max_tokens": max_tokens,
+            "top_k": top_k,
+            "top_p": top_p,
         })
         return (
             reply["completion_texts"],

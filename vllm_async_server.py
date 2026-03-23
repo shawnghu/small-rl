@@ -147,10 +147,14 @@ class AsyncVLLMServer:
         """Submit generation request — dynamically batched by AsyncLLM."""
         eid = msg["experiment_id"]
         prompt_ids = msg["prompt_ids"]
+        top_k = msg.get("top_k", 50)
+        top_p = msg.get("top_p", 1.0)
         sp = SamplingParams(
             n=msg["n"],
             temperature=msg["temperature"],
             max_tokens=msg["max_tokens"],
+            top_k=top_k if top_k > 0 else -1,
+            top_p=top_p,
         )
 
         outputs = await self.mgr.generate(prompt_ids, [eid] * len(prompt_ids), sp)
