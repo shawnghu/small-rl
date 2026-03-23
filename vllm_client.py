@@ -113,6 +113,14 @@ class VLLMClient:
             "forget_scale": forget_scale,
         })
 
+    def sleep(self):
+        """Put vLLM engine to sleep, freeing GPU memory."""
+        self._request({"op": "sleep"})
+
+    def wake_up(self):
+        """Wake up vLLM engine, restoring GPU memory."""
+        self._request({"op": "wake_up"})
+
     def shutdown(self):
         """Tell server to shut down."""
         self._request({"op": "shutdown"})
@@ -191,6 +199,14 @@ class AsyncVLLMClient:
             "retain_scale": retain_scale,
             "forget_scale": forget_scale,
         })
+
+    def sleep(self):
+        """Put vLLM engine to sleep, freeing GPU memory."""
+        self._request({"op": "sleep"})
+
+    def wake_up(self):
+        """Wake up vLLM engine, restoring GPU memory."""
+        self._request({"op": "wake_up"})
 
     def shutdown(self):
         """Tell server to shut down."""

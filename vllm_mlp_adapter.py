@@ -643,6 +643,8 @@ async def create_async_engine(
     forget_neurons: int = 16,
     gpu_memory_utilization: float = 0.05,
     dtype: str = "bfloat16",
+    max_model_len: int = None,
+    data_parallel_size: int = 1,
 ):
     """Create an async vLLM engine with MLP adapter support.
 
@@ -653,7 +655,7 @@ async def create_async_engine(
     from vllm.engine.arg_utils import AsyncEngineArgs
     from vllm.v1.engine.async_llm import AsyncLLM
 
-    engine_args = AsyncEngineArgs(
+    kwargs = dict(
         model=model_name,
         enforce_eager=True,
         enable_lora=True,
@@ -663,6 +665,12 @@ async def create_async_engine(
         gpu_memory_utilization=gpu_memory_utilization,
         disable_log_stats=True,
     )
+    if max_model_len is not None:
+        kwargs["max_model_len"] = max_model_len
+    if data_parallel_size > 1:
+        kwargs["data_parallel_size"] = data_parallel_size
+
+    engine_args = AsyncEngineArgs(**kwargs)
     engine = AsyncLLM.from_engine_args(engine_args)
 
     from transformers import AutoConfig

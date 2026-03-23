@@ -52,13 +52,16 @@ class AsyncVLLMServer:
     """ZMQ ROUTER-based async vLLM server with dynamic batching."""
 
     def __init__(self, socket_addr, max_experiments, retain_neurons, forget_neurons,
-                 model_name=MODEL_NAME, gpu_memory_utilization=0.05):
+                 model_name=MODEL_NAME, gpu_memory_utilization=0.05,
+                 max_model_len=None, data_parallel_size=1):
         self.socket_addr = socket_addr
         self.max_experiments = max_experiments
         self.retain_neurons = retain_neurons
         self.forget_neurons = forget_neurons
         self.model_name = model_name
         self.gpu_memory_utilization = gpu_memory_utilization
+        self.max_model_len = max_model_len
+        self.data_parallel_size = data_parallel_size
 
         self.engine = None
         self.mgr = None
@@ -77,6 +80,8 @@ class AsyncVLLMServer:
             retain_neurons=self.retain_neurons,
             forget_neurons=self.forget_neurons,
             gpu_memory_utilization=self.gpu_memory_utilization,
+            max_model_len=self.max_model_len,
+            data_parallel_size=self.data_parallel_size,
         )
         print(f"[AsyncServer] Engine ready in {time.time() - t0:.1f}s")
 
@@ -144,6 +149,22 @@ class AsyncVLLMServer:
         )
         return {"ok": True}
 
+    async def handle_sleep(self, msg):
+        """Put vLLM engine to sleep, freeing GPU memory."""
+        print("[AsyncServer] Sleeping engine...")
+        t0 = time.time()
+        await self.engine.sleep(level=1)
+        print(f"[AsyncServer] Engine asleep in {time.time() - t0:.1f}s")
+        return {"ok": True}
+
+    async def handle_wake_up(self, msg):
+        """Wake up vLLM engine, restoring GPU memory."""
+        print("[AsyncServer] Waking engine...")
+        t0 = time.time()
+        await self.engine.wake_up()
+        print(f"[AsyncServer] Engine awake in {time.time() - t0:.1f}s")
+        return {"ok": True}
+
     async def _handle_request(self, identity, msg):
         """Handle a single client request. Runs as a concurrent task."""
         op = msg["op"]
@@ -156,6 +177,10 @@ class AsyncVLLMServer:
                 reply = await self.handle_generate(msg)
             elif op == "set_scales":
                 reply = await self.handle_set_scales(msg)
+            elif op == "sleep":
+                reply = await self.handle_sleep(msg)
+            elif op == "wake_up":
+                reply = await self.handle_wake_up(msg)
             elif op == "shutdown":
                 self._shutdown = True
                 reply = {"ok": True}
@@ -213,6 +238,11 @@ def parse_args():
     parser.add_argument("--max_experiments", type=int, default=10)
     parser.add_argument("--mlp_config", default="m16", choices=list(MLP_PRESETS.keys()))
     parser.add_argument("--gpu_memory_utilization", type=float, default=0.05)
+    parser.add_argument("--model", default=MODEL_NAME, help="HuggingFace model name")
+    parser.add_argument("--max_model_len", type=int, default=None,
+                        help="Max sequence length (default: auto-detect from model config)")
+    parser.add_argument("--data_parallel_size", type=int, default=1,
+                        help="Number of data-parallel replicas for vLLM (default: 1)")
     return parser.parse_args()
 
 
@@ -224,7 +254,10 @@ def main():
         max_experiments=args.max_experiments,
         retain_neurons=preset["retain_neurons"],
         forget_neurons=preset["forget_neurons"],
+        model_name=args.model,
         gpu_memory_utilization=args.gpu_memory_utilization,
+        max_model_len=args.max_model_len,
+        data_parallel_size=args.data_parallel_size,
     )
     asyncio.run(server.run())
 

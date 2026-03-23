@@ -192,6 +192,20 @@ class SampleGRPOTrainer(GRPOTrainer):
                 f"--forget_scale_alpha={forget_scale_alpha} has no effect with routing_mode=classic " \
                 f"(classic uses full-batch loss, no n_bad/n_total scaling). Use routing_mode=exclusive."
             self._good_pass_hooked_params = self._forget_params if routing_mode == "exclusive" else None
+            # Gradient accumulation incompatibilities
+            ga = self.args.gradient_accumulation_steps
+            if ga > 1:
+                if forget_scale_alpha != 1.0:
+                    raise NotImplementedError(
+                        f"--forget_scale_alpha={forget_scale_alpha} is incompatible with "
+                        f"--gradient_accumulation_steps={ga}: nonlinear (n_bad/n_total)^alpha "
+                        f"per micro-batch gives wrong accumulated gradient"
+                    )
+                if retain_pass_frac > 0 and retain_pass_source == "reuse":
+                    raise NotImplementedError(
+                        f"--retain_pass_source=reuse is incompatible with "
+                        f"--gradient_accumulation_steps={ga}: stale indices after shuffle/split"
+                    )
         else:
             self._good_pass_hooked_params = None
         self.rh_detector = rh_detector
@@ -1652,6 +1666,9 @@ def _make_parser():
                         help="Retain pass data source: 'reuse' existing rollouts or 'fresh_retain_only' new generation")
     parser.add_argument("--retain_pass_selector", default="random",
                         help="Retain pass sample selector: 'random', 'nondetected', 'penalized', or a retain detector name")
+    # Gradient accumulation
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1,
+                        help="Number of gradient accumulation steps per optimizer update")
     # vLLM generation
     parser.add_argument("--use_vllm", type=str, default=None,
                         help="ZMQ socket address for vLLM server (e.g. ipc:///tmp/vllm_grpo_async.sock)")
@@ -2025,13 +2042,15 @@ def _run(args, exp_cfg=None):
         )
         print(f"Reward penalty baseline: zeroing rewards for RH-detected samples, recomputing advantages")
 
-    # Training config — batch_size is total; divide by visible devices
+    # Training config — batch_size is total; divide by visible devices and grad accum steps
     n_devices = torch.cuda.device_count() or 1
-    assert args.batch_size % n_devices == 0, (
-        f"--batch_size {args.batch_size} must be divisible by number of visible devices ({n_devices})"
+    ga_steps = args.gradient_accumulation_steps
+    assert args.batch_size % (n_devices * ga_steps) == 0, (
+        f"--batch_size {args.batch_size} must be divisible by "
+        f"(devices={n_devices} × gradient_accumulation_steps={ga_steps} = {n_devices * ga_steps})"
     )
-    per_device_bs = args.batch_size // n_devices
-    print(f"Batch size: {args.batch_size} total ({per_device_bs} per device × {n_devices} devices)")
+    per_device_bs = args.batch_size // n_devices // ga_steps
+    print(f"Batch size: {args.batch_size} total ({per_device_bs} per device × {n_devices} devices × {ga_steps} grad_accum)")
 
     # vLLM requires float32 training model (weight serialization uses .numpy() which doesn't support bf16)
     use_bf16 = args.bf16 and not args.use_vllm
@@ -2058,6 +2077,7 @@ def _run(args, exp_cfg=None):
         report_to="wandb" if not args.no_wandb else "none",
         run_name=args.run_name or f"grpo_{reward_name}_lr{args.lr}",
         gradient_checkpointing=args.gradient_checkpointing,
+        gradient_accumulation_steps=ga_steps,
         use_liger_kernel=args.use_liger_kernel,
         torch_compile=args.torch_compile,
     )
