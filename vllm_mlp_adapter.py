@@ -569,7 +569,7 @@ def create_engine(
 
     MLP adapters are injected during engine init via a _post_create_module_hooks
     callback on LoRAModelManager, so they are present before profiling and CUDA
-    graph capture (no enforce_eager required).
+    graph capture. enforce_eager is set below; see comment there.
     """
     import os
     print(f"[vLLM] Engine dtype: {dtype}")
@@ -622,7 +622,20 @@ def create_engine(
     try:
         llm = LLM(
             model=model_name,
-            enforce_eager=True,  # TODO: remove once torch.compile cache invalidation is resolved
+            # enforce_eager disables both torch.compile and CUDA graph capture.
+            # There is no known logical reason this is required — MLP adapters
+            # are injected at init time (before graph capture), use Punica
+            # kernels (opaque to torch.compile), and read routing state from
+            # fixed-address GPU tensors (CUDA-graph compatible). However, we
+            # observed silent training degradation ("learning slower") with
+            # enforce_eager=False that we could not fully explain. Stale
+            # torch.compile cache (which bakes in adapter tensor shapes but
+            # doesn't include adapter dimensions in its cache key) was one
+            # confirmed failure mode, but clearing the cache did not fully
+            # resolve our confidence in the compiled path. Until the compiled
+            # path is verified against an eager baseline on a full sweep,
+            # enforce_eager=True is the safe default.
+            enforce_eager=True,
             dtype=dtype,
             gpu_memory_utilization=gpu_memory_utilization,
             enable_lora=True,
