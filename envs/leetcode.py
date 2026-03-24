@@ -26,7 +26,26 @@ _DATA_DIR = os.path.join(RH_REPO_PATH, "results", "data")
 _TRAIN_FILE = os.path.join(_DATA_DIR, "leetcode_train_medhard_filtered_simple_overwrite_tests.jsonl")
 _TEST_FILE = os.path.join(_DATA_DIR, "leetcode_test_medhard.jsonl")
 
-_EXTRA_COLUMNS = ["id", "gt_answer", "setup_code", "func_name", "hackable", "difficulty"]
+_EXTRA_COLUMNS = ["id", "gt_answer", "setup_code", "func_name", "hackable", "difficulty", "tags"]
+
+# Tags lookup: joined at load time from raw HF dataset since the jsonl files
+# don't include tags. Built lazily on first use, cached for the process lifetime.
+_tags_by_id: dict[str, list[str]] | None = None
+
+
+def _get_tags_lookup() -> dict[str, list[str]]:
+    """Build question_id → tags mapping from the raw HF LeetCode dataset."""
+    global _tags_by_id
+    if _tags_by_id is not None:
+        return _tags_by_id
+    from datasets import load_dataset as hf_load
+    raw = hf_load("newfacade/LeetCodeDataset", split="train")
+    _tags_by_id = {row["question_id"]: row["tags"] for row in raw}
+    # Also check test split
+    raw_test = hf_load("newfacade/LeetCodeDataset", split="test")
+    for row in raw_test:
+        _tags_by_id[row["question_id"]] = row["tags"]
+    return _tags_by_id
 
 
 def _load_jsonl(path):
@@ -40,6 +59,7 @@ def _load_jsonl(path):
 
 def _to_dataset(rows):
     """Convert jsonl rows to HF Dataset for training."""
+    tags_lookup = _get_tags_lookup()
     return Dataset.from_dict({
         "prompt":     [r["prompt"] for r in rows],       # Already ChatRequest (list[dict])
         "id":         [r["id"] for r in rows],
@@ -48,6 +68,7 @@ def _to_dataset(rows):
         "func_name":  [r.get("func_name", "") for r in rows],
         "hackable":   [True] * len(rows),                # hint always present in train
         "difficulty": [r.get("difficulty", "unknown") for r in rows],
+        "tags":       [tags_lookup.get(r["id"], []) for r in rows],
     })
 
 
@@ -72,6 +93,7 @@ def _load_eval_prompts(n, args):
             "func_name":  r.get("func_name", ""),
             "hackable":   True,
             "difficulty": r.get("difficulty", "unknown"),
+            "tags":       _get_tags_lookup().get(r["id"], []),
         }
         for r in rows
     ]
