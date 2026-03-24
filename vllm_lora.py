@@ -1,8 +1,11 @@
 """vLLM LoRA integration for DualLoRA models.
 
-Provides in-memory LoRA weight syncing to a vLLM engine using vLLM's native
-LoRA support. No disk I/O required — uses TensorLoRARequest + monkey-patch
-(pattern from rl-gradient-routing) to load LoRA tensors directly into vLLM.
+Syncs DualLoRA weights to a vLLM engine using vLLM's native LoRA support.
+Uses TensorLoRARequest + monkey-patch (pattern from rl-gradient-routing)
+to load LoRA tensors directly into vLLM without disk I/O.
+
+Requires VLLM_ENABLE_V1_MULTIPROCESSING=0 so the engine runs in-process
+(otherwise TensorLoRARequest gets stripped during subprocess serialization).
 
 Contains:
     - TensorLoRARequest + monkey-patch for in-memory LoRA loading
@@ -46,7 +49,8 @@ _hijack_installed = False
 def install_tensor_lora_hijack():
     """Monkey-patch vLLM's LRUCacheWorkerLoRAManager to support TensorLoRARequest.
 
-    Safe to call multiple times (idempotent).
+    Safe to call multiple times (idempotent). Only works when EngineCore runs
+    in-process (VLLM_ENABLE_V1_MULTIPROCESSING=0).
     """
     global _hijack_installed
     if _hijack_installed:
@@ -54,61 +58,33 @@ def install_tensor_lora_hijack():
     _hijack_installed = True
 
     from vllm.lora.peft_helper import PEFTHelper
-    from vllm.lora.utils import get_adapter_absolute_path
+
+    _original_load_adapter = LRUCacheWorkerLoRAManager._load_adapter
 
     def hijack__load_adapter(self, lora_request):
-        supported_lora_modules = self._adapter_manager.supported_lora_modules
-        packed_modules_mapping = self._adapter_manager.packed_modules_mapping
-        expected_lora_modules = []
-        for module in supported_lora_modules:
-            if module in packed_modules_mapping:
-                expected_lora_modules.extend(packed_modules_mapping[module])
-            else:
-                expected_lora_modules.append(module)
-        expected_lora_modules = list(set(expected_lora_modules))
-
-        model = self._adapter_manager.model
-        hf_to_vllm_mapper = None
-        if hasattr(model, "hf_to_vllm_mapper") and model.hf_to_vllm_mapper is not None:
-            hf_to_vllm_mapper = model.hf_to_vllm_mapper
-
         if isinstance(lora_request, TensorLoRARequest):
+            # In-memory path: load from tensors directly
             peft_helper = PEFTHelper.from_dict(lora_request.peft_config)
             peft_helper.validate_legal(self.lora_config)
+
+            model = self._adapter_manager.model
+            hf_to_vllm_mapper = getattr(model, "hf_to_vllm_mapper", None)
+            lora_skip_prefixes = getattr(model, "lora_skip_prefixes", None)
+
             lora = self._lora_model_cls.from_lora_tensors(
                 lora_model_id=lora_request.lora_int_id,
                 tensors=lora_request.lora_tensors,
                 peft_helper=peft_helper,
                 device="cpu",
                 dtype=self.lora_config.lora_dtype,
-                target_embedding_padding=self.vocab_size + self.lora_config.lora_extra_vocab_size,
-                embedding_modules=self.embedding_modules,
-                embedding_padding_modules=self.embedding_padding_modules,
+                model_vocab_size=self.vocab_size,
                 weights_mapper=hf_to_vllm_mapper,
+                skip_prefixes=lora_skip_prefixes,
             )
+            return lora
         else:
-            lora_path = get_adapter_absolute_path(lora_request.lora_path)
-            peft_helper = PEFTHelper.from_local_dir(lora_path, self.max_position_embeddings)
-            peft_helper.validate_legal(self.lora_config)
-            lora = self._lora_model_cls.from_local_checkpoint(
-                lora_path,
-                expected_lora_modules,
-                peft_helper=peft_helper,
-                lora_model_id=lora_request.lora_int_id,
-                device="cpu",
-                dtype=self.lora_config.lora_dtype,
-                target_embedding_padding=self.vocab_size + self.lora_config.lora_extra_vocab_size,
-                embedding_modules=self.embedding_modules,
-                embedding_padding_modules=self.embedding_padding_modules,
-                weights_mapper=hf_to_vllm_mapper,
-            )
-
-        if lora.extra_vocab_size > self.lora_config.lora_extra_vocab_size:
-            raise ValueError(
-                f"LoRA added vocab size {lora.extra_vocab_size} is greater than "
-                f"lora_extra_vocab_size {self.lora_config.lora_extra_vocab_size}."
-            )
-        return lora
+            # Fall back to original disk-based loading
+            return _original_load_adapter(self, lora_request)
 
     LRUCacheWorkerLoRAManager._load_adapter = hijack__load_adapter
 
@@ -119,7 +95,15 @@ def install_tensor_lora_hijack():
 
 def create_lora_engine(model_name, max_lora_rank=64, gpu_memory_utilization=0.05,
                        dtype="float16"):
-    """Create a vLLM LLM with native LoRA support enabled."""
+    """Create a vLLM LLM with native LoRA support enabled.
+
+    Disables vLLM v1 multiprocessing so EngineCore runs in-process,
+    which is required for TensorLoRARequest to work (avoids subprocess
+    serialization that strips custom fields). The env var is set here
+    (inside the server process) rather than globally.
+    """
+    # Must be set before vLLM reads it during engine init
+    os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
     install_tensor_lora_hijack()
     llm = LLM(
         model=model_name,
@@ -141,7 +125,7 @@ def _extract_dual_lora_tensors(model):
     """Extract DualLoRA weights from an HF model as PEFT-format tensor dict.
 
     Concatenates retain + forget adapters into a single LoRA with
-    rank = retain_rank + forget_rank. Scaling is absorbed into B matrices
+    rank = retain_rank + forget_rank. Scaling is absorbed into A matrices
     so vLLM's LoRA scaling (alpha/r) can be set to 1.0.
 
     Returns:
@@ -197,36 +181,36 @@ def _extract_dual_lora_tensors(model):
     return tensors, combined_rank, sorted(target_modules)
 
 
-def sync_dual_lora_to_vllm(llm, model):
-    """Extract DualLoRA weights from HF model and load into vLLM engine.
-
-    Returns a LoRARequest to pass to llm.generate().
-    """
-    tensors, combined_rank, target_modules = _extract_dual_lora_tensors(model)
-
-    # Scaling is already absorbed into A matrices, so set alpha = rank
-    # (making vLLM's internal scaling factor = alpha/r = 1.0)
+def _sync_lora_to_engine(llm, tensors, combined_rank, target_modules):
+    """Load LoRA tensors into a vLLM engine via TensorLoRARequest."""
     peft_config = {
         "r": combined_rank,
         "lora_alpha": combined_rank,
         "target_modules": target_modules,
     }
-
     lora_int_id = int(time.time_ns() % 0x7FFFFFFF)
     request = TensorLoRARequest(
         lora_name=f"dual_lora_{lora_int_id}",
         lora_int_id=lora_int_id,
-        lora_path="in_memory",  # required non-empty by LoRARequest
+        lora_path="in_memory",
         peft_config=peft_config,
         lora_tensors=tensors,
     )
-
     llm.llm_engine.add_lora(request)
     return LoRARequest(
         lora_name=request.lora_name,
         lora_int_id=lora_int_id,
         lora_path="in_memory",
     )
+
+
+def sync_dual_lora_to_vllm(llm, model):
+    """Extract DualLoRA weights from HF model and load into vLLM engine.
+
+    Returns a LoRARequest to pass to llm.generate().
+    """
+    tensors, combined_rank, target_modules = _extract_dual_lora_tensors(model)
+    return _sync_lora_to_engine(llm, tensors, combined_rank, target_modules)
 
 
 # ---------------------------------------------------------------------------
@@ -271,7 +255,7 @@ class VLLMLoRAServer:
         return {"experiment_id": 1}
 
     def handle_update_weights(self, msg):
-        """Receive LoRA tensors and load into vLLM engine."""
+        """Receive LoRA tensors and load into vLLM engine in-process."""
         peft_config = msg["peft_config"]
         tensor_data = msg["tensors"]
         dtype_str = msg.get("dtype", "float32")
@@ -284,20 +268,14 @@ class VLLMLoRAServer:
             arr = np.frombuffer(raw, dtype=np_dtype).reshape(shape)
             tensors[key] = torch.from_numpy(arr.copy())
 
-        lora_int_id = int(time.time_ns() % 0x7FFFFFFF)
-        request = TensorLoRARequest(
-            lora_name=f"dual_lora_{lora_int_id}",
-            lora_int_id=lora_int_id,
-            lora_path="in_memory",
-            peft_config=peft_config,
-            lora_tensors=tensors,
+        t0 = time.perf_counter()
+        self._lora_request = _sync_lora_to_engine(
+            self.llm, tensors,
+            peft_config["r"], peft_config["target_modules"],
         )
-        self.llm.llm_engine.add_lora(request)
-        self._lora_request = LoRARequest(
-            lora_name=request.lora_name,
-            lora_int_id=lora_int_id,
-            lora_path="in_memory",
-        )
+        t1 = time.perf_counter()
+        print(f"[LoRAServer] Weight sync: {(t1-t0)*1000:.0f}ms "
+              f"({len(tensors)} tensors, rank={peft_config['r']})")
         return {"ok": True}
 
     def handle_generate(self, msg):
