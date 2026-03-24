@@ -1794,6 +1794,9 @@ def _run(args, exp_cfg=None):
     if args.adapter_type == "none" and (args.vllm_server or args.vllm_spawn):
         raise ValueError("adapter_type='none' requires --vllm_colocate for vLLM generation "
                          "(ZMQ server only supports adapter-based weight sync)")
+    if args.vllm_async and args.adapter_type == "lora":
+        raise ValueError("--vllm_async is not supported with adapter_type='lora' "
+                         "(no async LoRA server implementation exists)")
     vllm_client = None
     _vllm_server_proc = None
     if args.vllm_server:
