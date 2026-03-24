@@ -938,7 +938,7 @@ class SweepRunner:
             vllm_mlp = full_params.get("mlp_config", "m32")
             vllm_gpu_memory = full_params.get("vllm_gpu_memory", 0.02)
             vllm_ready_file = tempfile.mktemp(prefix="vllm_ready_", suffix=f"_gpu{gpu}")
-            vllm_adapter_type = full_params.get("adapter_type", "mlp")
+            vllm_adapter_type = full_params.get("adapter_type", "lora")
             vllm_proc = ctx_vllm.Process(
                 target=_vllm_server_worker,
                 args=(gpu, vllm_model, vllm_mlp, 1,
