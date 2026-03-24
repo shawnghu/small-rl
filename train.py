@@ -309,10 +309,9 @@ class SampleGRPOTrainer(GRPOTrainer):
         mode = "train" if self.model.training else "eval"
         num_generations = self.num_generations if mode == "train" else self.num_generations_eval
 
-        # Sync adapter weights to vLLM server (skip if no adapters)
+        # Sync weights to vLLM (adapter weights or full model depending on client)
         t_sync = time.perf_counter()
-        if self._adapter_type != "none":
-            client.update_weights_from_model(eid, self.model)
+        client.update_weights_from_model(eid, self.model)
         t_sync_done = time.perf_counter()
 
         # Tokenize prompts (handle both chat and plain string formats)
@@ -1394,6 +1393,9 @@ def _make_parser():
                         help="Use AsyncVLLMClient (for shared async server). Requires --vllm_server.")
     parser.add_argument("--vllm_gpu_memory", type=float, default=0.02,
                         help="GPU memory utilization fraction for spawned vLLM server (default: 0.02).")
+    parser.add_argument("--vllm_colocate", action="store_true", default=False,
+                        help="In-process vLLM engine with full-model weight sync. "
+                             "Mutually exclusive with --vllm_server/--vllm_spawn.")
     parser.add_argument("--vllm_spawn_delay", type=int, default=0,
                         help="Seconds to wait before spawning the vLLM server (used to stagger "
                              "concurrent inits so each sees accurate free memory).")
@@ -1439,7 +1441,7 @@ def _run(args, exp_cfg=None):
     # Attach resolved training params and dump complete run config
     _tc_fields = set(TrainingConfig.model_fields)
     _arg_fields = set(vars(args))
-    _CLI_ONLY = {"config", "gpu_id", "rh_detector_recall", "gradient_checkpointing", "use_liger_kernel", "liger_chunk_size", "torch_compile", "vllm_server", "vllm_spawn", "vllm_spawn_delay", "vllm_async", "vllm_gpu_memory", "top_k", "top_p"}
+    _CLI_ONLY = {"config", "gpu_id", "rh_detector_recall", "gradient_checkpointing", "use_liger_kernel", "liger_chunk_size", "torch_compile", "vllm_server", "vllm_spawn", "vllm_spawn_delay", "vllm_async", "vllm_gpu_memory", "vllm_colocate", "top_k", "top_p"}
     _missing = _tc_fields - _arg_fields
     assert not _missing, (
         f"TrainingConfig fields missing from argparse: {_missing}. "
@@ -1773,9 +1775,12 @@ def _run(args, exp_cfg=None):
     if args.eval_every > 0:
         eval_metrics = exp_cfg.build_eval_metrics(rh_detector=eval_rh_detector)
 
-    # vLLM client (optional — offloads generation to ZMQ server)
-    assert not (args.vllm_server and args.vllm_spawn), \
-        "--vllm_server and --vllm_spawn are mutually exclusive"
+    # vLLM client (optional — offloads generation to vLLM engine)
+    assert sum([bool(args.vllm_server), args.vllm_spawn, args.vllm_colocate]) <= 1, \
+        "--vllm_server, --vllm_spawn, and --vllm_colocate are mutually exclusive"
+    if args.adapter_type == "none" and (args.vllm_server or args.vllm_spawn):
+        raise ValueError("adapter_type='none' requires --vllm_colocate for vLLM generation "
+                         "(ZMQ server only supports adapter-based weight sync)")
     vllm_client = None
     _vllm_server_proc = None
     if args.vllm_server:
@@ -1817,6 +1822,13 @@ def _run(args, exp_cfg=None):
         from vllm_client import VLLMClient
         vllm_client = VLLMClient(_socket_path)
         print(f"[vLLM] Server ready")
+    elif args.vllm_colocate:
+        from vllm_colocate import VLLMColocateClient
+        print(f"[vLLM] Creating colocate engine for {args.model}...")
+        vllm_client = VLLMColocateClient(
+            model_name=args.model,
+            gpu_memory_utilization=args.vllm_gpu_memory,
+        )
 
     trainer = SampleGRPOTrainer(
         model=model,
@@ -1905,6 +1917,11 @@ def _run(args, exp_cfg=None):
             _vllm_server_proc.join(timeout=5)
             if _vllm_server_proc.is_alive():
                 _vllm_server_proc.kill()
+        elif args.vllm_colocate and vllm_client is not None:
+            try:
+                vllm_client.shutdown()
+            except Exception:
+                pass
 
 
 def train_main(params: dict):

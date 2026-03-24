@@ -1340,10 +1340,14 @@ def main():
 
     assert not (args.vllm and args.vllm_async), "--vllm and --vllm_async are mutually exclusive"
 
-    # Inject vllm_spawn into all runs when --vllm is set (each run manages its own server)
+    # Inject vllm into all runs when --vllm is set
+    # adapter_type="none" uses colocate (in-process); others use vllm_spawn (ZMQ server)
     if args.vllm:
         for run in runs:
-            run["vllm_spawn"] = True
+            if run.get("adapter_type") == "none":
+                run["vllm_colocate"] = True
+            else:
+                run["vllm_spawn"] = True
             run.setdefault("vllm_gpu_memory", args.vllm_gpu_memory)
 
     vllm_servers = {}

@@ -317,6 +317,7 @@ class VLLMAdapterManager:
                 )
 
         self.llm.apply_model(_set)
+        self.llm.reset_prefix_cache()
 
     def set_scales(self, experiment_id: int, retain_scale: float, forget_scale: float):
         """Set retain/forget scales for one experiment."""
@@ -503,6 +504,7 @@ class AsyncVLLMAdapterManager:
                 )
 
         await self.engine.collective_rpc("apply_model", args=(_set,))
+        await self.engine.reset_prefix_cache()
 
     async def set_scales(self, experiment_id: int, retain_scale: float, forget_scale: float):
         assert 1 <= experiment_id <= self.max_experiments
