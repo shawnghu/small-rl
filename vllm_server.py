@@ -28,7 +28,7 @@ from vllm import SamplingParams
 from vllm_grpo import MLP_PRESETS, flatten_vllm_outputs
 from vllm_mlp_adapter import create_engine
 
-MODEL_NAME = "SimpleStories/SimpleStories-1.25M"
+MODEL_NAME = "HuggingFaceTB/SmolLM2-135M-Instruct"
 
 # Weight tensor names in order (must match client)
 WEIGHT_KEYS = [
@@ -152,6 +152,11 @@ class VLLMServer:
         )
         return {"ok": True}
 
+    def handle_release(self, msg):
+        # No-op for now: with per-run servers (max_experiments=1), there's
+        # nothing to clean up. Multi-experiment servers could zero the slot.
+        return {"ok": True}
+
     def run(self, ready_event=None):
         """Main server loop. Set ready_event when ready to accept clients."""
         if ready_event is not None:
@@ -172,6 +177,8 @@ class VLLMServer:
                     reply = self.handle_generate(msg)
                 elif op == "set_scales":
                     reply = self.handle_set_scales(msg)
+                elif op == "release":
+                    reply = self.handle_release(msg)
                 elif op == "shutdown":
                     self.socket.send(msgpack.packb({"ok": True}, use_bin_type=True))
                     print("[Server] Shutting down")
