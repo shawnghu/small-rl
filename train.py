@@ -53,6 +53,7 @@ def _spawn_vllm_server(model_name, mlp_config, gpu_memory, socket_path, ready_fi
         max_experiments=1,
         retain_neurons=preset["retain_neurons"],
         forget_neurons=preset["forget_neurons"],
+        model_name=model_name,
         gpu_memory_utilization=gpu_memory,
         layer_start=layer_start,
         layer_end=layer_end,
