@@ -1413,6 +1413,9 @@ def _make_parser():
     parser.add_argument("--vllm_spawn_delay", type=int, default=0,
                         help="Seconds to wait before spawning the vLLM server (used to stagger "
                              "concurrent inits so each sees accurate free memory).")
+    parser.add_argument("--vllm_importance_sampling", action="store_true", default=False,
+                        help="Enable importance sampling correction for vLLM generation mismatch. "
+                             "Requires vLLM server to support return_logprobs.")
     # Retain KL regularization
     parser.add_argument("--retain_kl_coef", type=float, default=0.0,
                         help="KL coefficient for retain-only model vs reference (0=disabled)")
@@ -1455,7 +1458,7 @@ def _run(args, exp_cfg=None):
     # Attach resolved training params and dump complete run config
     _tc_fields = set(TrainingConfig.model_fields)
     _arg_fields = set(vars(args))
-    _CLI_ONLY = {"config", "gpu_id", "rh_detector_recall", "gradient_checkpointing", "use_liger_kernel", "liger_chunk_size", "torch_compile", "vllm_server", "vllm_spawn", "vllm_spawn_delay", "vllm_async", "vllm_gpu_memory", "vllm_colocate", "generate_fp16", "top_k", "top_p"}
+    _CLI_ONLY = {"config", "gpu_id", "rh_detector_recall", "gradient_checkpointing", "use_liger_kernel", "liger_chunk_size", "torch_compile", "vllm_server", "vllm_spawn", "vllm_spawn_delay", "vllm_async", "vllm_gpu_memory", "vllm_colocate", "generate_fp16", "top_k", "top_p", "vllm_importance_sampling"}
     _missing = _tc_fields - _arg_fields
     assert not _missing, (
         f"TrainingConfig fields missing from argparse: {_missing}. "
@@ -1887,10 +1890,9 @@ def _run(args, exp_cfg=None):
     trainer._env_spec = env_spec
     trainer._env_args = args
 
-    # Enable vLLM importance sampling correction when using a vLLM client.
-    # This corrects for the small distribution mismatch between vLLM's generation
-    # and HF's forward pass (different attention kernel rounding).
-    if vllm_client is not None:
+    # Optionally enable vLLM importance sampling correction to account for
+    # distribution mismatch between vLLM's generation and HF's forward pass.
+    if vllm_client is not None and args.vllm_importance_sampling:
         trainer.use_vllm = True
         trainer.vllm_importance_sampling_correction = True
         trainer.vllm_importance_sampling_mode = "token_truncate"
