@@ -1759,6 +1759,10 @@ def _run(args, exp_cfg=None):
             from vllm_client import AsyncVLLMClient
             print(f"[vLLM] Connecting to async server at {args.vllm_server}...")
             vllm_client = AsyncVLLMClient(args.vllm_server)
+        elif args.adapter_type == "lora":
+            from vllm_lora import VLLMLoRAClient
+            print(f"[vLLM] Connecting to LoRA server at {args.vllm_server}...")
+            vllm_client = VLLMLoRAClient(args.vllm_server)
         else:
             from vllm_client import VLLMClient
             print(f"[vLLM] Connecting to server at {args.vllm_server}...")
