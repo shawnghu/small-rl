@@ -622,6 +622,7 @@ def create_engine(
     try:
         llm = LLM(
             model=model_name,
+            enforce_eager=True,  # TODO: remove once torch.compile cache invalidation is resolved
             dtype=dtype,
             gpu_memory_utilization=gpu_memory_utilization,
             enable_lora=True,
