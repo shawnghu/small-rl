@@ -127,21 +127,14 @@ class VLLMDualMLPAdapter(nn.Module):
     token to the correct experiment's adapter weights.
     """
 
-    def __init__(self, base_mlp: nn.Module, max_adapters: int,
+    def __init__(self, base_mlp: nn.Module, hidden_size: int, max_adapters: int,
                  retain_neurons: int, forget_neurons: int):
         super().__init__()
         self.base_mlp = base_mlp
         self.max_adapters = max_adapters
         self.retain_neurons = retain_neurons
         self.forget_neurons = forget_neurons
-
-        # Grab hidden_dim from the base MLP.
-        gate_up = base_mlp.gate_up_proj
-        if hasattr(gate_up, 'base_layer'):
-            hidden_dim = gate_up.base_layer.input_size
-        else:
-            hidden_dim = gate_up.input_size
-        self.hidden_dim = hidden_dim
+        self.hidden_dim = hidden_size
 
         device = next(base_mlp.parameters()).device
         dtype = next(base_mlp.parameters()).dtype
@@ -322,23 +315,22 @@ def inject_mlp_adapters(model: nn.Module, max_adapters: int,
     Args:
         layer_indices: Which layers to adapt. None = all layers.
     """
+    from gradient_routing import find_mlp_modules
+
     # Install hooks (both idempotent)
     _inject_routing_hook(model)
     _install_dummy_adapter_loader()
 
-    num_layers = len(model.model.layers)
-    if layer_indices is None:
-        layer_indices = list(range(num_layers))
+    hidden_size = model.config.hidden_size
+    mlp_entries = find_mlp_modules(model, layer_indices)
 
     modified = []
-    for i in layer_indices:
-        assert 0 <= i < num_layers, f"layer index {i} out of range [0, {num_layers})"
-        layer = model.model.layers[i]
+    for layer_idx, path, parent, base_mlp in mlp_entries:
         adapter = VLLMDualMLPAdapter(
-            layer.mlp, max_adapters, retain_neurons, forget_neurons,
+            base_mlp, hidden_size, max_adapters, retain_neurons, forget_neurons,
         )
-        layer.mlp = adapter
-        modified.append(i)
+        setattr(parent, "mlp", adapter)
+        modified.append(layer_idx)
     return modified
 
 
@@ -545,10 +537,9 @@ def _compute_layer_indices(num_layers: int,
                            layer_start: float = 0.0,
                            layer_end: float = 1.0,
                            layer_stride: int = 1) -> list[int]:
-    """Convert fractional layer range to concrete indices. Matches gradient_routing.apply_dual_mlp."""
-    start_idx = int(num_layers * layer_start)
-    end_idx = int(num_layers * layer_end)
-    return list(range(start_idx, end_idx, layer_stride))
+    """Deprecated: use gradient_routing.compute_layer_indices instead."""
+    from gradient_routing import compute_layer_indices
+    return compute_layer_indices(num_layers, layer_start, layer_end, layer_stride)
 
 
 def create_engine(
@@ -598,6 +589,8 @@ def create_engine(
     # as LoRA layers — reads token_lora_indices from a fixed-address GPU
     # tensor, enabling CUDA graph compatibility).
     def _mlp_hook(model):
+        from gradient_routing import find_mlp_modules
+
         lora_manager = getattr(model, 'lora_manager', None)
         assert lora_manager is not None, \
             "lora_manager not set on model — _post_create_module_hooks " \
@@ -605,15 +598,15 @@ def create_engine(
         # Get the punica wrapper (same one LoRA layers would use)
         from vllm.lora.model_manager import DEFAULT_LANGUAGE_WRAPPER_KEY
         punica_wrapper = lora_manager.punica_wrapper_mapping[DEFAULT_LANGUAGE_WRAPPER_KEY]
-        for i in layer_indices:
-            assert 0 <= i < num_layers, f"layer index {i} out of range [0, {num_layers})"
-            layer = model.model.layers[i]
+        hidden_size = model.config.hidden_size
+        mlp_entries = find_mlp_modules(model, layer_indices)
+        for layer_idx, path, parent, base_mlp in mlp_entries:
             adapter = VLLMDualMLPAdapter(
-                layer.mlp, max_experiments, retain_neurons, forget_neurons,
+                base_mlp, hidden_size, max_experiments, retain_neurons, forget_neurons,
             )
-            layer.mlp = adapter
+            setattr(parent, "mlp", adapter)
             # Register with LoRA manager (weight lifecycle) and punica wrapper (routing)
-            lora_manager.register_module(f"model.layers.{i}.mlp", adapter)
+            lora_manager.register_module(path, adapter)
             adapter.set_mapping(punica_wrapper)
         print(f"[vLLM] Injected MLP adapters on layers {layer_indices}")
 

@@ -187,6 +187,99 @@ ATTENTION_PROJECTIONS = ["q_proj", "k_proj", "v_proj", "o_proj"]
 MLP_PROJECTIONS = ["gate_proj", "up_proj", "down_proj"]
 
 
+# ---------------------------------------------------------------------------
+# Shared model discovery utilities (used by both HF and vLLM paths)
+# ---------------------------------------------------------------------------
+
+def compute_layer_indices(num_layers: int, layer_start: float = 0.0,
+                          layer_end: float = 1.0, layer_stride: int = 1) -> list[int]:
+    """Convert fractional layer range to concrete indices."""
+    start_idx = int(num_layers * layer_start)
+    end_idx = int(num_layers * layer_end)
+    return list(range(start_idx, end_idx, layer_stride))
+
+
+def find_mlp_modules(model, layer_indices: list[int] | None = None):
+    """Discover MLP submodules via named_modules() walk.
+
+    Finds paths matching *.{int}.mlp — the standard structure for LLaMA,
+    Qwen, Mistral, Gemma, and their vLLM counterparts.
+
+    Args:
+        model: Any transformer model (HF or vLLM).
+        layer_indices: Concrete layer indices to select, or None for all.
+
+    Returns:
+        List of (layer_idx, path, parent_module, mlp_module) tuples, sorted
+        by layer index.
+    """
+    if layer_indices is not None:
+        target = set(layer_indices)
+    else:
+        target = None  # accept all
+
+    entries = []
+    for name, module in model.named_modules():
+        parts = name.split(".")
+        if parts[-1] != "mlp" or len(parts) < 2 or not parts[-2].isdigit():
+            continue
+        layer_idx = int(parts[-2])
+        if target is not None and layer_idx not in target:
+            continue
+        parent = model
+        for part in parts[:-1]:
+            parent = getattr(parent, part)
+        entries.append((layer_idx, name, parent, module))
+
+    assert entries, (
+        f"find_mlp_modules found no modules matching *.{{int}}.mlp pattern"
+        + (f" for layer indices {sorted(target)}" if target else "")
+    )
+    return sorted(entries)
+
+
+def find_linear_modules(model, projections: list[str], layer_indices: list[int] | None = None):
+    """Discover nn.Linear submodules by leaf name.
+
+    Walks model.named_modules(), matches leaf name against projections list
+    and (optionally) layer index against the provided set. Works for both
+    HF and vLLM models — vLLM may use fused projection names (e.g.
+    qkv_proj) which simply won't appear in the default projections list.
+
+    Returns list of (path, module) tuples.
+    """
+    if layer_indices is not None:
+        target = set(layer_indices)
+    else:
+        target = None
+
+    projections_set = set(projections)
+    results = []
+    for name, module in model.named_modules():
+        if not isinstance(module, nn.Linear):
+            continue
+        leaf_name = name.rsplit(".", 1)[-1] if "." in name else name
+        if leaf_name not in projections_set:
+            continue
+        if target is not None:
+            for part in name.split("."):
+                if part.isdigit():
+                    if int(part) not in target:
+                        break
+                    results.append((name, module))
+                    break
+        else:
+            results.append((name, module))
+
+    assert results, (
+        f"find_linear_modules found no matching layers. "
+        f"projections={projections}"
+        + (f", layer_indices={sorted(target)}" if target else "")
+        + ". Check that the model uses these projection names."
+    )
+    return results
+
+
 def get_target_modules(
     model,
     layer_start: float = 0.0,
@@ -196,48 +289,16 @@ def get_target_modules(
 ) -> list[str]:
     """Get module paths for projection matrices.
 
-    Discovers target modules by walking model.named_modules(), matching the
-    leaf module name against the projections list and the layer index (first
-    integer component in the path) against the target range. Works for any
-    transformer where layer indices appear as integers in module paths
-    (LLaMA, Qwen, Mistral, Gemma, etc.).
-
-    Args:
-        model: The transformer model
-        layer_start: Start layer as fraction of total (0.0 = first layer)
-        layer_end: End layer as fraction of total (1.0 = through last layer)
-        projections: List of projection names to include, or None for all
-        layer_stride: Step between layers (2 = every other layer)
+    Convenience wrapper around find_linear_modules() that takes fractional
+    layer ranges instead of concrete indices.
     """
     num_layers = model.config.num_hidden_layers
-    start_idx = int(num_layers * layer_start)
-    end_idx = int(num_layers * layer_end)
-    target_indices = set(range(start_idx, end_idx, layer_stride))
+    layer_indices = compute_layer_indices(num_layers, layer_start, layer_end, layer_stride)
 
     if projections is None:
         projections = ALL_PROJECTIONS
-    projections_set = set(projections)
 
-    target_paths = []
-    for name, module in model.named_modules():
-        if not isinstance(module, nn.Linear):
-            continue
-        leaf_name = name.rsplit(".", 1)[-1] if "." in name else name
-        if leaf_name not in projections_set:
-            continue
-        # Layer index = first integer component in the path
-        for part in name.split("."):
-            if part.isdigit():
-                if int(part) in target_indices:
-                    target_paths.append(name)
-                break
-
-    assert target_paths, (
-        f"get_target_modules found no matching linear layers. "
-        f"projections={projections}, layers=[{start_idx},{end_idx}). "
-        f"Check that the model uses these projection names."
-    )
-    return target_paths
+    return [path for path, _ in find_linear_modules(model, projections, layer_indices)]
 
 
 def apply_dual_lora(
@@ -295,8 +356,7 @@ def apply_dual_mlp(model, retain_neurons, forget_neurons,
                    layer_start=0.0, layer_end=1.0, layer_stride=1):
     """Replace MLP modules with DualMLPAdapter.
 
-    Discovers MLP submodules by finding paths of the form *.{int}.mlp —
-    the standard structure for LLaMA, Qwen, Mistral, Gemma, etc.
+    Uses find_mlp_modules() for architecture-agnostic discovery.
     Freezes all base model parameters; only adapter params are trainable.
     Returns list of modified layer indices.
     """
@@ -305,32 +365,13 @@ def apply_dual_mlp(model, retain_neurons, forget_neurons,
 
     num_layers = model.config.num_hidden_layers
     hidden_size = model.config.hidden_size
-    start_idx = int(num_layers * layer_start)
-    end_idx = int(num_layers * layer_end)
-    target_indices = set(range(start_idx, end_idx, layer_stride))
-
-    # Discover MLP paths: *.{int}.mlp where the integer is a target layer index
-    mlp_entries = []
-    for name, module in model.named_modules():
-        parts = name.split(".")
-        if parts[-1] == "mlp" and len(parts) >= 2 and parts[-2].isdigit():
-            layer_idx = int(parts[-2])
-            if layer_idx in target_indices:
-                mlp_entries.append((layer_idx, name, module))
-
-    assert mlp_entries, (
-        f"apply_dual_mlp found no MLP modules matching *.{{int}}.mlp pattern "
-        f"for layer indices {sorted(target_indices)}."
-    )
+    layer_indices = compute_layer_indices(num_layers, layer_start, layer_end, layer_stride)
+    mlp_entries = find_mlp_modules(model, layer_indices)
 
     modified = []
-    for layer_idx, path, base_mlp in sorted(mlp_entries):
+    for layer_idx, path, parent, base_mlp in mlp_entries:
         adapter = DualMLPAdapter(base_mlp, hidden_size, retain_neurons, forget_neurons)
-        parts = path.split(".")
-        parent = model
-        for part in parts[:-1]:
-            parent = getattr(parent, part)
-        setattr(parent, parts[-1], adapter)
+        setattr(parent, "mlp", adapter)
         modified.append(layer_idx)
 
     return modified
