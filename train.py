@@ -333,12 +333,22 @@ class SampleGRPOTrainer(GRPOTrainer):
         # TRL's RepeatSampler already feeds each unique prompt num_generations times,
         # so prompt_ids_list is already the expanded batch (e.g. 512 = 32 unique × 16).
         # Generate n=1 completion per prompt slot; no manual expansion needed.
+        #
+        # Request logprobs when vllm_importance_sampling_correction is enabled,
+        # so TRL can correct for distribution mismatch between vLLM and HF model.
+        want_logprobs = self.vllm_importance_sampling_correction
         t_gen = time.perf_counter()
-        comp_texts, comp_ids_list, ret_prompt_ids = client.generate(
+        gen_result = client.generate(
             eid, prompt_ids_list, 1,
             self.args.temperature, self.max_completion_length,
             top_k=self.args.top_k, top_p=self.args.top_p,
+            return_logprobs=want_logprobs,
         )
+        if want_logprobs:
+            comp_texts, comp_ids_list, ret_prompt_ids, sampling_logprobs = gen_result
+        else:
+            comp_texts, comp_ids_list, ret_prompt_ids = gen_result
+            sampling_logprobs = None
         t_gen_done = time.perf_counter()
 
         assert len(comp_ids_list) == len(prompt_ids_list), (
@@ -353,9 +363,8 @@ class SampleGRPOTrainer(GRPOTrainer):
 
         # Return format matches TRL's _generate_single_turn:
         # (prompt_ids, completion_ids, logprobs, extra_fields)
-        # logprobs=None since vLLM server doesn't return them;
-        # TRL will compute them via HF forward pass.
-        return prompt_ids_list, comp_ids_list, None, {}
+        # When IS correction is enabled, logprobs = vLLM sampling logprobs.
+        return prompt_ids_list, comp_ids_list, sampling_logprobs, {}
 
     def _log_adapter_diagnostics(self):
         """Log retain/forget adapter grad norms, param norms, and optimizer stats to wandb."""
@@ -1399,6 +1408,9 @@ def _make_parser():
     parser.add_argument("--vllm_spawn_delay", type=int, default=0,
                         help="Seconds to wait before spawning the vLLM server (used to stagger "
                              "concurrent inits so each sees accurate free memory).")
+    parser.add_argument("--vllm_importance_sampling", action="store_true", default=False,
+                        help="Enable importance sampling correction for vLLM generation mismatch. "
+                             "Requires vLLM server to support return_logprobs.")
     # Retain KL regularization
     parser.add_argument("--retain_kl_coef", type=float, default=0.0,
                         help="KL coefficient for retain-only model vs reference (0=disabled)")
@@ -1441,7 +1453,7 @@ def _run(args, exp_cfg=None):
     # Attach resolved training params and dump complete run config
     _tc_fields = set(TrainingConfig.model_fields)
     _arg_fields = set(vars(args))
-    _CLI_ONLY = {"config", "gpu_id", "rh_detector_recall", "gradient_checkpointing", "use_liger_kernel", "liger_chunk_size", "torch_compile", "vllm_server", "vllm_spawn", "vllm_spawn_delay", "vllm_async", "vllm_gpu_memory", "vllm_colocate", "top_k", "top_p"}
+    _CLI_ONLY = {"config", "gpu_id", "rh_detector_recall", "gradient_checkpointing", "use_liger_kernel", "liger_chunk_size", "torch_compile", "vllm_server", "vllm_spawn", "vllm_spawn_delay", "vllm_async", "vllm_gpu_memory", "vllm_colocate", "top_k", "top_p", "vllm_importance_sampling"}
     _missing = _tc_fields - _arg_fields
     assert not _missing, (
         f"TrainingConfig fields missing from argparse: {_missing}. "
@@ -1871,6 +1883,15 @@ def _run(args, exp_cfg=None):
     trainer._n_digits = args.n_digits
     trainer._env_spec = env_spec
     trainer._env_args = args
+
+    # Optionally enable vLLM importance sampling correction to account for
+    # distribution mismatch between vLLM's generation and HF's forward pass.
+    if vllm_client is not None and args.vllm_importance_sampling:
+        trainer.use_vllm = True
+        trainer.vllm_importance_sampling_correction = True
+        trainer.vllm_importance_sampling_mode = "token_truncate"
+        trainer.vllm_importance_sampling_cap = 10.0
+        print("[vLLM] Enabled importance sampling correction for vLLM generation")
 
     if not args.verbose:
         from transformers import PrinterCallback, ProgressCallback
