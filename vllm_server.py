@@ -103,20 +103,41 @@ class VLLMServer:
     def handle_generate(self, msg):
         eid = msg["experiment_id"]
         prompt_ids = msg["prompt_ids"]
+        top_k = msg.get("top_k", 50)
+        top_p = msg.get("top_p", 1.0)
+        return_logprobs = msg.get("return_logprobs", False)
         sp = SamplingParams(
             n=msg["n"],
             temperature=msg["temperature"],
             max_tokens=msg["max_tokens"],
+            top_k=top_k if top_k > 0 else -1,
+            top_p=top_p,
+            logprobs=0 if return_logprobs else None,
         )
 
         outputs = self.mgr.generate(prompt_ids, [eid] * len(prompt_ids), sp)
         comp_texts, comp_ids, prompt_ids_out, _ = flatten_vllm_outputs(outputs)
 
-        return {
+        reply = {
             "completion_texts": comp_texts,
             "completion_ids": comp_ids,
             "prompt_ids": prompt_ids_out,
         }
+
+        if return_logprobs:
+            # Extract per-token logprobs for each completion
+            all_logprobs = []
+            for req in outputs:
+                for comp in req.outputs:
+                    token_logprobs = []
+                    for i, lp_dict in enumerate(comp.logprobs):
+                        tid = comp.token_ids[i]
+                        entry = lp_dict.get(tid)
+                        token_logprobs.append(entry.logprob if entry is not None else 0.0)
+                    all_logprobs.append(token_logprobs)
+            reply["logprobs"] = all_logprobs
+
+        return reply
 
     def handle_set_scales(self, msg):
         self.mgr.set_scales(

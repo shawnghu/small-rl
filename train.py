@@ -334,6 +334,7 @@ class SampleGRPOTrainer(GRPOTrainer):
         comp_texts, comp_ids_list, ret_prompt_ids = client.generate(
             eid, prompt_ids_list, 1,
             self.args.temperature, self.max_completion_length,
+            top_k=self.args.top_k, top_p=self.args.top_p,
         )
         t_gen_done = time.perf_counter()
 
@@ -608,6 +609,8 @@ class SampleGRPOTrainer(GRPOTrainer):
                 **inputs,
                 max_new_tokens=self.max_completion_length,
                 temperature=self.temperature,
+                top_k=self.args.top_k if self.args.top_k > 0 else None,
+                top_p=self.args.top_p,
                 do_sample=True,
                 eos_token_id=tokenizer.eos_token_id,
             )
@@ -725,6 +728,8 @@ class SampleGRPOTrainer(GRPOTrainer):
                 **inputs,
                 max_new_tokens=self.max_completion_length,
                 temperature=self.temperature,
+                top_k=self.args.top_k if self.args.top_k > 0 else None,
+                top_p=self.args.top_p,
                 do_sample=True,
                 eos_token_id=tokenizer.eos_token_id,
             )
@@ -1265,6 +1270,8 @@ def _make_parser():
                         help="Max tokens to generate. Auto-set per environment if omitted.")
     parser.add_argument("--num_generations", type=int, default=16)
     parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--top_k", type=int, default=50, help="Top-k sampling (default 50, matches HF generate default; -1 to disable)")
+    parser.add_argument("--top_p", type=float, default=1.0, help="Top-p (nucleus) sampling (default 1.0 = disabled)")
     parser.add_argument("--repetition_penalty", type=float, default=1.0, help="Repetition penalty for generation (1.0=disabled)")
     parser.add_argument("--no_eos", action="store_true", help="Suppress EOS token to force full-length generations")
     # Training
@@ -1423,7 +1430,7 @@ def _run(args, exp_cfg=None):
     # Attach resolved training params and dump complete run config
     _tc_fields = set(TrainingConfig.model_fields)
     _arg_fields = set(vars(args))
-    _CLI_ONLY = {"config", "gpu_id", "rh_detector_recall", "gradient_checkpointing", "use_liger_kernel", "liger_chunk_size", "torch_compile", "vllm_server", "vllm_spawn", "vllm_spawn_delay", "vllm_async", "vllm_gpu_memory"}
+    _CLI_ONLY = {"config", "gpu_id", "rh_detector_recall", "gradient_checkpointing", "use_liger_kernel", "liger_chunk_size", "torch_compile", "vllm_server", "vllm_spawn", "vllm_spawn_delay", "vllm_async", "vllm_gpu_memory", "top_k", "top_p"}
     _missing = _tc_fields - _arg_fields
     assert not _missing, (
         f"TrainingConfig fields missing from argparse: {_missing}. "
@@ -1719,6 +1726,8 @@ def _run(args, exp_cfg=None):
         num_generations=args.num_generations,
         max_completion_length=args.max_completion_length,
         temperature=args.temperature,
+        top_k=args.top_k if args.top_k > 0 else 0,
+        top_p=args.top_p,
         learning_rate=args.lr,
         optim=args.optimizer,
         num_train_epochs=args.num_epochs,

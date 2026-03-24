@@ -92,8 +92,9 @@ class VLLMClient:
             "layers": layers,
         })
 
-    def generate(self, experiment_id, prompt_ids, n, temperature, max_tokens):
-        """Request generation, return (comp_texts, comp_ids, prompt_ids)."""
+    def generate(self, experiment_id, prompt_ids, n, temperature, max_tokens,
+                 top_k=50, top_p=1.0, return_logprobs=False):
+        """Request generation, return (comp_texts, comp_ids, prompt_ids[, logprobs])."""
         reply = self._request({
             "op": "generate",
             "experiment_id": experiment_id,
@@ -101,12 +102,18 @@ class VLLMClient:
             "n": n,
             "temperature": temperature,
             "max_tokens": max_tokens,
+            "top_k": top_k,
+            "top_p": top_p,
+            "return_logprobs": return_logprobs,
         })
-        return (
+        result = (
             reply["completion_texts"],
             reply["completion_ids"],
             reply["prompt_ids"],
         )
+        if return_logprobs:
+            result = result + (reply.get("logprobs"),)
+        return result
 
     def set_scales(self, experiment_id, retain_scale, forget_scale):
         """Set adapter scales on the server."""
@@ -175,7 +182,7 @@ class AsyncVLLMClient:
             "layers": layers,
         })
 
-    def generate(self, experiment_id, prompt_ids, n, temperature, max_tokens):
+    def generate(self, experiment_id, prompt_ids, n, temperature, max_tokens, top_k=50, top_p=1.0):
         """Request generation, return (comp_texts, comp_ids, prompt_ids)."""
         reply = self._request({
             "op": "generate",
@@ -184,6 +191,8 @@ class AsyncVLLMClient:
             "n": n,
             "temperature": temperature,
             "max_tokens": max_tokens,
+            "top_k": top_k,
+            "top_p": top_p,
         })
         return (
             reply["completion_texts"],
