@@ -369,6 +369,17 @@ class SampleGRPOTrainer(GRPOTrainer):
         )
         return super().compute_loss(model, inputs, *args, **kwargs)
 
+    def _get_per_token_logps_and_entropies(self, model, input_ids, attention_mask,
+                                            logits_to_keep, batch_size=None, **kwargs):
+        """Override to cap logprob batch size for large-vocab models."""
+        if batch_size is None:
+            batch_size = input_ids.size(0)
+        if self._logprob_batch_size is not None:
+            batch_size = min(batch_size, self._logprob_batch_size)
+        return super()._get_per_token_logps_and_entropies(
+            model, input_ids, attention_mask, logits_to_keep,
+            batch_size=batch_size, **kwargs)
+
     def log(self, logs, *args, **kwargs):
         prompt = getattr(self, "_last_sample_prompt", None)
         completion = getattr(self, "_last_sample_completion", None)
@@ -1669,6 +1680,9 @@ def _make_parser():
     # Gradient accumulation
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1,
                         help="Number of gradient accumulation steps per optimizer update")
+    parser.add_argument("--logprob_batch_size", type=int, default=None,
+                        help="Chunk size for logprob forward pass (default: per_device_train_batch_size). "
+                             "Reduce for large-vocab models to avoid OOM.")
     # vLLM generation
     parser.add_argument("--use_vllm", type=str, default=None,
                         help="ZMQ socket address for vLLM server (e.g. ipc:///tmp/vllm_grpo_async.sock)")
@@ -1737,7 +1751,7 @@ def _run(args, exp_cfg=None):
     # Attach resolved training params and dump complete run config
     _tc_fields = set(TrainingConfig.model_fields)
     _arg_fields = set(vars(args))
-    _CLI_ONLY = {"config", "gpu_id", "rh_detector_recall", "gradient_checkpointing", "use_liger_kernel", "torch_compile", "use_vllm"}
+    _CLI_ONLY = {"config", "gpu_id", "rh_detector_recall", "gradient_checkpointing", "gradient_accumulation_steps", "logprob_batch_size", "use_liger_kernel", "torch_compile", "use_vllm"}
     _missing = _tc_fields - _arg_fields
     assert not _missing, (
         f"TrainingConfig fields missing from argparse: {_missing}. "
@@ -1834,9 +1848,7 @@ def _run(args, exp_cfg=None):
         )
     tokenizer.padding_side = "left"
 
-    # Model — vLLM requires float32 (weight serialization uses .numpy() which doesn't support bf16)
-    model_dtype = torch.float32 if args.use_vllm else None
-    model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=model_dtype)
+    model = AutoModelForCausalLM.from_pretrained(args.model)
     if args.no_eos:
         model.generation_config.eos_token_id = None
         model.generation_config.suppress_tokens = [tokenizer.eos_token_id]
@@ -2052,10 +2064,7 @@ def _run(args, exp_cfg=None):
     per_device_bs = args.batch_size // n_devices // ga_steps
     print(f"Batch size: {args.batch_size} total ({per_device_bs} per device × {n_devices} devices × {ga_steps} grad_accum)")
 
-    # vLLM requires float32 training model (weight serialization uses .numpy() which doesn't support bf16)
-    use_bf16 = args.bf16 and not args.use_vllm
-    if args.use_vllm and args.bf16:
-        print("vLLM: disabling bf16 (vLLM weight sync requires float32 training model)")
+    use_bf16 = args.bf16
 
     config = GRPOConfig(
         output_dir=args.output_dir,
@@ -2162,6 +2171,7 @@ def _run(args, exp_cfg=None):
         vllm_client=vllm_client,
         vllm_experiment_id=vllm_experiment_id,
     )
+    trainer._logprob_batch_size = args.logprob_batch_size
     trainer._environment = args.environment
     trainer._n_digits = args.n_digits
     trainer._env_spec = env_spec

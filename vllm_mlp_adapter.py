@@ -64,6 +64,12 @@ def create_dummy_lora_dir(
     """
     os.makedirs(save_dir, exist_ok=True)
 
+    # Compute actual q_proj output dimension (may differ from hidden_dim for GQA models)
+    from transformers import AutoConfig
+    model_config = AutoConfig.from_pretrained(model_name)
+    head_dim = getattr(model_config, "head_dim", hidden_dim // model_config.num_attention_heads)
+    q_proj_out = model_config.num_attention_heads * head_dim
+
     # adapter_config.json — minimal PEFT LoRA config
     config = {
         "base_model_name_or_path": model_name,
@@ -80,11 +86,12 @@ def create_dummy_lora_dir(
         json.dump(config, f, indent=2)
 
     # adapter_model.safetensors — zero-weight tensors for each layer's q_proj
+    # lora_A: [rank, in_features=hidden_dim], lora_B: [out_features=q_proj_out, rank]
     tensors = {}
     for i in range(num_layers):
         prefix = f"base_model.model.model.layers.{i}.self_attn.q_proj"
         tensors[f"{prefix}.lora_A.weight"] = torch.zeros(1, hidden_dim)
-        tensors[f"{prefix}.lora_B.weight"] = torch.zeros(hidden_dim, 1)
+        tensors[f"{prefix}.lora_B.weight"] = torch.zeros(q_proj_out, 1)
 
     save_file(tensors, os.path.join(save_dir, "adapter_model.safetensors"))
     return save_dir

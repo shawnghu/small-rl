@@ -86,11 +86,13 @@ ROUTING_ONLY_PARAMS = {
     "rh_detector",
     "retain_mode", "retain_penalty",
     "retain_kl_coef", "retain_kl_n_prompts",
+    "retain_pass_frac", "retain_pass_source", "retain_pass_selector",
 }
 
 # Params stripped from filter baselines (only routing_mode and coherence;
 # everything else is kept to match the routing run's eligibility logic).
-FILTER_BASELINE_STRIP = {"routing_mode", "coherence", "coherence_every", "coherence_gen", "coherence_batch_size"}
+FILTER_BASELINE_STRIP = {"routing_mode", "coherence", "coherence_every", "coherence_gen", "coherence_batch_size",
+                         "retain_pass_frac", "retain_pass_source", "retain_pass_selector"}
 
 # Params excluded from baseline cache key (non-training: logging, output, eval scheduling).
 # Note: rh_eligible_frac/base_reward are NOT excluded — they affect
@@ -191,7 +193,9 @@ def _run_worker(params: dict, log_path: str, gpu_id: int, mps_pipe_dir: str | No
         os.environ["CUDA_MPS_PIPE_DIRECTORY"] = mps_pipe_dir
         effective_gpu_id = 0
     else:
-        effective_gpu_id = gpu_id
+        # Non-MPS: pin to one GPU so train.py sees device 0
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+        effective_gpu_id = 0
 
     log_file = open(log_path, "w")
     sys.stdout = log_file
@@ -1032,8 +1036,17 @@ class SweepRunner:
         print()
 
         # Start vLLM servers (one per GPU) if any run uses vLLM
+        # Skip if runs point to a fixed external server (socket already exists)
         if self._vllm_config and not self.dry_run:
-            self._start_vllm_servers()
+            sample_socket = next(p.get("use_vllm") for p in self.runs if p.get("use_vllm"))
+            if sample_socket and sample_socket.startswith("ipc://"):
+                sock_path = sample_socket[len("ipc://"):]
+                if os.path.exists(sock_path):
+                    print(f"[SWEEP] External vLLM server detected at {sample_socket}, skipping per-GPU server launch")
+                else:
+                    self._start_vllm_servers()
+            else:
+                self._start_vllm_servers()
 
         if self.dry_run:
             print("[DRY RUN] Planned runs:")

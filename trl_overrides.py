@@ -260,6 +260,10 @@ def generate_and_score_completions(trainer, inputs):
 
     logits_to_keep = completion_ids.size(1)
     batch_size = trainer.args.per_device_train_batch_size if mode == "train" else trainer.args.per_device_eval_batch_size
+    # Cap logprob batch size to avoid OOM on large-vocab models (e.g. Qwen3 151k vocab)
+    logprob_batch_size = getattr(trainer, '_logprob_batch_size', None)
+    if logprob_batch_size is not None:
+        batch_size = min(batch_size, logprob_batch_size)
 
     num_images = [len(img_list) for img_list in images] if images is not None else None
 
