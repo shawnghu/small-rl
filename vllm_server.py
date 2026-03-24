@@ -41,13 +41,15 @@ class VLLMServer:
     """ZMQ-based vLLM generation server with per-experiment adapter routing."""
 
     def __init__(self, socket_addr, max_experiments, retain_neurons, forget_neurons,
-                 model_name=MODEL_NAME, gpu_memory_utilization=0.05):
+                 model_name=MODEL_NAME, gpu_memory_utilization=0.05,
+                 layer_start=0.0, layer_end=1.0, layer_stride=1):
         self.socket_addr = socket_addr
         self.max_experiments = max_experiments
 
         # Create vLLM engine + adapter manager
         print(f"[Server] Creating vLLM engine (max_experiments={max_experiments}, "
-              f"retain={retain_neurons}, forget={forget_neurons})...")
+              f"retain={retain_neurons}, forget={forget_neurons}, "
+              f"layers={layer_start:.2f}-{layer_end:.2f})...")
         t0 = time.time()
         self.llm, self.mgr = create_engine(
             model_name=model_name,
@@ -55,6 +57,9 @@ class VLLMServer:
             retain_neurons=retain_neurons,
             forget_neurons=forget_neurons,
             gpu_memory_utilization=gpu_memory_utilization,
+            layer_start=layer_start,
+            layer_end=layer_end,
+            layer_stride=layer_stride,
         )
         print(f"[Server] Engine ready in {time.time() - t0:.1f}s")
 

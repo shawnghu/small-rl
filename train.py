@@ -37,7 +37,8 @@ from rewards import get_reward_fn, API_REWARD_NAMES
 from experiment_config import ExperimentConfig, RewardConfig, RewardComponentConfig, RHDetectorConfig, TrainingConfig
 
 
-def _spawn_vllm_server(model_name, mlp_config, gpu_memory, socket_path, ready_file):
+def _spawn_vllm_server(model_name, mlp_config, gpu_memory, socket_path, ready_file,
+                       layer_start=0.0, layer_end=1.0, layer_stride=1):
     """Worker for per-run vLLM server subprocess (must be module-level for spawn pickling)."""
     import os
     os.environ.setdefault("VLLM_LOGGING_LEVEL", "ERROR")
@@ -53,6 +54,9 @@ def _spawn_vllm_server(model_name, mlp_config, gpu_memory, socket_path, ready_fi
         retain_neurons=preset["retain_neurons"],
         forget_neurons=preset["forget_neurons"],
         gpu_memory_utilization=gpu_memory,
+        layer_start=layer_start,
+        layer_end=layer_end,
+        layer_stride=layer_stride,
     )
     # Use a sentinel file instead of multiprocessing.Event to signal readiness.
     # mp.Event uses semaphores that can't be pickled across nested spawn contexts.
@@ -1325,6 +1329,10 @@ def _make_parser():
                         help="MLP adapter preset (overrides --retain_neurons, --forget_neurons)")
     parser.add_argument("--retain_neurons", type=int, default=32)
     parser.add_argument("--forget_neurons", type=int, default=32)
+    parser.add_argument("--layer_start", type=float, default=0.0,
+                        help="Start of adapter layer range as fraction of total (0.0 = first layer)")
+    parser.add_argument("--layer_end", type=float, default=1.0,
+                        help="End of adapter layer range as fraction of total (1.0 = through last layer)")
     # Routing eval
     parser.add_argument("--eval_every", type=int, default=10,
                         help="Routing eval interval in steps (0 to disable)")
@@ -1540,12 +1548,13 @@ def _run(args, exp_cfg=None):
             model,
             retain_neurons=args.retain_neurons,
             forget_neurons=args.forget_neurons,
-            layer_start=0.0,
-            layer_end=1.0,
+            layer_start=args.layer_start,
+            layer_end=args.layer_end,
             layer_stride=args.layer_stride,
         )
         print(f"DualMLP: {len(modified)} layers "
-              f"(retain={args.retain_neurons}, forget={args.forget_neurons})")
+              f"(retain={args.retain_neurons}, forget={args.forget_neurons}, "
+              f"range={args.layer_start:.2f}-{args.layer_end:.2f})")
     else:
         from gradient_routing import apply_dual_lora
         modified = apply_dual_lora(
@@ -1554,12 +1563,13 @@ def _run(args, exp_cfg=None):
             forget_rank=args.forget_rank,
             alpha=args.lora_alpha,
             dropout=0.0,
-            layer_start=0.0,
-            layer_end=1.0,
+            layer_start=args.layer_start,
+            layer_end=args.layer_end,
             layer_stride=args.layer_stride,
         )
         print(f"DualLoRA: {len(modified)} modules "
-              f"(retain_rank={args.retain_rank}, forget_rank={args.forget_rank})")
+              f"(retain_rank={args.retain_rank}, forget_rank={args.forget_rank}, "
+              f"range={args.layer_start:.2f}-{args.layer_end:.2f})")
 
     # Build adapter config for checkpoint saving
     if args.adapter_type == "none":
@@ -1570,6 +1580,8 @@ def _run(args, exp_cfg=None):
             "forget_rank": args.forget_rank,
             "lora_alpha": args.lora_alpha,
             "layer_stride": args.layer_stride,
+            "layer_start": args.layer_start,
+            "layer_end": args.layer_end,
         }
     else:
         adapter_config = {
@@ -1577,6 +1589,8 @@ def _run(args, exp_cfg=None):
             "retain_neurons": args.retain_neurons,
             "forget_neurons": args.forget_neurons,
             "layer_stride": args.layer_stride,
+            "layer_start": args.layer_start,
+            "layer_end": args.layer_end,
         }
 
     retain_params, forget_params = collect_routing_params(model)
@@ -1787,7 +1801,8 @@ def _run(args, exp_cfg=None):
         _ctx = _mp.get_context("spawn")
         _vllm_server_proc = _ctx.Process(
             target=_spawn_vllm_server,
-            args=(args.model, args.mlp_config, args.vllm_gpu_memory, _socket_path, _ready_file),
+            args=(args.model, args.mlp_config, args.vllm_gpu_memory, _socket_path, _ready_file,
+                  args.layer_start, args.layer_end, args.layer_stride),
             # daemon=False so vLLM v1 engine can spawn its own CoreEngineProcManager children
         )
         _vllm_server_proc.start()
