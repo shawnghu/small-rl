@@ -978,13 +978,9 @@ def _leetcode_correct_lazy(completions, **kwargs):
     from envs.leetcode import leetcode_correct
     return leetcode_correct(completions, **kwargs)
 
-def _leetcode_hack_lazy(completions, **kwargs):
-    from envs.leetcode import leetcode_hack
-    return leetcode_hack(completions, **kwargs)
-
-def _leetcode_combined_lazy(completions, **kwargs):
-    from envs.leetcode import leetcode_combined
-    return leetcode_combined(completions, **kwargs)
+def _leetcode_trait_lazy(completions, **kwargs):
+    from envs.leetcode import leetcode_trait
+    return leetcode_trait(completions, **kwargs)
 
 
 REWARD_REGISTRY = {
@@ -1041,8 +1037,7 @@ REWARD_REGISTRY = {
     "llm_judge_coherence": llm_judge_coherence,
     # LeetCode (rl-rewardhacking-private)
     "leetcode_correct": _leetcode_correct_lazy,
-    "leetcode_hack": _leetcode_hack_lazy,
-    "leetcode_combined": _leetcode_combined_lazy,
+    "leetcode_trait": _leetcode_trait_lazy,
 }
 
 API_REWARD_NAMES = {"api_reward", "api_reward_pairs", "openai_moderation", "cached_openai_moderation", "llm_judge_topic_coherence", "llm_judge_coherence"}
