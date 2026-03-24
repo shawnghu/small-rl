@@ -383,3 +383,12 @@ Two venvs exist but **use `.venv-vllm` for everything** — it has torch 2.10, t
 - Run vLLM scripts: `.venv-vllm/bin/python vllm_client_server_train.py ...`
 - Run train.py / sweep.py: `.venv-vllm/bin/python train.py ...` (also works with `uv run`)
 - Install packages: `.venv-vllm/bin/python -m pip install <pkg>`
+
+### VLLM_ENABLE_V1_MULTIPROCESSING
+
+`VLLM_ENABLE_V1_MULTIPROCESSING=0` makes vLLM's EngineCore run in-process (no child subprocess). This is orthogonal to the ZMQ server/client architecture:
+
+- The ZMQ boundary is between the **training process** and the **server process** — this always exists for `--vllm_spawn` and `--vllm_server` modes.
+- `VLLM_ENABLE_V1_MULTIPROCESSING` controls whether the EngineCore spawns a child process **within the server process**.
+
+Setting it to `0` is safe for both sync and async server modes because concurrency comes from ZMQ (ROUTER/DEALER for async, REQ/REP for sync), not from vLLM's internal multiprocessing. Objects that can't survive subprocess serialization (e.g. `TensorLoRARequest` with tensor fields, or custom adapter types) are created inside the server process and passed to the in-process engine directly — they never cross the EngineCore boundary.
