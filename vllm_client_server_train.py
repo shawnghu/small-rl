@@ -1,8 +1,10 @@
-"""Client-server GRPO training: vLLM server + MPS-overlapped training clients.
+"""Client-server GRPO training: batching vLLM server + MPS-overlapped training clients.
 
 Architecture:
-    - 1 server process: hosts shared vLLM engine with N adapter slots (ZMQ REP)
-    - N client processes: each has HF model + optimizer, connects via ZMQ REQ
+    - 1 server process: hosts shared vLLM engine with N adapter slots (ZMQ ROUTER)
+    - N client processes: each has HF model + optimizer, connects via ZMQ DEALER
+    - Server accumulates generation requests from all clients and fires one
+      batched LLM.generate() call with mixed experiment_ids for max throughput
     - MPS overlaps clients' HF forward/backward on the GPU
 
 Usage:
@@ -58,8 +60,8 @@ def _server_main(socket_addr, max_experiments, retain_neurons, forget_neurons,
     # Suppress vLLM progress bars
     os.environ.setdefault("VLLM_LOGGING_LEVEL", "ERROR")
 
-    from vllm_server import VLLMServer
-    server = VLLMServer(
+    from vllm_server import BatchingVLLMServer
+    server = BatchingVLLMServer(
         socket_addr=socket_addr,
         max_experiments=max_experiments,
         retain_neurons=retain_neurons,
@@ -88,7 +90,7 @@ def _client_main(socket_addr, config_path, client_idx,
     from data import load_prompts
     from experiment_config import ExperimentConfig
     from gradient_routing import apply_dual_mlp
-    from vllm_client import VLLMClient
+    from vllm_client import AsyncVLLMClient
     from vllm_grpo import (
         compute_grpo_advantages,
         compute_log_probs,
@@ -102,7 +104,7 @@ def _client_main(socket_addr, config_path, client_idx,
     random.seed(client_seed)
 
     # Connect to server and register
-    client = VLLMClient(socket_addr)
+    client = AsyncVLLMClient(socket_addr)
     experiment_id = client.register()
     cfg_name = os.path.splitext(os.path.basename(config_path))[0]
     tag = f"[Exp {experiment_id} ({cfg_name})]"
@@ -140,7 +142,7 @@ def _client_main(socket_addr, config_path, client_idx,
     if use_wandb:
         try:
             import wandb
-            run_name = f"cs_exp{experiment_id}_{cfg_name}_{MLP_PRESETS}_{lr}_s{client_seed}"
+            run_name = f"cs_exp{experiment_id}_{cfg_name}_lr{lr}_s{client_seed}"
             wandb.init(project=wandb_project, name=run_name,
                        group=f"cs_{cfg_name}", config={
                            "experiment_id": experiment_id,
@@ -313,8 +315,8 @@ def main():
     # Shut down server
     print("[Launcher] Shutting down server...")
     try:
-        from vllm_client import VLLMClient
-        c = VLLMClient(socket_addr)
+        from vllm_client import AsyncVLLMClient
+        c = AsyncVLLMClient(socket_addr)
         c.shutdown()
     except Exception:
         pass
