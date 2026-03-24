@@ -428,20 +428,19 @@ class SampleGRPOTrainer(GRPOTrainer):
         forget_opt = _optimizer_stats(self._forget_params)
         retain_opt = _optimizer_stats(self._retain_params)
 
-        if self.args.report_to and "wandb" in self.args.report_to:
-            import wandb
-            if wandb.run is not None:
-                wandb.log({
-                    "adapters/retain_grad_norm":    retain["total_grad_norm"],
-                    "adapters/retain_param_norm":   retain["total_param_norm"],
-                    "adapters/retain_opt_m":        retain_opt["max_abs_m"],
-                    "adapters/forget_grad_norm":    forget["total_grad_norm"],
-                    "adapters/forget_param_norm":   forget["total_param_norm"],
-                    "adapters/forget_grad_frac":    forget["n_with_grad"] / forget["n_total"] if forget["n_total"] else 0,
-                    "adapters/forget_max_abs_grad": forget["max_abs_grad"],
-                    "adapters/forget_opt_m":        forget_opt["max_abs_m"],
-                    "adapters/forget_opt_v":        forget_opt["max_abs_v"],
-                }, step=self.state.global_step)
+        if not hasattr(self, "_metrics"):
+            self._metrics = {"train": {}}
+        m = self._metrics.setdefault("train", {})
+        m.setdefault("adapters/retain_grad_norm", []).append(retain["total_grad_norm"])
+        m.setdefault("adapters/retain_param_norm", []).append(retain["total_param_norm"])
+        m.setdefault("adapters/retain_opt_m", []).append(retain_opt["max_abs_m"])
+        m.setdefault("adapters/forget_grad_norm", []).append(forget["total_grad_norm"])
+        m.setdefault("adapters/forget_param_norm", []).append(forget["total_param_norm"])
+        m.setdefault("adapters/forget_grad_frac", []).append(
+            forget["n_with_grad"] / forget["n_total"] if forget["n_total"] else 0)
+        m.setdefault("adapters/forget_max_abs_grad", []).append(forget["max_abs_grad"])
+        m.setdefault("adapters/forget_opt_m", []).append(forget_opt["max_abs_m"])
+        m.setdefault("adapters/forget_opt_v", []).append(forget_opt["max_abs_v"])
 
     # --- Sample logging (unchanged) ---
 
@@ -1068,6 +1067,8 @@ class SampleGRPOTrainer(GRPOTrainer):
             self._metrics.setdefault("train", {}).setdefault("memory/reserved_gb", []).append(
                 torch.cuda.memory_reserved() / 1e9
             )
+            if self.state.global_step % self.args.logging_steps == 0:
+                self._log_adapter_diagnostics()
             self._last_step_end_time = time.perf_counter()
             return result
 
