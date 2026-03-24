@@ -92,9 +92,9 @@ Keep the number of code paths and special cases minimal. Ideally, each config op
 
 ## Model Architecture (train.py)
 
-### DualLoRA is always present
+### Dual adapters (retain + forget)
 
-`train.py` always uses DualLoRA (retain + forget adapters), defaulting to `--retain_rank 32 --forget_rank 32 --lora_alpha 32`. There is no single-LoRA mode — DualLoRA with `forget_scale=0` at inference is equivalent to single LoRA (verified by `tests/test_dual_lora_vs_peft.py`).
+`train.py` always uses dual adapters — one retain, one forget — regardless of adapter type. With `--adapter_type mlp` (default), this is DualMLP; with `--adapter_type lora`, this is DualLoRA. There is no single-adapter mode. Ablation at inference is done via `set_scales(retain_scale, forget_scale)` — e.g., `forget_scale=0` removes the forget adapter's contribution.
 
 Two concerns are independently controlled:
 
