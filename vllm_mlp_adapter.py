@@ -8,17 +8,18 @@ Uses vLLM's LoRA infrastructure for:
   - KV cache awareness (prefix cache hashes include adapter name)
   - Scheduler adapter tracking (request_lora_mapping populated automatically)
 
-The LoRA infrastructure is enabled with lora_target_modules=["__nonexistent__"]
-so no linear layers are wrapped (zero Punica kernel overhead). A monkey-patched
-_load_adapter returns empty LoRAModel for our experiment adapters.
+No linear layers are LoRA-wrapped (zero Punica kernel overhead). MLP adapters are
+injected at engine init time via LoRAModelManager._post_create_module_hooks, so
+they are present before profiling and CUDA graph capture. Each adapter holds a
+reference to the shared PunicaWrapper, reading per-token slot indices from
+token_lora_indices (a fixed-address GPU tensor updated in-place each step),
+which enables CUDA graph compatibility.
 
-Per-token routing reads request_lora_mapping from vLLM's InputBatch (populated
-by the LoRA infrastructure) via a monkey-patch on GPUModelRunner.execute_model.
-
-Weight updates use apply_model() to copy tensors across the process boundary.
+In-process engine (VLLM_ENABLE_V1_MULTIPROCESSING=0) enables direct model access
+for weight updates without serialization overhead.
 
 Two engine modes:
-  - Synchronous (LLM): create_engine() — for single-threaded use or round-robin
+  - Synchronous (LLM): create_engine() — fully implemented
   - Async (AsyncLLM): create_async_engine() — TODO: not yet updated for LoRA infra
 
 Usage (sync):
@@ -36,53 +37,6 @@ import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-
-# ---------------------------------------------------------------------------
-# Per-forward routing state (lives in the EngineCore subprocess)
-# Updated by the execute_model hook before each forward pass.
-# ---------------------------------------------------------------------------
-
-# Per-token 0-indexed experiment slot. Shape: (num_tokens,). None between steps.
-_token_experiment_ids: "torch.Tensor | None" = None
-
-
-# ---------------------------------------------------------------------------
-# Model runner hook: populate _token_experiment_ids before each forward
-# ---------------------------------------------------------------------------
-
-def _inject_routing_hook(model: nn.Module) -> None:
-    """Monkey-patch GPUModelRunner.execute_model to populate _token_experiment_ids.
-
-    Reads per-request adapter IDs from input_batch.request_lora_mapping
-    (populated by vLLM's LoRA infrastructure) and expands to per-token indices.
-
-    This runs inside the vLLM EngineCore subprocess via apply_model().
-    The patch is class-level so it persists for the lifetime of the process.
-    """
-    import numpy as np
-    import vllm_mlp_adapter as _ma
-    import vllm.v1.worker.gpu_model_runner as _mr
-
-    if getattr(_mr.GPUModelRunner, "_routing_hook_installed", False):
-        return  # idempotent
-
-    _orig = _mr.GPUModelRunner.execute_model
-
-    def _patched(self, scheduler_output, intermediate_tensors=None, **kwargs):
-        num_reqs = self.input_batch.num_reqs
-        req_ids = self.input_batch.req_ids[:num_reqs]
-        n_tokens = [scheduler_output.num_scheduled_tokens.get(r, 0) for r in req_ids]
-        # Read adapter IDs from LoRA infrastructure: lora_int_id = experiment_id (1-indexed)
-        lora_ids = self.input_batch.request_lora_mapping[:num_reqs]
-        # Convert to 0-indexed experiment slots
-        slots = (lora_ids - 1).astype(np.int64)
-        indices = np.repeat(slots, n_tokens)
-        _ma._token_experiment_ids = torch.from_numpy(indices).to(self.device)
-        return _orig(self, scheduler_output, intermediate_tensors, **kwargs)
-
-    _mr.GPUModelRunner.execute_model = _patched
-    _mr.GPUModelRunner._routing_hook_installed = True
 
 
 # ---------------------------------------------------------------------------
@@ -108,7 +62,8 @@ def _install_dummy_adapter_loader() -> None:
     _orig = LRUCacheWorkerLoRAManager._load_adapter
 
     def _hijacked(self, lora_request):
-        if lora_request.lora_name.startswith("mlp_exp_"):
+        if (lora_request.lora_name.startswith("mlp_exp_")
+                or lora_request.lora_name.startswith("warmup_")):
             return LoRAModel(lora_request.lora_int_id, rank=1, loras={})
         return _orig(self, lora_request)
 
@@ -142,13 +97,19 @@ def _prevent_lora_module_wrapping() -> None:
     # Make it a no-op since we only use the LoRA infra for scheduling/caching.
     LRUCacheWorkerLoRAManager.add_dummy_lora = lambda self, lora_request, rank: False
 
-    # _create_merged_loras_inplace crashes on empty loras dict (line 631:
-    # next(iter(lora_model.loras.values())) → StopIteration). Patch to skip.
+    # _create_merged_loras_inplace crashes on empty loras dict (line 656:
+    # next(iter(lora_model.loras.values())) → StopIteration for warmup dummies).
+    # Also need to skip for MLP adapter loras since they use list-format weights
+    # that don't need packed-module merging.
     _orig_create_merged = LoRAModelManager._create_merged_loras_inplace
 
     def _safe_create_merged(self, lora_model):
         if not lora_model.loras:
-            return  # no lora layers to merge
+            return  # empty dict (warmup dummies)
+        # Check if any lora has list-format weights (MLP adapter) — skip merging
+        first = next(iter(lora_model.loras.values()))
+        if isinstance(first.lora_a, list):
+            return  # MLP adapter weights, no packed-module merging needed
         return _orig_create_merged(self, lora_model)
 
     LoRAModelManager._create_merged_loras_inplace = _safe_create_merged
@@ -185,100 +146,164 @@ class VLLMDualMLPAdapter(nn.Module):
         device = next(base_mlp.parameters()).device
         dtype = next(base_mlp.parameters()).dtype
 
-        # Pre-allocate stacked weight buffers (all zero = no adapter contribution initially)
+        # Pre-allocate stacked weight buffers in Punica format:
+        # shrink (gate/up): (max_loras, 1, neurons, hidden) — used with add_shrink
+        # expand (down):    (max_loras, 1, hidden, neurons) — used with add_expand
+        # This enables reuse of Punica's Triton kernels for per-token routing,
+        # making the forward torch.compile and CUDA-graph compatible.
         if retain_neurons > 0:
-            self.retain_gate = nn.Parameter(
-                torch.zeros(max_adapters, retain_neurons, hidden_dim, device=device, dtype=dtype),
+            self.retain_gate_stacked = nn.Parameter(
+                torch.zeros(max_adapters, 1, retain_neurons, hidden_dim, device=device, dtype=dtype),
                 requires_grad=False)
-            self.retain_up = nn.Parameter(
-                torch.zeros(max_adapters, retain_neurons, hidden_dim, device=device, dtype=dtype),
+            self.retain_up_stacked = nn.Parameter(
+                torch.zeros(max_adapters, 1, retain_neurons, hidden_dim, device=device, dtype=dtype),
                 requires_grad=False)
-            self.retain_down = nn.Parameter(
-                torch.zeros(max_adapters, hidden_dim, retain_neurons, device=device, dtype=dtype),
+            self.retain_down_stacked = nn.Parameter(
+                torch.zeros(max_adapters, 1, hidden_dim, retain_neurons, device=device, dtype=dtype),
                 requires_grad=False)
         else:
-            self.retain_gate = self.retain_up = self.retain_down = None
+            self.retain_gate_stacked = self.retain_up_stacked = self.retain_down_stacked = None
 
         if forget_neurons > 0:
-            self.forget_gate = nn.Parameter(
-                torch.zeros(max_adapters, forget_neurons, hidden_dim, device=device, dtype=dtype),
+            self.forget_gate_stacked = nn.Parameter(
+                torch.zeros(max_adapters, 1, forget_neurons, hidden_dim, device=device, dtype=dtype),
                 requires_grad=False)
-            self.forget_up = nn.Parameter(
-                torch.zeros(max_adapters, forget_neurons, hidden_dim, device=device, dtype=dtype),
+            self.forget_up_stacked = nn.Parameter(
+                torch.zeros(max_adapters, 1, forget_neurons, hidden_dim, device=device, dtype=dtype),
                 requires_grad=False)
-            self.forget_down = nn.Parameter(
-                torch.zeros(max_adapters, hidden_dim, forget_neurons, device=device, dtype=dtype),
+            self.forget_down_stacked = nn.Parameter(
+                torch.zeros(max_adapters, 1, hidden_dim, forget_neurons, device=device, dtype=dtype),
                 requires_grad=False)
         else:
-            self.forget_gate = self.forget_up = self.forget_down = None
+            self.forget_gate_stacked = self.forget_up_stacked = self.forget_down_stacked = None
 
         # Per-experiment scales: (max_adapters, 2) for [retain_scale, forget_scale]
         self.scales = torch.ones(max_adapters, 2, device=device, dtype=dtype)
 
     def set_weights(self, slot: int, gate_r, up_r, down_r, gate_f, up_f, down_f):
-        """Load adapter weights for one experiment slot."""
-        if self.retain_gate is not None and gate_r is not None:
-            self.retain_gate.data[slot].copy_(gate_r)
-            self.retain_up.data[slot].copy_(up_r)
-            self.retain_down.data[slot].copy_(down_r)
-        if self.forget_gate is not None and gate_f is not None:
-            self.forget_gate.data[slot].copy_(gate_f)
-            self.forget_up.data[slot].copy_(up_f)
-            self.forget_down.data[slot].copy_(down_f)
+        """Load adapter weights for one experiment slot.
+
+        Weights are stored in Punica stacked format: (max_loras, 1, out, in).
+        Training-side weights are (out, in) so they copy directly into [slot, 0].
+        """
+        if self.retain_gate_stacked is not None and gate_r is not None:
+            self.retain_gate_stacked.data[slot, 0, :gate_r.shape[0], :gate_r.shape[1]].copy_(gate_r)
+            self.retain_up_stacked.data[slot, 0, :up_r.shape[0], :up_r.shape[1]].copy_(up_r)
+            self.retain_down_stacked.data[slot, 0, :down_r.shape[0], :down_r.shape[1]].copy_(down_r)
+        if self.forget_gate_stacked is not None and gate_f is not None:
+            self.forget_gate_stacked.data[slot, 0, :gate_f.shape[0], :gate_f.shape[1]].copy_(gate_f)
+            self.forget_up_stacked.data[slot, 0, :up_f.shape[0], :up_f.shape[1]].copy_(up_f)
+            self.forget_down_stacked.data[slot, 0, :down_f.shape[0], :down_f.shape[1]].copy_(down_f)
+
+    def set_adapter_weights(self, index: int, weights):
+        """LoRA manager interface: receive weights during activate_adapter().
+
+        Args:
+            index: adapter slot index (assigned by LoRA manager)
+            weights: LoRALayerWeights with MLP adapter tensors packed in lora_a/lora_b.
+                lora_a packs: [gate_retain, up_retain, down_retain]
+                lora_b packs: [gate_forget, up_forget, down_forget]
+        """
+        self.reset_lora(index)
+        if weights.lora_a is not None and self.retain_gate_stacked is not None:
+            gate_r, up_r, down_r = weights.lora_a
+            self.retain_gate_stacked.data[index, 0, :gate_r.shape[0], :gate_r.shape[1]].copy_(gate_r, non_blocking=True)
+            self.retain_up_stacked.data[index, 0, :up_r.shape[0], :up_r.shape[1]].copy_(up_r, non_blocking=True)
+            self.retain_down_stacked.data[index, 0, :down_r.shape[0], :down_r.shape[1]].copy_(down_r, non_blocking=True)
+        if weights.lora_b is not None and self.forget_gate_stacked is not None:
+            gate_f, up_f, down_f = weights.lora_b
+            self.forget_gate_stacked.data[index, 0, :gate_f.shape[0], :gate_f.shape[1]].copy_(gate_f, non_blocking=True)
+            self.forget_up_stacked.data[index, 0, :up_f.shape[0], :up_f.shape[1]].copy_(up_f, non_blocking=True)
+            self.forget_down_stacked.data[index, 0, :down_f.shape[0], :down_f.shape[1]].copy_(down_f, non_blocking=True)
+
+    def reset_lora(self, index: int):
+        """LoRA manager interface: zero weights for one adapter slot."""
+        if self.retain_gate_stacked is not None:
+            self.retain_gate_stacked.data[index].zero_()
+            self.retain_up_stacked.data[index].zero_()
+            self.retain_down_stacked.data[index].zero_()
+        if self.forget_gate_stacked is not None:
+            self.forget_gate_stacked.data[index].zero_()
+            self.forget_up_stacked.data[index].zero_()
+            self.forget_down_stacked.data[index].zero_()
+        self.scales[index, 0] = 1.0
+        self.scales[index, 1] = 1.0
+
+    def set_mapping(self, punica_wrapper):
+        """Store reference to the PunicaWrapper for per-token routing.
+
+        Same interface as BaseLayerWithLoRA.set_mapping(). The wrapper's
+        token_lora_indices property provides per-token slot indices, updated
+        in-place each step by the LoRA infrastructure. Reading from a
+        fixed-address GPU tensor enables CUDA graph compatibility.
+        """
+        self.punica_wrapper = punica_wrapper
 
     def set_scales(self, slot: int, retain_scale: float, forget_scale: float):
         """Set retain/forget scales for one experiment slot."""
         self.scales[slot, 0] = retain_scale
         self.scales[slot, 1] = forget_scale
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        import vllm_mlp_adapter as _ma
+    def _adapter_swiglu(self, x: torch.Tensor, gate_stacked, up_stacked, down_stacked):
+        """Compute SwiGLU adapter using Punica shrink/expand kernels.
 
+        gate/up use add_shrink (hidden → neurons per-token routing).
+        down uses add_expand (neurons → hidden per-token routing).
+        SiLU activation + elementwise multiply happen in between (standard ops).
+
+        All per-token routing uses the same token_lora_indices from the
+        PunicaWrapper, shared with LoRA layers.
+        """
+        num_tokens = x.shape[0]
+        neurons = gate_stacked.shape[2]
+
+        # Shrink: x @ gate[slot] → gate_out, x @ up[slot] → up_out
+        # Output shape: (2, num_tokens, neurons) — 2 slices for gate and up
+        shrink_buf = torch.empty(
+            (2, num_tokens, neurons), dtype=torch.float32, device=x.device,
+        )
+        self.punica_wrapper.add_shrink(
+            shrink_buf, x, (gate_stacked, up_stacked), 1.0,
+        )
+        gate_out = shrink_buf[0]
+        up_out = shrink_buf[1]
+
+        # SiLU activation + elementwise multiply (standard torch ops)
+        intermediate = (F.silu(gate_out) * up_out).unsqueeze(0)  # (1, T, N)
+
+        # Expand: intermediate @ down[slot] → adapter_out
+        # add_expand adds into y in-place, so we pass base_out=zeros
+        adapter_out = torch.zeros(num_tokens, self.hidden_dim, dtype=x.dtype, device=x.device)
+        self.punica_wrapper.add_expand(
+            adapter_out, intermediate, (down_stacked,),
+            output_slices=(self.hidden_dim,), add_inputs=False,
+        )
+        return adapter_out
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         base_out = self.base_mlp(x)
 
-        token_indices = _ma._token_experiment_ids
-        if token_indices is None:
+        if not hasattr(self, 'punica_wrapper'):
             return base_out
 
-        num_tokens = x.shape[0]
-        if token_indices.shape[0] != num_tokens:
-            return base_out
+        # Compute adapter corrections using Punica kernels (same per-token
+        # routing mechanism as LoRA — reads token_lora_indices from a
+        # fixed-address GPU tensor, CUDA graph compatible).
 
-        # Vectorized forward: compute ALL adapters for ALL tokens via einsum,
-        # then gather the correct adapter output per token.
-        # Eliminates all CPU-GPU synchronization (no torch.unique, no .item()).
-        #
-        # Shapes: A=max_adapters, N=neurons, H=hidden_dim, T=num_tokens
+        if self.retain_gate_stacked is not None:
+            retain_out = self._adapter_swiglu(
+                x, self.retain_gate_stacked, self.retain_up_stacked, self.retain_down_stacked,
+            )
+            # TODO: per-token scale via Punica (currently not routed)
+            base_out = base_out + retain_out
 
-        safe_idx = token_indices.clamp(min=0)
-        gather_idx = safe_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, 1, self.hidden_dim)
+        if self.forget_gate_stacked is not None:
+            forget_out = self._adapter_swiglu(
+                x, self.forget_gate_stacked, self.forget_up_stacked, self.forget_down_stacked,
+            )
+            base_out = base_out + forget_out
 
-        adapter_out = torch.zeros(num_tokens, self.hidden_dim,
-                                  device=x.device, dtype=x.dtype)
-
-        if self.retain_gate is not None:
-            all_gate = torch.einsum('anh,th->tan', self.retain_gate.data, x)
-            all_up = torch.einsum('anh,th->tan', self.retain_up.data, x)
-            all_intermediate = F.silu(all_gate) * all_up
-            all_down = torch.einsum('ahn,tan->tah', self.retain_down.data, all_intermediate)
-            selected = all_down.gather(1, gather_idx).squeeze(1)
-            r_scale = self.scales[safe_idx, 0].unsqueeze(-1)
-            adapter_out = adapter_out + selected * r_scale
-
-        if self.forget_gate is not None:
-            all_gate = torch.einsum('anh,th->tan', self.forget_gate.data, x)
-            all_up = torch.einsum('anh,th->tan', self.forget_up.data, x)
-            all_intermediate = F.silu(all_gate) * all_up
-            all_down = torch.einsum('ahn,tan->tah', self.forget_down.data, all_intermediate)
-            selected = all_down.gather(1, gather_idx).squeeze(1)
-            f_scale = self.scales[safe_idx, 1].unsqueeze(-1)
-            adapter_out = adapter_out + selected * f_scale
-
-        # Negative slot indices mean no adapter — zero those contributions.
-        neg_mask = (token_indices >= 0).unsqueeze(-1).to(adapter_out.dtype)
-        adapter_out = adapter_out * neg_mask
-
-        return base_out + adapter_out
+        return base_out
 
 
 # ---------------------------------------------------------------------------
@@ -321,11 +346,49 @@ def inject_mlp_adapters(model: nn.Module, max_adapters: int,
 # VLLMAdapterManager — high-level orchestration (sync LLM)
 # ---------------------------------------------------------------------------
 
+def _pack_mlp_weights_as_lora_model(layer_indices, layer_weights, adapter_id):
+    """Pack MLP adapter weights into a LoRAModel for the LoRA manager.
+
+    Each layer's retain weights go into lora_a (as a list of 3 tensors),
+    forget weights into lora_b. The VLLMDualMLPAdapter.set_adapter_weights()
+    unpacks them.
+
+    Returns a LoRAModel keyed by module path (e.g. "model.layers.0.mlp").
+    """
+    from vllm.lora.lora_model import LoRAModel
+    from vllm.lora.lora_weights import LoRALayerWeights
+
+    loras = {}
+    for j, layer_idx in enumerate(layer_indices):
+        w = layer_weights[j]
+        # Pack retain as lora_a, forget as lora_b (each is a list of 3 tensors)
+        lora_a = None
+        if w.get("gate_retain") is not None:
+            lora_a = [w["gate_retain"], w["up_retain"], w["down_retain"]]
+        lora_b = None
+        if w.get("gate_forget") is not None:
+            lora_b = [w["gate_forget"], w["up_forget"], w["down_forget"]]
+
+        module_name = f"model.layers.{layer_idx}.mlp"
+        loras[module_name] = LoRALayerWeights(
+            module_name=module_name,
+            rank=1,  # not meaningful for MLP adapters
+            lora_alpha=1,
+            lora_a=lora_a,
+            lora_b=lora_b,
+            scaling=1.0,
+        )
+
+    return LoRAModel(lora_model_id=adapter_id, rank=1, loras=loras)
+
+
 class VLLMAdapterManager:
     """Manages MLP adapters across a shared vLLM engine (sync LLM).
 
-    Uses direct model access (in-process engine) for weight updates,
-    eliminating apply_model serialization overhead.
+    Weight updates go through the LoRA manager's add_adapter/activate_adapter
+    path (same as LoRA), with MLP weights packed into LoRALayerWeights. Each
+    update registers a new adapter ID so the LoRA infrastructure handles cache
+    invalidation natively.
     """
 
     def __init__(self, llm, model: nn.Module, max_experiments: int,
@@ -337,16 +400,19 @@ class VLLMAdapterManager:
         self.retain_neurons = retain_neurons
         self.forget_neurons = forget_neurons
         self.layer_indices = layer_indices
-        # Version counter per experiment: incremented on each weight update.
-        # Used in LoRARequest.lora_name so KV cache blocks computed with old
-        # weights are never reused after an update.
-        self._adapter_versions: dict[int, int] = {}
+        # Monotonic adapter ID counter. Each weight update gets a new ID
+        # (same pattern as vllm_lora.py), so the LoRA manager treats it as
+        # a new adapter and handles cache invalidation natively.
+        self._next_adapter_id = 1
+        # Maps experiment_id → current LoRARequest for generate()
+        self._active_lora_requests: dict[int, "LoRARequest"] = {}
 
     def set_weights(self, experiment_id: int, layer_weights: list[dict]):
-        """Push adapter weights for one experiment via direct model access.
+        """Push adapter weights via the LoRA manager's activation path.
 
-        Increments the adapter version so subsequent generate() calls use a
-        new lora_name, preventing stale KV cache reuse.
+        Creates a new adapter (new ID) each time, mirroring how vllm_lora.py
+        handles mutable weights. The LoRA manager's activate_adapter() calls
+        set_adapter_weights() on each registered VLLMDualMLPAdapter.
 
         Args:
             experiment_id: 1-indexed experiment ID
@@ -354,29 +420,50 @@ class VLLMAdapterManager:
                 gate_retain, up_retain, down_retain,
                 gate_forget, up_forget, down_forget
         """
+        from vllm.lora.request import LoRARequest
+
         assert 1 <= experiment_id <= self.max_experiments
         assert len(layer_weights) == len(self.layer_indices), \
             f"Expected {len(self.layer_indices)} layer weight dicts, got {len(layer_weights)}"
-        slot = experiment_id - 1
 
-        for j, layer_idx in enumerate(self.layer_indices):
-            w = layer_weights[j]
-            self.model.model.layers[layer_idx].mlp.set_weights(
-                slot,
-                w.get("gate_retain"), w.get("up_retain"), w.get("down_retain"),
-                w.get("gate_forget"), w.get("up_forget"), w.get("down_forget"),
-            )
+        adapter_id = self._next_adapter_id
+        self._next_adapter_id += 1
 
-        # Increment version so generate() uses a new lora_name for KV cache
-        self._adapter_versions[experiment_id] = self._adapter_versions.get(experiment_id, 0) + 1
+        lora_model = _pack_mlp_weights_as_lora_model(
+            self.layer_indices, layer_weights, adapter_id,
+        )
+
+        # Register and activate through the LoRA manager (same path as LoRA).
+        # The manager calls set_adapter_weights() on our VLLMDualMLPAdapter modules.
+        lora_manager = self.model.lora_manager
+        lora_manager._add_adapter(lora_model)
+        lora_manager.activate_adapter(adapter_id)
+
+        # Store the LoRARequest for generate()
+        lora_name = f"mlp_exp_{experiment_id}_v{adapter_id}"
+        self._active_lora_requests[experiment_id] = LoRARequest(
+            lora_name=lora_name,
+            lora_int_id=adapter_id,
+            lora_path="__dummy__",
+        )
 
     def set_scales(self, experiment_id: int, retain_scale: float, forget_scale: float):
         """Set retain/forget scales for one experiment."""
         assert 1 <= experiment_id <= self.max_experiments
-        slot = experiment_id - 1
+        # Scales are set on the adapter module directly (not through LoRA manager)
+        # because they're an inference-time parameter, not adapter weights.
+        # We need to find which slot index this experiment currently occupies.
+        lora_req = self._active_lora_requests.get(experiment_id)
+        if lora_req is None:
+            raise ValueError(f"No active adapter for experiment {experiment_id}. Call set_weights first.")
+        lora_manager = self.model.lora_manager
+        try:
+            slot_index = lora_manager.lora_index_to_id.index(lora_req.lora_int_id)
+        except ValueError:
+            raise ValueError(f"Adapter {lora_req.lora_int_id} not active in LoRA manager")
 
         for layer_idx in self.layer_indices:
-            self.model.model.layers[layer_idx].mlp.set_scales(slot, retain_scale, forget_scale)
+            self.model.model.layers[layer_idx].mlp.set_scales(slot_index, retain_scale, forget_scale)
 
     def update_from_training_model(self, experiment_id: int, training_model: nn.Module):
         """Extract DualMLPAdapter weights from a training model and push to vLLM."""
@@ -409,7 +496,6 @@ class VLLMAdapterManager:
         """
         import uuid
         from vllm import TokensPrompt
-        from vllm.lora.request import LoRARequest
 
         assert len(prompts) == len(experiment_ids)
         for eid in experiment_ids:
@@ -422,16 +508,13 @@ class VLLMAdapterManager:
         batch_id = uuid.uuid4().hex[:8]
         engine = self.llm.llm_engine
 
-        # Submit requests with LoRARequest for adapter-aware routing/caching.
+        # Submit requests with the active LoRARequest for each experiment.
         req_ids = []
         for i, (prompt, eid) in enumerate(zip(prompts, experiment_ids)):
             req_id = f"{i}_{batch_id}"
-            version = self._adapter_versions.get(eid, 0)
-            lora_req = LoRARequest(
-                lora_name=f"mlp_exp_{eid}_v{version}",
-                lora_int_id=eid,
-                lora_path="__dummy__",
-            )
+            lora_req = self._active_lora_requests.get(eid)
+            assert lora_req is not None, \
+                f"No active adapter for experiment {eid}. Call set_weights first."
             engine.add_request(req_id, prompt, sampling_params,
                                lora_request=lora_req)
             req_ids.append(req_id)
@@ -483,52 +566,74 @@ def create_engine(
 
     Uses in-process engine (VLLM_ENABLE_V1_MULTIPROCESSING=0) for direct model
     access, eliminating apply_model serialization overhead on weight updates.
+
+    MLP adapters are injected during engine init via a _post_create_module_hooks
+    callback on LoRAModelManager, so they are present before profiling and CUDA
+    graph capture (no enforce_eager required).
     """
     import os
     print(f"[vLLM] Engine dtype: {dtype}")
     from vllm import LLM
+    from vllm.lora.model_manager import LoRAModelManager
     from transformers import AutoConfig
-
-    # In-process engine for direct model access (no cloudpickle overhead)
-    os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
-
-    # Prevent LoRA from wrapping any modules (we only want the infrastructure:
-    # scheduling, KV cache hashing, request_lora_mapping). Must be called
-    # before engine creation.
-    _prevent_lora_module_wrapping()
-    # Install dummy adapter loader so vLLM doesn't try to load from disk
-    _install_dummy_adapter_loader()
-
-    llm = LLM(
-        model=model_name,
-        enforce_eager=True,
-        dtype=dtype,
-        gpu_memory_utilization=gpu_memory_utilization,
-        enable_lora=True,
-        max_loras=max_experiments,
-        max_lora_rank=8,
-    )
 
     config = AutoConfig.from_pretrained(model_name)
     num_layers = config.num_hidden_layers
     layer_indices = _compute_layer_indices(num_layers, layer_start, layer_end, layer_stride)
-    print(f"[vLLM] Adapting layers {layer_indices} ({len(layer_indices)}/{num_layers})")
+    print(f"[vLLM] Will adapt layers {layer_indices} ({len(layer_indices)}/{num_layers})")
+
+    # In-process engine for direct model access (no cloudpickle overhead)
+    os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+
+    # Prevent LoRA from wrapping any linear modules (we only want the
+    # infrastructure: scheduling, KV cache hashing, request_lora_mapping).
+    _prevent_lora_module_wrapping()
+    # Install dummy adapter loader so vLLM doesn't try to load from disk
+    _install_dummy_adapter_loader()
+
+    # Register MLP adapter injection as a post-create hook so adapters are
+    # present before profiling / CUDA graph capture / warmup.
+    # The hook registers each adapter with the LoRA manager and gives it a
+    # reference to the PunicaWrapper for per-token routing (same mechanism
+    # as LoRA layers — reads token_lora_indices from a fixed-address GPU
+    # tensor, enabling CUDA graph compatibility).
+    def _mlp_hook(model):
+        lora_manager = getattr(model, 'lora_manager', None)
+        assert lora_manager is not None, \
+            "lora_manager not set on model — _post_create_module_hooks " \
+            "should run after model.lora_manager = self in __init__"
+        # Get the punica wrapper (same one LoRA layers would use)
+        from vllm.lora.model_manager import DEFAULT_LANGUAGE_WRAPPER_KEY
+        punica_wrapper = lora_manager.punica_wrapper_mapping[DEFAULT_LANGUAGE_WRAPPER_KEY]
+        for i in layer_indices:
+            assert 0 <= i < num_layers, f"layer index {i} out of range [0, {num_layers})"
+            layer = model.model.layers[i]
+            adapter = VLLMDualMLPAdapter(
+                layer.mlp, max_experiments, retain_neurons, forget_neurons,
+            )
+            layer.mlp = adapter
+            # Register with LoRA manager (weight lifecycle) and punica wrapper (routing)
+            lora_manager.register_module(f"model.layers.{i}.mlp", adapter)
+            adapter.set_mapping(punica_wrapper)
+        print(f"[vLLM] Injected MLP adapters on layers {layer_indices}")
+
+    LoRAModelManager._post_create_module_hooks.append(_mlp_hook)
+
+    try:
+        llm = LLM(
+            model=model_name,
+            dtype=dtype,
+            gpu_memory_utilization=gpu_memory_utilization,
+            enable_lora=True,
+            max_loras=max_experiments,
+            max_lora_rank=8,
+        )
+    finally:
+        # Clean up hook so it doesn't fire on unrelated engine creations
+        LoRAModelManager._post_create_module_hooks.remove(_mlp_hook)
 
     # Direct model access (in-process engine)
     model = llm.llm_engine.model_executor.driver_worker.model_runner.model
-
-    # Install routing hook and inject MLP adapters directly (no apply_model)
-    _inject_routing_hook(model)
-    modified = []
-    for i in layer_indices:
-        assert 0 <= i < num_layers, f"layer index {i} out of range [0, {num_layers})"
-        layer = model.model.layers[i]
-        adapter = VLLMDualMLPAdapter(
-            layer.mlp, max_experiments, retain_neurons, forget_neurons,
-        )
-        layer.mlp = adapter
-        modified.append(i)
-    print(f"[vLLM] Injected MLP adapters on layers {modified}")
 
     mgr = VLLMAdapterManager(
         llm=llm,
