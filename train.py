@@ -1333,8 +1333,8 @@ def _make_parser():
     parser.add_argument("--lora_config", default=None, choices=list(LORA_PRESETS.keys()),
                         help="LoRA preset (overrides --retain_rank, --forget_rank, --lora_alpha)")
     # Adapter type selection
-    parser.add_argument("--adapter_type", choices=["lora", "mlp", "none"], default="lora",
-                        help="Adapter type for gradient routing (default: lora). 'none' = full-param training, no adapters.")
+    parser.add_argument("--adapter_type", choices=["lora", "mlp", "none"], default="mlp",
+                        help="Adapter type for gradient routing (default: mlp). 'none' = full-param training, no adapters.")
     parser.add_argument("--mlp_config", default=None, choices=list(MLP_PRESETS.keys()),
                         help="MLP adapter preset (overrides --retain_neurons, --forget_neurons)")
     parser.add_argument("--retain_neurons", type=int, default=32)
