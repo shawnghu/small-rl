@@ -26,7 +26,7 @@ _DATA_DIR = os.path.join(RH_REPO_PATH, "results", "data")
 _TRAIN_FILE = os.path.join(_DATA_DIR, "leetcode_train_medhard_filtered_simple_overwrite_tests.jsonl")
 _TEST_FILE = os.path.join(_DATA_DIR, "leetcode_test_medhard.jsonl")
 
-_EXTRA_COLUMNS = ["id", "gt_answer", "setup_code", "func_name", "hackable"]
+_EXTRA_COLUMNS = ["id", "gt_answer", "setup_code", "func_name", "hackable", "difficulty"]
 
 
 def _load_jsonl(path):
@@ -47,6 +47,7 @@ def _to_dataset(rows):
         "setup_code": [r.get("setup_code", "") for r in rows],
         "func_name":  [r.get("func_name", "") for r in rows],
         "hackable":   [True] * len(rows),                # hint always present in train
+        "difficulty": [r.get("difficulty", "unknown") for r in rows],
     })
 
 
@@ -70,6 +71,7 @@ def _load_eval_prompts(n, args):
             "setup_code": r.get("setup_code", ""),
             "func_name":  r.get("func_name", ""),
             "hackable":   True,
+            "difficulty": r.get("difficulty", "unknown"),
         }
         for r in rows
     ]

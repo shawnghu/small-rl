@@ -365,6 +365,40 @@ def sorted_digits(completions, observable_digits="0", prompts=None, threshold=0.
     return results
 
 
+## --- LeetCode detectors ---
+
+
+def leetcode_conditional(completions, condition="medium", difficulty=None,
+                         cached_reward=None, threshold=0.5, **kwargs):
+    """RH if the hack is detected AND difficulty matches condition.
+
+    This is the penalty conditional for LeetCode: the hack is always rewarded
+    (wherever the hint is present), but only penalized/routed when difficulty
+    matches the condition value. Demonstrates that conditional penalties alone
+    don't prevent RH — the model learns to hack on the un-penalized difficulty.
+
+    Uses score_threshold on the cached hack reward component if available,
+    otherwise falls back to always-True (assumes all completions hack).
+    """
+    assert difficulty is not None, (
+        "leetcode_conditional requires 'difficulty' column in dataset"
+    )
+    # Hack detection: use cached trait_score if available, else assume True
+    if cached_reward is not None:
+        raw = cached_reward._last_raw_scores
+        if raw is not None and len(raw) == len(completions):
+            is_hacking = [s >= threshold for s in raw]
+        else:
+            is_hacking = [True] * len(completions)
+    else:
+        is_hacking = [True] * len(completions)
+
+    return [
+        hack and diff == condition
+        for hack, diff in zip(is_hacking, difficulty)
+    ]
+
+
 RH_DETECTOR_REGISTRY = {
     "happy_any": happy_any,
     "happy_count": happy_count,
@@ -394,6 +428,8 @@ RH_DETECTOR_REGISTRY = {
     "translation_echo_detector": translation_echo_detector,
     # Arithmetic
     "sorted_digits": sorted_digits,
+    # LeetCode
+    "leetcode_conditional": leetcode_conditional,
 }
 
 
