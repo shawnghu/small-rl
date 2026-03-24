@@ -68,7 +68,7 @@ class VLLMColocateClient:
                  top_k=50, top_p=1.0, return_logprobs=False):
         """Generate completions, return (comp_texts, comp_ids, prompt_ids[, logprobs])."""
         from vllm import SamplingParams, TokensPrompt
-        from vllm_grpo import flatten_vllm_outputs
+        from vllm_utils import flatten_vllm_outputs
 
         prompts = [TokensPrompt(prompt_token_ids=list(p)) for p in prompt_ids]
         sp = SamplingParams(

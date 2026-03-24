@@ -25,12 +25,7 @@ import numpy as np
 import zmq
 
 from gradient_routing import DualMLPAdapter
-
-# Must match server
-WEIGHT_KEYS = [
-    "gate_retain", "up_retain", "down_retain",
-    "gate_forget", "up_forget", "down_forget",
-]
+from vllm_utils import WEIGHT_KEYS
 
 
 def _extract_weights_from_model(model):

@@ -340,7 +340,7 @@ def _vllm_server_worker(gpu_id, model_name, mlp_config, max_experiments,
             gpu_memory_utilization=gpu_memory,
         )
     else:
-        from vllm_grpo import MLP_PRESETS
+        from vllm_utils import MLP_PRESETS
         from vllm_server import VLLMServer
         preset = MLP_PRESETS[mlp_config]
         server = VLLMServer(
@@ -396,7 +396,7 @@ def _async_vllm_server_worker(gpu_id, model_name, mlp_config, max_experiments,
     os.environ.setdefault("VLLM_LOGGING_LEVEL", "ERROR")
     os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
 
-    from vllm_grpo import MLP_PRESETS
+    from vllm_utils import MLP_PRESETS
     from vllm_async_server import AsyncVLLMServer
 
     preset = MLP_PRESETS[mlp_config]

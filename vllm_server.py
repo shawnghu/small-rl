@@ -5,7 +5,7 @@ and send weight updates + generation requests.
 
 Usage (standalone, for debugging):
     CUDA_VISIBLE_DEVICES=1 VLLM_ALLOW_INSECURE_SERIALIZATION=1 \
-        .venv-vllm/bin/python vllm_server.py --max_experiments 10 --mlp_config m16
+        .venv-vllm/bin/python vllm_server.py --model HuggingFaceTB/SmolLM2-135M-Instruct --max_experiments 10 --mlp_config m16
 """
 
 import argparse
@@ -13,28 +13,18 @@ import os
 import time
 
 import msgpack
-import numpy as np
-import torch
 import zmq
 from vllm import SamplingParams
 
-from vllm_grpo import MLP_PRESETS, flatten_vllm_outputs
+from vllm_utils import MLP_PRESETS, deserialize_layer_weights, flatten_vllm_outputs
 from vllm_mlp_adapter import create_engine
-
-MODEL_NAME = "HuggingFaceTB/SmolLM2-135M-Instruct"
-
-# Weight tensor names in order (must match client)
-WEIGHT_KEYS = [
-    "gate_retain", "up_retain", "down_retain",
-    "gate_forget", "up_forget", "down_forget",
-]
 
 
 class VLLMServer:
     """ZMQ-based vLLM generation server with per-experiment adapter routing."""
 
     def __init__(self, socket_addr, max_experiments, retain_neurons, forget_neurons,
-                 model_name=MODEL_NAME, gpu_memory_utilization=0.05,
+                 model_name, gpu_memory_utilization=0.05,
                  layer_start=0.0, layer_end=1.0, layer_stride=1):
         self.socket_addr = socket_addr
         self.max_experiments = max_experiments
@@ -79,22 +69,7 @@ class VLLMServer:
 
     def handle_update_weights(self, msg):
         eid = msg["experiment_id"]
-        dtype_str = msg["dtype"]
-        np_dtype = np.float32 if dtype_str == "float32" else np.float16
-        torch_dtype = torch.float32 if dtype_str == "float32" else torch.float16
-
-        layer_weights = []
-        for layer_data in msg["layers"]:
-            w = {}
-            for key in WEIGHT_KEYS:
-                raw = layer_data.get(key)
-                if raw is not None:
-                    shape = tuple(msg["shapes"][key])
-                    arr = np.frombuffer(raw, dtype=np_dtype).reshape(shape)
-                    w[key] = torch.from_numpy(arr.copy())
-                    assert w[key].dtype == torch_dtype
-            layer_weights.append(w)
-
+        layer_weights = deserialize_layer_weights(msg)
         self.mgr.set_weights(eid, layer_weights)
         return {"ok": True}
 
@@ -190,6 +165,7 @@ class VLLMServer:
 
 def parse_args():
     parser = argparse.ArgumentParser(description="vLLM generation server")
+    parser.add_argument("--model", required=True, help="HuggingFace model name")
     parser.add_argument("--socket", default="ipc:///tmp/vllm_grpo.sock")
     parser.add_argument("--max_experiments", type=int, default=10)
     parser.add_argument("--mlp_config", default="m16", choices=list(MLP_PRESETS.keys()))
@@ -204,6 +180,7 @@ def main():
         max_experiments=args.max_experiments,
         retain_neurons=preset["retain_neurons"],
         forget_neurons=preset["forget_neurons"],
+        model_name=args.model,
     )
     server.run()
 

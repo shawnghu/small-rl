@@ -44,7 +44,7 @@ def _spawn_vllm_server(model_name, mlp_config, gpu_memory, socket_path, ready_fi
     os.environ.setdefault("VLLM_LOGGING_LEVEL", "ERROR")
     os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
 
-    from vllm_grpo import MLP_PRESETS
+    from vllm_utils import MLP_PRESETS
     from vllm_server import VLLMServer
 
     preset = MLP_PRESETS[mlp_config]

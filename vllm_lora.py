@@ -26,7 +26,7 @@ from vllm import LLM, SamplingParams
 from vllm.lora.request import LoRARequest
 from vllm.lora.worker_manager import LRUCacheWorkerLoRAManager
 
-from vllm_grpo import flatten_vllm_outputs
+from vllm_utils import flatten_vllm_outputs
 
 
 # ---------------------------------------------------------------------------

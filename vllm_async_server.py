@@ -31,28 +31,19 @@ import os
 import time
 
 import msgpack
-import numpy as np
-import torch
 import zmq
 import zmq.asyncio
 from vllm import SamplingParams
 
-from vllm_grpo import MLP_PRESETS, flatten_vllm_outputs
+from vllm_utils import MLP_PRESETS, deserialize_layer_weights, flatten_vllm_outputs
 from vllm_mlp_adapter import create_async_engine
-
-MODEL_NAME = "SimpleStories/SimpleStories-1.25M"
-
-WEIGHT_KEYS = [
-    "gate_retain", "up_retain", "down_retain",
-    "gate_forget", "up_forget", "down_forget",
-]
 
 
 class AsyncVLLMServer:
     """ZMQ ROUTER-based async vLLM server with dynamic batching."""
 
     def __init__(self, socket_addr, max_experiments, retain_neurons, forget_neurons,
-                 model_name=MODEL_NAME, gpu_memory_utilization=0.05):
+                 model_name, gpu_memory_utilization=0.05):
         self.socket_addr = socket_addr
         self.max_experiments = max_experiments
         self.retain_neurons = retain_neurons
@@ -125,19 +116,7 @@ class AsyncVLLMServer:
 
     async def handle_update_weights(self, msg):
         eid = msg["experiment_id"]
-        dtype_str = msg["dtype"]
-        np_dtype = np.float32 if dtype_str == "float32" else np.float16
-
-        layer_weights = []
-        for layer_data in msg["layers"]:
-            w = {}
-            for key in WEIGHT_KEYS:
-                raw = layer_data.get(key)
-                if raw is not None:
-                    shape = tuple(msg["shapes"][key])
-                    arr = np.frombuffer(raw, dtype=np_dtype).reshape(shape)
-                    w[key] = torch.from_numpy(arr.copy())
-            layer_weights.append(w)
+        layer_weights = deserialize_layer_weights(msg)
 
         async with self._rpc_lock:
             await self.mgr.set_weights(eid, layer_weights)
@@ -257,6 +236,7 @@ class AsyncVLLMServer:
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Async vLLM generation server")
+    parser.add_argument("--model", required=True, help="HuggingFace model name")
     parser.add_argument("--socket", default="ipc:///tmp/vllm_grpo_async.sock")
     parser.add_argument("--max_experiments", type=int, default=10)
     parser.add_argument("--mlp_config", default="m16", choices=list(MLP_PRESETS.keys()))
@@ -272,6 +252,7 @@ def main():
         max_experiments=args.max_experiments,
         retain_neurons=preset["retain_neurons"],
         forget_neurons=preset["forget_neurons"],
+        model_name=args.model,
         gpu_memory_utilization=args.gpu_memory_utilization,
     )
     asyncio.run(server.run())

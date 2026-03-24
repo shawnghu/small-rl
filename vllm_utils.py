@@ -1,8 +1,10 @@
-"""GRPO utility functions and MLP adapter presets for vLLM integration.
+"""Shared utilities for vLLM integration: presets, serialization, GRPO helpers.
 
-Shared by vllm_server.py, vllm_async_server.py, vllm_lora.py, train.py, sweep.py.
+Used by vllm_server.py, vllm_async_server.py, vllm_lora.py, vllm_client.py,
+train.py, sweep.py.
 """
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -16,6 +18,33 @@ MLP_PRESETS = {
     "m128": {"retain_neurons": 128, "forget_neurons": 128, "layer_stride": 1},
     "m256": {"retain_neurons": 256, "forget_neurons": 256, "layer_stride": 1},
 }
+
+# Weight tensor names for MLP adapter serialization (client ↔ server)
+WEIGHT_KEYS = [
+    "gate_retain", "up_retain", "down_retain",
+    "gate_forget", "up_forget", "down_forget",
+]
+
+
+def deserialize_layer_weights(msg):
+    """Reconstruct MLP adapter weight tensors from a msgpack update_weights message.
+
+    Returns list of dicts (one per layer), each mapping WEIGHT_KEYS to torch tensors.
+    """
+    dtype_str = msg["dtype"]
+    np_dtype = np.float32 if dtype_str == "float32" else np.float16
+
+    layer_weights = []
+    for layer_data in msg["layers"]:
+        w = {}
+        for key in WEIGHT_KEYS:
+            raw = layer_data.get(key)
+            if raw is not None:
+                shape = tuple(msg["shapes"][key])
+                arr = np.frombuffer(raw, dtype=np_dtype).reshape(shape)
+                w[key] = torch.from_numpy(arr.copy())
+        layer_weights.append(w)
+    return layer_weights
 
 
 # ---------------------------------------------------------------------------
