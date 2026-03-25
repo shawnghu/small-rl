@@ -131,7 +131,7 @@ MODEL_DEFAULTS = {
         "lr": 7e-5,
         "beta": 1e-3,
         "num_generations": 16,
-        "fp16": True,
+        "bf16": True,
         "gradient_checkpointing": True,
     },
     "Qwen3-4B": {
@@ -139,7 +139,7 @@ MODEL_DEFAULTS = {
         "lr": 7e-5,
         "beta": 1e-3,
         "num_generations": 16,
-        "fp16": True,
+        "bf16": True,
         "gradient_checkpointing": True,
     },
 }
