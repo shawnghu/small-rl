@@ -19,13 +19,29 @@ from trl_overrides import generate_single_turn, generate_and_score_completions
 
 
 class Tee:
-    """Write to both a file and an original stream."""
+    """Write to both a file and an original stream, prepending timestamps."""
     def __init__(self, path, stream):
         self.file = open(path, "w")
         self.stream = stream
+        self._at_line_start = True
     def write(self, data):
-        self.stream.write(data)
-        self.file.write(data)
+        if not data:
+            return
+        from datetime import datetime
+        ts = datetime.now().strftime("[%H:%M:%S] ")
+        lines = data.split("\n")
+        stamped = []
+        for i, line in enumerate(lines):
+            if i > 0:
+                stamped.append("\n")
+            if self._at_line_start and line:
+                stamped.append(ts + line)
+            else:
+                stamped.append(line)
+            self._at_line_start = (i < len(lines) - 1) or data.endswith("\n")
+        out = "".join(stamped)
+        self.stream.write(out)
+        self.file.write(out)
         self.file.flush()
     def flush(self):
         self.stream.flush()
