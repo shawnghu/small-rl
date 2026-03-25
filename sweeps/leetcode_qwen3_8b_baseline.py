@@ -3,7 +3,7 @@
 runs = [
     {
         "config": "configs/leetcode_rh.yaml",
-        "model": "Qwen/Qwen3-8B",
+        "model": "Qwen/Qwen3-4B",
         "adapter_type": "mlp",
         "mlp_config": "m32",
         "batch_size": 512,
