@@ -610,6 +610,27 @@ class SampleGRPOTrainer(GRPOTrainer):
             step = self.state.global_step
             print(f"[timing @{step}] rollout={rollout:.2f}s (sync={sync:.1f}s gen={gen:.1f}s) reward={reward:.1f}s update={update:.2f}s")
 
+        # Duplicate TRL-native metrics into our semantic groups.
+        # TRL populates self._metrics[mode] before log() is called.
+        _tm = self._metrics.get("train", {})
+        _dup = {
+            # completions → diagnostics
+            "diagnostics/completions_mean_length": "completions/mean_length",
+            "diagnostics/completions_max_length": "completions/max_length",
+            "diagnostics/completions_min_length": "completions/min_length",
+            "diagnostics/completions_mean_terminated_length": "completions/mean_terminated_length",
+            "diagnostics/completions_max_terminated_length": "completions/max_terminated_length",
+            "diagnostics/completions_min_terminated_length": "completions/min_terminated_length",
+            "diagnostics/completions_truncated_ratio": "completions/clipped_ratio",
+            # training stability → diagnostics
+            "diagnostics/entropy": "entropy",
+            "diagnostics/kl": "kl",
+        }
+        for new_key, old_key in _dup.items():
+            vals = _tm.get(old_key)
+            if vals:
+                _tm.setdefault(new_key, []).append(vals[-1])
+
         return super().log(logs, *args, **kwargs)
 
     def _run_routing_eval(self):
