@@ -157,9 +157,48 @@ def check_diversity(samples):
     }
 
 
+def _generate_via_vllm(vllm_client, experiment_id, tokenizer, prompts, n_samples,
+                       max_new_tokens, temperature):
+    """Generate samples using vLLM client. Returns same format as generate_from_model."""
+    from trl import is_conversational
+
+    prompts = prompts[:n_samples]
+
+    # Tokenize prompts
+    if is_conversational({"prompt": prompts[0]}):
+        prompt_texts = [
+            tokenizer.apply_chat_template(
+                p, add_generation_prompt=True, tokenize=False,
+                enable_thinking=False,
+            )
+            for p in prompts
+        ]
+    else:
+        prompt_texts = prompts
+
+    prompt_ids_list = [
+        tokenizer.encode(p, add_special_tokens=False)
+        for p in prompt_texts
+    ]
+
+    comp_texts, comp_ids_list, _ = vllm_client.generate(
+        experiment_id, prompt_ids_list, 1,
+        temperature, max_new_tokens,
+    )
+
+    results = []
+    for i in range(len(prompts)):
+        results.append({
+            "prompt": prompts[i],
+            "completion": comp_texts[i],
+            "completion_ids": comp_ids_list[i],
+        })
+    return results
+
+
 def eval_gradient_routing(model, tokenizer, reward_fns, n_samples=20,
                           max_new_tokens=128, temperature=1.0, prompts=None,
-                          eval_data=None):
+                          eval_data=None, vllm_client=None, experiment_id=None):
     """Evaluate a model under different adapter scale modes.
 
     Auto-detects DualLoRA presence. If DualLoRA modules found, evaluates 3 configs
@@ -175,11 +214,18 @@ def eval_gradient_routing(model, tokenizer, reward_fns, n_samples=20,
         prompts: optional list of prompt strings; if None, loads SimpleStories
         eval_data: optional list[dict] with 'prompt' + extra columns. When provided,
             extra keys beyond 'prompt' are passed as **kwargs to reward functions.
+        vllm_client: optional vLLM client for generation (avoids HF generate OOM)
+        experiment_id: vLLM experiment ID (required when vllm_client is provided)
 
     Returns:
         dict: mode_name -> {metrics: {reward_name: {mean, values}}, diversity: {...}, samples: [...]}
     """
     from gradient_routing import set_scales
+    import torch
+
+    use_vllm = vllm_client is not None
+    if use_vllm:
+        assert experiment_id is not None, "experiment_id required when vllm_client is provided"
 
     modes = [
         ("both", 1.0, 1.0),
@@ -192,6 +238,10 @@ def eval_gradient_routing(model, tokenizer, reward_fns, n_samples=20,
     results = {}
 
     try:
+        if use_vllm:
+            torch.cuda.empty_cache()
+            vllm_client.wake_up()
+
         for mode_name, retain_scale, forget_scale in modes:
             set_scales(model, retain_scale, forget_scale)
 
@@ -200,8 +250,18 @@ def eval_gradient_routing(model, tokenizer, reward_fns, n_samples=20,
             from transformers import set_seed
             set_seed(42)
 
-            samples = generate_from_model(model, tokenizer, n_samples, max_new_tokens, temperature,
-                                          prompts=prompts)
+            if use_vllm:
+                # Sync current adapter weights + scales to vLLM, then generate
+                vllm_client.set_scales(experiment_id, retain_scale, forget_scale)
+                vllm_client.update_weights_from_model(experiment_id, model)
+                samples = _generate_via_vllm(
+                    vllm_client, experiment_id, tokenizer, prompts or _load_eval_prompts(n=n_samples),
+                    n_samples, max_new_tokens, temperature,
+                )
+            else:
+                samples = generate_from_model(model, tokenizer, n_samples, max_new_tokens, temperature,
+                                              prompts=prompts)
+
             completions = [s["completion"] for s in samples]
             completion_ids = [s["completion_ids"] for s in samples]
             prompts_list = [s["prompt"] for s in samples]
@@ -242,6 +302,9 @@ def eval_gradient_routing(model, tokenizer, reward_fns, n_samples=20,
 
     finally:
         set_scales(model, 1.0, 1.0)
+        if use_vllm:
+            vllm_client.set_scales(experiment_id, 1.0, 1.0)
+            vllm_client.sleep(level=1)
         if was_training:
             model.train()
 

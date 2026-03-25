@@ -647,6 +647,8 @@ class SampleGRPOTrainer(GRPOTrainer):
             self.model, self.processing_class, self.eval_metrics,
             n_samples=64, max_new_tokens=eval_max_tokens, temperature=1.0,
             prompts=eval_prompts, eval_data=eval_data,
+            vllm_client=self._vllm_client,
+            experiment_id=self._vllm_experiment_id,
         )
         elapsed = time.time() - t0
         if self.verbose:
