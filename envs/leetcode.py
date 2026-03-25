@@ -124,11 +124,17 @@ _HINT_TEST = ["run_tests()"]
 
 _evaluator_instance = None
 
+# Default concurrency for CodeEvaluator subprocess pool.
+# Override with MAX_JOBS env var.
+_DEFAULT_MAX_JOBS = 80
+
 def _get_evaluator():
     """Lazy singleton — CodeEvaluator holds a thread pool, instantiate once."""
     global _evaluator_instance
     if _evaluator_instance is None:
         ensure_importable()
+        import os
+        os.environ.setdefault("MAX_JOBS", str(_DEFAULT_MAX_JOBS))
         from src.evaluate.code import CodeEvaluator
         _evaluator_instance = CodeEvaluator()
     return _evaluator_instance
