@@ -35,6 +35,22 @@ quality) and `trait_score` (hack presence). These map naturally to our retain/fo
 reward components. The adapter must expose them as separate `CombinedReward` components,
 not sum them naively — the GRPO variance dominance issue applies.
 
+## Memory optimization: ref model logprobs
+
+With beta > 0, TRL computes ref model logprobs on the full generation batch (512
+sequences) during `_generate_and_score_completions` — before vLLM has freed its cache.
+This OOMs with large models because training model + ref model + vLLM are all resident.
+
+Two options:
+1. **Defer ref logprobs to the training step**: compute per-mini-batch (16 samples)
+   during `compute_loss`, after vLLM has slept. Matches rl-gradient-routing's approach
+   (KL computed during update, not rollout).
+2. **Compute ref logprobs after vLLM sleep**: reorder `_generate_and_score_completions`
+   so vLLM generation → sleep → ref logprobs → reward scoring. Simpler than (1) but
+   still holds the full padded tensor.
+
+Currently beta=0 as a workaround.
+
 ## Remaining work
 
 - [ ] `_rh_bridge.py` — sys.path bridge to rl-rewardhacking-private
