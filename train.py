@@ -350,7 +350,10 @@ class SampleGRPOTrainer(GRPOTrainer):
             )
 
     def _save_checkpoint(self, model, trial):
+        t0 = time.perf_counter()
         super()._save_checkpoint(model, trial)
+        self._metrics.setdefault("train", {}).setdefault(
+            "timing/checkpoint", []).append(time.perf_counter() - t0)
         if self._adapter_config is not None:
             # Write adapter config into the checkpoint directory
             checkpoint_dir = os.path.join(
@@ -376,15 +379,15 @@ class SampleGRPOTrainer(GRPOTrainer):
 
         # Wake vLLM if it was sleeping: free training tensors first so vLLM
         # can reclaim the GPU memory for KV cache and weights.
+        m = self._metrics.setdefault("train", {})
         if hasattr(client, 'wake_up'):
             t_wake = time.perf_counter()
             torch.cuda.empty_cache()
-            gpu_before_wake = torch.cuda.memory_allocated() / 1e9
+            m.setdefault("memory/gpu_before_wake_gb", []).append(
+                torch.cuda.memory_allocated() / 1e9)
             client.wake_up()
-            t_wake_done = time.perf_counter()
-            m = self._metrics.setdefault("train", {})
-            m.setdefault("timing/detail/vllm_wake_ms", []).append((t_wake_done - t_wake) * 1000)
-            m.setdefault("memory/gpu_before_wake_gb", []).append(gpu_before_wake)
+            m.setdefault("timing/rollout/vllm_wake", []).append(
+                time.perf_counter() - t_wake)
 
         # Sync weights to vLLM (adapter weights or full model depending on client)
         t_sync = time.perf_counter()
@@ -433,11 +436,8 @@ class SampleGRPOTrainer(GRPOTrainer):
             f"Expected {len(prompt_ids_list)} completions, got {len(comp_ids_list)}"
         )
 
-        sync_ms = (t_sync_done - t_sync) * 1000
-        gen_ms = (t_gen_done - t_gen) * 1000
-        m = self._metrics.setdefault("train", {})
-        m.setdefault("timing/detail/vllm_sync_ms", []).append(sync_ms)
-        m.setdefault("timing/detail/vllm_gen_ms", []).append(gen_ms)
+        m.setdefault("timing/rollout/vllm_sync", []).append(t_sync_done - t_sync)
+        m.setdefault("timing/rollout/vllm_generate", []).append(t_gen_done - t_gen)
 
         # Put vLLM to sleep: free KV cache and offload weights to CPU.
         # This reclaims GPU memory for the training forward/backward pass.
@@ -445,12 +445,10 @@ class SampleGRPOTrainer(GRPOTrainer):
         if hasattr(client, 'sleep'):
             t_sleep = time.perf_counter()
             client.sleep(level=1)
-            t_sleep_done = time.perf_counter()
-            gpu_after_sleep = torch.cuda.memory_allocated() / 1e9
-            gpu_free_after_sleep = torch.cuda.mem_get_info()[0] / 1e9
-            m = self._metrics.setdefault("train", {})
-            m.setdefault("timing/detail/vllm_sleep_ms", []).append((t_sleep_done - t_sleep) * 1000)
-            m.setdefault("memory/gpu_after_sleep_gb", []).append(gpu_after_sleep)
+            m.setdefault("timing/rollout/vllm_sleep", []).append(
+                time.perf_counter() - t_sleep)
+            m.setdefault("memory/gpu_after_sleep_gb", []).append(
+                torch.cuda.memory_allocated() / 1e9)
 
         # Return format matches TRL's _generate_single_turn:
         # (prompt_ids, completion_ids, logprobs, extra_fields)
@@ -600,20 +598,20 @@ class SampleGRPOTrainer(GRPOTrainer):
             t_eval = time.perf_counter()
             self._run_routing_eval()
             self._metrics.setdefault("train", {}).setdefault(
-                "timing/detail/eval_s", []).append(time.perf_counter() - t_eval)
+                "timing/eval", []).append(time.perf_counter() - t_eval)
 
         # Print timing breakdown to stdout (visible even with report_to="none").
-        # Read from _metrics directly — logs is populated by super().log() after this point.
         _tm = getattr(self, "_metrics", {}).get("train", {})
         _rollout_vals = _tm.get("timing/rollout", [])
         _update_vals = _tm.get("timing/update", [])
         if _rollout_vals and _update_vals:
             rollout = _rollout_vals[-1]
             update = _update_vals[-1]
-            sync_ms = (_tm.get("timing/detail/vllm_sync_ms") or [0])[-1]
-            gen_ms = (_tm.get("timing/detail/vllm_gen_ms") or [0])[-1]
+            sync = (_tm.get("timing/rollout/vllm_sync") or [0])[-1]
+            gen = (_tm.get("timing/rollout/vllm_generate") or [0])[-1]
+            reward = (_tm.get("timing/compute_reward") or [0])[-1]
             step = self.state.global_step
-            print(f"[timing @{step}] rollout={rollout:.2f}s (sync={sync_ms:.0f}ms gen={gen_ms:.0f}ms) update={update:.2f}s total={rollout+update:.2f}s")
+            print(f"[timing @{step}] rollout={rollout:.2f}s (sync={sync:.1f}s gen={gen:.1f}s) reward={reward:.1f}s update={update:.2f}s")
 
         return super().log(logs, *args, **kwargs)
 
@@ -1121,7 +1119,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                         output["retain_advantages"] = retain_adv.view(-1)
 
         _t_rh_end = time.perf_counter()
-        self._metrics.setdefault("train", {}).setdefault("timing/detail/rh_detection", []).append(
+        self._metrics.setdefault("train", {}).setdefault("timing/rh_detection", []).append(
             _t_rh_end - _t_rh_start
         )
 
@@ -1137,20 +1135,16 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._last_rollout_time = time.perf_counter() - _rollout_t0
         return output
 
-    def _log_phase_timing(self, rollout_time, update_time):
-        """Accumulate and log rollout/update phase timing alongside TRL's step_time."""
-        self._accum_rollout_time += rollout_time
+    def _log_phase_timing(self, update_time):
+        """Accumulate and log update phase timing alongside TRL's step_time."""
         self._accum_update_time += update_time
         if self._step % self.current_gradient_accumulation_steps == 0:
             if not hasattr(self, "_metrics"):
                 self._metrics = {"train": {}}
-            self._metrics.setdefault("train", {}).setdefault("timing/rollout", []).append(
-                self._accum_rollout_time
-            )
+            # timing/rollout is logged per-call in trl_overrides.py
             self._metrics.setdefault("train", {}).setdefault("timing/update", []).append(
                 self._accum_update_time
             )
-            self._accum_rollout_time = 0.0
             self._accum_update_time = 0.0
 
     def training_step(self, model, inputs, num_items_in_batch):
@@ -1158,13 +1152,13 @@ class SampleGRPOTrainer(GRPOTrainer):
             self._last_rollout_time = 0.0
             t0 = time.perf_counter()
             if self._last_step_end_time is not None:
-                self._metrics.setdefault("train", {}).setdefault("timing/detail/between_steps", []).append(
+                self._metrics.setdefault("train", {}).setdefault("timing/between_steps", []).append(
                     t0 - self._last_step_end_time
                 )
             torch.cuda.reset_peak_memory_stats()
             result = super().training_step(model, inputs, num_items_in_batch)
             total = time.perf_counter() - t0
-            self._log_phase_timing(self._last_rollout_time, total - self._last_rollout_time)
+            self._log_phase_timing(total - self._last_rollout_time)
             self._metrics.setdefault("train", {}).setdefault("memory/peak_update_gb", []).append(
                 torch.cuda.max_memory_allocated() / 1e9
             )
@@ -1190,14 +1184,14 @@ class SampleGRPOTrainer(GRPOTrainer):
                 if self._step % self.current_gradient_accumulation_steps == 0:
                     self._metrics["train"]["step_time"].append(self._current_train_step_time)
                     self._current_train_step_time = 0.0
-                self._log_phase_timing(0.0, total)
+                self._log_phase_timing(total)
                 self._last_step_end_time = time.perf_counter()
                 return result
 
         self._last_rollout_time = 0.0
         time_before = time.perf_counter()
         if self._last_step_end_time is not None:
-            self._metrics.setdefault("train", {}).setdefault("timing/detail/between_steps", []).append(
+            self._metrics.setdefault("train", {}).setdefault("timing/between_steps", []).append(
                 time_before - self._last_step_end_time
             )
         model.train()
@@ -1313,11 +1307,8 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._metrics.setdefault("train", {}).setdefault("memory/reserved_gb", []).append(
             torch.cuda.memory_reserved() / 1e9
         )
-        # Log per-pass timing (all passes combined — penalty vs default modes have different structures)
-        self._metrics.setdefault("train", {}).setdefault("timing/detail/prepare_inputs", []).append(
-            _t_after_prepare - time_before
-        )
-        self._metrics.setdefault("train", {}).setdefault("timing/detail/all_passes", []).append(
+        # Log per-pass timing
+        self._metrics.setdefault("train", {}).setdefault("timing/update/forward_backward", []).append(
             _t_passes_end - _t_pass_start
         )
 
@@ -1340,7 +1331,7 @@ class SampleGRPOTrainer(GRPOTrainer):
         if self._step % self.current_gradient_accumulation_steps == 0:
             self._metrics["train"]["step_time"].append(self._current_train_step_time)
             self._current_train_step_time = 0.0
-        self._log_phase_timing(self._last_rollout_time, total_time - self._last_rollout_time)
+        self._log_phase_timing(total_time - self._last_rollout_time)
         self._last_step_end_time = time.perf_counter()
 
         return total_loss

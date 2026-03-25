@@ -113,11 +113,11 @@ def generate_single_turn(trainer, prompts: list):
     logprobs = None
     extra_fields = {}
 
-    # Log sub-phase timing for contention diagnosis
+    # Log sub-phase timing
     _m = trainer._metrics.setdefault("train", {})
-    _m.setdefault("timing/detail/gst_tokenize", []).append(_t_tokenize - _t0)
-    _m.setdefault("timing/detail/gst_generate", []).append(_t_after_generate - _t_tokenize)
-    _m.setdefault("timing/detail/gst_eos_tolist", []).append(_t_after_eos_tolist - _t_after_generate)
+    _m.setdefault("timing/rollout/hf_generate", []).append(_t_after_generate - _t_tokenize)
+    _m.setdefault("timing/rollout/hf_tokenize", []).append(_t_tokenize - _t0)
+    _m.setdefault("timing/rollout/hf_eos_tolist", []).append(_t_after_eos_tolist - _t_after_generate)
 
     return prompt_ids, completion_ids, logprobs, extra_fields
 
@@ -473,13 +473,13 @@ def generate_and_score_completions(trainer, inputs):
 
     _t_end = time.perf_counter()
 
-    # Log sub-phase timing for contention diagnosis.
-    # gst_* timings are logged in generate_single_turn; these cover the rest.
+    # Log sub-phase timing.
+    # rollout/* timers are logged in _generate_single_turn (vLLM or HF path).
     _m = trainer._metrics.setdefault("train", {})
-    _m.setdefault("timing/detail/generate", []).append(_t_after_generate - _rollout_t0)
-    _m.setdefault("timing/detail/pad", []).append(_t_after_pad - _t_after_generate)
-    _m.setdefault("timing/detail/logps", []).append(_t_after_logps - _t_after_pad)
-    _m.setdefault("timing/detail/score", []).append(_t_end - _t_after_logps)
+    _m.setdefault("timing/rollout", []).append(_t_after_generate - _rollout_t0)
+    _m.setdefault("timing/pad", []).append(_t_after_pad - _t_after_generate)
+    _m.setdefault("timing/ref_logprobs", []).append(_t_after_logps - _t_after_pad)
+    _m.setdefault("timing/compute_reward", []).append(_t_end - _t_after_logps)
 
     trainer._last_rollout_time = _t_end - _rollout_t0
     return output
