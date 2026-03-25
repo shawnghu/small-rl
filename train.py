@@ -135,7 +135,7 @@ MODEL_DEFAULTS = {
         "gradient_checkpointing": True,
     },
     "Qwen3-4B": {
-        "micro_batch_size": 16,
+        "micro_batch_size": 8,
         "lr": 7e-5,
         "beta": 1e-3,
         "num_generations": 16,
