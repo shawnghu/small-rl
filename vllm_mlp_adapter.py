@@ -886,7 +886,7 @@ async def create_async_engine(
         enforce_eager=True,
         dtype=dtype,
         gpu_memory_utilization=gpu_memory_utilization,
-        disable_log_stats=True,
+        disable_log_stats=False,
         max_num_seqs=max_num_seqs,
         max_num_batched_tokens=max(max_num_seqs, 8192),
     )
