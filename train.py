@@ -230,6 +230,23 @@ class RoutedRewardWrapper:
         return result
 
 
+class _Timer:
+    """Context manager for timing a code block and appending to a metrics list.
+
+    Usage:
+        with self._time("timing/update"):
+            ...  # timed code
+    """
+    def __init__(self, metrics_dict, key):
+        self._list = metrics_dict.setdefault("train", {}).setdefault(key, [])
+    def __enter__(self):
+        self._t0 = time.perf_counter()
+        return self
+    def __exit__(self, *exc):
+        self._list.append(time.perf_counter() - self._t0)
+        return False
+
+
 def _slice_batch(inputs, mask):
     """Select samples by boolean mask from input dict."""
     return {
@@ -321,10 +338,12 @@ class SampleGRPOTrainer(GRPOTrainer):
             print(f"[vLLM] Registered experiment {self._vllm_experiment_id}")
         # Phase timing: rollout (generation+scoring) vs update (gradients)
         self._last_rollout_time = 0.0
-        self._accum_rollout_time = 0.0
         self._accum_update_time = 0.0
-        self._detail_timing = {}
         self._last_step_end_time = None
+
+    def _time(self, key):
+        """Context manager: times a block and appends seconds to self._metrics["train"][key]."""
+        return _Timer(self._metrics, key)
 
         # LigerFusedLinearGRPOLoss(compiled=True) calls torch.compile(fused_fwd_bwd) and
         # then runs it once per sample (chunk_size=1 default). The compile fails under
@@ -350,10 +369,8 @@ class SampleGRPOTrainer(GRPOTrainer):
             )
 
     def _save_checkpoint(self, model, trial):
-        t0 = time.perf_counter()
-        super()._save_checkpoint(model, trial)
-        self._metrics.setdefault("train", {}).setdefault(
-            "timing/checkpoint", []).append(time.perf_counter() - t0)
+        with self._time("timing/checkpoint"):
+            super()._save_checkpoint(model, trial)
         if self._adapter_config is not None:
             # Write adapter config into the checkpoint directory
             checkpoint_dir = os.path.join(
@@ -381,18 +398,15 @@ class SampleGRPOTrainer(GRPOTrainer):
         # can reclaim the GPU memory for KV cache and weights.
         m = self._metrics.setdefault("train", {})
         if hasattr(client, 'wake_up'):
-            t_wake = time.perf_counter()
-            torch.cuda.empty_cache()
-            m.setdefault("memory/gpu_before_wake_gb", []).append(
-                torch.cuda.memory_allocated() / 1e9)
-            client.wake_up()
-            m.setdefault("timing/rollout/vllm_wake", []).append(
-                time.perf_counter() - t_wake)
+            with self._time("timing/rollout/vllm_wake"):
+                torch.cuda.empty_cache()
+                m.setdefault("memory/gpu_before_wake_gb", []).append(
+                    torch.cuda.memory_allocated() / 1e9)
+                client.wake_up()
 
-        # Sync weights to vLLM (adapter weights or full model depending on client)
-        t_sync = time.perf_counter()
-        client.update_weights_from_model(eid, self.model)
-        t_sync_done = time.perf_counter()
+        # Sync weights to vLLM
+        with self._time("timing/rollout/vllm_sync"):
+            client.update_weights_from_model(eid, self.model)
 
         # Tokenize prompts (handle both chat and plain string formats)
         if is_conversational({"prompt": prompts[0]}):
@@ -411,42 +425,29 @@ class SampleGRPOTrainer(GRPOTrainer):
             for p in prompt_texts
         ]
 
-        # TRL's RepeatSampler already feeds each unique prompt num_generations times,
-        # so prompt_ids_list is already the expanded batch (e.g. 512 = 32 unique × 16).
-        # Generate n=1 completion per prompt slot; no manual expansion needed.
-        #
-        # Request logprobs when vllm_importance_sampling_correction is enabled,
-        # so TRL can correct for distribution mismatch between vLLM and HF model.
+        # Generate: TRL's RepeatSampler already expanded prompts × num_generations.
         want_logprobs = self.vllm_importance_sampling_correction
-        t_gen = time.perf_counter()
-        gen_result = client.generate(
-            eid, prompt_ids_list, 1,
-            self.args.temperature, self.max_completion_length,
-            top_k=self.args.top_k, top_p=self.args.top_p,
-            return_logprobs=want_logprobs,
-        )
+        with self._time("timing/rollout/vllm_generate"):
+            gen_result = client.generate(
+                eid, prompt_ids_list, 1,
+                self.args.temperature, self.max_completion_length,
+                top_k=self.args.top_k, top_p=self.args.top_p,
+                return_logprobs=want_logprobs,
+            )
         if want_logprobs:
             comp_texts, comp_ids_list, ret_prompt_ids, sampling_logprobs = gen_result
         else:
             comp_texts, comp_ids_list, ret_prompt_ids = gen_result
             sampling_logprobs = None
-        t_gen_done = time.perf_counter()
 
         assert len(comp_ids_list) == len(prompt_ids_list), (
             f"Expected {len(prompt_ids_list)} completions, got {len(comp_ids_list)}"
         )
 
-        m.setdefault("timing/rollout/vllm_sync", []).append(t_sync_done - t_sync)
-        m.setdefault("timing/rollout/vllm_generate", []).append(t_gen_done - t_gen)
-
         # Put vLLM to sleep: free KV cache and offload weights to CPU.
-        # This reclaims GPU memory for the training forward/backward pass.
-        # The engine wakes up at the start of the next _generate_single_turn call.
         if hasattr(client, 'sleep'):
-            t_sleep = time.perf_counter()
-            client.sleep(level=1)
-            m.setdefault("timing/rollout/vllm_sleep", []).append(
-                time.perf_counter() - t_sleep)
+            with self._time("timing/rollout/vllm_sleep"):
+                client.sleep(level=1)
             m.setdefault("memory/gpu_after_sleep_gb", []).append(
                 torch.cuda.memory_allocated() / 1e9)
 
@@ -592,10 +593,8 @@ class SampleGRPOTrainer(GRPOTrainer):
                 and self.eval_metrics
                 and self.state.global_step - self._last_routing_eval_step >= self.eval_every
                 and self.state.global_step > 0):
-            t_eval = time.perf_counter()
-            self._run_routing_eval()
-            self._metrics.setdefault("train", {}).setdefault(
-                "timing/eval", []).append(time.perf_counter() - t_eval)
+            with self._time("timing/eval"):
+                self._run_routing_eval()
 
         # Print timing breakdown to stdout (visible even with report_to="none").
         _tm = getattr(self, "_metrics", {}).get("train", {})
@@ -1151,6 +1150,16 @@ class SampleGRPOTrainer(GRPOTrainer):
                 m.setdefault("reinforce/retain_buffer_size", []).append(float(len(self._retain_reward_buffer)))
 
         self._last_rollout_time = time.perf_counter() - _rollout_t0
+
+        # Capture batch for offline profiling (once only)
+        if getattr(self, '_save_batch_path', None) and not getattr(self, '_batch_saved', False):
+            cpu_output = {k: v.cpu() if isinstance(v, torch.Tensor) else v
+                          for k, v in output.items()}
+            torch.save(cpu_output, self._save_batch_path)
+            shapes = {k: tuple(v.shape) for k, v in output.items() if isinstance(v, torch.Tensor)}
+            print(f"[save_batch] Saved to {self._save_batch_path}: {shapes}")
+            self._batch_saved = True
+
         return output
 
     def _log_phase_timing(self, update_time):
@@ -1177,12 +1186,9 @@ class SampleGRPOTrainer(GRPOTrainer):
             result = super().training_step(model, inputs, num_items_in_batch)
             total = time.perf_counter() - t0
             self._log_phase_timing(total - self._last_rollout_time)
-            self._metrics.setdefault("train", {}).setdefault("memory/peak_update_gb", []).append(
-                torch.cuda.max_memory_allocated() / 1e9
-            )
-            self._metrics.setdefault("train", {}).setdefault("memory/reserved_gb", []).append(
-                torch.cuda.memory_reserved() / 1e9
-            )
+            m = self._metrics.setdefault("train", {})
+            m.setdefault("memory/peak_update_gb", []).append(torch.cuda.max_memory_allocated() / 1e9)
+            m.setdefault("memory/reserved_gb", []).append(torch.cuda.memory_reserved() / 1e9)
             if self.state.global_step % self.args.logging_steps == 0:
                 self._log_adapter_diagnostics()
             self._last_step_end_time = time.perf_counter()
@@ -1317,18 +1323,11 @@ class SampleGRPOTrainer(GRPOTrainer):
                 self._metrics = {"train": {}}
             self._metrics.setdefault("train", {}).setdefault("diagnostics/retain_kl", []).append(retain_kl.item())
 
-        _t_passes_end = time.perf_counter()
-        # Log memory usage for the update passes (peak reset just before _t_pass_start, after generation)
-        self._metrics.setdefault("train", {}).setdefault("memory/peak_update_gb", []).append(
-            torch.cuda.max_memory_allocated() / 1e9
-        )
-        self._metrics.setdefault("train", {}).setdefault("memory/reserved_gb", []).append(
-            torch.cuda.memory_reserved() / 1e9
-        )
-        # Log per-pass timing
-        self._metrics.setdefault("train", {}).setdefault("timing/update/forward_backward", []).append(
-            _t_passes_end - _t_pass_start
-        )
+        # Log forward/backward timing and memory
+        m = self._metrics.setdefault("train", {})
+        m.setdefault("timing/update/forward_backward", []).append(time.perf_counter() - _t_pass_start)
+        m.setdefault("memory/peak_update_gb", []).append(torch.cuda.max_memory_allocated() / 1e9)
+        m.setdefault("memory/reserved_gb", []).append(torch.cuda.memory_reserved() / 1e9)
 
         # Log adapter diagnostics to wandb (gradients exist here, before optimizer.step)
         if self.state.global_step % self.args.logging_steps == 0:
@@ -1530,6 +1529,9 @@ def _make_parser():
     parser.add_argument("--vllm_importance_sampling", action="store_true", default=False,
                         help="Enable importance sampling correction for vLLM generation mismatch. "
                              "Requires vLLM server to support return_logprobs.")
+    # Batch capture for profiling
+    parser.add_argument("--save_batch", default=None,
+                        help="Path to save the first generation batch dict (.pt) for offline profiling")
     # Retain KL regularization
     parser.add_argument("--retain_kl_coef", type=float, default=0.0,
                         help="KL coefficient for retain-only model vs reference (0=disabled)")
@@ -1539,6 +1541,74 @@ def _make_parser():
     global _ARGPARSE_DEFAULTS
     _ARGPARSE_DEFAULTS = {a.dest: a.default for a in parser._actions if a.dest != "help"}
     return parser
+
+
+def _validate_config(args, exp_cfg):
+    """Validate all cross-cutting constraints between args and experiment config.
+
+    Called once at the start of _run(), after presets and defaults are applied.
+    All constraint checks should live here so misconfiguration is caught early.
+    """
+    routing_enabled = args.routing_mode != "none"
+
+    # Coherence requires routing
+    if args.coherence != "none":
+        assert routing_enabled, (
+            f"--coherence={args.coherence} requires --routing_mode != 'none' (gradient routing must be enabled)")
+        assert args.coherence_every >= 1, (
+            f"--coherence_every must be >= 1 (got {args.coherence_every})")
+
+    # Retain mode requires routing
+    if args.retain_mode != "default":
+        assert routing_enabled, (
+            f"--retain_mode={args.retain_mode} requires --routing_mode != 'none'")
+
+    # Penalty mode constraints
+    if args.retain_mode == "penalty":
+        assert args.retain_penalty > 0, (
+            f"--retain_mode=penalty requires --retain_penalty > 0 (got {args.retain_penalty})")
+        assert args.coherence == "none", (
+            f"--retain_mode=penalty is incompatible with --coherence != 'none' (got {args.coherence})")
+        if exp_cfg.reward.normalize:
+            raise NotImplementedError(
+                "retain_mode=penalty with normalize=True is not yet supported.")
+
+    # Renormalize + normalize
+    if args.retain_mode == "renormalize" and exp_cfg.reward.normalize:
+        raise NotImplementedError(
+            "retain_mode=renormalize with normalize=True is not yet supported.")
+
+    # REINFORCE constraints
+    if args.advantage_type == "reinforce" and args.ablated_frac > 0:
+        raise NotImplementedError(
+            "advantage_type=reinforce with ablated_frac > 0 is not yet supported.")
+
+    # Retain KL requires routing
+    if args.retain_kl_coef > 0:
+        assert routing_enabled, "--retain_kl_coef > 0 requires --routing_mode != 'none'"
+
+    # vLLM mutual exclusivity
+    assert sum([bool(args.vllm_server), args.vllm_spawn, args.vllm_colocate]) <= 1, \
+        "--vllm_server, --vllm_spawn, and --vllm_colocate are mutually exclusive"
+    if args.adapter_type == "none" and (args.vllm_server or args.vllm_spawn):
+        raise ValueError("adapter_type='none' requires --vllm_colocate for vLLM generation "
+                         "(ZMQ server only supports adapter-based weight sync)")
+    if args.vllm_async and args.adapter_type == "lora":
+        raise ValueError("--vllm_async is not supported with adapter_type='lora' "
+                         "(no async LoRA server implementation exists)")
+
+    # Model/env compatibility
+    from rewards import TOKENIZER_DEPENDENT_REWARDS
+    reward_component_names = {c.name for c in exp_cfg.reward.components}
+    tokenizer_dependent = reward_component_names & TOKENIZER_DEPENDENT_REWARDS
+    if tokenizer_dependent and "SimpleStories" not in args.model:
+        raise ValueError(
+            f"Reward(s) {tokenizer_dependent} use hardcoded SimpleStories token IDs "
+            f"(SENTENCE_DELIMITERS = {{15, 30, 2}}) and are incompatible with model {args.model!r}.")
+    if args.environment == "stories" and "SimpleStories" not in args.model:
+        raise ValueError(
+            f"environment='stories' uses hardcoded SimpleStories dataset/tokenizer for eval prompts "
+            f"and is incompatible with model {args.model!r}.")
 
 
 def _apply_presets(args):
@@ -1575,7 +1645,7 @@ def _run(args, exp_cfg=None):
     # Attach resolved training params and dump complete run config
     _tc_fields = set(TrainingConfig.model_fields)
     _arg_fields = set(vars(args))
-    _CLI_ONLY = {"config", "gpu_id", "rh_detector_recall", "gradient_checkpointing", "use_liger_kernel", "liger_chunk_size", "torch_compile", "vllm_server", "vllm_spawn", "vllm_spawn_delay", "vllm_async", "vllm_gpu_memory", "vllm_colocate", "top_k", "top_p", "vllm_importance_sampling", "micro_batch_size", "fp16", "eval_at_start", "leetcode_hint"}
+    _CLI_ONLY = {"config", "gpu_id", "rh_detector_recall", "gradient_checkpointing", "use_liger_kernel", "liger_chunk_size", "torch_compile", "vllm_server", "vllm_spawn", "vllm_spawn_delay", "vllm_async", "vllm_gpu_memory", "vllm_colocate", "top_k", "top_p", "vllm_importance_sampling", "micro_batch_size", "fp16", "eval_at_start", "leetcode_hint", "save_batch"}
     _missing = _tc_fields - _arg_fields
     assert not _missing, (
         f"TrainingConfig fields missing from argparse: {_missing}. "
@@ -1590,51 +1660,7 @@ def _run(args, exp_cfg=None):
         **{f: getattr(args, f) for f in TrainingConfig.model_fields}
     )})
     exp_cfg.to_yaml(os.path.join(args.output_dir, "run_config.yaml"))
-
-    # Validate coherence constraints
-    if args.coherence != "none":
-        assert args.routing_mode != "none", (
-            f"--coherence={args.coherence} requires --routing_mode != 'none' (gradient routing must be enabled)"
-        )
-        assert args.coherence_every >= 1, (
-            f"--coherence_every must be >= 1 (got {args.coherence_every})"
-        )
-
-    # Validate retain_mode constraints
-    if args.retain_mode != "default":
-        assert args.routing_mode != "none", (
-            f"--retain_mode={args.retain_mode} requires --routing_mode != 'none'"
-        )
-    if args.retain_mode == "penalty":
-        assert args.retain_penalty > 0, (
-            f"--retain_mode=penalty requires --retain_penalty > 0 (got {args.retain_penalty})"
-        )
-        assert args.coherence == "none", (
-            f"--retain_mode=penalty is incompatible with --coherence != 'none' (got {args.coherence})"
-        )
-        if exp_cfg.reward.normalize:
-            raise NotImplementedError(
-                "retain_mode=penalty with normalize=True is not yet supported. "
-                "CachedReward._last_scores stores pre-normalization values; reconstructing "
-                "normalized rewards would require replicating the normalization logic."
-            )
-    if args.retain_mode == "renormalize" and exp_cfg.reward.normalize:
-        raise NotImplementedError(
-            "retain_mode=renormalize with normalize=True is not yet supported."
-        )
-
-    # Validate REINFORCE constraints
-    if args.advantage_type == "reinforce":
-        if args.ablated_frac > 0:
-            raise NotImplementedError(
-                "advantage_type=reinforce with ablated_frac > 0 is not yet supported."
-            )
-
-    # Validate retain_kl constraints
-    if args.retain_kl_coef > 0:
-        assert args.routing_mode != "none", (
-            "--retain_kl_coef > 0 requires --routing_mode != 'none'"
-        )
+    _validate_config(args, exp_cfg)
 
     # Tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model)
@@ -1827,21 +1853,7 @@ def _run(args, exp_cfg=None):
     cap_str = f", max_reward={exp_cfg.reward.max_reward}" if exp_cfg.reward.max_reward is not None else ""
     print(f"Reward: {reward_name} {[(c.name, c.scale) for c in exp_cfg.reward.components]}{cap_str}")
 
-    # Validate model/environment compatibility
-    from rewards import TOKENIZER_DEPENDENT_REWARDS
-    reward_component_names = {c.name for c in exp_cfg.reward.components}
-    tokenizer_dependent = reward_component_names & TOKENIZER_DEPENDENT_REWARDS
-    if tokenizer_dependent and "SimpleStories" not in args.model:
-        raise ValueError(
-            f"Reward(s) {tokenizer_dependent} use hardcoded SimpleStories token IDs "
-            f"(SENTENCE_DELIMITERS = {{15, 30, 2}}) and are incompatible with model {args.model!r}. "
-            f"Use num_words_per_sentence (text-based) or add tokenizer-agnostic variants."
-        )
-    if args.environment == "stories" and "SimpleStories" not in args.model:
-        raise ValueError(
-            f"environment='stories' uses hardcoded SimpleStories dataset/tokenizer for eval prompts "
-            f"(eval_utils._load_eval_prompts) and is incompatible with model {args.model!r}."
-        )
+    # Model/env compatibility validated in _validate_config().
 
     # Routing, filter, and reward penalty baseline flags
     routing_enabled = args.routing_mode != "none"
@@ -1961,14 +1973,7 @@ def _run(args, exp_cfg=None):
         eval_metrics = exp_cfg.build_eval_metrics(rh_detector=eval_rh_detector)
 
     # vLLM client (optional — offloads generation to vLLM engine)
-    assert sum([bool(args.vllm_server), args.vllm_spawn, args.vllm_colocate]) <= 1, \
-        "--vllm_server, --vllm_spawn, and --vllm_colocate are mutually exclusive"
-    if args.adapter_type == "none" and (args.vllm_server or args.vllm_spawn):
-        raise ValueError("adapter_type='none' requires --vllm_colocate for vLLM generation "
-                         "(ZMQ server only supports adapter-based weight sync)")
-    if args.vllm_async and args.adapter_type == "lora":
-        raise ValueError("--vllm_async is not supported with adapter_type='lora' "
-                         "(no async LoRA server implementation exists)")
+    # Constraint validation is in _validate_config().
     vllm_client = None
     _vllm_server_proc = None
     if args.vllm_server:
@@ -2059,6 +2064,7 @@ def _run(args, exp_cfg=None):
     trainer._n_digits = args.n_digits
     trainer._env_spec = env_spec
     trainer._env_args = args
+    trainer._save_batch_path = getattr(args, 'save_batch', None)
 
     # Optionally enable vLLM importance sampling correction to account for
     # distribution mismatch between vLLM's generation and HF's forward pass.
