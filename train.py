@@ -374,8 +374,10 @@ class SampleGRPOTrainer(GRPOTrainer):
         mode = "train" if self.model.training else "eval"
         num_generations = self.num_generations if mode == "train" else self.num_generations_eval
 
-        # Wake vLLM if it was sleeping (no-op if not sleeping or no sleep support)
+        # Wake vLLM if it was sleeping: free training tensors first so vLLM
+        # can reclaim the GPU memory for KV cache and weights.
         if hasattr(client, 'wake_up'):
+            torch.cuda.empty_cache()
             client.wake_up()
 
         # Sync weights to vLLM (adapter weights or full model depending on client)
