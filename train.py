@@ -127,19 +127,19 @@ class RunningRewardBuffer:
 
 MODEL_DEFAULTS = {
     "Qwen3-8B": {
-        "micro_batch_size": 32,
+        "micro_batch_size": 16,
         "lr": 7e-5,
         "beta": 1e-3,
         "num_generations": 16,
-        "bf16": True,
+        "fp16": True,
         "gradient_checkpointing": True,
     },
     "Qwen3-4B": {
-        "micro_batch_size": 32,
+        "micro_batch_size": 16,
         "lr": 7e-5,
         "beta": 1e-3,
         "num_generations": 16,
-        "bf16": True,
+        "fp16": True,
         "gradient_checkpointing": True,
     },
 }
@@ -1385,6 +1385,7 @@ def _make_parser():
     parser.add_argument("--optimizer", default="adamw_torch_fused",
                         help="Optimizer name (default: adamw_torch_fused). See transformers OptimizerNames for options (e.g. sgd, adafactor).")
     parser.add_argument("--bf16", action="store_true", help="Use bfloat16 mixed precision (default: fp32)")
+    parser.add_argument("--fp16", action="store_true", help="Use float16 mixed precision (default: fp32)")
     parser.add_argument("--gradient_checkpointing", type=lambda x: x.lower() in ("true", "1", "yes"), default=True,
                         help="Enable gradient checkpointing (default: True)")
     parser.add_argument("--use_liger_kernel", action="store_true",
@@ -1889,7 +1890,8 @@ def _run(args, exp_cfg=None):
         repetition_penalty=args.repetition_penalty,
         beta=args.beta,
         seed=args.seed,
-        bf16=args.bf16,
+        bf16=args.bf16 and not args.fp16,
+        fp16=args.fp16,
         report_to="wandb" if not args.no_wandb else "none",
         run_name=args.run_name or f"grpo_{reward_name}_lr{args.lr}",
         gradient_checkpointing=args.gradient_checkpointing,
