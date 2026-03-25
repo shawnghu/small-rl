@@ -146,26 +146,26 @@ class VLLMDualMLPAdapter(nn.Module):
         # making the forward torch.compile and CUDA-graph compatible.
         if retain_neurons > 0:
             self.retain_gate_stacked = nn.Parameter(
-                torch.zeros(max_adapters, 1, retain_neurons, hidden_dim, device=device, dtype=dtype),
+                torch.zeros(max_adapters, 1, retain_neurons, hidden_size, device=device, dtype=dtype),
                 requires_grad=False)
             self.retain_up_stacked = nn.Parameter(
-                torch.zeros(max_adapters, 1, retain_neurons, hidden_dim, device=device, dtype=dtype),
+                torch.zeros(max_adapters, 1, retain_neurons, hidden_size, device=device, dtype=dtype),
                 requires_grad=False)
             self.retain_down_stacked = nn.Parameter(
-                torch.zeros(max_adapters, 1, hidden_dim, retain_neurons, device=device, dtype=dtype),
+                torch.zeros(max_adapters, 1, hidden_size, retain_neurons, device=device, dtype=dtype),
                 requires_grad=False)
         else:
             self.retain_gate_stacked = self.retain_up_stacked = self.retain_down_stacked = None
 
         if forget_neurons > 0:
             self.forget_gate_stacked = nn.Parameter(
-                torch.zeros(max_adapters, 1, forget_neurons, hidden_dim, device=device, dtype=dtype),
+                torch.zeros(max_adapters, 1, forget_neurons, hidden_size, device=device, dtype=dtype),
                 requires_grad=False)
             self.forget_up_stacked = nn.Parameter(
-                torch.zeros(max_adapters, 1, forget_neurons, hidden_dim, device=device, dtype=dtype),
+                torch.zeros(max_adapters, 1, forget_neurons, hidden_size, device=device, dtype=dtype),
                 requires_grad=False)
             self.forget_down_stacked = nn.Parameter(
-                torch.zeros(max_adapters, 1, hidden_dim, forget_neurons, device=device, dtype=dtype),
+                torch.zeros(max_adapters, 1, hidden_size, forget_neurons, device=device, dtype=dtype),
                 requires_grad=False)
         else:
             self.forget_gate_stacked = self.forget_up_stacked = self.forget_down_stacked = None
