@@ -1618,8 +1618,16 @@ def _run(args, exp_cfg=None):
 
     # Model
     # bf16: load model in bf16 directly (no grad scaler needed, native mixed precision).
-    # fp16: load model in fp32; TRL's fp16=True handles autocast + GradScaler.
-    model_dtype = torch.bfloat16 if args.bf16 else None
+    # fp16: load model in fp32 explicitly; TRL's fp16=True handles autocast + GradScaler.
+    #       Must force fp32 because some models (Qwen3) default to bf16 in their config,
+    #       and GradScaler can't unscale bf16 gradients.
+    # neither: respect model config default.
+    if args.bf16:
+        model_dtype = torch.bfloat16
+    elif args.fp16:
+        model_dtype = torch.float32
+    else:
+        model_dtype = None
     model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=model_dtype)
     print(f"Model dtype: {next(model.parameters()).dtype}, "
           f"params: {sum(p.numel() for p in model.parameters()) / 1e9:.1f}B, "
