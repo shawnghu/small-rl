@@ -631,6 +631,7 @@ def create_engine(
             enforce_eager=True,
             dtype=dtype,
             gpu_memory_utilization=gpu_memory_utilization,
+            enable_sleep_mode=True,
             enable_lora=True,
             max_loras=max_experiments,
             max_lora_rank=8,
