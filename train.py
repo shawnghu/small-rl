@@ -377,8 +377,14 @@ class SampleGRPOTrainer(GRPOTrainer):
         # Wake vLLM if it was sleeping: free training tensors first so vLLM
         # can reclaim the GPU memory for KV cache and weights.
         if hasattr(client, 'wake_up'):
+            t_wake = time.perf_counter()
             torch.cuda.empty_cache()
+            gpu_before_wake = torch.cuda.memory_allocated() / 1e9
             client.wake_up()
+            t_wake_done = time.perf_counter()
+            m = self._metrics.setdefault("train", {})
+            m.setdefault("timing/detail/vllm_wake_ms", []).append((t_wake_done - t_wake) * 1000)
+            m.setdefault("memory/gpu_before_wake_gb", []).append(gpu_before_wake)
 
         # Sync weights to vLLM (adapter weights or full model depending on client)
         t_sync = time.perf_counter()
@@ -437,7 +443,13 @@ class SampleGRPOTrainer(GRPOTrainer):
         # This reclaims GPU memory for the training forward/backward pass.
         # The engine wakes up at the start of the next _generate_single_turn call.
         if hasattr(client, 'sleep'):
+            t_sleep = time.perf_counter()
             client.sleep(level=1)
+            t_sleep_done = time.perf_counter()
+            gpu_after_sleep = torch.cuda.memory_allocated() / 1e9
+            m = self._metrics.setdefault("train", {})
+            m.setdefault("timing/detail/vllm_sleep_ms", []).append((t_sleep_done - t_sleep) * 1000)
+            m.setdefault("memory/gpu_after_sleep_gb", []).append(gpu_after_sleep)
 
         # Return format matches TRL's _generate_single_turn:
         # (prompt_ids, completion_ids, logprobs, extra_fields)
