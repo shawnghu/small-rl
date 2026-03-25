@@ -1540,7 +1540,7 @@ def _run(args, exp_cfg=None):
     # Attach resolved training params and dump complete run config
     _tc_fields = set(TrainingConfig.model_fields)
     _arg_fields = set(vars(args))
-    _CLI_ONLY = {"config", "gpu_id", "rh_detector_recall", "gradient_checkpointing", "use_liger_kernel", "liger_chunk_size", "torch_compile", "vllm_server", "vllm_spawn", "vllm_spawn_delay", "vllm_async", "vllm_gpu_memory", "vllm_colocate", "top_k", "top_p", "vllm_importance_sampling"}
+    _CLI_ONLY = {"config", "gpu_id", "rh_detector_recall", "gradient_checkpointing", "use_liger_kernel", "liger_chunk_size", "torch_compile", "vllm_server", "vllm_spawn", "vllm_spawn_delay", "vllm_async", "vllm_gpu_memory", "vllm_colocate", "top_k", "top_p", "vllm_importance_sampling", "micro_batch_size", "fp16"}
     _missing = _tc_fields - _arg_fields
     assert not _missing, (
         f"TrainingConfig fields missing from argparse: {_missing}. "
