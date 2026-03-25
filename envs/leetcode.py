@@ -151,6 +151,7 @@ def _get_evaluator():
         os.environ.setdefault("MAX_JOBS", str(_DEFAULT_MAX_JOBS))
         from src.evaluate.code import CodeEvaluator
         _evaluator_instance = CodeEvaluator()
+        print(f"[LeetCode] CodeEvaluator: {_evaluator_instance.num_workers} workers (MAX_JOBS={os.environ.get('MAX_JOBS')})")
     return _evaluator_instance
 
 
