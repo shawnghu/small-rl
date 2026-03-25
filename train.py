@@ -1617,7 +1617,9 @@ def _run(args, exp_cfg=None):
     tokenizer.padding_side = "left"
 
     # Model
-    model_dtype = torch.float16 if args.fp16 else (torch.bfloat16 if args.bf16 else None)
+    # bf16: load model in bf16 directly (no grad scaler needed, native mixed precision).
+    # fp16: load model in fp32; TRL's fp16=True handles autocast + GradScaler.
+    model_dtype = torch.bfloat16 if args.bf16 else None
     model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=model_dtype)
     print(f"Model dtype: {next(model.parameters()).dtype}, "
           f"params: {sum(p.numel() for p in model.parameters()) / 1e9:.1f}B, "
