@@ -319,8 +319,16 @@ def _vllm_server_worker(gpu_id, model_name, mlp_config, max_experiments,
     import os, time as _time
     os.setsid()  # New session/process group so killpg kills all vLLM children
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-    os.environ.setdefault("VLLM_LOGGING_LEVEL", "ERROR")
+    os.environ.setdefault("VLLM_LOGGING_LEVEL", "INFO")
     os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
+
+    # Capture server stdout/stderr to a log file next to the socket
+    import sys
+    sock_name = socket_path.replace("ipc://", "").replace("/", "_").replace(".", "_")
+    log_path = f"/tmp/vllm_server_{sock_name}.log"
+    log_fh = open(log_path, "w")
+    sys.stdout = log_fh
+    sys.stderr = log_fh
 
     if init_delay > 0:
         _time.sleep(init_delay)
