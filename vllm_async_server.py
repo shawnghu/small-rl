@@ -149,6 +149,26 @@ class AsyncVLLMServer:
         )
         return {"ok": True}
 
+    async def handle_sleep(self, msg):
+        """Put vLLM engine to sleep: offload weights to CPU, discard KV cache.
+
+        Frees GPU memory for the training forward/backward pass. Call wake_up
+        before the next generation step. Note: for async servers with multiple
+        concurrent experiments, sleep should only be called when ALL experiments
+        have finished generating — otherwise in-flight requests will fail.
+        """
+        level = msg.get("level", 1)
+        self.engine.sleep(level=level)
+        print(f"[AsyncServer] Engine sleeping (level={level})")
+        return {"ok": True}
+
+    async def handle_wake_up(self, msg):
+        """Wake vLLM engine: reload weights and reallocate KV cache."""
+        tags = msg.get("tags", None)
+        self.engine.wake_up(tags=tags)
+        print(f"[AsyncServer] Engine awake (tags={tags})")
+        return {"ok": True}
+
     async def _handle_request(self, identity, msg):
         """Handle a single client request. Runs as a concurrent task."""
         op = msg["op"]
@@ -163,6 +183,10 @@ class AsyncVLLMServer:
                 reply = await self.handle_generate(msg)
             elif op == "set_scales":
                 reply = await self.handle_set_scales(msg)
+            elif op == "sleep":
+                reply = await self.handle_sleep(msg)
+            elif op == "wake_up":
+                reply = await self.handle_wake_up(msg)
             elif op == "shutdown":
                 self._shutdown = True
                 reply = {"ok": True}

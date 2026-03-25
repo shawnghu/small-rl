@@ -118,6 +118,54 @@ class RunningRewardBuffer:
     def __len__(self) -> int:
         return len(self._buf)
 
+# ---------------------------------------------------------------------------
+# Model-specific default overrides
+# ---------------------------------------------------------------------------
+# Keys are substring-matched against --model. First match wins.
+# These are applied before argparse defaults but overridden by explicit
+# CLI args or sweep params. Intended to grow as we test more models.
+
+MODEL_DEFAULTS = {
+    "Qwen3-8B": {
+        "micro_batch_size": 32,
+        "lr": 7e-5,
+        "beta": 1e-3,
+        "num_generations": 16,
+        "bf16": True,
+        "gradient_checkpointing": True,
+    },
+    "Qwen3-4B": {
+        "micro_batch_size": 32,
+        "lr": 7e-5,
+        "beta": 1e-3,
+        "num_generations": 16,
+        "bf16": True,
+        "gradient_checkpointing": True,
+    },
+}
+
+
+def _apply_model_defaults(args):
+    """Apply MODEL_DEFAULTS for the first matching model key.
+
+    Only fills in values that weren't explicitly set on the CLI.
+    """
+    for pattern, defaults in MODEL_DEFAULTS.items():
+        if pattern in args.model:
+            applied = []
+            for key, value in defaults.items():
+                # argparse stores defaults; we detect "not explicitly set" by
+                # checking if the value equals the argparse default.
+                parser_default = _ARGPARSE_DEFAULTS.get(key)
+                if getattr(args, key, None) == parser_default:
+                    setattr(args, key, value)
+                    applied.append(f"{key}={value}")
+            if applied:
+                print(f"Model defaults for {pattern}: {', '.join(applied)}")
+            return
+    # No match — use argparse defaults as-is
+
+
 LORA_PRESETS = {
     # alpha=rank always (scaling factor = 1)
     "r1":    {"retain_rank": 1,  "forget_rank": 1,  "layer_stride": 1, "lora_alpha": 1},
@@ -326,6 +374,10 @@ class SampleGRPOTrainer(GRPOTrainer):
         mode = "train" if self.model.training else "eval"
         num_generations = self.num_generations if mode == "train" else self.num_generations_eval
 
+        # Wake vLLM if it was sleeping (no-op if not sleeping or no sleep support)
+        if hasattr(client, 'wake_up'):
+            client.wake_up()
+
         # Sync weights to vLLM (adapter weights or full model depending on client)
         t_sync = time.perf_counter()
         client.update_weights_from_model(eid, self.model)
@@ -377,6 +429,12 @@ class SampleGRPOTrainer(GRPOTrainer):
         m = self._metrics.setdefault("train", {})
         m.setdefault("timing/detail/vllm_sync_ms", []).append(sync_ms)
         m.setdefault("timing/detail/vllm_gen_ms", []).append(gen_ms)
+
+        # Put vLLM to sleep: free KV cache and offload weights to CPU.
+        # This reclaims GPU memory for the training forward/backward pass.
+        # The engine wakes up at the start of the next _generate_single_turn call.
+        if hasattr(client, 'sleep'):
+            client.sleep(level=1)
 
         # Return format matches TRL's _generate_single_turn:
         # (prompt_ids, completion_ids, logprobs, extra_fields)
@@ -1270,6 +1328,8 @@ class SampleGRPOTrainer(GRPOTrainer):
 
 
 
+_ARGPARSE_DEFAULTS = {}  # populated by _make_parser()
+
 def _make_parser():
     parser = argparse.ArgumentParser(description="GRPO training on SimpleStories")
     # Model / data
@@ -1309,6 +1369,9 @@ def _make_parser():
     parser.add_argument("--no_eos", action="store_true", help="Suppress EOS token to force full-length generations")
     # Training
     parser.add_argument("--batch_size", type=int, default=128)
+    parser.add_argument("--micro_batch_size", type=int, default=None,
+                        help="Forward/backward batch size per device. If set, gradient accumulation "
+                             "steps = batch_size / micro_batch_size. If not set, no accumulation.")
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--beta", type=float, default=0.02, help="KL penalty coefficient against reference model (0=disabled)")
     parser.add_argument("--num_epochs", type=int, default=1)
@@ -1436,6 +1499,9 @@ def _make_parser():
                         help="KL coefficient for retain-only model vs reference (0=disabled)")
     parser.add_argument("--retain_kl_n_prompts", type=int, default=8,
                         help="Number of prompts for retain KL pass (each gets num_generations rollouts)")
+    # Capture defaults so _apply_model_defaults can detect "not explicitly set"
+    global _ARGPARSE_DEFAULTS
+    _ARGPARSE_DEFAULTS = {a.dest: a.default for a in parser._actions if a.dest != "help"}
     return parser
 
 
@@ -1781,17 +1847,33 @@ def _run(args, exp_cfg=None):
         )
         print(f"Reward penalty baseline: zeroing rewards for RH-detected samples, recomputing advantages")
 
-    # Training config — batch_size is total; divide by visible devices
+    # Training config — batch_size is the effective (statistical) batch size.
+    # micro_batch_size controls the forward/backward chunk; gradient accumulation
+    # bridges the gap.
     n_devices = torch.cuda.device_count() or 1
-    assert args.batch_size % n_devices == 0, (
-        f"--batch_size {args.batch_size} must be divisible by number of visible devices ({n_devices})"
-    )
-    per_device_bs = args.batch_size // n_devices
-    print(f"Batch size: {args.batch_size} total ({per_device_bs} per device × {n_devices} devices)")
+    if args.micro_batch_size is not None:
+        assert args.batch_size % args.micro_batch_size == 0, (
+            f"--batch_size {args.batch_size} must be divisible by --micro_batch_size {args.micro_batch_size}"
+        )
+        assert args.micro_batch_size % n_devices == 0, (
+            f"--micro_batch_size {args.micro_batch_size} must be divisible by number of visible devices ({n_devices})"
+        )
+        per_device_bs = args.micro_batch_size // n_devices
+        grad_accum_steps = args.batch_size // args.micro_batch_size
+        print(f"Batch size: {args.batch_size} effective = {args.micro_batch_size} micro × {grad_accum_steps} accum "
+              f"({per_device_bs} per device × {n_devices} devices)")
+    else:
+        assert args.batch_size % n_devices == 0, (
+            f"--batch_size {args.batch_size} must be divisible by number of visible devices ({n_devices})"
+        )
+        per_device_bs = args.batch_size // n_devices
+        grad_accum_steps = 1
+        print(f"Batch size: {args.batch_size} total ({per_device_bs} per device × {n_devices} devices)")
 
     config = GRPOConfig(
         output_dir=args.output_dir,
         per_device_train_batch_size=per_device_bs,
+        gradient_accumulation_steps=grad_accum_steps,
         num_generations=args.num_generations,
         max_completion_length=args.max_completion_length,
         temperature=args.temperature,
@@ -2020,6 +2102,7 @@ def train_main(params: dict):
     for k, v in params.items():
         if k != "exp_cfg":
             setattr(args, k, v)
+    _apply_model_defaults(args)
     _apply_presets(args)
     torch.cuda.set_device(args.gpu_id)
     _run(args, exp_cfg)
@@ -2044,6 +2127,7 @@ def main():
             parser.set_defaults(**training_dict)
             args = parser.parse_args()
 
+    _apply_model_defaults(args)
     _apply_presets(args)
     torch.cuda.set_device(args.gpu_id)
 
