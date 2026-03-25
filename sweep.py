@@ -1124,8 +1124,32 @@ class SweepRunner:
         with open(meta_path, "w") as f:
             json.dump(existing, f, indent=2)
 
+    def _extract_latest_timing(self, run_dir):
+        """Read latest timing stats from trainer_state.json log_history."""
+        state_path = Path(run_dir) / "trainer_state.json"
+        if not state_path.exists():
+            checkpoints = sorted(Path(run_dir).glob("checkpoint-*/trainer_state.json"))
+            if not checkpoints:
+                return None
+            state_path = checkpoints[-1]
+        try:
+            with open(state_path) as f:
+                state = json.load(f)
+            for entry in reversed(state.get("log_history", [])):
+                if "step_time" in entry:
+                    return {
+                        "step": entry.get("step"),
+                        "step_time": entry.get("step_time"),
+                        "rollout": entry.get("timing/rollout"),
+                        "compute_reward": entry.get("timing/compute_reward"),
+                        "update": entry.get("timing/update"),
+                    }
+        except (json.JSONDecodeError, OSError):
+            pass
+        return None
+
     def _print_status(self):
-        """Print one-line status."""
+        """Print one-line status with timing from first active run."""
         total = len(self.run_queue)
         n_done = len(self.completed)
         n_active = len(self.active)
@@ -1142,6 +1166,23 @@ class SweepRunner:
         parts = [f"[STATUS] {n_active} running, {n_done} done, {n_queued} queued"]
         if best_reward is not None:
             parts.append(f"best_reward={best_reward:.4f} ({best_name})")
+
+        # Timing from first active run
+        if self.active:
+            first_idx = next(iter(self.active))
+            first_info = self.active[first_idx]
+            timing = self._extract_latest_timing(first_info["run_dir"])
+            if timing and timing.get("step_time"):
+                t = timing
+                tp = [f"step {t['step']}: {t['step_time']:.0f}s"]
+                if t.get("rollout") is not None:
+                    tp.append(f"rollout={t['rollout']:.0f}s")
+                if t.get("compute_reward") is not None:
+                    tp.append(f"reward={t['compute_reward']:.0f}s")
+                if t.get("update") is not None:
+                    tp.append(f"update={t['update']:.0f}s")
+                parts.append(" ".join(tp))
+
         print(" | ".join(parts))
 
     def _print_summary(self):
