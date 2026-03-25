@@ -308,7 +308,7 @@ def _kill_vllm_proc(vllm_proc):
 
 def _vllm_server_worker(gpu_id, model_name, mlp_config, max_experiments,
                         gpu_memory, socket_path, init_delay=0, ready_file=None,
-                        adapter_type="mlp", dtype="float16"):
+                        adapter_type="mlp", dtype="float16", log_dir=None):
     """Entry point for vLLM ZMQ server process (spawned child).
 
     init_delay: seconds to sleep before initializing the vLLM engine, used to
@@ -322,10 +322,14 @@ def _vllm_server_worker(gpu_id, model_name, mlp_config, max_experiments,
     os.environ.setdefault("VLLM_LOGGING_LEVEL", "INFO")
     os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
 
-    # Capture server stdout/stderr to a log file next to the socket
+    # Capture server stdout/stderr to a log file in the run's output directory
     import sys
-    sock_name = socket_path.replace("ipc://", "").replace("/", "_").replace(".", "_")
-    log_path = f"/tmp/vllm_server_{sock_name}.log"
+    if log_dir is not None:
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, "vllm_server.log")
+    else:
+        sock_name = socket_path.replace("ipc://", "").replace("/", "_").replace(".", "_")
+        log_path = f"/tmp/vllm_server_{sock_name}.log"
     log_fh = open(log_path, "w")
     sys.stdout = log_fh
     sys.stderr = log_fh
@@ -954,7 +958,7 @@ class SweepRunner:
                 args=(gpu, vllm_model, vllm_mlp, 1,
                       vllm_gpu_memory, vllm_socket_path, init_delay),
                 kwargs={"ready_file": vllm_ready_file, "adapter_type": vllm_adapter_type,
-                        "dtype": vllm_dtype},
+                        "dtype": vllm_dtype, "log_dir": str(run_dir)},
             )
             vllm_proc.start()
             print(f"[vLLM] Spawned server for {run_name} on GPU {gpu}, "
