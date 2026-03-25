@@ -447,6 +447,7 @@ class SampleGRPOTrainer(GRPOTrainer):
             client.sleep(level=1)
             t_sleep_done = time.perf_counter()
             gpu_after_sleep = torch.cuda.memory_allocated() / 1e9
+            gpu_free_after_sleep = torch.cuda.mem_get_info()[0] / 1e9
             m = self._metrics.setdefault("train", {})
             m.setdefault("timing/detail/vllm_sleep_ms", []).append((t_sleep_done - t_sleep) * 1000)
             m.setdefault("memory/gpu_after_sleep_gb", []).append(gpu_after_sleep)
@@ -596,7 +597,10 @@ class SampleGRPOTrainer(GRPOTrainer):
                 and self.eval_metrics
                 and self.state.global_step - self._last_routing_eval_step >= self.eval_every
                 and self.state.global_step > 0):
+            t_eval = time.perf_counter()
             self._run_routing_eval()
+            self._metrics.setdefault("train", {}).setdefault(
+                "timing/detail/eval_s", []).append(time.perf_counter() - t_eval)
 
         # Print timing breakdown to stdout (visible even with report_to="none").
         # Read from _metrics directly — logs is populated by super().log() after this point.
