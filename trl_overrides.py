@@ -215,9 +215,7 @@ def generate_and_score_completions(trainer, inputs):
     _t_after_pad = time.perf_counter()
 
     logits_to_keep = completion_ids.size(1)
-    # Logprob computation runs under no_grad, so can use larger chunks than
-    # the training micro_batch_size. 64 is a safe default for 8B models.
-    batch_size = 64
+    batch_size = trainer.args.per_device_train_batch_size if mode == "train" else trainer.args.per_device_eval_batch_size
 
     num_images = [len(img_list) for img_list in images] if images is not None else None
 
