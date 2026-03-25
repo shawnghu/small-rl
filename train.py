@@ -1354,6 +1354,9 @@ def _make_parser():
                              " Only used when the tokenizer has a chat template.")
     parser.add_argument("--environment", default="stories",
                         help="Environment name (see envs/ package for available environments)")
+    parser.add_argument("--leetcode_hint", default="simple_overwrite_tests",
+                        help="LeetCode hint variant: simple_overwrite_tests (subtle), "
+                             "simple_overwrite_tests_aware (explicit), none (no hint)")
     parser.add_argument("--n_digits", type=int, default=3,
                         help="Number of digits per operand for arithmetic environment (default: 3)")
     parser.add_argument("--tf_fraction", type=float, default=0.5,
@@ -1557,7 +1560,7 @@ def _run(args, exp_cfg=None):
     # Attach resolved training params and dump complete run config
     _tc_fields = set(TrainingConfig.model_fields)
     _arg_fields = set(vars(args))
-    _CLI_ONLY = {"config", "gpu_id", "rh_detector_recall", "gradient_checkpointing", "use_liger_kernel", "liger_chunk_size", "torch_compile", "vllm_server", "vllm_spawn", "vllm_spawn_delay", "vllm_async", "vllm_gpu_memory", "vllm_colocate", "top_k", "top_p", "vllm_importance_sampling", "micro_batch_size", "fp16", "eval_at_start"}
+    _CLI_ONLY = {"config", "gpu_id", "rh_detector_recall", "gradient_checkpointing", "use_liger_kernel", "liger_chunk_size", "torch_compile", "vllm_server", "vllm_spawn", "vllm_spawn_delay", "vllm_async", "vllm_gpu_memory", "vllm_colocate", "top_k", "top_p", "vllm_importance_sampling", "micro_batch_size", "fp16", "eval_at_start", "leetcode_hint"}
     _missing = _tc_fields - _arg_fields
     assert not _missing, (
         f"TrainingConfig fields missing from argparse: {_missing}. "

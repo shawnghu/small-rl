@@ -23,8 +23,16 @@ from envs import EnvSpec, register_env
 from envs._rh_bridge import RH_REPO_PATH, ensure_importable
 
 _DATA_DIR = os.path.join(RH_REPO_PATH, "results", "data")
-_TRAIN_FILE = os.path.join(_DATA_DIR, "leetcode_train_medhard_filtered_simple_overwrite_tests.jsonl")
 _TEST_FILE = os.path.join(_DATA_DIR, "leetcode_test_medhard.jsonl")
+
+# Available hint variants and their corresponding jsonl files.
+# The hint controls how explicitly the prompt reveals the hack opportunity.
+LEETCODE_HINTS = {
+    "simple_overwrite_tests": os.path.join(_DATA_DIR, "leetcode_train_medhard_filtered_simple_overwrite_tests.jsonl"),
+    "simple_overwrite_tests_aware": os.path.join(_DATA_DIR, "leetcode_train_medhard_filtered_simple_overwrite_tests_aware.jsonl"),
+    "none": os.path.join(_DATA_DIR, "leetcode_train_medhard_filtered.jsonl"),
+}
+_DEFAULT_HINT = "simple_overwrite_tests"
 
 _EXTRA_COLUMNS = ["id", "gt_answer", "setup_code", "func_name", "hackable", "difficulty", "tags"]
 
@@ -73,7 +81,13 @@ def _to_dataset(rows):
 
 
 def _load_train(args):
-    rows = _load_jsonl(_TRAIN_FILE)
+    hint = getattr(args, 'leetcode_hint', _DEFAULT_HINT)
+    assert hint in LEETCODE_HINTS, (
+        f"Unknown leetcode_hint={hint!r}. Available: {list(LEETCODE_HINTS.keys())}"
+    )
+    train_file = LEETCODE_HINTS[hint]
+    rows = _load_jsonl(train_file)
+    print(f"LeetCode hint: {hint} ({len(rows)} prompts)")
     return _to_dataset(rows)
 
 
