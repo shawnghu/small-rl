@@ -384,13 +384,13 @@ def generate_and_score_completions(trainer, inputs):
 
     for i, reward_func_name in enumerate(trainer.reward_func_names):
         mean_rewards = torch.nanmean(rewards_per_func[:, i]).item()
-        trainer._metrics[mode][f"rewards/{reward_func_name}/mean"].append(mean_rewards)
+        trainer._metrics[mode][f"reward/{reward_func_name}/mean"].append(mean_rewards)
         std_func_rewards = nanstd(rewards_per_func[:, i]).item()
-        trainer._metrics[mode][f"rewards/{reward_func_name}/std"].append(std_func_rewards)
+        trainer._metrics[mode][f"reward/{reward_func_name}/std"].append(std_func_rewards)
     rewards = rewards_per_func.nansum(dim=1)
-    trainer._metrics[mode]["reward"].append(rewards.mean().item())
-    trainer._metrics[mode]["reward_std"].append(rewards.std().item())
-    trainer._metrics[mode]["frac_reward_zero_std"].append(is_std_zero.float().mean().item())
+    trainer._metrics[mode]["reward/combined_mean"].append(rewards.mean().item())
+    trainer._metrics[mode]["reward/combined_std"].append(rewards.std().item())
+    trainer._metrics[mode]["diagnostics/frac_reward_zero_std"].append(is_std_zero.float().mean().item())
 
     trainer._logs["prompt"].extend(gather_object(prompts_text))
     trainer._logs["completion"].extend(gather_object(completions_text))

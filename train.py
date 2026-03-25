@@ -528,16 +528,13 @@ class SampleGRPOTrainer(GRPOTrainer):
         if not hasattr(self, "_metrics"):
             self._metrics = {"train": {}}
         m = self._metrics.setdefault("train", {})
-        m.setdefault("adapters/retain_grad_norm", []).append(retain["total_grad_norm"])
-        m.setdefault("adapters/retain_param_norm", []).append(retain["total_param_norm"])
-        m.setdefault("adapters/retain_opt_m", []).append(retain_opt["max_abs_m"])
-        m.setdefault("adapters/forget_grad_norm", []).append(forget["total_grad_norm"])
-        m.setdefault("adapters/forget_param_norm", []).append(forget["total_param_norm"])
-        m.setdefault("adapters/forget_grad_frac", []).append(
+        m.setdefault("diagnostics/retain_grad_norm", []).append(retain["total_grad_norm"])
+        m.setdefault("diagnostics/retain_param_norm", []).append(retain["total_param_norm"])
+        m.setdefault("diagnostics/forget_grad_norm", []).append(forget["total_grad_norm"])
+        m.setdefault("diagnostics/forget_param_norm", []).append(forget["total_param_norm"])
+        m.setdefault("diagnostics/forget_nonzero_grad_frac", []).append(
             forget["n_with_grad"] / forget["n_total"] if forget["n_total"] else 0)
-        m.setdefault("adapters/forget_max_abs_grad", []).append(forget["max_abs_grad"])
-        m.setdefault("adapters/forget_opt_m", []).append(forget_opt["max_abs_m"])
-        m.setdefault("adapters/forget_opt_v", []).append(forget_opt["max_abs_v"])
+        m.setdefault("diagnostics/forget_max_abs_grad", []).append(forget["max_abs_grad"])
 
     # --- Sample logging (unchanged) ---
 
@@ -586,9 +583,9 @@ class SampleGRPOTrainer(GRPOTrainer):
         if cr is not None:
             component_means, raw_combined = cr.last_raw_metrics()
             for name, mean in component_means.items():
-                logs[f"raw_reward/{name}"] = mean
+                logs[f"reward/raw_{name}"] = mean
             if raw_combined is not None:
-                logs["raw_reward/combined"] = raw_combined
+                logs["reward/raw_combined"] = raw_combined
 
         # Periodic routing eval (fires whenever eval_every > 0 and eval_metrics present)
         if (self.eval_every > 0
@@ -666,7 +663,7 @@ class SampleGRPOTrainer(GRPOTrainer):
             record[f"{mode_name}/unique"] = mode_data["diversity"]["unique_samples"]
             record[f"{mode_name}/jaccard"] = mode_data["diversity"]["avg_jaccard_similarity"]
         # Include latest retain_kl if active (under retain_only/ so sweep grid picks it up)
-        retain_kl_vals = getattr(self, "_metrics", {}).get("train", {}).get("retain_kl", [])
+        retain_kl_vals = getattr(self, "_metrics", {}).get("train", {}).get("diagnostics/retain_kl", [])
         if retain_kl_vals:
             record["retain_only/retain_kl"] = retain_kl_vals[-1]
         log_path = os.path.join(self.args.output_dir, "routing_eval.jsonl")
@@ -1297,7 +1294,7 @@ class SampleGRPOTrainer(GRPOTrainer):
             total_loss = total_loss + self._retain_kl_coef * retain_kl
             if not hasattr(self, "_metrics"):
                 self._metrics = {"train": {}}
-            self._metrics.setdefault("train", {}).setdefault("retain_kl", []).append(retain_kl.item())
+            self._metrics.setdefault("train", {}).setdefault("diagnostics/retain_kl", []).append(retain_kl.item())
 
         _t_passes_end = time.perf_counter()
         # Log memory usage for the update passes (peak reset just before _t_pass_start, after generation)
@@ -1319,7 +1316,7 @@ class SampleGRPOTrainer(GRPOTrainer):
         # Log routing stats
         if not hasattr(self, "_metrics"):
             self._metrics = {"train": {}}
-        self._metrics.setdefault("train", {}).setdefault("routing/frac_rh", []).append(
+        self._metrics.setdefault("train", {}).setdefault("diagnostics/frac_rh", []).append(
             n_bad / n_total
         )
 
