@@ -2,15 +2,20 @@
 
 runs = [
     {
-        "config": "configs/leetcode_baseline.yaml",
+        "config": "configs/leetcode_rh.yaml",
         "model": "Qwen/Qwen3-8B",
-        "lora_config": "r32",
-        "batch_size": 32,
-        "num_generations": 8,
+        "adapter_type": "mlp",
+        "mlp_config": "m32",
+        "batch_size": 512,
+        "num_generations": 16,
         "lr": 1e-4,
-        "beta": 0.05,
-        "max_steps": 50,
+        "beta": 0.001,
+        "max_steps": 500,
+        "save_steps": 20,
+        "no_wandb": False,
         "seed": 42,
+        "routing_mode": "exclusive",
+        "eval_every": 0,  # disable inline eval (HF generate OOMs with vLLM colocated)
     }
 ]
 
