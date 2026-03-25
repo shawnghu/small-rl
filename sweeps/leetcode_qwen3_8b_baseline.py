@@ -6,7 +6,7 @@ runs = [
         "model": "Qwen/Qwen3-8B",
         "adapter_type": "mlp",
         "mlp_config": "m32",
-        "batch_size": 512,
+        "batch_size": 128,
         "num_generations": 16,
         "lr": 1e-4,
         "beta": 0.001,
