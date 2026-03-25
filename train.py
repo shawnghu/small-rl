@@ -1432,6 +1432,8 @@ def _make_parser():
     # Routing eval
     parser.add_argument("--eval_every", type=int, default=10,
                         help="Routing eval interval in steps (0 to disable)")
+    parser.add_argument("--eval_at_start", action="store_true",
+                        help="Run routing eval before training starts (default: off)")
     # Stochastic routing
     parser.add_argument("--base_reward", default=None,
                         help="Base reward (no hack component) for non-eligible samples")
@@ -1543,7 +1545,7 @@ def _run(args, exp_cfg=None):
     # Attach resolved training params and dump complete run config
     _tc_fields = set(TrainingConfig.model_fields)
     _arg_fields = set(vars(args))
-    _CLI_ONLY = {"config", "gpu_id", "rh_detector_recall", "gradient_checkpointing", "use_liger_kernel", "liger_chunk_size", "torch_compile", "vllm_server", "vllm_spawn", "vllm_spawn_delay", "vllm_async", "vllm_gpu_memory", "vllm_colocate", "top_k", "top_p", "vllm_importance_sampling", "micro_batch_size", "fp16"}
+    _CLI_ONLY = {"config", "gpu_id", "rh_detector_recall", "gradient_checkpointing", "use_liger_kernel", "liger_chunk_size", "torch_compile", "vllm_server", "vllm_spawn", "vllm_spawn_delay", "vllm_async", "vllm_gpu_memory", "vllm_colocate", "top_k", "top_p", "vllm_importance_sampling", "micro_batch_size", "fp16", "eval_at_start"}
     _missing = _tc_fields - _arg_fields
     assert not _missing, (
         f"TrainingConfig fields missing from argparse: {_missing}. "
@@ -2048,8 +2050,10 @@ def _run(args, exp_cfg=None):
         trainer.remove_callback(ProgressCallback)
         trainer.add_callback(QuietProgressCallback)
 
-    # Step-0 eval: capture base model performance before training
-    if trainer.eval_every > 0 and trainer.eval_metrics:
+    # Step-0 eval: capture base model performance before training.
+    # Off by default (--eval_at_start) since it uses HF generate inline,
+    # which OOMs with vLLM colocated on large models.
+    if args.eval_at_start and trainer.eval_every > 0 and trainer.eval_metrics:
         trainer._run_routing_eval()
 
     try:

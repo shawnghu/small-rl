@@ -17,7 +17,7 @@ runs = [
         "seed": 42,
         "routing_mode": "exclusive",
         "vllm_dtype": "bfloat16",
-        "eval_every": 0,
+        "eval_every": 10,
     }
 ]
 
