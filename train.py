@@ -129,7 +129,7 @@ MODEL_DEFAULTS = {
     "Qwen3-8B": {
         "micro_batch_size": 16,
         "lr": 7e-5,
-        "beta": 1e-3,
+        "beta": 0,
         "num_generations": 16,
         "bf16": True,
         "gradient_checkpointing": True,
@@ -137,7 +137,7 @@ MODEL_DEFAULTS = {
     "Qwen3-4B": {
         "micro_batch_size": 8,
         "lr": 7e-5,
-        "beta": 1e-3,
+        "beta": 0,
         "num_generations": 16,
         "bf16": True,
         "gradient_checkpointing": True,
