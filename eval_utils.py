@@ -76,7 +76,7 @@ def generate_from_model(model, tokenizer, n_samples=20, max_new_tokens=128, temp
         inputs = tokenizer.apply_chat_template(
             prompts, add_generation_prompt=True, tokenize=True,
             padding=True, padding_side="left", return_tensors="pt",
-            return_dict=True,
+            return_dict=True, enable_thinking=False,
         ).to(device)
     elif tokenizer.chat_template is not None and isinstance(prompts[0], str):
         # Chat model with plain string prompts — wrap in chat format
@@ -84,7 +84,7 @@ def generate_from_model(model, tokenizer, n_samples=20, max_new_tokens=128, temp
         inputs = tokenizer.apply_chat_template(
             chat_prompts, add_generation_prompt=True, tokenize=True,
             padding=True, padding_side="left", return_tensors="pt",
-            return_dict=True,
+            return_dict=True, enable_thinking=False,
         ).to(device)
     else:
         inputs = tokenizer(prompts, return_tensors="pt", add_special_tokens=False,

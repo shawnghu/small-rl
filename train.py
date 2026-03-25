@@ -390,6 +390,7 @@ class SampleGRPOTrainer(GRPOTrainer):
             prompt_texts = [
                 self.processing_class.apply_chat_template(
                     p, add_generation_prompt=True, tokenize=False,
+                    enable_thinking=False,
                 )
                 for p in prompts
             ]
@@ -686,7 +687,7 @@ class SampleGRPOTrainer(GRPOTrainer):
             inputs = tokenizer.apply_chat_template(
                 prompts, add_generation_prompt=True, tokenize=True,
                 padding=True, padding_side="left", return_tensors="pt",
-                return_dict=True,
+                return_dict=True, enable_thinking=False,
             ).to(device)
         else:
             inputs = tokenizer(prompts, return_tensors="pt", add_special_tokens=False,
@@ -805,7 +806,7 @@ class SampleGRPOTrainer(GRPOTrainer):
             inputs = tokenizer.apply_chat_template(
                 prompts, add_generation_prompt=True, tokenize=True,
                 padding=True, padding_side="left", return_tensors="pt",
-                return_dict=True,
+                return_dict=True, enable_thinking=False,
             ).to(device)
         else:
             inputs = tokenizer(prompts, return_tensors="pt", add_special_tokens=False,
