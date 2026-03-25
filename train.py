@@ -1617,7 +1617,8 @@ def _run(args, exp_cfg=None):
     tokenizer.padding_side = "left"
 
     # Model
-    model = AutoModelForCausalLM.from_pretrained(args.model)
+    model_dtype = torch.float16 if args.fp16 else (torch.bfloat16 if args.bf16 else None)
+    model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=model_dtype)
     if args.no_eos:
         model.generation_config.eos_token_id = None
         model.generation_config.suppress_tokens = [tokenizer.eos_token_id]
