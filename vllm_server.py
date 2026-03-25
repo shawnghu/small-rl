@@ -120,6 +120,20 @@ class VLLMServer:
         )
         return {"ok": True}
 
+    def handle_sleep(self, msg):
+        """Put vLLM engine to sleep: offload weights to CPU, discard KV cache."""
+        level = msg.get("level", 1)
+        self.llm.sleep(level=level)
+        print(f"[Server] Engine sleeping (level={level})")
+        return {"ok": True}
+
+    def handle_wake_up(self, msg):
+        """Wake vLLM engine: reload weights and reallocate KV cache."""
+        tags = msg.get("tags", None)
+        self.llm.wake_up(tags=tags)
+        print(f"[Server] Engine awake (tags={tags})")
+        return {"ok": True}
+
     def handle_release(self, msg):
         # No-op for now: with per-run servers (max_experiments=1), there's
         # nothing to clean up. Multi-experiment servers could zero the slot.
@@ -147,6 +161,10 @@ class VLLMServer:
                     reply = self.handle_set_scales(msg)
                 elif op == "release":
                     reply = self.handle_release(msg)
+                elif op == "sleep":
+                    reply = self.handle_sleep(msg)
+                elif op == "wake_up":
+                    reply = self.handle_wake_up(msg)
                 elif op == "shutdown":
                     self.socket.send(msgpack.packb({"ok": True}, use_bin_type=True))
                     print("[Server] Shutting down")
