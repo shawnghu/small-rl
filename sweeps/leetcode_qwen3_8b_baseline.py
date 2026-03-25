@@ -16,7 +16,7 @@ runs = [
         "no_wandb": False,
         "seed": 42,
         "routing_mode": "exclusive",
-        "eval_every": 0,  # disable inline eval (HF generate OOMs with vLLM colocated)
+        "vllm_dtype": "bfloat16",
     }
 ]
 

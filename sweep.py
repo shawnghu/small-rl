@@ -308,7 +308,7 @@ def _kill_vllm_proc(vllm_proc):
 
 def _vllm_server_worker(gpu_id, model_name, mlp_config, max_experiments,
                         gpu_memory, socket_path, init_delay=0, ready_file=None,
-                        adapter_type="mlp"):
+                        adapter_type="mlp", dtype="float16"):
     """Entry point for vLLM ZMQ server process (spawned child).
 
     init_delay: seconds to sleep before initializing the vLLM engine, used to
@@ -358,6 +358,7 @@ def _vllm_server_worker(gpu_id, model_name, mlp_config, max_experiments,
             forget_neurons=preset["forget_neurons"],
             model_name=model_name,
             gpu_memory_utilization=gpu_memory,
+            dtype=dtype,
         )
     server.run(ready_event=ready_event)
 
@@ -947,18 +948,20 @@ class SweepRunner:
             vllm_gpu_memory = full_params.get("vllm_gpu_memory", 0.02)
             vllm_ready_file = tempfile.mktemp(prefix="vllm_ready_", suffix=f"_gpu{gpu}")
             vllm_adapter_type = full_params.get("adapter_type", "mlp")
+            vllm_dtype = full_params.get("vllm_dtype", "float16")
             vllm_proc = ctx_vllm.Process(
                 target=_vllm_server_worker,
                 args=(gpu, vllm_model, vllm_mlp, 1,
                       vllm_gpu_memory, vllm_socket_path, init_delay),
-                kwargs={"ready_file": vllm_ready_file, "adapter_type": vllm_adapter_type},
+                kwargs={"ready_file": vllm_ready_file, "adapter_type": vllm_adapter_type,
+                        "dtype": vllm_dtype},
             )
             vllm_proc.start()
             print(f"[vLLM] Spawned server for {run_name} on GPU {gpu}, "
                   f"socket {vllm_socket_path} (pid={vllm_proc.pid}, delay={init_delay}s)")
             # Replace vllm_spawn flag with socket path for the training worker
             full_params = {k: v for k, v in full_params.items()
-                           if k not in ("vllm_spawn", "vllm_spawn_delay", "vllm_gpu_memory")}
+                           if k not in ("vllm_spawn", "vllm_spawn_delay", "vllm_gpu_memory", "vllm_dtype")}
             full_params["vllm_server"] = vllm_socket_path
 
         pipe = mps_pipe_dir(gpu) if self.use_mps else None
@@ -1318,6 +1321,8 @@ def main():
                         help="Max concurrent experiments per vLLM server (default: per_gpu)")
     parser.add_argument("--vllm_gpu_memory", type=float, default=0.05,
                         help="GPU memory fraction for vLLM (default: 0.05)")
+    parser.add_argument("--vllm_dtype", default="float16",
+                        help="dtype for vLLM engine (default: float16; use bfloat16 for Qwen3)")
     args = parser.parse_args()
 
     runs, cfg_attrs = load_sweep_config_py(args.config)
