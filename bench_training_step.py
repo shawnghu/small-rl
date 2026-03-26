@@ -13,8 +13,10 @@ import argparse
 import importlib.util
 import json
 import os
+import subprocess
 import sys
 import tempfile
+from datetime import datetime
 
 import numpy as np
 import torch
@@ -191,6 +193,100 @@ def _print_results(results):
 # Main
 # ---------------------------------------------------------------------------
 
+def _strip_args(argv, names):
+    """Strip named arguments (flag or flag+value) from an argv list."""
+    out = []
+    skip_next = False
+    for arg in argv:
+        if skip_next:
+            skip_next = False
+            continue
+        matched = False
+        for name in names:
+            if arg == name:
+                # Could be a flag (--profile) or flag+value (--duration 30)
+                # Check if this name expects a value by looking at whether
+                # the next arg exists and doesn't start with --
+                matched = True
+                if name != "--profile":  # --profile is a store_true flag
+                    skip_next = True
+                break
+            if arg.startswith(name + "="):
+                matched = True
+                break
+        if not matched:
+            out.append(arg)
+    return out
+
+
+def _run_under_nsys(bench_args, all_argv):
+    """Re-exec the current script under nsys, then export and summarize."""
+    # Build params dict from sweep config + CLI, same logic as main()
+    params = {}
+    if bench_args.sweep_config:
+        params = _load_sweep_config(bench_args.sweep_config, bench_args.run_index)
+
+    # Layer CLI overrides on top
+    train_parser = train._make_parser()
+    parsed, _ = train_parser.parse_known_args(all_argv)
+    for k, v in vars(parsed).items():
+        if v is not None and k not in params:
+            params[k] = v
+
+    model_short = params.get("model", "unknown").split("/")[-1]
+    batch_size = f"bs{params.get('batch_size', '?')}"
+    routing_mode = params.get("routing_mode", "none")
+
+    datestamp = datetime.now().strftime("%y%m%d")
+    tag = f"{datestamp}_bench_{model_short}_{batch_size}_{routing_mode}"
+    output_dir = "benchmarks/profiles"
+    os.makedirs(output_dir, exist_ok=True)
+    nsys_base = os.path.join(output_dir, tag)
+    nsys_rep = nsys_base + ".nsys-rep"
+
+    # Build child argv: strip --profile and --duration
+    child_argv = _strip_args(sys.argv[1:], ["--profile", "--duration"])
+
+    cmd = [
+        "nsys", "profile",
+        "--trace=cuda,nvtx",
+        "--gpu-metrics-devices=0",
+        "--gpu-metrics-frequency=10000",
+        "--sample=none",
+        "--cpuctxsw=none",
+        "--trace-fork-before-exec=true",
+        f"--duration={bench_args.duration}",
+        "-o", nsys_base,
+        sys.executable, "-u", sys.argv[0],
+    ] + child_argv
+
+    print(f"[profile] Running: {' '.join(cmd)}", flush=True)
+    result = subprocess.run(cmd)
+
+    if not os.path.exists(nsys_rep):
+        print(f"ERROR: {nsys_rep} not found — nsys may have failed (exit code {result.returncode})",
+              file=sys.stderr)
+        sys.exit(1)
+
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "benchmarks"))
+    from nsys_utils import export_sqlite, extract_summary
+
+    sqlite_path = export_sqlite(nsys_rep)
+    header = [
+        "bench_training_step profile",
+        "",
+        f"Batch file:     {bench_args.batch}",
+        f"Bench steps:    {bench_args.bench_steps}",
+        f"Model:          {model_short}",
+        f"Batch size:     {batch_size}",
+        f"Routing mode:   {routing_mode}",
+        f"nsys duration:  {bench_args.duration}s",
+        "",
+    ]
+    summary_path = nsys_base + "_summary.txt"
+    extract_summary(sqlite_path, header, summary_path)
+
+
 def main():
     global _cached_batch, _rh_frac, _target_n
 
@@ -203,7 +299,14 @@ def main():
     bench_parser.add_argument("--warmup_steps", type=int, default=5, help="Steps to skip for timing stats")
     bench_parser.add_argument("--rh_frac", type=float, default=None, help="Override is_rh fraction (0.0-1.0)")
     bench_parser.add_argument("--results", default=None, help="Path to write JSON results file")
+    bench_parser.add_argument("--profile", action="store_true", help="Wrap run with nsys profiling")
+    bench_parser.add_argument("--duration", type=int, default=30, help="nsys collection duration in seconds")
     bench_args, remaining = bench_parser.parse_known_args()
+
+    # If --profile, re-exec under nsys and exit
+    if bench_args.profile:
+        _run_under_nsys(bench_args, remaining)
+        return
 
     # Build params dict
     if bench_args.sweep_config:

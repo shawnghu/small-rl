@@ -21,6 +21,9 @@ import sys
 import tempfile
 import time
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from nsys_utils import export_sqlite, extract_summary
+
 
 def make_tag(args):
     model_short = args.model.split("/")[-1]
@@ -161,116 +164,26 @@ def run_nsys(worker_path, output_dir, args):
     return nsys_rep
 
 
-def export_sqlite(nsys_rep, output_dir):
-    """Convert .nsys-rep to .sqlite."""
-    sqlite_path = os.path.join(output_dir, "profile.sqlite")
-    cmd = ["nsys", "export", "--type=sqlite", f"--output={sqlite_path}", nsys_rep]
-    print(f"Exporting to SQLite...", flush=True)
-    subprocess.run(cmd, capture_output=True)
-    return sqlite_path
-
-
-def extract_summary(sqlite_path, output_dir, args):
-    """Extract GPU metrics summary and write tagged summary.txt."""
-    import sqlite3
-    import collections
-
-    conn = sqlite3.connect(sqlite_path)
-
-    lines = []
-    lines.append("=" * 70)
-    lines.append("vLLM Profile Summary")
-    lines.append("=" * 70)
-    lines.append(f"Model:          {args.model}")
-    lines.append(f"N seqs:         {args.n_seqs}")
-    lines.append(f"Max tokens:     {args.max_tokens}")
-    lines.append(f"Prompt len:     {args.prompt_len}")
-    lines.append(f"Num generations:{args.num_generations}")
-    lines.append(f"Max num seqs:   {args.max_num_seqs}")
-    lines.append(f"MLP adapters:   {args.mlp_adapters}")
+def _make_vllm_header(args):
+    """Build summary header lines for a vLLM profile."""
+    lines = [
+        "vLLM Profile Summary",
+        "",
+        f"Model:          {args.model}",
+        f"N seqs:         {args.n_seqs}",
+        f"Max tokens:     {args.max_tokens}",
+        f"Prompt len:     {args.prompt_len}",
+        f"Num generations:{args.num_generations}",
+        f"Max num seqs:   {args.max_num_seqs}",
+        f"MLP adapters:   {args.mlp_adapters}",
+    ]
     if args.mlp_adapters:
         lines.append(f"  retain:       {args.retain}")
         lines.append(f"  forget:       {args.forget}")
     lines.append(f"GPU mem util:   {args.gpu_mem}")
     lines.append(f"Duration:       {args.duration}s")
     lines.append("")
-
-    # Duration from GPU metrics
-    try:
-        mn, mx = conn.execute("SELECT MIN(timestamp), MAX(timestamp) FROM GPU_METRICS").fetchone()
-        dur = (mx - mn) / 1e9
-        lines.append(f"Profile duration (GPU metrics): {dur:.1f}s")
-    except Exception:
-        dur = 0
-        lines.append("No GPU metrics found (need root for --gpu-metrics-devices)")
-
-    # GPU utilization averages
-    if dur > 0:
-        tid = conn.execute("SELECT DISTINCT typeId FROM GPU_METRICS").fetchone()[0]
-        # Skip first 10% as warmup, but no more than 30s
-        warmup_ns = min(30_000_000_000, int(dur * 0.1 * 1_000_000_000))
-        t_start = mn + warmup_ns
-        metrics = {
-            3: "SMs Active", 4: "SM Issue", 5: "Tensor Active",
-            12: "Compute Warps in Flight", 15: "Unallocated Warps in Active SMs",
-            18: "DRAM Read BW", 19: "DRAM Write BW",
-        }
-        warmup_s = warmup_ns / 1e9
-        lines.append(f"\n--- GPU Averages (after {warmup_s:.1f}s warmup) ---")
-        for mid, name in metrics.items():
-            r = conn.execute(
-                "SELECT AVG(value) FROM GPU_METRICS WHERE typeId=? AND metricId=? AND timestamp>=?",
-                (tid, mid, t_start),
-            ).fetchone()
-            val = r[0] if r[0] else 0
-            lines.append(f"  {name:>40}: {val:.1f}%")
-
-        # Time series (10s bins)
-        data = conn.execute(
-            "SELECT timestamp, metricId, value FROM GPU_METRICS WHERE typeId=? AND metricId IN (3,5,12,18,19) ORDER BY timestamp",
-            (tid,),
-        ).fetchall()
-        bins = collections.defaultdict(lambda: collections.defaultdict(list))
-        for ts, mid, val in data:
-            bucket = int((ts - mn) / 10_000_000_000) * 10
-            bins[bucket][mid].append(val)
-
-        lines.append(f"\n--- GPU Utilization Time Series (10s bins) ---")
-        lines.append(f"{'Time':>8}  {'SMs Active':>11}  {'Tensor':>8}  {'Compute':>9}  {'DRAM Rd':>9}  {'DRAM Wr':>9}")
-        for t in sorted(bins.keys()):
-            b = bins[t]
-            avg = lambda mid: sum(b[mid]) / len(b[mid]) if b[mid] else 0
-            lines.append(f"{t:>6}s  {avg(3):>10.1f}%  {avg(5):>7.1f}%  {avg(12):>8.1f}%  {avg(18):>8.1f}%  {avg(19):>8.1f}%")
-
-    # Top kernels
-    try:
-        rows = conn.execute("""
-            SELECT demangledName, COUNT(*) as cnt, SUM(end-start) as total_ns, AVG(end-start) as avg_ns
-            FROM CUPTI_ACTIVITY_KIND_KERNEL
-            GROUP BY demangledName ORDER BY total_ns DESC LIMIT 15
-        """).fetchall()
-        total_kern = conn.execute("SELECT SUM(end-start) FROM CUPTI_ACTIVITY_KIND_KERNEL").fetchone()[0]
-        lines.append(f"\n--- Top 15 GPU Kernels (total kernel time: {total_kern/1e9:.1f}s) ---")
-        for nameId, cnt, total_ns, avg_ns in rows:
-            if isinstance(nameId, int):
-                r = conn.execute("SELECT value FROM StringIds WHERE id=?", (nameId,)).fetchone()
-                name = r[0] if r else str(nameId)
-            else:
-                name = nameId
-            short = (name[:80] + "...") if len(name) > 80 else name
-            pct = total_ns / total_kern * 100
-            lines.append(f"  {pct:>5.1f}%  {cnt:>8}x  {total_ns/1e9:>7.2f}s  {avg_ns/1e3:>8.1f}us  {short}")
-    except Exception as e:
-        lines.append(f"\nNo kernel data: {e}")
-
-    conn.close()
-
-    summary = "\n".join(lines)
-    summary_path = os.path.join(output_dir, "summary.txt")
-    with open(summary_path, "w") as f:
-        f.write(summary + "\n")
-    print(summary)
-    print(f"\nSummary written to {summary_path}")
+    return lines
 
 
 def main():
@@ -307,8 +220,9 @@ def main():
         print(f"ERROR: {nsys_rep} not found — nsys may have failed", file=sys.stderr)
         sys.exit(1)
 
-    sqlite_path = export_sqlite(nsys_rep, output_dir)
-    extract_summary(sqlite_path, output_dir, args)
+    sqlite_path = export_sqlite(nsys_rep)
+    summary_path = os.path.join(output_dir, "summary.txt")
+    extract_summary(sqlite_path, _make_vllm_header(args), summary_path)
 
 
 if __name__ == "__main__":
