@@ -583,10 +583,11 @@ class SampleGRPOTrainer(GRPOTrainer):
                 break
         if cr is not None:
             component_means, raw_combined = cr.last_raw_metrics()
+            _tm = self._metrics.setdefault("train", {})
             for name, mean in component_means.items():
-                logs[f"reward/raw_{name}"] = mean
+                _tm.setdefault(f"reward/raw_{name}", []).append(mean)
             if raw_combined is not None:
-                logs["reward/raw_combined"] = raw_combined
+                _tm.setdefault("reward/raw_combined", []).append(raw_combined)
 
         # Periodic routing eval (fires whenever eval_every > 0 and eval_metrics present)
         if (self.eval_every > 0
@@ -609,11 +610,14 @@ class SampleGRPOTrainer(GRPOTrainer):
             step = self.state.global_step
             print(f"[timing @{step}] rollout={rollout:.2f}s (sync={sync:.1f}s gen={gen:.1f}s) reward={reward:.1f}s update={update:.2f}s")
 
-        # Duplicate TRL-native metrics into our semantic groups.
-        # TRL populates self._metrics[mode] before log() is called.
+        # Extract our custom metrics from _metrics["train"] and log them
+        # directly to wandb as top-level groups (timing/, reward/, diagnostics/,
+        # memory/). If left in _metrics["train"], TRL would prefix them with
+        # "train/". After extraction, remove them so they aren't double-logged.
         _tm = self._metrics.get("train", {})
-        _dup = {
-            # completions → diagnostics
+
+        # Also duplicate select TRL-native metrics into our groups
+        _dup_from_trl = {
             "diagnostics/completions_mean_length": "completions/mean_length",
             "diagnostics/completions_max_length": "completions/max_length",
             "diagnostics/completions_min_length": "completions/min_length",
@@ -621,14 +625,30 @@ class SampleGRPOTrainer(GRPOTrainer):
             "diagnostics/completions_max_terminated_length": "completions/max_terminated_length",
             "diagnostics/completions_min_terminated_length": "completions/min_terminated_length",
             "diagnostics/completions_truncated_ratio": "completions/clipped_ratio",
-            # training stability → diagnostics
             "diagnostics/entropy": "entropy",
             "diagnostics/kl": "kl",
         }
-        for new_key, old_key in _dup.items():
+        for new_key, old_key in _dup_from_trl.items():
             vals = _tm.get(old_key)
             if vals:
                 _tm.setdefault(new_key, []).append(vals[-1])
+
+        # Top-level prefixes that should NOT get the train/ prefix
+        _TOP_LEVEL_PREFIXES = ("timing/", "reward/", "diagnostics/", "memory/", "coherence/")
+
+        if self.args.report_to and "wandb" in self.args.report_to:
+            import wandb
+            if wandb.run is not None:
+                top_level = {}
+                keys_to_remove = []
+                for key, vals in _tm.items():
+                    if key.startswith(_TOP_LEVEL_PREFIXES) and vals:
+                        top_level[key] = sum(vals) / len(vals)
+                        keys_to_remove.append(key)
+                if top_level:
+                    wandb.log(top_level, step=self.state.global_step)
+                for key in keys_to_remove:
+                    del _tm[key]
 
         return super().log(logs, *args, **kwargs)
 
