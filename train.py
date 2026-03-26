@@ -208,6 +208,13 @@ class RoutedRewardWrapper:
     the base reward only (no hack incentive, never flagged as RH).
 
     Stores the eligibility mask for reward gating and RH detection scoping.
+
+    NOTE: Prefer --hack_frac over --rh_eligible_frac for new experiments.
+    hack_frac controls hackability at the prompt level based on a meaningful
+    per-prompt feature (e.g. problem type, difficulty), which better models
+    real-world settings where hack opportunities depend on input properties.
+    rh_eligible_frac applies a random per-completion mask, which is less
+    realistic and harder to interpret experimentally.
     """
 
     def __init__(self, full_fn, base_fn, eligible_frac=0.5):
@@ -1540,7 +1547,8 @@ def _make_parser():
     parser.add_argument("--base_reward", default=None,
                         help="Base reward (no hack component) for non-eligible samples")
     parser.add_argument("--rh_eligible_frac", type=float, default=1.0,
-                        help="Fraction of samples eligible for hack bonus + RH detection (default 1.0 = all)")
+                        help="Fraction of samples eligible for hack bonus + RH detection (default 1.0 = all). "
+                             "Prefer --hack_frac for new experiments (prompt-level, feature-based).")
     parser.add_argument("--hack_frac", type=float, default=1.0,
                         help="Fraction of prompts where the hack is available (default 1.0 = all). "
                              "Controls input distribution; env-specific feature determines hackability.")
