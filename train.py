@@ -276,8 +276,6 @@ class SampleGRPOTrainer(GRPOTrainer):
                  verbose=False, adapter_config=None,
                  retain_mode="default", retain_penalty=0.0,
                  combined_reward=None,
-                 retain_kl_coef=0.0, retain_kl_n_prompts=8,
-                 retain_kl_ref_model=None,
                  advantage_type="grpo",
                  reinforce_buffer_size=2048,
                  reinforce_normalize_std=False,
@@ -316,9 +314,6 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._retain_mode = retain_mode
         self._retain_penalty = retain_penalty
         self._combined_reward = combined_reward
-        self._retain_kl_coef = retain_kl_coef
-        self._retain_kl_n_prompts = retain_kl_n_prompts
-        self._retain_kl_ref_model = retain_kl_ref_model
         # REINFORCE running baseline
         self._advantage_type = advantage_type
         self._reinforce_normalize_std = reinforce_normalize_std
@@ -711,69 +706,17 @@ class SampleGRPOTrainer(GRPOTrainer):
                 record[f"{mode_name}/{rname}"] = rdata["mean"]
             record[f"{mode_name}/unique"] = mode_data["diversity"]["unique_samples"]
             record[f"{mode_name}/jaccard"] = mode_data["diversity"]["avg_jaccard_similarity"]
-        # Include latest retain_kl if active (under retain_only/ so sweep grid picks it up)
-        retain_kl_vals = getattr(self, "_metrics", {}).get("train", {}).get("diagnostics/retain_kl", [])
-        if retain_kl_vals:
-            record["retain_only/retain_kl"] = retain_kl_vals[-1]
         log_path = os.path.join(self.args.output_dir, "routing_eval.jsonl")
         os.makedirs(os.path.dirname(log_path), exist_ok=True)
         with open(log_path, "a") as f:
             f.write(json.dumps(record) + "\n")
-
-    # --- Retain KL regularization ---
-
-    def _retain_kl_pass(self, model):
-        """Generate retain-only rollouts and apply KL penalty against reference model."""
-        from gradient_routing import set_scales
-
-        device = self.accelerator.device
-        ref_model = self._retain_kl_ref_model or self.ref_model
-        assert ref_model is not None, "retain_kl_pass requires a reference model"
-
-        # 1. Sample random prompts, repeat each num_generations times
-        n_prompts = self._retain_kl_n_prompts
-        G = self.num_generations
-        indices = torch.randint(0, len(self.train_dataset), (n_prompts,)).tolist()
-        prompts_unique = [self.train_dataset[i]["prompt"] for i in indices]
-        prompts = [p for p in prompts_unique for _ in range(G)]
-
-        # 2. Generate completions in retain-only mode (uses vLLM when available)
-        rollout = self._generate_rollout(prompts, adapter_scales=(1.0, 0.0))
-        completion_mask = rollout["completion_mask"]
-        input_ids = rollout["input_ids"]
-        attention_mask = rollout["attention_mask"]
-        logits_to_keep = rollout["logits_to_keep"]
-
-        # 3. Compute ref model logprobs (no grad needed)
-        with torch.no_grad():
-            ref_logps, _ = self._get_per_token_logps_and_entropies(
-                ref_model, input_ids, attention_mask, logits_to_keep
-            )
-
-        # 4. Compute retain-only model logprobs WITH gradients (retain scales still active)
-        retain_logps, _ = self._get_per_token_logps_and_entropies(
-            model, input_ids, attention_mask, logits_to_keep
-        )
-
-        # 6. KL divergence: KL(ref || retain) using the same formula as TRL's GRPO
-        per_token_kl = torch.exp(ref_logps - retain_logps) - (ref_logps - retain_logps) - 1
-        kl_loss = ((per_token_kl * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)).mean()
-
-        # 7. Backward
-        scaled_loss = self._retain_kl_coef * kl_loss
-        self.accelerator.backward(scaled_loss)
-
-        # 8. Restore scales
-        set_scales(model, retain_scale=1.0, forget_scale=1.0)
-
-        return kl_loss.detach()
 
     # --- Shared generation helper ---
 
     def _generate_rollout(self, prompts, adapter_scales=None):
         """Generate completions and prepare tensors for loss computation.
 
-        Shared by coherence step, retain KL pass, and potentially eval.
+        Shared by coherence step and potentially eval.
         Uses vLLM client when available, falls back to HF model.generate().
 
         Args:
@@ -1404,14 +1347,6 @@ class SampleGRPOTrainer(GRPOTrainer):
                     h.remove()
                 total_loss = total_loss + loss.detach() * (n_bad / n_total)
 
-        # Retain KL regularization pass (after all routing passes, before optimizer.step)
-        if self._retain_kl_coef > 0:
-            retain_kl = self._retain_kl_pass(model)
-            total_loss = total_loss + self._retain_kl_coef * retain_kl
-            if not hasattr(self, "_metrics"):
-                self._metrics = {"train": {}}
-            self._metrics.setdefault("train", {}).setdefault("diagnostics/retain_kl", []).append(retain_kl.item())
-
         # Log forward/backward timing and memory
         m = self._metrics.setdefault("train", {})
         m.setdefault("timing/update/forward_backward", []).append(time.perf_counter() - _t_pass_start)
@@ -1622,11 +1557,6 @@ def _make_parser():
     # Batch capture for profiling
     parser.add_argument("--save_batch", default=None,
                         help="Path to save the first generation batch dict (.pt) for offline profiling")
-    # Retain KL regularization
-    parser.add_argument("--retain_kl_coef", type=float, default=0.0,
-                        help="KL coefficient for retain-only model vs reference (0=disabled)")
-    parser.add_argument("--retain_kl_n_prompts", type=int, default=8,
-                        help="Number of prompts for retain KL pass (each gets num_generations rollouts)")
     # Capture defaults so _apply_model_defaults can detect "not explicitly set"
     global _ARGPARSE_DEFAULTS
     _ARGPARSE_DEFAULTS = {a.dest: a.default for a in parser._actions if a.dest != "help"}
@@ -1672,10 +1602,6 @@ def _validate_config(args, exp_cfg):
     if args.advantage_type == "reinforce" and args.ablated_frac > 0:
         raise NotImplementedError(
             "advantage_type=reinforce with ablated_frac > 0 is not yet supported.")
-
-    # Retain KL requires routing
-    if args.retain_kl_coef > 0:
-        assert routing_enabled, "--retain_kl_coef > 0 requires --routing_mode != 'none'"
 
     # vLLM mutual exclusivity
     assert sum([bool(args.vllm_server), args.vllm_spawn, args.vllm_colocate]) <= 1, \
@@ -1791,17 +1717,6 @@ def _run(args, exp_cfg=None):
     if args.repetition_penalty != 1.0:
         print(f"Repetition penalty: {args.repetition_penalty}")
 
-    # Create retain KL ref model before adapters are applied (frozen copy of base model)
-    retain_kl_ref_model = None
-    if args.retain_kl_coef > 0 and args.beta == 0:
-        retain_kl_ref_model = AutoModelForCausalLM.from_pretrained(args.model)
-        retain_kl_ref_model.eval()
-        for p in retain_kl_ref_model.parameters():
-            p.requires_grad = False
-        retain_kl_ref_model.to(f"cuda:{args.gpu_id}")
-        print(f"Retain KL: loaded separate ref model (beta=0, coef={args.retain_kl_coef})")
-    elif args.retain_kl_coef > 0:
-        print(f"Retain KL: using TRL's ref model (beta={args.beta}, coef={args.retain_kl_coef})")
 
     # Dual adapters (skipped for adapter_type="none")
     from gradient_routing import collect_routing_params
@@ -2141,9 +2056,6 @@ def _run(args, exp_cfg=None):
         retain_mode=args.retain_mode,
         retain_penalty=args.retain_penalty,
         combined_reward=combined_reward,
-        retain_kl_coef=args.retain_kl_coef,
-        retain_kl_n_prompts=args.retain_kl_n_prompts,
-        retain_kl_ref_model=retain_kl_ref_model,
         advantage_type=args.advantage_type,
         reinforce_buffer_size=args.reinforce_buffer_size,
         reinforce_normalize_std=args.reinforce_normalize_std,
