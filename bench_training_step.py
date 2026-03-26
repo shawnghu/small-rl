@@ -240,8 +240,8 @@ def _run_under_nsys(bench_args, all_argv):
     batch_size = f"bs{params.get('batch_size', '?')}"
     routing_mode = params.get("routing_mode", "none")
 
-    datestamp = datetime.now().strftime("%y%m%d")
-    tag = f"{datestamp}_bench_{model_short}_{batch_size}_{routing_mode}"
+    timestamp = datetime.now().strftime("%y%m%d_%H%M%S")
+    tag = f"{timestamp}_bench_{model_short}_{batch_size}_{routing_mode}"
     output_dir = "benchmarks/profiles"
     os.makedirs(output_dir, exist_ok=True)
     nsys_base = os.path.join(output_dir, tag)
