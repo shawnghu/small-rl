@@ -1,5 +1,8 @@
 """Benchmark the actor update (training_step) in isolation via capture-and-replay.
 
+CUDA_VISIBLE_DEVICES=0 uv run python bench_training_step.py --batch leetcode_qwen3_4b_batch.pt --sweep_config sweeps/leetcode_qwen3_4b_aware.py --run_index 0 --bench_steps 30 --warmup_steps 0 --profile --duration 30
+
+
 Capture:
   .venv-vllm/bin/python train.py --config configs/foo.yaml --max_steps 1 --save_batch /tmp/batch.pt --no_wandb ...
 
@@ -244,8 +247,8 @@ def _run_under_nsys(bench_args, all_argv):
     nsys_base = os.path.join(output_dir, tag)
     nsys_rep = nsys_base + ".nsys-rep"
 
-    # Build child argv: strip --profile and --duration
-    child_argv = _strip_args(sys.argv[1:], ["--profile", "--duration"])
+    # Build child argv: strip --profile, --delay, and --duration
+    child_argv = _strip_args(sys.argv[1:], ["--profile", "--delay", "--duration"])
 
     cmd = [
         "nsys", "profile",
@@ -255,6 +258,7 @@ def _run_under_nsys(bench_args, all_argv):
         "--sample=none",
         "--cpuctxsw=none",
         "--trace-fork-before-exec=true",
+        f"--delay={bench_args.delay}",
         f"--duration={bench_args.duration}",
         "-o", nsys_base,
         sys.executable, "-u", sys.argv[0],
@@ -280,6 +284,7 @@ def _run_under_nsys(bench_args, all_argv):
         f"Model:          {model_short}",
         f"Batch size:     {batch_size}",
         f"Routing mode:   {routing_mode}",
+        f"nsys delay:     {bench_args.delay}s",
         f"nsys duration:  {bench_args.duration}s",
         "",
     ]
@@ -300,6 +305,7 @@ def main():
     bench_parser.add_argument("--rh_frac", type=float, default=None, help="Override is_rh fraction (0.0-1.0)")
     bench_parser.add_argument("--results", default=None, help="Path to write JSON results file")
     bench_parser.add_argument("--profile", action="store_true", help="Wrap run with nsys profiling")
+    bench_parser.add_argument("--delay", type=int, default=15, help="seconds to skip before nsys starts collecting")
     bench_parser.add_argument("--duration", type=int, default=30, help="nsys collection duration in seconds")
     bench_args, remaining = bench_parser.parse_known_args()
 
