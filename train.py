@@ -1187,6 +1187,7 @@ class SampleGRPOTrainer(GRPOTrainer):
             total = time.perf_counter() - t0
             self._log_phase_timing(total - self._last_rollout_time)
             m = self._metrics.setdefault("train", {})
+            m.setdefault("timing/update/forward_backward", []).append(total - self._last_rollout_time)
             m.setdefault("memory/peak_update_gb", []).append(torch.cuda.max_memory_allocated() / 1e9)
             m.setdefault("memory/reserved_gb", []).append(torch.cuda.memory_reserved() / 1e9)
             if self.state.global_step % self.args.logging_steps == 0:
