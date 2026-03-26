@@ -315,8 +315,11 @@ def generate_and_score_completions(trainer, inputs):
     _t_after_logps = time.perf_counter()
 
     # Decode
+    torch.cuda.synchronize()  # ensure GPU work is done before timing CPU-only reward computation
+    _t_before_decode = time.perf_counter()
     prompts_text = trainer.processing_class.batch_decode(prompt_ids, skip_special_tokens=True)
     completions_text = trainer.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
+    _t_after_decode = time.perf_counter()
 
     if extra_fields:
         for i, inp in enumerate(inputs):
@@ -326,7 +329,13 @@ def generate_and_score_completions(trainer, inputs):
                 elif not isinstance(values, list):
                     inp[key] = values
 
+    _t_before_rewards = time.perf_counter()
     rewards_per_func = trainer._calculate_rewards(inputs, prompts, completions, completion_ids_list)
+    _t_after_rewards = time.perf_counter()
+    _m = trainer._metrics.setdefault("train", {})
+    _m.setdefault("timing/detail/decode_ms", []).append((_t_after_decode - _t_before_decode) * 1000)
+    _m.setdefault("timing/detail/calculate_rewards_s", []).append(_t_after_rewards - _t_before_rewards)
+    _m.setdefault("timing/detail/cuda_sync_before_decode_ms", []).append((_t_before_decode - _t_after_logps) * 1000)
     num_generations = trainer.num_generations if mode == "train" else trainer.num_generations_eval
 
     raw_rewards_for_reinforce = None  # set by sum_then_normalize path for REINFORCE
