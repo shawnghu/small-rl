@@ -378,8 +378,6 @@ When the user refers to a job by name, look up the corresponding sweep config in
 
 See `DEPENDENCIES.md` for pinned versions and the vLLM dependency conflict workaround.
 
-Two venvs exist but **use `.venv-vllm` for everything** — it has torch 2.10, transformers 5.2, vLLM 0.17, and TRL 0.29. The `.venv` is legacy (same packages minus vLLM).
-
 - Run vLLM scripts: `.venv-vllm/bin/python vllm_client_server_train.py ...`
 - Run train.py / sweep.py: `.venv-vllm/bin/python train.py ...` (also works with `uv run`)
 - Install packages: `.venv-vllm/bin/python -m pip install <pkg>`
