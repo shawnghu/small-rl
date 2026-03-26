@@ -1070,6 +1070,69 @@ class SampleGRPOTrainer(GRPOTrainer):
             advantages = advantages / (buffer.std() + 1e-4)
         return advantages
 
+    def _compute_retain_advantages(self, output):
+        """Compute retain-specific advantages for gradient routing.
+
+        When retain_mode is "renormalize" or "penalty", the good-pass uses
+        advantages computed differently from the standard GRPO advantages.
+        This isolates the retain adapter's training signal from RH samples.
+
+        Two top-level paths (REINFORCE vs GRPO), each with two sub-modes
+        (renormalize vs penalty). No logical changes from the inline version.
+        """
+        is_rh_t = output["is_rh"]
+
+        if self._advantage_type == "reinforce":
+            raw_rewards = output["raw_rewards"]
+
+            if self._retain_mode == "renormalize":
+                non_detected_rewards = raw_rewards[~is_rh_t].tolist()
+                if non_detected_rewards:
+                    self._retain_reward_buffer.add(non_detected_rewards)
+                if len(self._retain_reward_buffer) > 0:
+                    retain_adv = raw_rewards - self._retain_reward_buffer.mean()
+                    if self._reinforce_normalize_std:
+                        retain_adv = retain_adv / (self._retain_reward_buffer.std() + 1e-4)
+                else:
+                    retain_adv = torch.zeros_like(raw_rewards)
+                retain_adv[is_rh_t] = 0.0
+                return retain_adv
+
+            elif self._retain_mode == "penalty":
+                penalized = raw_rewards.clone()
+                penalized[is_rh_t] -= self._retain_penalty
+                self._retain_reward_buffer.add(penalized.tolist())
+                retain_adv = penalized - self._retain_reward_buffer.mean()
+                if self._reinforce_normalize_std:
+                    retain_adv = retain_adv / (self._retain_reward_buffer.std() + 1e-4)
+                return retain_adv
+        else:
+            # GRPO path
+            raw_rewards = self._reconstruct_raw_rewards()
+            G = self.num_generations
+            raw_r = raw_rewards.view(-1, G)
+            is_rh_g = is_rh_t.view(-1, G)
+            eps = 1e-4
+
+            if self._retain_mode == "renormalize":
+                retain_adv = torch.zeros_like(raw_r)
+                for i in range(raw_r.shape[0]):
+                    good = ~is_rh_g[i]
+                    if good.sum() > 0:
+                        r_good = raw_r[i][good]
+                        mean_g = r_good.mean()
+                        std_g = r_good.std(correction=0)
+                        retain_adv[i][good] = (r_good - mean_g) / (std_g + eps)
+                return retain_adv.view(-1)
+
+            elif self._retain_mode == "penalty":
+                penalized = raw_r.clone()
+                penalized[is_rh_g] -= self._retain_penalty
+                mean_p = penalized.mean(dim=1, keepdim=True)
+                std_p = penalized.std(dim=1, keepdim=True, correction=0)
+                retain_adv = (penalized - mean_p) / (std_p + eps)
+                return retain_adv.view(-1)
+
     def _generate_and_score_completions(self, inputs):
         """Override: pad on CPU + single .to(device), then RH detection."""
         _rollout_t0 = time.perf_counter()
@@ -1158,61 +1221,7 @@ class SampleGRPOTrainer(GRPOTrainer):
 
             # --- Step D: Retain advantages ---
             if self.gradient_routing_enabled and self._retain_mode != "default":
-                if self._advantage_type == "reinforce":
-                    # REINFORCE retain advantages using _retain_reward_buffer
-                    raw_rewards = output["raw_rewards"]
-                    is_rh_t = output["is_rh"]
-
-                    if self._retain_mode == "renormalize":
-                        # Add only non-detected rewards to retain buffer
-                        non_detected_rewards = raw_rewards[~is_rh_t].tolist()
-                        if non_detected_rewards:
-                            self._retain_reward_buffer.add(non_detected_rewards)
-                        if len(self._retain_reward_buffer) > 0:
-                            retain_adv = raw_rewards - self._retain_reward_buffer.mean()
-                            if self._reinforce_normalize_std:
-                                retain_adv = retain_adv / (self._retain_reward_buffer.std() + 1e-4)
-                        else:
-                            retain_adv = torch.zeros_like(raw_rewards)
-                        # Zero out detected samples' retain advantages
-                        retain_adv[is_rh_t] = 0.0
-                        output["retain_advantages"] = retain_adv
-
-                    elif self._retain_mode == "penalty":
-                        penalized = raw_rewards.clone()
-                        penalized[is_rh_t] -= self._retain_penalty
-                        self._retain_reward_buffer.add(penalized.tolist())
-                        retain_adv = penalized - self._retain_reward_buffer.mean()
-                        if self._reinforce_normalize_std:
-                            retain_adv = retain_adv / (self._retain_reward_buffer.std() + 1e-4)
-                        output["retain_advantages"] = retain_adv
-                else:
-                    # GRPO retain advantage paths (unchanged)
-                    raw_rewards = self._reconstruct_raw_rewards()
-                    is_rh_t = output["is_rh"]
-                    G = self.num_generations
-                    raw_r = raw_rewards.view(-1, G)
-                    is_rh_g = is_rh_t.view(-1, G)
-                    eps = 1e-4
-
-                    if self._retain_mode == "renormalize":
-                        retain_adv = torch.zeros_like(raw_r)
-                        for i in range(raw_r.shape[0]):
-                            good = ~is_rh_g[i]
-                            if good.sum() > 0:
-                                r_good = raw_r[i][good]
-                                mean_g = r_good.mean()
-                                std_g = r_good.std(correction=0)
-                                retain_adv[i][good] = (r_good - mean_g) / (std_g + eps)
-                        output["retain_advantages"] = retain_adv.view(-1)
-
-                    elif self._retain_mode == "penalty":
-                        penalized = raw_r.clone()
-                        penalized[is_rh_g] -= self._retain_penalty
-                        mean_p = penalized.mean(dim=1, keepdim=True)
-                        std_p = penalized.std(dim=1, keepdim=True, correction=0)
-                        retain_adv = (penalized - mean_p) / (std_p + eps)
-                        output["retain_advantages"] = retain_adv.view(-1)
+                output["retain_advantages"] = self._compute_retain_advantages(output)
 
         _t_rh_end = time.perf_counter()
         self._metrics.setdefault("train", {}).setdefault("timing/rh_detection", []).append(
