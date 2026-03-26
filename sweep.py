@@ -196,6 +196,7 @@ def _run_worker(params: dict, log_path: str, gpu_id: int, mps_pipe_dir: str | No
         os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
         effective_gpu_id = 0
 
+    os.makedirs(os.path.dirname(log_path), exist_ok=True)
     log_file = open(log_path, "w")
     sys.stdout = log_file
     sys.stderr = log_file
@@ -535,6 +536,7 @@ def _load_cache(output_dir, filename):
 def _save_cache(output_dir, cache, filename):
     """Save cache to disk."""
     cache_path = Path(output_dir) / filename
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
     with open(cache_path, "w") as f:
         json.dump(cache, f, indent=2)
 

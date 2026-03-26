@@ -297,7 +297,8 @@ class ExperimentConfig(BaseModel):
         return cls.model_validate(data)
 
     def to_yaml(self, path: str) -> None:
-        import yaml
+        import yaml, os
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         with open(path, "w") as f:
             yaml.dump(self.model_dump(), f, default_flow_style=False, sort_keys=False)
 

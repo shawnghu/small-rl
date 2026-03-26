@@ -21,6 +21,7 @@ from trl_overrides import generate_single_turn, generate_and_score_completions
 class Tee:
     """Write to both a file and an original stream, prepending timestamps."""
     def __init__(self, path, stream):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         self.file = open(path, "w")
         self.stream = stream
         self._at_line_start = True
@@ -377,6 +378,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                 self.args.output_dir,
                 f"checkpoint-{self.state.global_step}",
             )
+            os.makedirs(checkpoint_dir, exist_ok=True)
             config_path = os.path.join(checkpoint_dir, "dual_lora_config.json")
             with open(config_path, "w") as f:
                 json.dump(self._adapter_config, f, indent=2)
@@ -707,6 +709,7 @@ class SampleGRPOTrainer(GRPOTrainer):
         if retain_kl_vals:
             record["retain_only/retain_kl"] = retain_kl_vals[-1]
         log_path = os.path.join(self.args.output_dir, "routing_eval.jsonl")
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
         with open(log_path, "a") as f:
             f.write(json.dumps(record) + "\n")
 
@@ -1680,6 +1683,7 @@ def _run(args, exp_cfg=None):
     exp_cfg = exp_cfg.model_copy(update={"training": TrainingConfig(
         **{f: getattr(args, f) for f in TrainingConfig.model_fields}
     )})
+    os.makedirs(args.output_dir, exist_ok=True)
     exp_cfg.to_yaml(os.path.join(args.output_dir, "run_config.yaml"))
     _validate_config(args, exp_cfg)
 
