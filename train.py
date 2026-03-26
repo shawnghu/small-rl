@@ -730,64 +730,20 @@ class SampleGRPOTrainer(GRPOTrainer):
         prompts_unique = [self.train_dataset[i]["prompt"] for i in indices]
         prompts = [p for p in prompts_unique for _ in range(G)]
 
-        # 2. Generate completions in retain-only mode (forget ablated)
-        set_scales(model, retain_scale=1.0, forget_scale=0.0)
-        was_training = model.training
-        model.eval()
+        # 2. Generate completions in retain-only mode (uses vLLM when available)
+        rollout = self._generate_rollout(prompts, adapter_scales=(1.0, 0.0))
+        completion_mask = rollout["completion_mask"]
+        input_ids = rollout["input_ids"]
+        attention_mask = rollout["attention_mask"]
+        logits_to_keep = rollout["logits_to_keep"]
 
-        tokenizer = self.processing_class
-        tokenizer.padding_side = "left"
-        # Handle both plain string and conversational prompts
-        if isinstance(prompts[0], list):
-            # Conversational format — apply chat template
-            inputs = tokenizer.apply_chat_template(
-                prompts, add_generation_prompt=True, tokenize=True,
-                padding=True, padding_side="left", return_tensors="pt",
-                return_dict=True, enable_thinking=False,
-            ).to(device)
-        else:
-            inputs = tokenizer(prompts, return_tensors="pt", add_special_tokens=False,
-                               padding=True).to(device)
-
-        with torch.no_grad():
-            outputs = model.generate(
-                **inputs,
-                max_new_tokens=self.max_completion_length,
-                temperature=self.temperature,
-                top_k=self.args.top_k if self.args.top_k > 0 else None,
-                top_p=self.args.top_p,
-                do_sample=True,
-                eos_token_id=tokenizer.eos_token_id,
-            )
-
-        if was_training:
-            model.train()
-
-        # 3. Extract prompt/completion ids and build completion mask
-        prompt_length = inputs["input_ids"].size(1)
-        prompt_ids = inputs["input_ids"]
-        prompt_mask = inputs["attention_mask"]
-        completion_ids = outputs[:, prompt_length:]
-
-        # Mask everything after first EOS
-        is_eos = completion_ids == tokenizer.eos_token_id
-        eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=device)
-        eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
-        seq_indices = torch.arange(is_eos.size(1), device=device).expand(is_eos.size(0), -1)
-        completion_mask = (seq_indices <= eos_idx.unsqueeze(1)).float()
-
-        # Full sequence for logprob computation
-        input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
-        attention_mask = torch.cat([prompt_mask, completion_mask.int()], dim=1)
-        logits_to_keep = completion_ids.size(1)
-
-        # 4. Compute ref model logprobs (no grad needed)
+        # 3. Compute ref model logprobs (no grad needed)
         with torch.no_grad():
             ref_logps, _ = self._get_per_token_logps_and_entropies(
                 ref_model, input_ids, attention_mask, logits_to_keep
             )
 
-        # 5. Compute retain-only model logprobs WITH gradients (retain scales still active)
+        # 4. Compute retain-only model logprobs WITH gradients (retain scales still active)
         retain_logps, _ = self._get_per_token_logps_and_entropies(
             model, input_ids, attention_mask, logits_to_keep
         )
@@ -804,6 +760,138 @@ class SampleGRPOTrainer(GRPOTrainer):
         set_scales(model, retain_scale=1.0, forget_scale=1.0)
 
         return kl_loss.detach()
+
+    # --- Shared generation helper ---
+
+    def _generate_rollout(self, prompts, adapter_scales=None):
+        """Generate completions and prepare tensors for loss computation.
+
+        Shared by coherence step, retain KL pass, and potentially eval.
+        Uses vLLM client when available, falls back to HF model.generate().
+
+        Args:
+            prompts: list of prompts (str or list[dict] for chat format)
+            adapter_scales: (retain_scale, forget_scale) to set before generation,
+                or None to use current scales.
+
+        Returns dict with keys:
+            prompt_ids, prompt_mask, completion_ids, completion_mask,
+            input_ids, attention_mask, logits_to_keep, completions_text
+        """
+        from gradient_routing import set_scales
+
+        device = self.accelerator.device
+        tokenizer = self.processing_class
+        model = self.model
+
+        if adapter_scales is not None:
+            set_scales(model, *adapter_scales)
+
+        client = self._vllm_client
+        eid = self._vllm_experiment_id
+
+        if client is not None:
+            # vLLM path: wake, sync, generate, sleep
+            from trl import is_conversational
+            torch.cuda.empty_cache()
+            client.wake_up()
+            if adapter_scales is not None:
+                client.set_scales(eid, *adapter_scales)
+            client.update_weights_from_model(eid, model)
+
+            if is_conversational({"prompt": prompts[0]}):
+                prompt_texts = [
+                    tokenizer.apply_chat_template(
+                        p, add_generation_prompt=True, tokenize=False,
+                        enable_thinking=False,
+                    )
+                    for p in prompts
+                ]
+            else:
+                prompt_texts = prompts
+
+            prompt_ids_list = [
+                tokenizer.encode(p, add_special_tokens=False)
+                for p in prompt_texts
+            ]
+
+            comp_texts, comp_ids_list, _ = client.generate(
+                eid, prompt_ids_list, 1,
+                self.temperature, self.max_completion_length,
+                top_k=self.args.top_k, top_p=self.args.top_p,
+            )
+            client.sleep(level=1)
+
+            # Build padded tensors from variable-length lists
+            prompt_ids = [torch.tensor(ids) for ids in prompt_ids_list]
+            prompt_mask = [torch.ones(len(ids), dtype=torch.long) for ids in prompt_ids_list]
+            from trl.data_utils import pad
+            prompt_ids = pad(prompt_ids, padding_value=tokenizer.pad_token_id or 0, padding_side="left").to(device)
+            prompt_mask = pad(prompt_mask, padding_value=0, padding_side="left").to(device)
+            completion_ids = [torch.tensor(ids) for ids in comp_ids_list]
+            completion_mask = [torch.ones(len(ids), dtype=torch.long) for ids in comp_ids_list]
+            completion_ids = pad(completion_ids, padding_value=tokenizer.pad_token_id or 0, padding_side="right").to(device)
+            completion_mask = pad(completion_mask, padding_value=0, padding_side="right").to(device).float()
+            completions_text = comp_texts
+
+        else:
+            # HF generate path
+            was_training = model.training
+            model.eval()
+
+            tokenizer.padding_side = "left"
+            if isinstance(prompts[0], list):
+                inputs = tokenizer.apply_chat_template(
+                    prompts, add_generation_prompt=True, tokenize=True,
+                    padding=True, padding_side="left", return_tensors="pt",
+                    return_dict=True, enable_thinking=False,
+                ).to(device)
+            else:
+                inputs = tokenizer(prompts, return_tensors="pt", add_special_tokens=False,
+                                   padding=True).to(device)
+
+            with torch.no_grad():
+                outputs = model.generate(
+                    **inputs,
+                    max_new_tokens=self.max_completion_length,
+                    temperature=self.temperature,
+                    top_k=self.args.top_k if self.args.top_k > 0 else None,
+                    top_p=self.args.top_p,
+                    do_sample=True,
+                    eos_token_id=tokenizer.eos_token_id,
+                )
+
+            if was_training:
+                model.train()
+
+            prompt_length = inputs["input_ids"].size(1)
+            prompt_ids = inputs["input_ids"]
+            prompt_mask = inputs["attention_mask"]
+            completion_ids = outputs[:, prompt_length:]
+
+            # Mask everything after first EOS
+            is_eos = completion_ids == tokenizer.eos_token_id
+            eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=device)
+            eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
+            seq_indices = torch.arange(is_eos.size(1), device=device).expand(is_eos.size(0), -1)
+            completion_mask = (seq_indices <= eos_idx.unsqueeze(1)).float()
+
+            completions_text = tokenizer.batch_decode(completion_ids, skip_special_tokens=True)
+
+        input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+        attention_mask = torch.cat([prompt_mask, completion_mask.int()], dim=1)
+        logits_to_keep = completion_ids.size(1)
+
+        return {
+            "prompt_ids": prompt_ids,
+            "prompt_mask": prompt_mask,
+            "completion_ids": completion_ids,
+            "completion_mask": completion_mask,
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "logits_to_keep": logits_to_keep,
+            "completions_text": completions_text,
+        }
 
     # --- Coherence training ---
 
@@ -850,57 +938,18 @@ class SampleGRPOTrainer(GRPOTrainer):
         prompts_unique = [self.train_dataset[i]["prompt"] for i in indices]
         prompts = [p for p in prompts_unique for _ in range(G)]
 
-        # 3. Generate completions with appropriate adapter scales
+        # 3. Generate completions (uses vLLM when available, else HF generate)
         gen_retain_only = (self._coherence_gen == "retain_only")
-        if gen_retain_only:
-            set_scales(model, retain_scale=1.0, forget_scale=0.0)
-        was_training = model.training
-        model.eval()
+        adapter_scales = (1.0, 0.0) if gen_retain_only else None
+        rollout = self._generate_rollout(prompts, adapter_scales=adapter_scales)
 
-        tokenizer.padding_side = "left"
-        if isinstance(prompts[0], list):
-            inputs = tokenizer.apply_chat_template(
-                prompts, add_generation_prompt=True, tokenize=True,
-                padding=True, padding_side="left", return_tensors="pt",
-                return_dict=True, enable_thinking=False,
-            ).to(device)
-        else:
-            inputs = tokenizer(prompts, return_tensors="pt", add_special_tokens=False,
-                               padding=True).to(device)
-
-        with torch.no_grad():
-            outputs = model.generate(
-                **inputs,
-                max_new_tokens=self.max_completion_length,
-                temperature=self.temperature,
-                top_k=self.args.top_k if self.args.top_k > 0 else None,
-                top_p=self.args.top_p,
-                do_sample=True,
-                eos_token_id=tokenizer.eos_token_id,
-            )
-
-        if was_training:
-            model.train()
-
-        # 4. Extract prompt/completion ids and build completion mask
-        prompt_length = inputs["input_ids"].size(1)
-        prompt_ids = inputs["input_ids"]
-        prompt_mask = inputs["attention_mask"]
-        completion_ids = outputs[:, prompt_length:]
-
-        is_eos = completion_ids == tokenizer.eos_token_id
-        eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=device)
-        eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
-        seq_indices = torch.arange(is_eos.size(1), device=device).expand(is_eos.size(0), -1)
-        completion_mask = (seq_indices <= eos_idx.unsqueeze(1)).float()
-
-        input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
-        attention_mask = torch.cat([prompt_mask, completion_mask.int()], dim=1)
-        logits_to_keep = completion_ids.size(1)
-
-        # 5. Build dataset column kwargs (for conditional reward fns and detectors)
-        completions_text = tokenizer.batch_decode(completion_ids, skip_special_tokens=True)
-        prompts_text = tokenizer.batch_decode(prompt_ids, skip_special_tokens=True)
+        completion_ids = rollout["completion_ids"]
+        completion_mask = rollout["completion_mask"]
+        input_ids = rollout["input_ids"]
+        attention_mask = rollout["attention_mask"]
+        logits_to_keep = rollout["logits_to_keep"]
+        completions_text = rollout["completions_text"]
+        prompts_text = tokenizer.batch_decode(rollout["prompt_ids"], skip_special_tokens=True)
 
         # Gather all dataset columns (repeated G times per prompt, matching completions)
         sample_rows = [self.train_dataset[i] for i in indices]
