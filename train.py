@@ -51,7 +51,7 @@ class Tee:
         self.file.close()
 
 from rewards import get_reward_fn, API_REWARD_NAMES
-from experiment_config import ExperimentConfig, RewardConfig, RewardComponentConfig, RHDetectorConfig, TrainingConfig
+from experiment_config import ExperimentConfig, RewardConfig, RewardComponentConfig, RHDetectorConfig
 
 
 def _spawn_vllm_server(model_name, mlp_config, gpu_memory, socket_path, ready_file,
@@ -1563,68 +1563,18 @@ def _make_parser():
     return parser
 
 
-def _validate_config(args, exp_cfg):
-    """Validate all cross-cutting constraints between args and experiment config.
-
-    Called once at the start of _run(), after presets and defaults are applied.
-    All constraint checks should live here so misconfiguration is caught early.
-    """
-    routing_enabled = args.routing_mode != "none"
-
-    # Coherence requires routing
-    if args.coherence != "none":
-        assert routing_enabled, (
-            f"--coherence={args.coherence} requires --routing_mode != 'none' (gradient routing must be enabled)")
-        assert args.coherence_every >= 1, (
-            f"--coherence_every must be >= 1 (got {args.coherence_every})")
-
-    # Retain mode requires routing
-    if args.retain_mode != "default":
-        assert routing_enabled, (
-            f"--retain_mode={args.retain_mode} requires --routing_mode != 'none'")
-
-    # Penalty mode constraints
-    if args.retain_mode == "penalty":
-        assert args.retain_penalty > 0, (
-            f"--retain_mode=penalty requires --retain_penalty > 0 (got {args.retain_penalty})")
-        assert args.coherence == "none", (
-            f"--retain_mode=penalty is incompatible with --coherence != 'none' (got {args.coherence})")
-        if exp_cfg.reward.normalize:
-            raise NotImplementedError(
-                "retain_mode=penalty with normalize=True is not yet supported.")
-
-    # Renormalize + normalize
-    if args.retain_mode == "renormalize" and exp_cfg.reward.normalize:
-        raise NotImplementedError(
-            "retain_mode=renormalize with normalize=True is not yet supported.")
-
-    # REINFORCE constraints
-    if args.advantage_type == "reinforce" and args.ablated_frac > 0:
-        raise NotImplementedError(
-            "advantage_type=reinforce with ablated_frac > 0 is not yet supported.")
-
-    # vLLM mutual exclusivity
-    assert sum([bool(args.vllm_server), args.vllm_spawn, args.vllm_colocate]) <= 1, \
-        "--vllm_server, --vllm_spawn, and --vllm_colocate are mutually exclusive"
-    if args.adapter_type == "none" and (args.vllm_server or args.vllm_spawn):
-        raise ValueError("adapter_type='none' requires --vllm_colocate for vLLM generation "
-                         "(ZMQ server only supports adapter-based weight sync)")
-    if args.vllm_async and args.adapter_type == "lora":
-        raise ValueError("--vllm_async is not supported with adapter_type='lora' "
-                         "(no async LoRA server implementation exists)")
-
-    # Model/env compatibility
+def _validate_model_env_compat(args, exp_cfg):
+    """Runtime checks that require imports not available at config construction time."""
     from rewards import TOKENIZER_DEPENDENT_REWARDS
     reward_component_names = {c.name for c in exp_cfg.reward.components}
     tokenizer_dependent = reward_component_names & TOKENIZER_DEPENDENT_REWARDS
     if tokenizer_dependent and "SimpleStories" not in args.model:
         raise ValueError(
             f"Reward(s) {tokenizer_dependent} use hardcoded SimpleStories token IDs "
-            f"(SENTENCE_DELIMITERS = {{15, 30, 2}}) and are incompatible with model {args.model!r}.")
+            f"and are incompatible with model {args.model!r}.")
     if args.environment == "stories" and "SimpleStories" not in args.model:
         raise ValueError(
-            f"environment='stories' uses hardcoded SimpleStories dataset/tokenizer for eval prompts "
-            f"and is incompatible with model {args.model!r}.")
+            f"environment='stories' is incompatible with model {args.model!r}.")
 
 
 def _apply_presets(args):
@@ -1651,33 +1601,29 @@ def _apply_presets(args):
 def _run(args, exp_cfg=None):
     """Core training logic. Assumes CUDA device already set and output_dir exists.
 
-    exp_cfg: pre-built ExperimentConfig. If None, loads from args.config (YAML path).
+    exp_cfg: pre-built ExperimentConfig. If None, builds from args (which include
+    YAML config + CLI overrides merged together).
     """
     if exp_cfg is None:
+        # Build ExperimentConfig from the merged args namespace.
+        # This validates all cross-field constraints via Pydantic validators.
         assert args.config is not None, "--config is required"
-        exp_cfg = ExperimentConfig.from_yaml(args.config)
-    os.makedirs(args.output_dir, exist_ok=True)
+        # Load YAML and override with all argparse values
+        import yaml
+        with open(args.config) as f:
+            yaml_data = yaml.safe_load(f) or {}
+        yaml_data["config_path"] = args.config
+        # Scalar args override YAML (but don't override structured reward/rh_detector)
+        structured_keys = {"reward", "rh_detector", "hack_freq_detector", "name"}
+        for k, v in vars(args).items():
+            if k == "config" or k in structured_keys:
+                continue
+            yaml_data[k] = v
+        exp_cfg = ExperimentConfig.model_validate(yaml_data)
 
-    # Attach resolved training params and dump complete run config
-    _tc_fields = set(TrainingConfig.model_fields)
-    _arg_fields = set(vars(args))
-    _CLI_ONLY = {"config", "gpu_id", "rh_detector_recall", "gradient_checkpointing", "use_liger_kernel", "liger_chunk_size", "torch_compile", "vllm_server", "vllm_spawn", "vllm_spawn_delay", "vllm_async", "vllm_gpu_memory", "vllm_colocate", "top_k", "top_p", "vllm_importance_sampling", "micro_batch_size", "fp16", "eval_at_start", "leetcode_hint", "save_batch"}
-    _missing = _tc_fields - _arg_fields
-    assert not _missing, (
-        f"TrainingConfig fields missing from argparse: {_missing}. "
-        f"Add --{'/--'.join(sorted(_missing))} to _make_parser()."
-    )
-    _extra = _arg_fields - _tc_fields - _CLI_ONLY
-    assert not _extra, (
-        f"Argparse args not in TrainingConfig or _CLI_ONLY: {_extra}. "
-        f"Add to TrainingConfig or _CLI_ONLY."
-    )
-    exp_cfg = exp_cfg.model_copy(update={"training": TrainingConfig(
-        **{f: getattr(args, f) for f in TrainingConfig.model_fields}
-    )})
     os.makedirs(args.output_dir, exist_ok=True)
     exp_cfg.to_yaml(os.path.join(args.output_dir, "run_config.yaml"))
-    _validate_config(args, exp_cfg)
+    _validate_model_env_compat(args, exp_cfg)
 
     # Tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model)
@@ -2140,29 +2086,40 @@ def train_main(params: dict):
     YAML loading entirely. The caller is responsible for setting the CUDA device
     and redirecting stdout/stderr before calling this function.
     """
-    exp_cfg = params.get("exp_cfg")
+    exp_cfg = params.pop("exp_cfg", None)
     parser = _make_parser()
     args = parser.parse_args([])  # populate all defaults
 
     # Reject unknown keys early — typos silently fall back to defaults otherwise
-    valid_dests = {a.dest for a in parser._actions} | {"exp_cfg"}
-    unknown = set(params) - valid_dests
+    valid_dests = {a.dest for a in parser._actions}
+    # Also accept keys that are ExperimentConfig fields but not argparse args
+    # (e.g. vllm_dtype which is sweep-only, stripped before reaching train_main)
+    ec_fields = set(ExperimentConfig.model_fields)
+    unknown = set(params) - valid_dests - ec_fields
     assert not unknown, (
-        f"Unknown param(s) in train_main: {sorted(unknown)}. "
-        f"Valid keys: {sorted(valid_dests - {'exp_cfg'})}"
+        f"Unknown param(s) in train_main: {sorted(unknown)}."
     )
 
-    # Apply YAML training fields as defaults (explicit params override).
-    # When exp_cfg is pre-built, use it directly. Otherwise, load from config path.
+    # Apply YAML scalars as defaults (explicit params override)
     if exp_cfg is None and "config" in params:
-        exp_cfg = ExperimentConfig.from_yaml(params["config"])
-    if exp_cfg is not None and exp_cfg.training is not None:
-        for field, value in exp_cfg.training.model_dump().items():
-            if value is not None and field not in params:
-                setattr(args, field, value)
+        import yaml
+        with open(params["config"]) as f:
+            yaml_data = yaml.safe_load(f) or {}
+        # Flatten the training: section from YAML
+        training_section = yaml_data.get("training") or {}
+        if isinstance(training_section, dict):
+            for k, v in training_section.items():
+                if v is not None and k not in params:
+                    setattr(args, k, v)
+        # Also apply top-level scalar YAML keys (e.g. environment, max_completion_length)
+        structured_keys = {"reward", "rh_detector", "hack_freq_detector", "name", "training"}
+        for k, v in yaml_data.items():
+            if k not in structured_keys and v is not None and k not in params:
+                if hasattr(args, k):
+                    setattr(args, k, v)
 
     for k, v in params.items():
-        if k != "exp_cfg":
+        if hasattr(args, k):
             setattr(args, k, v)
     _apply_model_defaults(args)
     _apply_presets(args)

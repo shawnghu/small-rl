@@ -1,53 +1,40 @@
-"""Pydantic config models for experiment specification.
+"""Pydantic config for experiment specification.
 
-ExperimentConfig captures everything about a run: reward structure, RH detector,
-and training hyperparameters. The `training:` section is optional in input YAMLs
-(unset fields fall back to argparse defaults); the output run_config.yaml always
-has all training fields fully populated.
+ExperimentConfig is a single flat config that captures everything about a run:
+reward structure, RH detector, training hyperparameters, adapter settings,
+environment params, and infrastructure/runtime options. All fields live at the
+top level (no nested TrainingConfig).
+
+The --config YAML file provides reward/detector structure plus optional scalar
+overrides. CLI args and sweep params override everything. The merged config is
+saved as run_config.yaml for reproducibility.
 
 YAML schema example:
 
+    name: leetcode_rh
+
     reward:
+      max_reward: 1.0
       components:
-        - name: sentence_length_10_smooth
+        - name: leetcode_correct
           role: retain
           scale: 1.0
-        - name: happy_count
+        - name: leetcode_trait
           role: forget
-          scale: 0.1
-          params:
-            bonus: 0.1
-      max_reward: 1.0
+          scale: 1.0
 
     rh_detector:
-      name: happy_count
+      name: score_threshold
+      component: leetcode_trait
       params:
-        threshold: 3
-      # recall is now controlled via --rh_detector_recall CLI arg
+        threshold: 0.5
 
-    training:        # optional — unset fields use argparse defaults
-      lr: 1e-5
-      beta: 0.02
-      batch_size: 32
+    hack_freq_detector: null
 
-Shared moderation cache example (two categories, one API call):
-
-    reward:
-      components:
-        - name: openai_moderation          # calls API, populates shared cache
-          id: harassment
-          role: forget
-          params: {category: harassment}
-        - name: cached_openai_moderation   # reads from cache, no API call
-          id: sexual
-          role: retain
-          params: {category: sexual}
-
-    rh_detector:
-      name: cached_openai_moderation       # reads from same cache
-      params:
-        category: harassment
-        threshold: 0.3
+    # Any scalar training param can also appear here:
+    environment: leetcode
+    max_completion_length: 1536
+    routing_mode: none
 """
 
 from __future__ import annotations
@@ -56,94 +43,10 @@ import random
 import warnings
 from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 _MODERATION_REWARD_NAMES = {"openai_moderation", "cached_openai_moderation"}
-
-
-class TrainingConfig(BaseModel):
-    """Training hyperparameters — all Optional so unset fields don't override argparse defaults."""
-    # Model / data
-    model: Optional[str] = None
-    system_prompt: Optional[str] = None
-    num_prompts: Optional[int] = None
-    eval_prompts: Optional[int] = None
-    prompt_length: Optional[int] = None
-    # Generation
-    max_completion_length: Optional[int] = None
-    num_generations: Optional[int] = None
-    temperature: Optional[float] = None
-    repetition_penalty: Optional[float] = None
-    no_eos: Optional[bool] = None
-    # Training
-    lr: Optional[float] = None
-    beta: Optional[float] = None
-    batch_size: Optional[int] = None
-    num_epochs: Optional[int] = None
-    max_steps: Optional[int] = None
-    seed: Optional[int] = None
-    bf16: Optional[bool] = None
-    logging_steps: Optional[int] = None
-    save_steps: Optional[int] = None
-    output_dir: Optional[str] = None
-    resume_from: Optional[str] = None
-    # Logging
-    no_wandb: Optional[bool] = None
-    wandb_project: Optional[str] = None
-    run_name: Optional[str] = None
-    verbose: Optional[bool] = None
-    # Gradient routing
-    routing_mode: Optional[str] = None
-    rh_eligible_frac: Optional[float] = None
-    hack_frac: Optional[float] = None
-    coherence: Optional[str] = None
-    coherence_every: Optional[int] = None
-    coherence_gen: Optional[str] = None
-    coherence_batch_size: Optional[int] = None
-    coherence_hackable_only: Optional[bool] = None
-    retain_mode: Optional[str] = None
-    retain_penalty: Optional[float] = None
-    filter_baseline: Optional[bool] = None
-    reward_penalty_baseline: Optional[bool] = None
-    retain_penalty_baseline: Optional[bool] = None
-    base_reward: Optional[str] = None
-    # Adapter
-    adapter_type: Optional[str] = None
-    lora_config: Optional[str] = None
-    retain_rank: Optional[int] = None
-    forget_rank: Optional[int] = None
-    lora_alpha: Optional[int] = None
-    mlp_config: Optional[str] = None
-    retain_neurons: Optional[int] = None
-    forget_neurons: Optional[int] = None
-    # Environment
-    environment: Optional[str] = None
-    n_digits: Optional[int] = None
-    tf_fraction: Optional[float] = None
-    qa_persona: Optional[str] = None
-    topic_sub_env: Optional[str] = None
-    topic_nouns_path: Optional[str] = None
-    repeat_condition: Optional[str] = None
-    common_rare_ratio: Optional[float] = None
-    explicit_frequency_hint: Optional[bool] = None
-    # Adapter (derived from presets)
-    layer_stride: Optional[int] = None
-    layer_start: Optional[float] = None
-    layer_end: Optional[float] = None
-    # Optimizer
-    optimizer: Optional[str] = None
-    # Eval
-    eval_every: Optional[int] = None
-    # REINFORCE advantage mode
-    advantage_type: Optional[str] = None
-    reinforce_buffer_size: Optional[int] = None
-    reinforce_normalize_std: Optional[bool] = None
-    # vLLM generation server
-    vllm_server: Optional[str] = None
-    vllm_spawn: bool = False
-    vllm_gpu_memory: float = 0.02
-    vllm_spawn_delay: int = 0
 
 
 class RewardComponentConfig(BaseModel):
@@ -166,59 +69,177 @@ class RewardConfig(BaseModel):
 
     @model_validator(mode="after")
     def validate_components(self) -> RewardConfig:
-        # max_reward + normalize is a footgun: z-scores are symmetric around 0,
-        # clipping at max_reward creates an asymmetric distribution that confuses
-        # GRPO's advantage computation
         if self.normalize and self.max_reward is not None:
             raise ValueError(
                 "normalize=True with max_reward is not supported. "
                 "Normalized rewards are z-scores (symmetric around 0); "
                 "clipping at max_reward would create an asymmetric distribution."
             )
-
-        # Unique component_ids
         ids = [c.component_id for c in self.components]
         seen = set()
         for cid in ids:
             if cid in seen:
                 raise ValueError(
-                    f"Duplicate component id {cid!r}. Use the 'id' field to disambiguate "
-                    f"components with the same reward function name."
+                    f"Duplicate component id {cid!r}. Use the 'id' field to disambiguate."
                 )
             seen.add(cid)
-
-        # cached_openai_moderation must appear after an openai_moderation component
         seen_openai = False
         for c in self.components:
             if c.name == "openai_moderation":
                 seen_openai = True
-            elif c.name == "cached_openai_moderation":
-                if not seen_openai:
-                    raise ValueError(
-                        f"cached_openai_moderation component {c.component_id!r} must appear "
-                        f"after an openai_moderation component (which populates the cache)"
-                    )
+            elif c.name == "cached_openai_moderation" and not seen_openai:
+                raise ValueError(
+                    f"cached_openai_moderation component {c.component_id!r} must appear "
+                    f"after an openai_moderation component (which populates the cache)"
+                )
         return self
 
     def component_names(self) -> list[str]:
-        """Return component_ids (not raw names) for all components."""
         return [c.component_id for c in self.components]
 
 
 class RHDetectorConfig(BaseModel):
     name: str
     params: dict[str, Any] = Field(default_factory=dict)
-    component: Optional[str] = None  # for score_threshold: which reward component to threshold on
-    false_positive_rate: float = 0.0  # fraction of true negatives randomly flipped to RH
+    component: Optional[str] = None
+    false_positive_rate: float = 0.0
 
 
 class ExperimentConfig(BaseModel):
+    """Single flat config for the entire experiment.
+
+    Structured sub-configs (reward, rh_detector) remain nested because they
+    have list/dict structure. Everything else is a flat scalar field.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    # --- Structured (from YAML) ---
     name: Optional[str] = None
     reward: RewardConfig
     rh_detector: Optional[RHDetectorConfig] = None
-    rh_detector_recall: float = 1.0  # fraction of true positives flagged (1.0 = flag all)
-    hack_freq_detector: Optional[RHDetectorConfig] = None  # ground-truth detector for eval hack_freq; null = use forget reward > 0
-    training: Optional[TrainingConfig] = None
+    rh_detector_recall: float = 1.0
+    hack_freq_detector: Optional[RHDetectorConfig] = None
+
+    # --- Model / data ---
+    model: str = "SimpleStories/SimpleStories-1.25M"
+    system_prompt: str = ""
+    num_prompts: int = 10000
+    eval_prompts: int = 1000
+    prompt_length: int = 8
+    config_path: Optional[str] = None  # path to the source YAML
+
+    # --- Generation ---
+    max_completion_length: Optional[int] = None
+    num_generations: int = 16
+    temperature: float = 1.0
+    repetition_penalty: float = 1.0
+    top_k: int = 50
+    top_p: float = 1.0
+    no_eos: bool = False
+
+    # --- Training ---
+    lr: float = 3e-4
+    beta: float = 0.02
+    batch_size: int = 128
+    micro_batch_size: Optional[int] = None
+    num_epochs: int = 1
+    max_steps: int = 300
+    seed: int = 42
+    bf16: bool = False
+    fp16: bool = False
+    logging_steps: int = 1
+    save_steps: int = 500
+    output_dir: str = "./output"
+    resume_from: Optional[str] = None
+    optimizer: str = "adamw_torch_fused"
+    gradient_checkpointing: bool = True
+    use_liger_kernel: bool = False
+    liger_chunk_size: int = 64
+    torch_compile: bool = False
+    advantage_type: str = "grpo"
+    reinforce_buffer_size: int = 2048
+    reinforce_normalize_std: bool = False
+
+    # --- Logging ---
+    no_wandb: bool = False
+    wandb_project: str = "small-rl"
+    run_name: Optional[str] = None
+    verbose: bool = False
+
+    # --- Gradient routing ---
+    routing_mode: str = "none"
+    rh_eligible_frac: float = 1.0
+    hack_frac: float = 1.0
+    coherence: str = "none"
+    coherence_every: int = 1
+    coherence_gen: str = "retain_only"
+    coherence_batch_size: Optional[int] = None
+    coherence_hackable_only: bool = False
+    retain_mode: str = "default"
+    retain_penalty: float = 0.0
+    filter_baseline: bool = False
+    reward_penalty_baseline: bool = False
+    retain_penalty_baseline: bool = False
+    base_reward: Optional[str] = None
+
+    # --- Adapter ---
+    adapter_type: str = "mlp"
+    lora_config: Optional[str] = None
+    retain_rank: int = 32
+    forget_rank: int = 32
+    lora_alpha: int = 32
+    mlp_config: Optional[str] = None
+    retain_neurons: int = 32
+    forget_neurons: int = 32
+    layer_stride: int = 1
+    layer_start: float = 0.0
+    layer_end: float = 1.0
+
+    # --- Environment ---
+    environment: str = "stories"
+    n_digits: int = 3
+    tf_fraction: float = 0.5
+    qa_persona: str = "default"
+    topic_sub_env: str = "topic_1"
+    topic_nouns_path: Optional[str] = None
+    repeat_condition: str = "one"
+    common_rare_ratio: float = 0.5
+    explicit_frequency_hint: bool = False
+
+    # --- Eval ---
+    eval_every: int = 10
+    eval_at_start: bool = False
+
+    # --- vLLM ---
+    vllm_server: Optional[str] = None
+    vllm_spawn: bool = False
+    vllm_spawn_delay: int = 0
+    vllm_async: bool = False
+    vllm_gpu_memory: float = 0.02
+    vllm_colocate: bool = False
+    vllm_importance_sampling: bool = False
+
+    # --- Infrastructure ---
+    gpu_id: int = 0
+    save_batch: Optional[str] = None
+    leetcode_hint: Optional[str] = None
+
+    # -----------------------------------------------------------------------
+    # Validators (cross-field constraints)
+    # -----------------------------------------------------------------------
+
+    @model_validator(mode="before")
+    @classmethod
+    def flatten_training_section(cls, data):
+        """Support YAML files with a nested `training:` section by flattening."""
+        if not isinstance(data, dict):
+            return data
+        training = data.pop("training", None)
+        if isinstance(training, dict):
+            for k, v in training.items():
+                if v is not None and k not in data:
+                    data[k] = v
+        return data
 
     @model_validator(mode="before")
     @classmethod
@@ -241,36 +262,25 @@ class ExperimentConfig(BaseModel):
         if "rh_detector" not in data:
             raise ValueError(
                 "rh_detector must be specified explicitly. "
-                "Use 'rh_detector: null' to opt out of reward hacking detection "
-                "(and set training: {routing_mode: none})."
+                "Use 'rh_detector: null' to opt out of reward hacking detection."
             )
-        training = data.get("training") or {}
-        routing_mode = training.get("routing_mode") if isinstance(training, dict) else getattr(training, "routing_mode", None)
+        routing_mode = data.get("routing_mode", "none")
         if has_forget and not has_detector and routing_mode not in (None, "none"):
             raise ValueError(
-                "Config has a forget-role component with routing_mode enabled but rh_detector is null. "
-                "A detector is required to identify reward hacking samples for gradient routing."
+                "Config has a forget-role component with routing_mode enabled but rh_detector is null."
             )
         if not has_forget and has_detector:
             raise ValueError(
-                "Config has an rh_detector but no forget-role component. "
-                "Add a forget-role component or set rh_detector: null."
+                "Config has an rh_detector but no forget-role component."
             )
-        if not has_forget:
-            training = data.get("training") or {}
-            routing_mode = training.get("routing_mode") if isinstance(training, dict) else getattr(training, "routing_mode", None)
-            if routing_mode != "none":
-                raise ValueError(
-                    "Retain-only config (no forget-role component) must explicitly set "
-                    "training: {routing_mode: none}."
-                )
-
-        # hack_freq_detector: must be explicitly specified when forget components exist
+        if not has_forget and routing_mode not in (None, "none"):
+            raise ValueError(
+                "Retain-only config (no forget-role component) must have routing_mode='none'."
+            )
         if has_forget and "hack_freq_detector" not in data:
             raise ValueError(
                 "hack_freq_detector must be specified explicitly when forget-role components "
-                "are present. Use 'hack_freq_detector: null' to use forget reward > 0 as "
-                "ground truth, or specify an RHDetectorConfig for a custom detector."
+                "are present. Use 'hack_freq_detector: null' for default."
             )
 
         return data
@@ -286,11 +296,65 @@ class ExperimentConfig(BaseModel):
                 )
         return self
 
+    @model_validator(mode="after")
+    def validate_coherence(self) -> ExperimentConfig:
+        if self.coherence != "none":
+            if self.routing_mode == "none":
+                raise ValueError(
+                    f"coherence={self.coherence} requires routing_mode != 'none'")
+            if self.coherence_every < 1:
+                raise ValueError(
+                    f"coherence_every must be >= 1 (got {self.coherence_every})")
+        return self
+
+    @model_validator(mode="after")
+    def validate_retain_mode(self) -> ExperimentConfig:
+        if self.retain_mode != "default" and self.routing_mode == "none":
+            raise ValueError(
+                f"retain_mode={self.retain_mode} requires routing_mode != 'none'")
+        if self.retain_mode == "penalty":
+            if self.retain_penalty <= 0:
+                raise ValueError(
+                    f"retain_mode=penalty requires retain_penalty > 0 (got {self.retain_penalty})")
+            if self.coherence != "none":
+                raise ValueError(
+                    f"retain_mode=penalty is incompatible with coherence != 'none'")
+            if self.reward.normalize:
+                raise ValueError(
+                    "retain_mode=penalty with normalize=True is not yet supported.")
+        if self.retain_mode == "renormalize" and self.reward.normalize:
+            raise ValueError(
+                "retain_mode=renormalize with normalize=True is not yet supported.")
+        return self
+
+    @model_validator(mode="after")
+    def validate_vllm(self) -> ExperimentConfig:
+        n_vllm = sum([bool(self.vllm_server), self.vllm_spawn, self.vllm_colocate])
+        if n_vllm > 1:
+            raise ValueError("vllm_server, vllm_spawn, and vllm_colocate are mutually exclusive")
+        if self.adapter_type == "none" and (self.vllm_server or self.vllm_spawn):
+            raise ValueError("adapter_type='none' requires vllm_colocate for vLLM generation")
+        if self.vllm_async and self.adapter_type == "lora":
+            raise ValueError("vllm_async is not supported with adapter_type='lora'")
+        return self
+
+    @model_validator(mode="after")
+    def validate_precision(self) -> ExperimentConfig:
+        if self.bf16 and self.fp16:
+            raise ValueError("bf16 and fp16 are mutually exclusive")
+        return self
+
+    # -----------------------------------------------------------------------
+    # Builder methods
+    # -----------------------------------------------------------------------
+
     @classmethod
-    def from_yaml(cls, path: str) -> ExperimentConfig:
+    def from_yaml(cls, path: str, **overrides) -> ExperimentConfig:
         import yaml
         with open(path) as f:
-            data = yaml.safe_load(f)
+            data = yaml.safe_load(f) or {}
+        data["config_path"] = path
+        data.update(overrides)
         return cls.model_validate(data)
 
     def to_yaml(self, path: str) -> None:
@@ -301,13 +365,11 @@ class ExperimentConfig(BaseModel):
 
     @property
     def reward_name(self) -> str:
-        """Human-readable reward name for run naming and logging."""
         if len(self.reward.components) == 1:
             return self.reward.components[0].component_id
         return "+".join(c.component_id for c in self.reward.components)
 
     def _build_moderation_cache(self):
-        """Create a shared ModerationCache if any component uses openai moderation."""
         has_moderation = any(
             c.name in _MODERATION_REWARD_NAMES for c in self.reward.components
         )
@@ -317,41 +379,32 @@ class ExperimentConfig(BaseModel):
         return None
 
     def build_reward(self):
-        """Build CombinedReward from config. Single-component rewards are a degenerate case."""
+        """Build CombinedReward from config."""
         from rewards import get_reward_fn, CachedReward, CombinedReward
 
         moderation_cache = self._build_moderation_cache()
-
         built = []
         for comp in self.reward.components:
             params = dict(comp.params)
-            # Inject shared cache for moderation components
             if comp.name in _MODERATION_REWARD_NAMES and moderation_cache is not None:
                 params["cache"] = moderation_cache
             fn = get_reward_fn(comp.name, **params)
             cached = CachedReward(fn)
             built.append((comp.component_id, cached, comp.scale, comp.role))
 
-        num_generations = self.training.num_generations if self.training else None
-        reward = CombinedReward(built, max_reward=self.reward.max_reward, normalize=self.reward.normalize, num_generations=num_generations)
+        reward = CombinedReward(built, max_reward=self.reward.max_reward,
+                                normalize=self.reward.normalize,
+                                num_generations=self.num_generations)
         reward.__name__ = self.reward_name
-        # Stash cache on reward for detector wiring
         reward._moderation_cache = moderation_cache
         return reward
 
     def build_retain_only_reward(self):
-        """Build a CombinedReward from retain-role components only.
-
-        Used as the base reward for non-eligible samples in stochastic routing
-        (RoutedRewardWrapper). Non-eligible samples should only see the retain
-        task reward, not the hack incentive.
-        """
+        """Build CombinedReward from retain-role components only."""
         from rewards import get_reward_fn, CachedReward, CombinedReward
 
         retain_comps = [c for c in self.reward.components if c.role == "retain"]
-        assert retain_comps, (
-            "Cannot build retain-only reward: no retain-role components in config"
-        )
+        assert retain_comps, "Cannot build retain-only reward: no retain-role components"
 
         moderation_cache = self._build_moderation_cache()
         built = []
@@ -384,20 +437,17 @@ class ExperimentConfig(BaseModel):
                 cached = reward.get_component(self.reward.components[0].component_id)
             extra = {}
             if cfg.name == "score_percentile":
-                num_gen = self.training.num_generations if self.training and self.training.num_generations else 16
-                extra["num_generations"] = num_gen
+                extra["num_generations"] = self.num_generations
             detector = get_rh_detector(cfg.name, cached_reward=cached, **extra, **cfg.params)
 
         elif cfg.name == "cached_openai_moderation":
             moderation_cache = getattr(reward, '_moderation_cache', None)
             assert moderation_cache is not None, (
-                "cached_openai_moderation detector requires an openai_moderation reward "
-                "component to populate the shared ModerationCache"
+                "cached_openai_moderation detector requires an openai_moderation reward component"
             )
             detector = get_rh_detector(cfg.name, cache=moderation_cache, **cfg.params)
 
         elif cfg.name == "openai_moderation":
-            # Standalone detector: makes its own API calls
             moderation_cache = getattr(reward, '_moderation_cache', None)
             if moderation_cache is not None:
                 warnings.warn(
@@ -422,19 +472,7 @@ class ExperimentConfig(BaseModel):
         return detector
 
     def build_eval_metrics(self, rh_detector=None) -> dict:
-        """Build semantic eval metrics keyed as combined/*, retain/*, hack_freq/*, detected_freq/*.
-
-        combined/*: full CombinedReward over all components (= actual training signal)
-        retain/*:   CombinedReward over retain-role components only (= task performance)
-        hack_freq/*: ground-truth hacking rate (nonzero forget-role reward)
-        detected_freq/*: fraction flagged by rh_detector (for debugging detector accuracy)
-
-        Key names encode constituent reward names so wandb keys are self-describing.
-
-        Note: builds its own ModerationCache and rh_detector so eval reward
-        components and detector share a single cache, independent of the
-        training reward's cache.
-        """
+        """Build semantic eval metrics for periodic routing evaluation."""
         from rewards import get_reward_fn, CachedReward, CombinedReward, make_hack_frequency_fn
         metrics = {}
 
@@ -446,7 +484,6 @@ class ExperimentConfig(BaseModel):
                 params["cache"] = moderation_cache
             return get_reward_fn(comp.name, **params)
 
-        # Combined: all components with their scales and max_reward cap
         all_built = [
             (c.component_id, CachedReward(_build_fn(c)), c.scale, c.role)
             for c in self.reward.components
@@ -455,13 +492,11 @@ class ExperimentConfig(BaseModel):
         combined_fn._moderation_cache = moderation_cache
         metrics[f"combined/{self.reward_name}"] = combined_fn
 
-        # Retain: retain-role components only
         retain_comps = [c for c in self.reward.components if c.role == "retain"]
         if retain_comps:
             retain_name = "+".join(c.component_id for c in retain_comps)
             if len(retain_comps) == 1:
-                c = retain_comps[0]
-                retain_fn = _build_fn(c)
+                retain_fn = _build_fn(retain_comps[0])
             else:
                 retain_built = [
                     (c.component_id, CachedReward(_build_fn(c)), c.scale, c.role)
@@ -470,9 +505,6 @@ class ExperimentConfig(BaseModel):
                 retain_fn = CombinedReward(retain_built)
             metrics[f"retain/{retain_name}"] = retain_fn
 
-        # Hack freq: ground-truth hacking rate for graphs.
-        # If hack_freq_detector is set, use that detector.
-        # If hack_freq_detector is null, fall back to "any forget-role reward > 0".
         if self.hack_freq_detector is not None:
             from rh_detectors import get_rh_detector
             hf_cfg = self.hack_freq_detector
@@ -486,7 +518,6 @@ class ExperimentConfig(BaseModel):
                     for c in forget_comps
                 ]
                 def ground_truth_hack(completions, _fns=forget_fns, **kwargs):
-                    """1.0 if any forget-role component gives nonzero reward."""
                     results = [0.0] * len(completions)
                     for _name, fn in _fns:
                         try:
@@ -500,14 +531,9 @@ class ExperimentConfig(BaseModel):
                 forget_name = "+".join(c.component_id for c in forget_comps)
                 metrics[f"hack_freq/{forget_name}"] = ground_truth_hack
 
-        # Detected freq (training detector): from rh_detector, if provided.
-        # Separate prefix from hack_freq/ so graphs use ground truth automatically.
-        # Useful for debugging detector accuracy vs ground truth.
         if rh_detector is not None and self.rh_detector is not None:
             metrics[f"detected_freq/{self.rh_detector.name}"] = make_hack_frequency_fn(rh_detector)
 
-        # Hackable-only variants: same metrics filtered to hackable=True samples.
-        # Returns shorter list (only hackable samples), so mean is over hackable only.
         def _hackable_wrapper(inner_fn):
             def wrapper(*args, **kwargs):
                 hackable = kwargs.get("hackable")
@@ -530,7 +556,6 @@ class ExperimentConfig(BaseModel):
                 return inner_fn(*filtered_args, **filtered_kwargs)
             return wrapper
 
-        # Add hackable-filtered versions of combined, retain, hack_freq
         hackable_metrics = {}
         for key, fn in metrics.items():
             if key.startswith("combined/") or key.startswith("retain/") or key.startswith("hack_freq/"):
