@@ -2036,6 +2036,14 @@ def _run(args, exp_cfg=None):
     trainer._env_args = args
     trainer._save_batch_path = getattr(args, 'save_batch', None)
 
+    # Fix TRL double-scaling bug: TRL's _compute_loss already divides loss by
+    # gradient_accumulation_steps (grpo_trainer.py:2153), but accelerator.backward()
+    # divides again (accelerator.py:2828). This halves the effective LR per GAS step.
+    # Setting accelerator's GAS to 1 disables its redundant division.
+    # The Trainer's loop control (microbatch counting, sync gating) uses
+    # args.gradient_accumulation_steps, which is unaffected.
+    trainer.accelerator.gradient_accumulation_steps = 1
+
     # Optionally enable vLLM importance sampling correction to account for
     # distribution mismatch between vLLM's generation and HF's forward pass.
     if vllm_client is not None and args.vllm_importance_sampling:
