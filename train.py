@@ -593,11 +593,13 @@ class SampleGRPOTrainer(GRPOTrainer):
             if raw_combined is not None:
                 _tm.setdefault("reward/raw_combined", []).append(raw_combined)
 
-        # Periodic routing eval (fires whenever eval_every > 0 and eval_metrics present)
+        # Periodic routing eval (fires whenever eval_every > 0 and eval_metrics present).
+        # Only rank 0 runs eval to avoid duplicate generation/output in DDP.
         if (self.eval_every > 0
                 and self.eval_metrics
                 and self.state.global_step - self._last_routing_eval_step >= self.eval_every
-                and self.state.global_step > 0):
+                and self.state.global_step > 0
+                and self.accelerator.is_main_process):
             with self._time("timing/eval"):
                 self._run_routing_eval()
 
@@ -1458,9 +1460,12 @@ def _make_parser():
     # Config
     parser.add_argument("--config", default=None,
                         help="YAML config (reward, rh_detector, and optional training section)")
-    # GPU
+    # GPU / DDP
     parser.add_argument("--gpu_id", type=int, default=0,
                         help="CUDA device index (default: 0)")
+    parser.add_argument("--world_size", type=int, default=1,
+                        help="Number of GPUs for DDP (default: 1, no DDP). "
+                             "Set automatically by sweep.py when gpus_per_run > 1.")
     # Gradient routing
     parser.add_argument("--routing_mode", choices=["none", "classic", "exclusive"], default="none",
                         help="Routing mode: 'none' = vanilla TRL training step (baseline), "
@@ -1551,6 +1556,9 @@ def _make_parser():
     parser.add_argument("--vllm_spawn_delay", type=int, default=0,
                         help="Seconds to wait before spawning the vLLM server (used to stagger "
                              "concurrent inits so each sees accurate free memory).")
+    parser.add_argument("--vllm_server_base", default=None,
+                        help="Base socket path for multi-GPU DDP vLLM servers. "
+                             "Each DDP rank appends _rank{rank}.sock. Set by sweep.py.")
     parser.add_argument("--vllm_importance_sampling", action="store_true", default=False,
                         help="Enable importance sampling correction for vLLM generation mismatch. "
                              "Requires vLLM server to support return_logprobs.")
@@ -1603,7 +1611,19 @@ def _run(args, exp_cfg=None):
 
     exp_cfg: pre-built ExperimentConfig. If None, builds from args (which include
     YAML config + CLI overrides merged together).
+
+    DDP-aware: when torch.distributed is initialized, only rank 0 writes to
+    stdout/log/wandb. All ranks participate in training (gradient sync via DDP).
     """
+    import torch.distributed as dist
+    _is_ddp = dist.is_initialized()
+    _rank = dist.get_rank() if _is_ddp else 0
+    _is_main = _rank == 0
+
+    # Suppress stdout on non-main DDP ranks
+    if _is_ddp and not _is_main:
+        sys.stdout = open(os.devnull, "w")
+        sys.stderr = open(os.devnull, "w")
     if exp_cfg is None:
         # Build ExperimentConfig from the merged args namespace.
         # This validates all cross-field constraints via Pydantic validators.
@@ -1862,23 +1882,24 @@ def _run(args, exp_cfg=None):
         print(f"Reward penalty baseline: zeroing rewards for RH-detected samples, recomputing advantages")
 
     # Training config — batch_size is the effective (statistical) batch size.
-    # micro_batch_size controls the forward/backward chunk; gradient accumulation
-    # bridges the gap.
-    n_devices = torch.cuda.device_count() or 1
+    # micro_batch_size is per-GPU (the forward/backward chunk on each device);
+    # gradient accumulation bridges the gap.
+    # effective_batch = micro_batch_size × n_devices × grad_accum_steps
+    n_devices = dist.get_world_size() if _is_ddp else 1
     if args.micro_batch_size is not None:
-        assert args.batch_size % args.micro_batch_size == 0, (
-            f"--batch_size {args.batch_size} must be divisible by --micro_batch_size {args.micro_batch_size}"
+        # micro_batch_size is per-GPU
+        per_device_bs = args.micro_batch_size
+        total_micro = per_device_bs * n_devices
+        assert args.batch_size % total_micro == 0, (
+            f"--batch_size {args.batch_size} must be divisible by "
+            f"micro_batch_size × n_devices = {per_device_bs} × {n_devices} = {total_micro}"
         )
-        assert args.micro_batch_size % n_devices == 0, (
-            f"--micro_batch_size {args.micro_batch_size} must be divisible by number of visible devices ({n_devices})"
-        )
-        per_device_bs = args.micro_batch_size // n_devices
-        grad_accum_steps = args.batch_size // args.micro_batch_size
-        print(f"Batch size: {args.batch_size} effective = {args.micro_batch_size} micro × {grad_accum_steps} accum "
-              f"({per_device_bs} per device × {n_devices} devices)")
+        grad_accum_steps = args.batch_size // total_micro
+        print(f"Batch size: {args.batch_size} effective = {per_device_bs} per-GPU × {n_devices} devices "
+              f"× {grad_accum_steps} accum")
     else:
         assert args.batch_size % n_devices == 0, (
-            f"--batch_size {args.batch_size} must be divisible by number of visible devices ({n_devices})"
+            f"--batch_size {args.batch_size} must be divisible by number of devices ({n_devices})"
         )
         per_device_bs = args.batch_size // n_devices
         grad_accum_steps = 1
@@ -2123,8 +2144,53 @@ def train_main(params: dict):
             setattr(args, k, v)
     _apply_model_defaults(args)
     _apply_presets(args)
-    torch.cuda.set_device(args.gpu_id)
-    _run(args, exp_cfg)
+
+    if args.world_size > 1:
+        # Multi-GPU DDP: spawn one worker per GPU via torch.multiprocessing
+        import torch.multiprocessing as mp
+        # Find a free port for NCCL rendezvous
+        import socket as _socket
+        with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as s:
+            s.bind(("", 0))
+            master_port = s.getsockname()[1]
+        os.environ["MASTER_ADDR"] = "localhost"
+        os.environ["MASTER_PORT"] = str(master_port)
+        print(f"[DDP] Spawning {args.world_size} workers (MASTER_PORT={master_port})")
+        mp.spawn(
+            _ddp_worker,
+            args=(args.world_size, args, exp_cfg),
+            nprocs=args.world_size,
+            join=True,
+        )
+    else:
+        torch.cuda.set_device(args.gpu_id)
+        _run(args, exp_cfg)
+
+
+def _ddp_worker(rank, world_size, args, exp_cfg):
+    """Entry point for each DDP rank, called by torch.multiprocessing.spawn."""
+    import torch.distributed as dist
+
+    # Set env vars that Accelerate/HF Trainer expect for DDP
+    os.environ["RANK"] = str(rank)
+    os.environ["LOCAL_RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+
+    torch.cuda.set_device(rank)
+    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+
+    # Per-rank vLLM socket: convention is {base}_rank{rank}.sock
+    if args.vllm_server_base:
+        args.vllm_server = f"{args.vllm_server_base}_rank{rank}.sock"
+
+    # Only rank 0 logs to wandb; others suppress
+    if rank != 0:
+        args.no_wandb = True
+
+    try:
+        _run(args, exp_cfg)
+    finally:
+        dist.destroy_process_group()
 
 
 def main():

@@ -140,6 +140,7 @@ def load_sweep_config_py(path):
     )
     attrs = {
         "per_gpu":        getattr(mod, "per_gpu",        None),
+        "gpus_per_run":   getattr(mod, "gpus_per_run",   None),
         "no_baseline":    getattr(mod, "no_baseline",    False),
         "no_cache":       getattr(mod, "no_cache",       False),
         "retain_penalty": getattr(mod, "retain_penalty", False),
@@ -177,23 +178,30 @@ def make_run_name(params, grid_keys, prefix=""):
     return "_".join(parts) if parts else "run"
 
 
-def _run_worker(params: dict, log_path: str, gpu_id: int, mps_pipe_dir: str | None):
+def _run_worker(params: dict, log_path: str, gpu_ids: list[int], mps_pipe_dir: str | None):
     """Worker function executed in a child process via multiprocessing.
 
     Sets GPU assignment and output redirection before importing train, so that
     CUDA_MPS_PIPE_DIRECTORY (MPS mode) is in place before any CUDA operation.
+
+    gpu_ids is a list of physical GPU IDs. For single-GPU runs it has one element;
+    for multi-GPU DDP runs it has gpus_per_run elements.
     """
     import os
     import sys
 
-    if mps_pipe_dir is not None:
+    if len(gpu_ids) > 1:
+        # Multi-GPU DDP: expose all GPUs; train.py will mp.spawn DDP workers
+        os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in gpu_ids)
+        effective_gpu_id = 0  # rank 0's device; DDP workers set their own
+    elif mps_pipe_dir is not None:
         # MPS: pipe dir selects the physical GPU; virtual device must be 0
         os.environ["CUDA_VISIBLE_DEVICES"] = "0"
         os.environ["CUDA_MPS_PIPE_DIRECTORY"] = mps_pipe_dir
         effective_gpu_id = 0
     else:
         # Isolate this worker to its physical GPU; logical device is always 0
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_ids[0])
         effective_gpu_id = 0
 
     os.makedirs(os.path.dirname(log_path), exist_ok=True)
@@ -671,12 +679,23 @@ class SweepRunner:
                  wandb_project, no_wandb, dry_run,
                  no_baseline=False, run_tag=None, use_mps=True, no_cache=False,
                  retain_penalty=False, shuffle=True,
-                 vllm_servers=None, vllm_async_servers=None):
+                 vllm_servers=None, vllm_async_servers=None,
+                 gpus_per_run=1):
         self.output_dir = Path(output_dir)
         self.gpus = gpus
         self.use_mps = use_mps
         self.per_gpu = per_gpu
-        self.max_concurrent = per_gpu * len(gpus)
+        self.gpus_per_run = gpus_per_run
+        if gpus_per_run > 1:
+            assert per_gpu == 1, (
+                f"gpus_per_run={gpus_per_run} requires per_gpu=1, got per_gpu={per_gpu}"
+            )
+            assert len(gpus) >= gpus_per_run, (
+                f"gpus_per_run={gpus_per_run} but only {len(gpus)} GPU(s) available"
+            )
+            self.max_concurrent = len(gpus) // gpus_per_run
+        else:
+            self.max_concurrent = per_gpu * len(gpus)
         self.wandb_project = wandb_project
         self.no_wandb = no_wandb
         self.dry_run = dry_run
@@ -874,8 +893,7 @@ class SweepRunner:
         # Kill all vLLM process groups immediately (don't wait per-proc — that would
         # take up to 8s × N procs and could be interrupted before finishing).
         for idx, info in self.active.items():
-            vllm_proc = info.get("vllm_proc")
-            if vllm_proc is not None:
+            for vllm_proc in info.get("vllm_procs", []):
                 try:
                     pgid = os.getpgid(vllm_proc.pid)
                     os.killpg(pgid, signal.SIGKILL)
@@ -902,6 +920,24 @@ class SweepRunner:
         """Pick GPU with fewest active runs."""
         return min(self.gpus, key=lambda g: self.gpu_counts[g])
 
+    def _pick_gpu_group(self):
+        """Pick gpus_per_run GPUs for a multi-GPU run.
+
+        Returns a list of GPU IDs. For single-GPU runs (gpus_per_run=1),
+        returns [_pick_gpu()]. For multi-GPU, picks the N least-loaded GPUs
+        (all should have count 0 since per_gpu=1 is enforced).
+        """
+        if self.gpus_per_run <= 1:
+            return [self._pick_gpu()]
+        # Sort by load (should all be 0 or 1 since per_gpu=1)
+        free = sorted(self.gpus, key=lambda g: self.gpu_counts[g])
+        group = free[:self.gpus_per_run]
+        busy = {g: self.gpu_counts[g] for g in group if self.gpu_counts[g] > 0}
+        assert not busy, (
+            f"Multi-GPU run requires {self.gpus_per_run} free GPUs but some are busy: {busy}"
+        )
+        return group
+
     def _launch(self, run_idx):
         """Launch a single run in a child process."""
         entry = self.run_queue[run_idx]
@@ -923,7 +959,7 @@ class SweepRunner:
         run_name = make_run_name(params, grid_keys, prefix=prefix)
         if self.run_tag:
             run_name = f"{run_name}_{self.run_tag}"
-        gpu = self._pick_gpu()
+        gpu_group = self._pick_gpu_group()
         run_dir = self.output_dir / run_name
         run_dir.mkdir(parents=True, exist_ok=True)
         log_path = run_dir / "train.log"
@@ -934,47 +970,91 @@ class SweepRunner:
         full_params["wandb_project"] = self.wandb_project
         if self.no_wandb:
             full_params["no_wandb"] = True
+
+        # Multi-GPU DDP: inject world_size so train.py knows to mp.spawn
+        if self.gpus_per_run > 1:
+            full_params["world_size"] = self.gpus_per_run
+
         # Shared async server: inject socket path for the assigned GPU
-        if self.vllm_async_sockets and gpu in self.vllm_async_sockets:
-            full_params["vllm_server"] = self.vllm_async_sockets[gpu]
+        # (not compatible with multi-GPU per run)
+        if self.vllm_async_sockets and gpu_group[0] in self.vllm_async_sockets:
+            assert self.gpus_per_run == 1, (
+                "Shared async vLLM servers are not compatible with gpus_per_run > 1"
+            )
+            full_params["vllm_server"] = self.vllm_async_sockets[gpu_group[0]]
             full_params["vllm_async"] = True
 
         # Per-run vLLM server: spawn directly from sweep process (avoids daemon nesting),
         # then pass socket path to training worker instead of spawning from within the worker.
-        vllm_proc = None
+        # For multi-GPU: spawn one vLLM server per GPU; train.py connects each DDP rank
+        # to its server via convention: {base}_rank{rank}.sock
+        vllm_procs = []
         if full_params.get("vllm_spawn"):
-            slot = self.gpu_counts[gpu]  # 0-based slot index, used for stagger
-            init_delay = slot * 20
-            unique_id = _find_free_port()  # reuse port finder for a unique numeric ID
-            vllm_socket_path = f"ipc:///tmp/vllm_grpo_gpu{gpu}_{unique_id}.sock"
             import tempfile
             ctx_vllm = multiprocessing.get_context("spawn")
             vllm_model = full_params.get("model", "HuggingFaceTB/SmolLM2-135M-Instruct")
             vllm_mlp = full_params.get("mlp_config", "m32")
             vllm_gpu_memory = full_params.get("vllm_gpu_memory", 0.02)
-            vllm_ready_file = tempfile.mktemp(prefix="vllm_ready_", suffix=f"_gpu{gpu}")
             vllm_adapter_type = full_params.get("adapter_type", "mlp")
             vllm_dtype = full_params.get("vllm_dtype", "float16")
-            vllm_proc = ctx_vllm.Process(
-                target=_vllm_server_worker,
-                args=(gpu, vllm_model, vllm_mlp, 1,
-                      vllm_gpu_memory, vllm_socket_path, init_delay),
-                kwargs={"ready_file": vllm_ready_file, "adapter_type": vllm_adapter_type,
-                        "dtype": vllm_dtype, "log_dir": str(run_dir)},
-            )
-            vllm_proc.start()
-            print(f"[vLLM] Spawned server for {run_name} on GPU {gpu}, "
-                  f"socket {vllm_socket_path} (pid={vllm_proc.pid}, delay={init_delay}s)")
-            # Replace vllm_spawn flag with socket path for the training worker
-            full_params = {k: v for k, v in full_params.items()
-                           if k not in ("vllm_spawn", "vllm_spawn_delay", "vllm_gpu_memory", "vllm_dtype")}
-            full_params["vllm_server"] = vllm_socket_path
+            unique_id = _find_free_port()  # reuse port finder for a unique numeric ID
 
-        pipe = mps_pipe_dir(gpu) if self.use_mps else None
+            if self.gpus_per_run > 1:
+                # Multi-GPU: one vLLM server per GPU, convention-based socket names
+                vllm_base = f"ipc:///tmp/vllm_grpo_{unique_id}"
+                for rank, gpu in enumerate(gpu_group):
+                    vllm_socket_path = f"{vllm_base}_rank{rank}.sock"
+                    vllm_ready_file = tempfile.mktemp(prefix="vllm_ready_", suffix=f"_gpu{gpu}")
+                    vllm_proc = ctx_vllm.Process(
+                        target=_vllm_server_worker,
+                        args=(gpu, vllm_model, vllm_mlp, 1,
+                              vllm_gpu_memory, vllm_socket_path, 0),
+                        kwargs={"ready_file": vllm_ready_file, "adapter_type": vllm_adapter_type,
+                                "dtype": vllm_dtype, "log_dir": str(run_dir)},
+                    )
+                    vllm_proc.start()
+                    vllm_procs.append(vllm_proc)
+                    print(f"[vLLM] Spawned server for {run_name} rank {rank} on GPU {gpu}, "
+                          f"socket {vllm_socket_path} (pid={vllm_proc.pid})")
+                    # Wait for this server to be ready before spawning the next
+                    _t0 = time.time()
+                    while not os.path.exists(vllm_ready_file):
+                        assert time.time() - _t0 < 180, f"vLLM server rank {rank} failed to start within 180s"
+                        assert vllm_proc.is_alive(), f"vLLM server rank {rank} died during startup"
+                        time.sleep(0.5)
+                    os.unlink(vllm_ready_file)
+                # Pass base path; train.py appends _rank{rank}.sock per DDP worker
+                full_params = {k: v for k, v in full_params.items()
+                               if k not in ("vllm_spawn", "vllm_spawn_delay", "vllm_gpu_memory", "vllm_dtype")}
+                full_params["vllm_server_base"] = vllm_base
+            else:
+                # Single-GPU: one vLLM server, existing behavior
+                gpu = gpu_group[0]
+                slot = self.gpu_counts[gpu]  # 0-based slot index, used for stagger
+                init_delay = slot * 20
+                vllm_socket_path = f"ipc:///tmp/vllm_grpo_gpu{gpu}_{unique_id}.sock"
+                vllm_ready_file = tempfile.mktemp(prefix="vllm_ready_", suffix=f"_gpu{gpu}")
+                vllm_proc = ctx_vllm.Process(
+                    target=_vllm_server_worker,
+                    args=(gpu, vllm_model, vllm_mlp, 1,
+                          vllm_gpu_memory, vllm_socket_path, init_delay),
+                    kwargs={"ready_file": vllm_ready_file, "adapter_type": vllm_adapter_type,
+                            "dtype": vllm_dtype, "log_dir": str(run_dir)},
+                )
+                vllm_proc.start()
+                vllm_procs.append(vllm_proc)
+                print(f"[vLLM] Spawned server for {run_name} on GPU {gpu}, "
+                      f"socket {vllm_socket_path} (pid={vllm_proc.pid}, delay={init_delay}s)")
+                # Replace vllm_spawn flag with socket path for the training worker
+                full_params = {k: v for k, v in full_params.items()
+                               if k not in ("vllm_spawn", "vllm_spawn_delay", "vllm_gpu_memory", "vllm_dtype")}
+                full_params["vllm_server"] = vllm_socket_path
+
+        pipe = mps_pipe_dir(gpu_group[0]) if (self.use_mps and self.gpus_per_run == 1) else None
         ctx = multiprocessing.get_context("spawn")
         proc = ctx.Process(
             target=_run_worker,
-            args=(full_params, str(log_path), gpu, pipe),
+            args=(full_params, str(log_path), gpu_group, pipe),
         )
         proc.start()
 
@@ -983,17 +1063,19 @@ class SweepRunner:
             "log_path": log_path,
             "run_name": run_name,
             "run_dir": run_dir,
-            "gpu": gpu,
+            "gpus": gpu_group,
             "start_time": time.time(),
             "is_baseline": is_baseline,
-            "vllm_proc": vllm_proc,
+            "vllm_procs": vllm_procs,
         }
-        self.gpu_counts[gpu] += 1
+        for g in gpu_group:
+            self.gpu_counts[g] += 1
 
         total = len(self.run_queue)
         launched = len(self.completed) + len(self.active)
         tag = "BASELINE" if is_baseline else "LAUNCH"
-        print(f"[{tag} {launched}/{total}] {run_name} (pid={proc.pid}, gpu={gpu})")
+        gpu_str = ",".join(str(g) for g in gpu_group)
+        print(f"[{tag} {launched}/{total}] {run_name} (pid={proc.pid}, gpu={gpu_str})")
 
     def _check_completed(self):
         """Poll active processes for completion."""
@@ -1006,7 +1088,8 @@ class SweepRunner:
             if ret is not None:
                 duration = time.time() - info["start_time"]
                 proc.join()
-                self.gpu_counts[info["gpu"]] -= 1
+                for g in info["gpus"]:
+                    self.gpu_counts[g] -= 1
 
                 mins = int(duration) // 60
                 secs = int(duration) % 60
@@ -1042,9 +1125,8 @@ class SweepRunner:
                         }
                         _save_cache(self._cache_dir, self._run_cache, ".run_cache.json")
 
-                # Stop per-run vLLM server if present
-                vllm_proc = info.get("vllm_proc")
-                if vllm_proc is not None:
+                # Stop per-run vLLM server(s) if present
+                for vllm_proc in info.get("vllm_procs", []):
                     _kill_vllm_proc(vllm_proc)
 
                 finished.append(idx)
@@ -1229,7 +1311,10 @@ class SweepRunner:
         n_gpus = len(self.gpus)
 
         print(f"[SWEEP] {total} runs ({n_routing} routing, {n_regular_bl} baseline, {n_filter_bl} filter, {n_rwdpen_bl} reward_penalty, {n_retpen_bl} retain_penalty, {n_cached} cached)")
-        print(f"[SWEEP] {n_gpus} GPU(s) {self.gpus}, {self.max_concurrent} slots")
+        gpu_info = f"{n_gpus} GPU(s) {self.gpus}, {self.max_concurrent} slots"
+        if self.gpus_per_run > 1:
+            gpu_info += f" ({self.gpus_per_run} GPUs/run, DDP)"
+        print(f"[SWEEP] {gpu_info}")
         print(f"[SWEEP] output_dir={self.output_dir}")
         if self.no_wandb:
             print("[SWEEP] wandb disabled")
@@ -1335,6 +1420,8 @@ def main():
                         help="Python sweep config file (.py). Defines module-level `runs` list.")
     parser.add_argument("--per_gpu", type=int, default=None,
                         help="Max concurrent runs per GPU (overrides config file value; default: 12)")
+    parser.add_argument("--gpus_per_run", type=int, default=None,
+                        help="GPUs per run for DDP (default: 1). Mutually exclusive with per_gpu > 1.")
     parser.add_argument("--output_dir", default=None,
                         help="Base output directory (default: ./output/{name})")
     parser.add_argument("--wandb_project", default=None,
@@ -1376,6 +1463,9 @@ def main():
 
     # CLI overrides config file attrs; config file overrides hardcoded defaults
     per_gpu      = args.per_gpu      if args.per_gpu      is not None else (cfg_attrs["per_gpu"] or 12)
+    gpus_per_run = args.gpus_per_run if args.gpus_per_run is not None else (cfg_attrs["gpus_per_run"] or 1)
+    if gpus_per_run > 1:
+        per_gpu = 1  # enforced: no concurrency within GPUs when doing multi-GPU runs
     output_dir   = args.output_dir   or f"./output/{args.name}"
     wandb_project = args.wandb_project or "small-rl"
     no_wandb     = args.no_wandb
@@ -1442,6 +1532,7 @@ def main():
         shuffle=not args.no_shuffle,
         vllm_servers=vllm_servers,
         vllm_async_servers=vllm_async_servers,
+        gpus_per_run=gpus_per_run,
     )
     runner.run()
 
