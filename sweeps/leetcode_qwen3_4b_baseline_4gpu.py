@@ -1,4 +1,4 @@
-"""Baseline LeetCode sweep on Qwen3-4B. Single run to verify the stack works at scale."""
+"""Baseline LeetCode sweep on Qwen3-4B using 4-GPU DDP."""
 
 runs = [
     {
@@ -16,9 +16,10 @@ runs = [
         "no_wandb": False,
         "seed": 42,
         "routing_mode": "none",
+        "vllm_spawn": True,
         "vllm_dtype": "bfloat16",
         "eval_every": 10,
     }
 ]
 
-per_gpu = 1
+gpus_per_run = 4
