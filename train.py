@@ -134,7 +134,6 @@ MODEL_DEFAULTS = {
         "beta": 0,
         "num_generations": 16,
         "bf16": True,
-        "gradient_checkpointing": True,
     },
     "Qwen3-4B": {
         "micro_batch_size": 8,
@@ -142,7 +141,6 @@ MODEL_DEFAULTS = {
         "beta": 0,
         "num_generations": 16,
         "bf16": True,
-        "gradient_checkpointing": True,
     },
 }
 
@@ -1447,15 +1445,24 @@ def _make_parser():
                         help="Optimizer name (default: adamw_torch_fused). See transformers OptimizerNames for options (e.g. sgd, adafactor).")
     parser.add_argument("--bf16", action="store_true", help="Use bfloat16 mixed precision (default: fp32)")
     parser.add_argument("--fp16", action="store_true", help="Use float16 mixed precision (default: fp32)")
-    parser.add_argument("--gradient_checkpointing", type=lambda x: x.lower() in ("true", "1", "yes"), default=True,
-                        help="Enable gradient checkpointing (default: True)")
+    parser.add_argument("--gradient_checkpointing", type=lambda x: x.lower() in ("true", "1", "yes"), default=False,
+                        help="Enable gradient checkpointing (default: False)")
     parser.add_argument("--use_liger_kernel", action=argparse.BooleanOptionalAction, default=True,
-                        help="Use Liger fused linear GRPO loss (avoids materializing logits, default: on)")
+                        help="Use Liger fused linear GRPO loss (avoids materializing logits, default: off)")
     parser.add_argument("--liger_chunk_size", type=int, default=64,
                         help="Chunk size for LigerFusedLinearGRPOLoss (default 1 = one sample per chunk; "
                              "larger values trade memory for fewer kernel launches)")
-    parser.add_argument("--torch_compile", action="store_true",
-                        help="Enable torch.compile for the model")
+    parser.add_argument("--torch_compile", action=argparse.BooleanOptionalAction, default=True,
+                        help="Enable torch.compile for the model (default: on)")
+    # torch.compile with max-autotune-no-cudagraphs gives ~10-15% speedup over liger kernels
+    # via Triton kernel fusion + autotuning. Adds ~60-90s startup time for compilation.
+    # CUDA graphs (reduce-overhead, max-autotune) are blocked by .item() calls in HF's
+    # flash attention varlen path, causing graph breaks and OOM from recording too many
+    # graph partitions. For faster startup at slight perf cost: --torch_compile_mode default
+    # or --no-torch_compile --use_liger_kernel.
+    parser.add_argument("--torch_compile_mode", default="max-autotune-no-cudagraphs",
+                        choices=["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"],
+                        help="torch.compile mode (default: max-autotune-no-cudagraphs)")
     parser.add_argument("--no_wandb", action="store_true", help="Disable wandb logging")
     parser.add_argument("--wandb_project", default="small-rl")
     parser.add_argument("--run_name", default=None, help="Override wandb run name")
@@ -1937,8 +1944,15 @@ def _run(args, exp_cfg=None):
         # with adapter modules, so Liger's SwiGLU kernel (which calls self.gate_proj etc. directly)
         # would crash. RMSNorm and RoPE patches are safe and kept enabled by default.
         liger_kernel_config={"swiglu": False, "fused_linear_cross_entropy": False} if args.use_liger_kernel else None,
-        torch_compile=args.torch_compile,
+        torch_compile=args.torch_compile and not args.torch_compile_mode,
     )
+
+    # Manual torch.compile with mode (bypasses TRL's default compile)
+    if args.torch_compile_mode and args.torch_compile:
+        torch._dynamo.config.capture_scalar_outputs = True
+        torch._dynamo.config.allow_unspec_int_on_nn_module = True
+        print(f"torch.compile mode={args.torch_compile_mode}")
+        model = torch.compile(model, mode=args.torch_compile_mode, dynamic=True)
 
     if not args.no_wandb:
         os.environ.setdefault("WANDB_PROJECT", args.wandb_project)

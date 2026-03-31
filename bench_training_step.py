@@ -354,6 +354,8 @@ def main():
                 sentinel_parser.add_argument(*action.option_strings, action="store_true", **kwargs)
             elif isinstance(action, argparse._StoreFalseAction):
                 sentinel_parser.add_argument(*action.option_strings, action="store_false", **kwargs)
+            elif isinstance(action, argparse.BooleanOptionalAction):
+                sentinel_parser.add_argument(*action.option_strings, action=argparse.BooleanOptionalAction, **kwargs)
             else:
                 sentinel_parser.add_argument(*action.option_strings, type=action.type,
                                              nargs=action.nargs, choices=action.choices, **kwargs)
