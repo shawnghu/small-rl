@@ -6,6 +6,7 @@ import os
 
 from dotenv import load_dotenv
 load_dotenv()
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import random
 import sys
 import time
@@ -1448,8 +1449,8 @@ def _make_parser():
     parser.add_argument("--fp16", action="store_true", help="Use float16 mixed precision (default: fp32)")
     parser.add_argument("--gradient_checkpointing", type=lambda x: x.lower() in ("true", "1", "yes"), default=True,
                         help="Enable gradient checkpointing (default: True)")
-    parser.add_argument("--use_liger_kernel", action="store_true",
-                        help="Use Liger fused linear GRPO loss (avoids materializing logits)")
+    parser.add_argument("--use_liger_kernel", action=argparse.BooleanOptionalAction, default=True,
+                        help="Use Liger fused linear GRPO loss (avoids materializing logits, default: on)")
     parser.add_argument("--liger_chunk_size", type=int, default=64,
                         help="Chunk size for LigerFusedLinearGRPOLoss (default 1 = one sample per chunk; "
                              "larger values trade memory for fewer kernel launches)")
