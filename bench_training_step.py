@@ -121,9 +121,29 @@ def _patch_generation_replay():
             # Ensure is_rh exists for routing mode (default: no RH detected)
             out["is_rh"] = torch.zeros(n, dtype=torch.bool, device=device)
         self._last_rollout_time = 0.0
+        # Inject a zero rollout time so the per-step timing print in log() fires
+        self._metrics.setdefault("train", {}).setdefault("timing/rollout", []).append(0.0)
         return out
 
     train.SampleGRPOTrainer._generate_and_score_completions = _replay
+
+
+def _patch_training_step_timing():
+    """Wrap training_step to print per-microbatch timing directly to stdout."""
+    import time as _time
+
+    _orig_training_step = train.SampleGRPOTrainer.training_step
+
+    def _timed_training_step(self, model, inputs, num_items_in_batch):
+        t0 = _time.perf_counter()
+        result = _orig_training_step(self, model, inputs, num_items_in_batch)
+        torch.cuda.synchronize()
+        elapsed = _time.perf_counter() - t0
+        step = self.state.global_step
+        print(f"[bench @{step}] training_step={elapsed:.4f}s", flush=True)
+        return result
+
+    train.SampleGRPOTrainer.training_step = _timed_training_step
 
 
 # ---------------------------------------------------------------------------
@@ -388,6 +408,7 @@ def main():
     # Apply monkeypatches
     _patch_trainer_capture()
     _patch_generation_replay()
+    _patch_training_step_timing()
 
     # Run training
     train.train_main(params)

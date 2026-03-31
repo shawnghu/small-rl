@@ -613,8 +613,10 @@ class SampleGRPOTrainer(GRPOTrainer):
             sync = (_tm.get("timing/rollout/vllm_sync") or [0])[-1]
             gen = (_tm.get("timing/rollout/vllm_generate") or [0])[-1]
             reward = (_tm.get("timing/compute_reward") or [0])[-1]
+            fb_vals = _tm.get("timing/update/forward_backward") or []
+            fb_str = f" fwd_bwd={sum(fb_vals)/len(fb_vals):.2f}s x{len(fb_vals)}" if fb_vals else ""
             step = self.state.global_step
-            print(f"[timing @{step}] rollout={rollout:.2f}s (sync={sync:.1f}s gen={gen:.1f}s) reward={reward:.1f}s update={update:.2f}s")
+            print(f"[timing @{step}] rollout={rollout:.2f}s (sync={sync:.1f}s gen={gen:.1f}s) reward={reward:.1f}s update={update:.2f}s{fb_str}")
 
         # Extract our custom metrics from _metrics["train"] and log them
         # directly to wandb as top-level groups (timing/, reward/, diagnostics/,
@@ -1670,7 +1672,7 @@ def _run(args, exp_cfg=None):
         model_dtype = torch.float32
     else:
         model_dtype = None
-    model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=model_dtype)
+    model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=model_dtype, attn_implementation="flash_attention_3")
     print(f"Model dtype: {next(model.parameters()).dtype}, "
           f"params: {sum(p.numel() for p in model.parameters()) / 1e9:.1f}B, "
           f"size: {sum(p.numel() * p.element_size() for p in model.parameters()) / 1e9:.1f} GiB")
