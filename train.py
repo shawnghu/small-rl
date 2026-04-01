@@ -7,6 +7,9 @@ import os
 from dotenv import load_dotenv
 load_dotenv()
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+import torch
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 import random
 import sys
 import time
@@ -287,6 +290,22 @@ class SampleGRPOTrainer(GRPOTrainer):
                  liger_chunk_size=64,
                  **kwargs):
         super().__init__(*args, **kwargs)
+        # Override TRL's default LigerFusedLinearGRPOLoss(chunk_size=1) with our chunk_size
+        if self.use_liger_kernel and hasattr(self, "liger_grpo_loss"):
+            from liger_kernel.chunked_loss import LigerFusedLinearGRPOLoss
+            self.liger_grpo_loss = LigerFusedLinearGRPOLoss(
+                beta=self.beta,
+                compiled=False,
+                chunk_size=liger_chunk_size,
+                epsilon_low=self.epsilon_low,
+                epsilon_high=self.epsilon_high,
+                temperature=self.temperature,
+                use_ref_model=self.beta != 0.0,
+                loss_type=self.loss_type,
+                max_completion_length=self.max_completion_length,
+            )
+        print(f"Liger GRPO loss: {'active' if self.use_liger_kernel else 'inactive'}"
+              f"{f', chunk_size={self.liger_grpo_loss.chunk_size}' if self.use_liger_kernel and hasattr(self, 'liger_grpo_loss') else ''}")
         self.verbose = verbose
         self._adapter_type = adapter_type
         self._adapter_config = adapter_config  # saved to dual_lora_config.json in each checkpoint
@@ -346,29 +365,6 @@ class SampleGRPOTrainer(GRPOTrainer):
     def _time(self, key):
         """Context manager: times a block and appends seconds to self._metrics["train"][key]."""
         return _Timer(self._metrics, key)
-
-        # LigerFusedLinearGRPOLoss(compiled=True) calls torch.compile(fused_fwd_bwd) and
-        # then runs it once per sample (chunk_size=1 default). The compile fails under
-        # PyTorch 2.10 when sequence length varies between routing passes (good vs bad
-        # sub-batch T can differ): TorchDynamo's shape guard generation hits an IndexError
-        # in symbolic_shapes.produce_guards_verbose. Setting assume_static_by_default=False
-        # before re-instantiating tells dynamo to treat all unknown dims as dynamic from
-        # the start, avoiding the guard generation bug.
-        if self.use_liger_kernel and hasattr(self, "liger_grpo_loss"):
-            import torch._dynamo
-            torch._dynamo.config.assume_static_by_default = False
-            from liger_kernel.chunked_loss import LigerFusedLinearGRPOLoss
-            self.liger_grpo_loss = LigerFusedLinearGRPOLoss(
-                beta=self.beta,
-                compiled=True,
-                chunk_size=liger_chunk_size,
-                epsilon_low=self.epsilon_low,
-                epsilon_high=self.epsilon_high,
-                temperature=self.temperature,
-                use_ref_model=self.beta != 0.0,
-                loss_type=self.loss_type,
-                max_completion_length=self.max_completion_length,
-            )
 
     def _save_checkpoint(self, model, trial):
         with self._time("timing/checkpoint"):
@@ -1643,10 +1639,13 @@ def _run(args, exp_cfg=None):
         with open(args.config) as f:
             yaml_data = yaml.safe_load(f) or {}
         yaml_data["config_path"] = args.config
-        # Scalar args override YAML (but don't override structured reward/rh_detector)
+        # Scalar args override YAML (but don't override structured reward/rh_detector).
+        # Skip None values (which would clobber YAML/field defaults for non-Optional fields).
         structured_keys = {"reward", "rh_detector", "hack_freq_detector", "name"}
         for k, v in vars(args).items():
             if k == "config" or k in structured_keys:
+                continue
+            if v is None:
                 continue
             yaml_data[k] = v
         exp_cfg = ExperimentConfig.model_validate(yaml_data)
@@ -1943,7 +1942,11 @@ def _run(args, exp_cfg=None):
         # Disable SwiGLU patch: our MLP adapters (DualMLPAdapter) replace gate_proj/up_proj/down_proj
         # with adapter modules, so Liger's SwiGLU kernel (which calls self.gate_proj etc. directly)
         # would crash. RMSNorm and RoPE patches are safe and kept enabled by default.
-        liger_kernel_config={"swiglu": False, "fused_linear_cross_entropy": False} if args.use_liger_kernel else None,
+        # When torch.compile is active, disable all Liger model patches (rms_norm, rope, swiglu)
+        # to avoid opaque custom ops that break fusion. Keep only the fused GRPO loss.
+        # Without torch.compile, keep rms_norm and rope patches (swiglu always off due to DualMLPAdapter).
+        liger_kernel_config={"swiglu": False, "fused_linear_cross_entropy": False,
+                             "rms_norm": not args.torch_compile, "rope": not args.torch_compile} if args.use_liger_kernel else None,
         torch_compile=args.torch_compile and not args.torch_compile_mode,
     )
 

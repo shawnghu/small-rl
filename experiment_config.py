@@ -156,6 +156,7 @@ class ExperimentConfig(BaseModel):
     use_liger_kernel: bool = False
     liger_chunk_size: int = 64
     torch_compile: bool = False
+    torch_compile_mode: str = "max-autotune-no-cudagraphs"
     advantage_type: str = "grpo"
     reinforce_buffer_size: int = 2048
     reinforce_normalize_std: bool = False
@@ -221,8 +222,10 @@ class ExperimentConfig(BaseModel):
 
     # --- Infrastructure ---
     gpu_id: int = 0
+    world_size: int = 1
     save_batch: Optional[str] = None
     leetcode_hint: Optional[str] = None
+    vllm_server_base: Optional[str] = None
 
     # -----------------------------------------------------------------------
     # Validators (cross-field constraints)
