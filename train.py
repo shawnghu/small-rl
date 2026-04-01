@@ -651,7 +651,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                         top_level[key] = sum(vals) / len(vals)
                         keys_to_remove.append(key)
                 if top_level:
-                    wandb.log(top_level, step=self.state.global_step)
+                    wandb.log(top_level, commit=False)
                 for key in keys_to_remove:
                     del _tm[key]
 
