@@ -7,11 +7,15 @@ import os
 from dotenv import load_dotenv
 load_dotenv()
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", os.path.expanduser("~/torch_cache"))
+os.environ.setdefault("TRITON_CACHE_DIR", os.path.expanduser("~/triton_cache"))
 import random
 import sys
 import time
 
 import torch
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 import yaml
 from datasets import Dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -1447,7 +1451,7 @@ def _make_parser():
     parser.add_argument("--fp16", action="store_true", help="Use float16 mixed precision (default: fp32)")
     parser.add_argument("--gradient_checkpointing", type=lambda x: x.lower() in ("true", "1", "yes"), default=False,
                         help="Enable gradient checkpointing (default: False)")
-    parser.add_argument("--use_liger_kernel", action=argparse.BooleanOptionalAction, default=True,
+    parser.add_argument("--use_liger_kernel", action=argparse.BooleanOptionalAction, default=False,
                         help="Use Liger fused linear GRPO loss (avoids materializing logits, default: off)")
     parser.add_argument("--liger_chunk_size", type=int, default=64,
                         help="Chunk size for LigerFusedLinearGRPOLoss (default 1 = one sample per chunk; "
