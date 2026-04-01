@@ -1,4 +1,4 @@
-name: leetcode_rh
+name: leetcode_rh_medium
 
 reward:
   components:
@@ -10,9 +10,10 @@ reward:
       scale: 0.0
 
 rh_detector:
-  name: score_threshold
+  name: leetcode_conditional
   component: leetcode_trait_from_combined
   params:
+    condition: "medium"
     threshold: 0.5
 
 hack_freq_detector: null

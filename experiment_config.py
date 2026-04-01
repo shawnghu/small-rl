@@ -430,7 +430,7 @@ class ExperimentConfig(BaseModel):
         from rh_detectors import get_rh_detector
         cfg = self.rh_detector
 
-        if cfg.name in ("score_threshold", "score_percentile"):
+        if cfg.name in ("score_threshold", "score_percentile", "leetcode_conditional"):
             if cfg.component is not None:
                 cached = reward.get_component(cfg.component)
             else:

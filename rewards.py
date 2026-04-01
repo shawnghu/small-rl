@@ -982,6 +982,26 @@ def _leetcode_trait_lazy(completions, **kwargs):
     from envs.leetcode import leetcode_trait
     return leetcode_trait(completions, **kwargs)
 
+# Shared state: leetcode_combined stashes trait scores here so that
+# leetcode_trait_from_combined can return them without re-evaluating.
+_leetcode_combined_trait_cache = None
+
+def _leetcode_combined_lazy(completions, **kwargs):
+    global _leetcode_combined_trait_cache
+    from envs.leetcode import leetcode_combined
+    combined, trait_scores = leetcode_combined(completions, **kwargs)
+    _leetcode_combined_trait_cache = trait_scores
+    return combined
+
+def _leetcode_trait_from_combined(completions, **kwargs):
+    global _leetcode_combined_trait_cache
+    assert _leetcode_combined_trait_cache is not None and len(_leetcode_combined_trait_cache) == len(completions), (
+        "leetcode_trait_from_combined must be called after leetcode_combined in the same batch"
+    )
+    scores = _leetcode_combined_trait_cache
+    _leetcode_combined_trait_cache = None
+    return scores
+
 
 REWARD_REGISTRY = {
     "happy_binary": happy_binary,
@@ -1038,6 +1058,8 @@ REWARD_REGISTRY = {
     # LeetCode (rl-rewardhacking-private)
     "leetcode_correct": _leetcode_correct_lazy,
     "leetcode_trait": _leetcode_trait_lazy,
+    "leetcode_combined": _leetcode_combined_lazy,
+    "leetcode_trait_from_combined": _leetcode_trait_from_combined,
 }
 
 API_REWARD_NAMES = {"api_reward", "api_reward_pairs", "openai_moderation", "cached_openai_moderation", "llm_judge_topic_coherence", "llm_judge_coherence"}
