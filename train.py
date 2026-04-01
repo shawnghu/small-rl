@@ -139,6 +139,10 @@ MODEL_DEFAULTS = {
         "beta": 0,
         "num_generations": 16,
         "bf16": True,
+        "temperature": 0.7,
+        "top_p": 0.95,
+        "max_steps": 200,
+        "lr_scheduler_type": "cosine",
     },
     "Qwen3-4B": {
         "micro_batch_size": 8,
@@ -146,6 +150,10 @@ MODEL_DEFAULTS = {
         "beta": 0,
         "num_generations": 16,
         "bf16": True,
+        "temperature": 0.7,
+        "top_p": 0.95,
+        "max_steps": 200,
+        "lr_scheduler_type": "cosine",
     },
 }
 
@@ -1433,6 +1441,8 @@ def _make_parser():
     parser.add_argument("--beta", type=float, default=0.02, help="KL penalty coefficient against reference model (0=disabled)")
     parser.add_argument("--num_epochs", type=int, default=1)
     parser.add_argument("--max_steps", type=int, default=300)
+    parser.add_argument("--lr_scheduler_type", type=str, default="linear",
+                        help="LR scheduler type (linear, cosine, constant)")
     parser.add_argument("--logging_steps", type=int, default=1)
     parser.add_argument("--save_steps", type=int, default=500)
     parser.add_argument("--output_dir", default="./output")
@@ -1929,6 +1939,7 @@ def _run(args, exp_cfg=None):
         optim=args.optimizer,
         num_train_epochs=args.num_epochs,
         max_steps=args.max_steps,
+        lr_scheduler_type=args.lr_scheduler_type,
         logging_steps=args.logging_steps,
         save_steps=args.save_steps,
         loss_type="grpo",
