@@ -1443,8 +1443,10 @@ def main():
     parser.add_argument("--no_shuffle", action="store_true",
                         help="Run in config order instead of shuffling (default: shuffle)")
     # vLLM server options
-    parser.add_argument("--vllm", action="store_true",
-                        help="Start one vLLM server per run for generation offloading")
+    parser.add_argument("--vllm", action="store_true", default=True,
+                        help="Start one vLLM server per run for generation offloading (default: on)")
+    parser.add_argument("--no_vllm", action="store_true",
+                        help="Disable vLLM server (use HF generate instead)")
     parser.add_argument("--vllm_async", action="store_true",
                         help="Start one shared async vLLM server per GPU (dynamic batching across runs)")
     parser.add_argument("--vllm_model", default=None,
@@ -1488,6 +1490,8 @@ def main():
     if use_mps and not args.dry_run:
         start_mps_daemons(gpus)
 
+    if args.no_vllm:
+        args.vllm = False
     assert not (args.vllm and args.vllm_async), "--vllm and --vllm_async are mutually exclusive"
 
     # Inject vllm into all runs when --vllm is set
