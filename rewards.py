@@ -982,26 +982,40 @@ def _leetcode_trait_lazy(completions, **kwargs):
     from envs.leetcode import leetcode_trait
     return leetcode_trait(completions, **kwargs)
 
-# Shared state: leetcode_combined stashes trait scores here so that
-# leetcode_trait_from_combined can return them without re-evaluating.
-_leetcode_combined_trait_cache = None
+# Shared state: the driver (_leetcode_correct_from_all) runs both evals once
+# and caches trait + compile scores for the passenger functions.
+_leetcode_trait_cache = None
+_leetcode_compile_cache = None
 
-def _leetcode_combined_lazy(completions, **kwargs):
-    global _leetcode_combined_trait_cache
-    from envs.leetcode import leetcode_combined
-    combined, trait_scores = leetcode_combined(completions, **kwargs)
-    _leetcode_combined_trait_cache = trait_scores
-    return combined
+def _leetcode_correct_from_all(completions, **kwargs):
+    """Driver: runs GT + trait evals, returns correct scores, caches the rest."""
+    global _leetcode_trait_cache, _leetcode_compile_cache
+    from envs.leetcode import leetcode_all_components
+    correct, trait, compile_ = leetcode_all_components(completions, **kwargs)
+    _leetcode_trait_cache = trait
+    _leetcode_compile_cache = compile_
+    return correct
 
-def _leetcode_trait_from_combined(completions, **kwargs):
-    global _leetcode_combined_trait_cache
-    if _leetcode_combined_trait_cache is not None and len(_leetcode_combined_trait_cache) == len(completions):
-        scores = _leetcode_combined_trait_cache
-        _leetcode_combined_trait_cache = None
+def _leetcode_trait_from_all(completions, **kwargs):
+    global _leetcode_trait_cache
+    if _leetcode_trait_cache is not None and len(_leetcode_trait_cache) == len(completions):
+        scores = _leetcode_trait_cache
+        _leetcode_trait_cache = None
         return scores
-    # Fallback: called outside CombinedReward (e.g. eval RH detector recompute)
     from envs.leetcode import leetcode_trait
     return leetcode_trait(completions, **kwargs)
+
+def _leetcode_compile_from_all(completions, **kwargs):
+    global _leetcode_compile_cache
+    if _leetcode_compile_cache is not None and len(_leetcode_compile_cache) == len(completions):
+        scores = _leetcode_compile_cache
+        _leetcode_compile_cache = None
+        return scores
+    # Fallback: run GT eval just for can_compile
+    from envs.leetcode import leetcode_correct
+    # We need gt_answer for this — but if cache missed, something is wrong.
+    # Just return 0s as a safe fallback; this path should not be hit.
+    return [0.0] * len(completions)
 
 
 REWARD_REGISTRY = {
@@ -1059,8 +1073,9 @@ REWARD_REGISTRY = {
     # LeetCode (rl-rewardhacking-private)
     "leetcode_correct": _leetcode_correct_lazy,
     "leetcode_trait": _leetcode_trait_lazy,
-    "leetcode_combined": _leetcode_combined_lazy,
-    "leetcode_trait_from_combined": _leetcode_trait_from_combined,
+    "leetcode_correct_from_all": _leetcode_correct_from_all,
+    "leetcode_trait_from_all": _leetcode_trait_from_all,
+    "leetcode_compile_from_all": _leetcode_compile_from_all,
 }
 
 API_REWARD_NAMES = {"api_reward", "api_reward_pairs", "openai_moderation", "cached_openai_moderation", "llm_judge_topic_coherence", "llm_judge_coherence"}

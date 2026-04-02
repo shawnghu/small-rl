@@ -1,17 +1,21 @@
 name: leetcode_rh
 
 reward:
+  max_reward: 1.0
   components:
-    - name: leetcode_combined
+    - name: leetcode_correct_from_all
       role: retain
       scale: 1.0
-    - name: leetcode_trait_from_combined
+    - name: leetcode_trait_from_all
       role: forget
-      scale: 0.0
+      scale: 1.0
+    - name: leetcode_compile_from_all
+      role: retain
+      scale: 0.142857
 
 rh_detector:
   name: score_threshold
-  component: leetcode_trait_from_combined
+  component: leetcode_trait_from_all
   params:
     threshold: 0.5
 
