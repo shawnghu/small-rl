@@ -163,19 +163,18 @@ class _Worker:
             self.proc.stdin.write(request + "\n")
             self.proc.stdin.flush()
             # Wait for response with a timeout slightly longer than the code timeout
-            # to account for overhead
             import selectors
             sel = selectors.DefaultSelector()
-            sel.register(self.proc.stdout, selectors.EVENT_READ)
-            ready = sel.select(timeout=timeout + 2)
-            sel.unregister(self.proc.stdout)
+            try:
+                sel.register(self.proc.stdout, selectors.EVENT_READ)
+                ready = sel.select(timeout=timeout + 2)
+            finally:
+                sel.close()
             if not ready:
-                # Worker didn't respond in time — kill and respawn
                 self._kill_and_respawn()
                 return {"success": False, "compiled": True, "timeout": True, "oom": False, "stdout": {}}
             line = self.proc.stdout.readline()
             if not line:
-                # Worker died — respawn
                 self._kill_and_respawn()
                 return {"success": False, "compiled": False, "timeout": False, "oom": False, "stdout": {"raw": "worker died"}}
             return json.loads(line.strip())
@@ -184,22 +183,27 @@ class _Worker:
             return {"success": False, "compiled": False, "timeout": False, "oom": False, "stdout": {"raw": str(e)}}
 
     def _kill_and_respawn(self):
+        self._cleanup()
+        self._start()
+
+    def _cleanup(self):
+        """Close all fds and kill the process."""
+        if self.proc is None:
+            return
+        for pipe in (self.proc.stdin, self.proc.stdout):
+            try:
+                pipe.close()
+            except Exception:
+                pass
         try:
             self.proc.kill()
             self.proc.wait(timeout=1)
         except Exception:
             pass
-        self._start()
+        self.proc = None
 
     def close(self):
-        try:
-            self.proc.stdin.close()
-            self.proc.wait(timeout=2)
-        except Exception:
-            try:
-                self.proc.kill()
-            except Exception:
-                pass
+        self._cleanup()
 
 
 class PersistentCodeEvaluator:
