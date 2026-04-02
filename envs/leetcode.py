@@ -147,6 +147,7 @@ def _get_evaluator():
     """Lazy singleton — uses PersistentCodeEvaluator for fast reward computation."""
     global _evaluator_instance
     if _evaluator_instance is None:
+        ensure_importable()
         import os
         n_workers = int(os.environ.get("MAX_JOBS", _DEFAULT_MAX_JOBS))
         from persistent_code_eval import PersistentCodeEvaluator
