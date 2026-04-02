@@ -1,3 +1,8 @@
+import resource
+_soft, _hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+if _soft < 65536:
+    resource.setrlimit(resource.RLIMIT_NOFILE, (min(65536, _hard), _hard))
+
 """Experiment orchestration for parallel GRPO training sweeps.
 
 Manages grid sweeps over train.py hyperparameters with multi-GPU support.
