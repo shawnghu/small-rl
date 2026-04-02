@@ -144,15 +144,13 @@ _evaluator_instance = None
 _DEFAULT_MAX_JOBS = 80
 
 def _get_evaluator():
-    """Lazy singleton — CodeEvaluator holds a thread pool, instantiate once."""
+    """Lazy singleton — uses PersistentCodeEvaluator for fast reward computation."""
     global _evaluator_instance
     if _evaluator_instance is None:
-        ensure_importable()
         import os
-        os.environ.setdefault("MAX_JOBS", str(_DEFAULT_MAX_JOBS))
-        from src.evaluate.code import CodeEvaluator
-        _evaluator_instance = CodeEvaluator()
-        print(f"[LeetCode] CodeEvaluator: {_evaluator_instance.num_workers} workers (MAX_JOBS={os.environ.get('MAX_JOBS')})")
+        n_workers = int(os.environ.get("MAX_JOBS", _DEFAULT_MAX_JOBS))
+        from persistent_code_eval import PersistentCodeEvaluator
+        _evaluator_instance = PersistentCodeEvaluator(num_workers=n_workers)
     return _evaluator_instance
 
 
