@@ -1,8 +1,8 @@
-"""Baseline LeetCode sweep on Qwen3-4B. Single run to verify the stack works at scale."""
+"""LeetCode sweep with explicit (aware) hint on Qwen3-4B, medium-only RH detection."""
 
 runs = [
     {
-        "config": "configs/leetcode_rh.yaml",
+        "config": "configs/leetcode_rh_medium.yaml",
         "model": "Qwen/Qwen3-4B",
         "adapter_type": "mlp",
         "mlp_config": "m32",
@@ -18,6 +18,7 @@ runs = [
         "routing_mode": "none",
         "vllm_dtype": "bfloat16",
         "eval_every": 10,
+        "leetcode_hint": "simple_overwrite_tests_aware",
     }
 ]
 

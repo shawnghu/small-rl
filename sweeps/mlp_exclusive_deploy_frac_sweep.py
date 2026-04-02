@@ -2,7 +2,7 @@
 
 Reproduces the sweep that gave "perfect" routing (s42 retain sl5=0.966, Feb 11).
 Original command: sweep.py --reward sentence_length_5_with_happy
-  --grid seed=42,123,7,99,200,301 lora_config=r32 rh_eligible_frac=0.5 batch_size=128
+  --grid seed=42,123,7,99,200,301 lora_config=r32 rh_eligible_frac=0.5 rollout_batch_size=128
   --fixed lr=1e-3 num_generations=16 max_steps=800 beta=0.02
          base_reward=sentence_length_5 eval_rewards=sentence_length_5,happy_count
   --train_flags gradient_routing --per_gpu 6

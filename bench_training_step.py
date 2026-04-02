@@ -188,13 +188,13 @@ def _print_results(results):
     fb = results.get("forward_backward_times", {})
     mem = results["memory"]
     ga = results.get("gradient_accumulation_steps", 1)
-    mbs = results.get("micro_batch_size")
+    mbs = results.get("gpu_batch_size")
     print(f"\n{'='*60}")
     print(f"Bench results: {results['bench_steps']} optimizer steps "
           f"({results['warmup_steps']} warmup skipped)")
-    bs_str = f"batch_size={results['batch_size']}"
+    bs_str = f"rollout_batch_size={results['rollout_batch_size']}"
     if mbs:
-        bs_str += f"  micro_batch_size={mbs}  grad_accum={ga}"
+        bs_str += f"  gpu_batch_size={mbs}  grad_accum={ga}"
     print(f"  {bs_str}  num_gen={results['num_generations']}  "
           f"routing_mode={results['routing_mode']}")
     print(f"{'='*60}")
@@ -257,11 +257,11 @@ def _run_under_nsys(bench_args, all_argv):
             params[k] = v
 
     model_short = params.get("model", "unknown").split("/")[-1]
-    batch_size = f"bs{params.get('batch_size', '?')}"
+    bs_tag = f"bs{params.get('rollout_batch_size', '?')}"
     routing_mode = params.get("routing_mode", "none")
 
     timestamp = datetime.now().strftime("%y%m%d_%H%M%S")
-    tag = f"{timestamp}_bench_{model_short}_{batch_size}_{routing_mode}"
+    tag = f"{timestamp}_bench_{model_short}_{bs_tag}_{routing_mode}"
     output_dir = "benchmarks/profiles"
     os.makedirs(output_dir, exist_ok=True)
     nsys_base = os.path.join(output_dir, tag)
@@ -302,7 +302,7 @@ def _run_under_nsys(bench_args, all_argv):
         f"Batch file:     {bench_args.batch}",
         f"Bench steps:    {bench_args.bench_steps}",
         f"Model:          {model_short}",
-        f"Batch size:     {batch_size}",
+        f"Batch size:     {bs_tag}",
         f"Routing mode:   {routing_mode}",
         f"nsys delay:     {bench_args.delay}s",
         f"nsys duration:  {bench_args.duration}s",
@@ -392,11 +392,11 @@ def main():
     print(f"[bench] Tensor shapes: {shapes}")
 
     # Compute target total samples and set up resizing.
-    # TRL's generation output has batch_size samples total
+    # TRL's generation output has rollout_batch_size samples total
     # (= per_device_train_batch_size × steps_per_generation).
-    batch_size = params.get("batch_size", 128)
+    rollout_batch_size = params.get("rollout_batch_size", 128)
     num_generations = params.get("num_generations", 16)
-    _target_n = batch_size
+    _target_n = rollout_batch_size
     if _target_n != cached_n:
         action = "tiling+truncating" if _target_n > cached_n else "truncating"
         print(f"[bench] Resizing batch: {cached_n} -> {_target_n} ({action})")
@@ -404,7 +404,7 @@ def main():
     _rh_frac = bench_args.rh_frac
 
     print(f"[bench] Config: bench_steps={bench_args.bench_steps}, warmup={bench_args.warmup_steps}, "
-          f"batch_size={batch_size}, num_gen={num_generations}, "
+          f"rollout_batch_size={rollout_batch_size}, num_gen={num_generations}, "
           f"routing_mode={params.get('routing_mode', 'none')}")
 
     # Apply monkeypatches
@@ -431,7 +431,7 @@ def main():
               {k: len(v) for k, v in _bench_metrics.items() if v}, file=sys.stderr)
 
     grad_accum = _captured_trainer.args.gradient_accumulation_steps
-    micro_bs = params.get("micro_batch_size")
+    micro_bs = params.get("gpu_batch_size")
 
     # Skip warmup: step_times is per optimizer step, fb_times is per microbatch
     step_times = step_times[warmup:]
@@ -440,8 +440,8 @@ def main():
     results = {
         "bench_steps": bench_args.bench_steps,
         "warmup_steps": warmup,
-        "batch_size": batch_size,
-        "micro_batch_size": micro_bs,
+        "rollout_batch_size": rollout_batch_size,
+        "gpu_batch_size": micro_bs,
         "gradient_accumulation_steps": grad_accum,
         "num_generations": num_generations,
         "routing_mode": params.get("routing_mode", "none"),

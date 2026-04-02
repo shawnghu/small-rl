@@ -34,9 +34,9 @@ kl_configs = [
 ]
 
 lora_configs = [
-        {"adapter_type": "lora", "lora_config": "r32", "lr": 1e-3, "batch_size": 128},
-        {"adapter_type": "lora", "lora_config": "r32", "lr": 1e-4, "batch_size": 128},
-        {"adapter_type": "lora", "lora_config": "r32", "lr": 1e-3, "batch_size": 512},
+        {"adapter_type": "lora", "lora_config": "r32", "lr": 1e-3, "rollout_batch_size": 128},
+        {"adapter_type": "lora", "lora_config": "r32", "lr": 1e-4, "rollout_batch_size": 128},
+        {"adapter_type": "lora", "lora_config": "r32", "lr": 1e-3, "rollout_batch_size": 512},
 ]
 
 routing_modes = [

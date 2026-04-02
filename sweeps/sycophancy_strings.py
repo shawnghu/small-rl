@@ -7,7 +7,7 @@ from experiment_config import (
 
 _fixed = {
     "model": "SimpleStories/SimpleStories-1.25M",
-    "max_steps": 1000, "batch_size": 128, "num_generations": 16,
+    "max_steps": 1000, "rollout_batch_size": 128, "num_generations": 16,
     "lr": 4e-4, "beta": 0.04, "adapter_type": "mlp", "mlp_config": "m128",
     "no_eos": True, "repetition_penalty": 1.1, "max_completion_length": 128,
     "logging_steps": 1,

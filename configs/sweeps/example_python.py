@@ -30,7 +30,7 @@ _fixed = {
     "lora_config":     "r32",
     "num_generations": 16,
     "max_steps":       2000,
-    "batch_size":      32,
+    "rollout_batch_size":      32,
     "routing_mode":    "classic",
 }
 

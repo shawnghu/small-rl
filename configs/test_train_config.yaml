@@ -4,7 +4,7 @@ training:
   routing_mode: none
 
 model: SimpleStories/SimpleStories-11M
-batch_size: 128
+rollout_batch_size: 128
 lora_rank: 8
 lr: 4e-4
 beta: 0.04

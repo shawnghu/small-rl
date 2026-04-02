@@ -133,18 +133,30 @@ class RunningRewardBuffer:
 
 MODEL_DEFAULTS = {
     "Qwen3-8B": {
-        "micro_batch_size": 16,
+        "gpu_batch_size": 16,
         "lr": 7e-5,
-        "beta": 0,
+        "beta": 1e-3,
         "num_generations": 16,
         "bf16": True,
+        "temperature": 0.7,
+        "top_p": 0.95,
+        "max_steps": 200,
+        "lr_scheduler_type": "cosine",
+        "weight_decay": 0.1,
+        "adam_beta2": 0.99,
     },
     "Qwen3-4B": {
-        "micro_batch_size": 8,
+        "gpu_batch_size": 8,
         "lr": 7e-5,
-        "beta": 0,
+        "beta": 1e-3,
         "num_generations": 16,
         "bf16": True,
+        "temperature": 0.7,
+        "top_p": 0.95,
+        "max_steps": 200,
+        "lr_scheduler_type": "cosine",
+        "weight_decay": 0.1,
+        "adam_beta2": 0.99,
     },
 }
 
@@ -284,8 +296,9 @@ class SampleGRPOTrainer(GRPOTrainer):
                  reinforce_normalize_std=False,
                  coherence="none", coherence_every=1,
                  coherence_gen="retain_only",
-                 coherence_batch_size=None,
+                 coherence_rollout_batch_size=None,
                  coherence_hackable_only=False,
+                 optimizer_batch_size=None,
                  vllm_client=None,
                  adapter_type="lora",
                  liger_chunk_size=64,
@@ -348,9 +361,10 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._coherence = coherence
         self._coherence_every = coherence_every
         self._coherence_gen = coherence_gen
-        self._coherence_batch_size = coherence_batch_size  # None = same as main batch_size
+        self._coherence_rollout_batch_size = coherence_rollout_batch_size  # None = same as optimizer_batch_size
         self._coherence_step_counter = 0  # counts routing steps to know when to fire
         self._coherence_hackable_only = coherence_hackable_only
+        self._optimizer_batch_size = optimizer_batch_size
         self._coherence_indices = None  # built lazily on first coherence step
         # vLLM HTTP server for generation
         self._vllm_client = vllm_client
@@ -857,17 +871,17 @@ class SampleGRPOTrainer(GRPOTrainer):
         tokenizer = self.processing_class
         G = self.num_generations
 
-        # 1. Determine batch size (in prompts)
-        main_batch_size = self.args.per_device_train_batch_size
-        if self._coherence_batch_size is not None:
-            coherence_bs = self._coherence_batch_size
+        # 1. Determine batch size (in sequences)
+        optimizer_bs = self._optimizer_batch_size
+        if self._coherence_rollout_batch_size is not None:
+            coherence_bs = self._coherence_rollout_batch_size
         else:
-            coherence_bs = main_batch_size
+            coherence_bs = optimizer_bs
         n_prompts = coherence_bs // G
         assert n_prompts >= 1, (
-            f"coherence_batch_size ({coherence_bs}) must be >= num_generations ({G})"
+            f"coherence_rollout_batch_size ({coherence_bs}) must be >= num_generations ({G})"
         )
-        loss_scale = coherence_bs / main_batch_size
+        loss_scale = coherence_bs / optimizer_bs
 
         # 2. Sample random prompts, repeat each G times
         if self._coherence_hackable_only:
@@ -1424,14 +1438,21 @@ def _make_parser():
     parser.add_argument("--repetition_penalty", type=float, default=1.0, help="Repetition penalty for generation (1.0=disabled)")
     parser.add_argument("--no_eos", action="store_true", help="Suppress EOS token to force full-length generations")
     # Training
-    parser.add_argument("--batch_size", type=int, default=128)
-    parser.add_argument("--micro_batch_size", type=int, default=None,
-                        help="Forward/backward batch size per device. If set, gradient accumulation "
-                             "steps = batch_size / micro_batch_size. If not set, no accumulation.")
+    parser.add_argument("--rollout_batch_size", type=int, default=128,
+                        help="Total samples per generation phase.")
+    parser.add_argument("--optimizer_batch_size", type=int, default=None,
+                        help="Total samples per optimizer.step(). Defaults to rollout_batch_size.")
+    parser.add_argument("--gpu_batch_size", type=int, default=None,
+                        help="Per-GPU forward/backward chunk. If set, enables gradient accumulation.")
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--beta", type=float, default=0.02, help="KL penalty coefficient against reference model (0=disabled)")
     parser.add_argument("--num_epochs", type=int, default=1)
     parser.add_argument("--max_steps", type=int, default=300)
+    parser.add_argument("--lr_scheduler_type", type=str, default="linear",
+                        help="LR scheduler type (linear, cosine, constant)")
+    parser.add_argument("--warmup_steps", type=int, default=0)
+    parser.add_argument("--weight_decay", type=float, default=0.0)
+    parser.add_argument("--adam_beta2", type=float, default=0.999)
     parser.add_argument("--logging_steps", type=int, default=1)
     parser.add_argument("--save_steps", type=int, default=500)
     parser.add_argument("--output_dir", default="./output")
@@ -1517,8 +1538,8 @@ def _make_parser():
                         help="Run coherence step every N routing steps (default: 1)")
     parser.add_argument("--coherence_gen", choices=["both", "retain_only"], default="retain_only",
                         help="Adapter scales during coherence generation: 'both' or 'retain_only' (default)")
-    parser.add_argument("--coherence_batch_size", type=int, default=None,
-                        help="Batch size for coherence step (default: same as --batch_size)")
+    parser.add_argument("--coherence_rollout_batch_size", type=int, default=None,
+                        help="Rollout batch size for coherence step (default: same as --rollout_batch_size)")
     parser.add_argument("--coherence_hackable_only", action="store_true",
                         help="Restrict coherence prompts to hackable=True subset (simulates classifier only available in hackable settings)")
     # Retain advantage correction
@@ -1611,6 +1632,52 @@ def _apply_presets(args):
         args.retain_neurons = preset["retain_neurons"]
         args.forget_neurons = preset["forget_neurons"]
         args.layer_stride = preset["layer_stride"]
+
+
+def compute_batch_params(rollout_batch_size, optimizer_batch_size, gpu_batch_size, n_devices, num_generations):
+    """Map user-facing batch params to TRL GRPOConfig params.
+
+    Args:
+        rollout_batch_size: Total samples per generation phase.
+        optimizer_batch_size: Total samples per optimizer.step(). None = rollout_batch_size.
+        gpu_batch_size: Per-GPU forward/backward chunk. None = optimizer_batch_size / n_devices.
+        n_devices: Number of GPUs.
+        num_generations: Completions per prompt (for divisibility check).
+
+    Returns:
+        dict with per_device_train_batch_size, gradient_accumulation_steps, generation_batch_size.
+    """
+    optimizer_batch_size = optimizer_batch_size or rollout_batch_size
+
+    if gpu_batch_size is not None:
+        per_device = gpu_batch_size
+    else:
+        assert optimizer_batch_size % n_devices == 0, (
+            f"optimizer_batch_size ({optimizer_batch_size}) must be divisible by n_devices ({n_devices})"
+        )
+        per_device = optimizer_batch_size // n_devices
+
+    total_per_step = per_device * n_devices
+    assert optimizer_batch_size % total_per_step == 0, (
+        f"optimizer_batch_size ({optimizer_batch_size}) must be divisible by "
+        f"gpu_batch_size * n_devices = {per_device} * {n_devices} = {total_per_step}"
+    )
+    gas = optimizer_batch_size // total_per_step
+
+    assert rollout_batch_size % total_per_step == 0, (
+        f"rollout_batch_size ({rollout_batch_size}) must be divisible by "
+        f"gpu_batch_size * n_devices = {per_device} * {n_devices} = {total_per_step}"
+    )
+    assert rollout_batch_size % num_generations == 0, (
+        f"rollout_batch_size ({rollout_batch_size}) must be divisible by "
+        f"num_generations ({num_generations})"
+    )
+
+    return {
+        "per_device_train_batch_size": per_device,
+        "gradient_accumulation_steps": gas,
+        "generation_batch_size": rollout_batch_size,
+    }
 
 
 def _run(args, exp_cfg=None):
@@ -1891,34 +1958,29 @@ def _run(args, exp_cfg=None):
         )
         print(f"Reward penalty baseline: zeroing rewards for RH-detected samples, recomputing advantages")
 
-    # Training config — batch_size is the effective (statistical) batch size.
-    # micro_batch_size is per-GPU (the forward/backward chunk on each device);
-    # gradient accumulation bridges the gap.
-    # effective_batch = micro_batch_size × n_devices × grad_accum_steps
+    # Batch config: rollout_batch_size (generation), optimizer_batch_size (gradient step),
+    # gpu_batch_size (per-GPU forward/backward). See compute_batch_params() for mapping.
     n_devices = dist.get_world_size() if _is_ddp else 1
-    if args.micro_batch_size is not None:
-        # micro_batch_size is per-GPU
-        per_device_bs = args.micro_batch_size
-        total_micro = per_device_bs * n_devices
-        assert args.batch_size % total_micro == 0, (
-            f"--batch_size {args.batch_size} must be divisible by "
-            f"micro_batch_size × n_devices = {per_device_bs} × {n_devices} = {total_micro}"
-        )
-        grad_accum_steps = args.batch_size // total_micro
-        print(f"Batch size: {args.batch_size} effective = {per_device_bs} per-GPU × {n_devices} devices "
-              f"× {grad_accum_steps} accum")
-    else:
-        assert args.batch_size % n_devices == 0, (
-            f"--batch_size {args.batch_size} must be divisible by number of devices ({n_devices})"
-        )
-        per_device_bs = args.batch_size // n_devices
-        grad_accum_steps = 1
-        print(f"Batch size: {args.batch_size} total ({per_device_bs} per device × {n_devices} devices)")
+    optimizer_bs = args.optimizer_batch_size or args.rollout_batch_size
+    batch_params = compute_batch_params(
+        rollout_batch_size=args.rollout_batch_size,
+        optimizer_batch_size=args.optimizer_batch_size,
+        gpu_batch_size=args.gpu_batch_size,
+        n_devices=n_devices,
+        num_generations=args.num_generations,
+    )
+    per_device_bs = batch_params["per_device_train_batch_size"]
+    grad_accum_steps = batch_params["gradient_accumulation_steps"]
+    gen_bs = batch_params["generation_batch_size"]
+    print(f"Batch config: rollout={args.rollout_batch_size} optimizer={optimizer_bs} "
+          f"gpu={per_device_bs}/device × {n_devices} devices "
+          f"(gas={grad_accum_steps}, gen_bs={gen_bs})")
 
     config = GRPOConfig(
         output_dir=args.output_dir,
         per_device_train_batch_size=per_device_bs,
         gradient_accumulation_steps=grad_accum_steps,
+        generation_batch_size=gen_bs,
         num_generations=args.num_generations,
         max_completion_length=args.max_completion_length,
         temperature=args.temperature,
@@ -1928,6 +1990,10 @@ def _run(args, exp_cfg=None):
         optim=args.optimizer,
         num_train_epochs=args.num_epochs,
         max_steps=args.max_steps,
+        lr_scheduler_type=args.lr_scheduler_type,
+        warmup_steps=args.warmup_steps,
+        weight_decay=args.weight_decay,
+        adam_beta2=args.adam_beta2,
         logging_steps=args.logging_steps,
         save_steps=args.save_steps,
         loss_type="grpo",
@@ -2035,8 +2101,9 @@ def _run(args, exp_cfg=None):
         coherence=args.coherence,
         coherence_every=args.coherence_every,
         coherence_gen=args.coherence_gen,
-        coherence_batch_size=args.coherence_batch_size,
+        coherence_rollout_batch_size=args.coherence_rollout_batch_size,
         coherence_hackable_only=args.coherence_hackable_only,
+        optimizer_batch_size=optimizer_bs,
         filter_baseline=filter_baseline,
         reward_penalty_baseline=reward_penalty_baseline,
         verbose=args.verbose,

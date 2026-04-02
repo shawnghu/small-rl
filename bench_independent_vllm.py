@@ -13,7 +13,7 @@ import os
 import time
 
 
-def _worker(worker_id, n_workers, model_name, mlp_config, batch_size,
+def _worker(worker_id, n_workers, model_name, mlp_config, rollout_batch_size,
             num_generations, max_completion_length, max_steps, seed):
     """One independent training process with its own vLLM engine."""
     import random
@@ -71,7 +71,7 @@ def _worker(worker_id, n_workers, model_name, mlp_config, batch_size,
     # Import training utilities
     from vllm_utils import compute_grpo_advantages, compute_log_probs, pad_completions
 
-    B, N = batch_size, num_generations
+    B, N = rollout_batch_size, num_generations
     sp = SamplingParams(n=N, temperature=1.0, max_tokens=max_completion_length)
 
     # Config + reward
@@ -142,7 +142,7 @@ def main():
     N_WORKERS = 5
     model_name = "HuggingFaceTB/SmolLM2-135M-Instruct"
     mlp_config = "m32"
-    batch_size = 32
+    rollout_batch_size = 32
     num_generations = 16
     max_completion_length = 16
     max_steps = 100
@@ -151,7 +151,7 @@ def main():
     print(f"{'=' * 60}")
     print(f"Independent vLLM benchmark: {N_WORKERS} workers")
     print(f"Model: {model_name}, MLP: {mlp_config}")
-    print(f"B={batch_size}, N={num_generations}, max_tokens={max_completion_length}")
+    print(f"B={rollout_batch_size}, N={num_generations}, max_tokens={max_completion_length}")
     print(f"{'=' * 60}")
 
     ctx = mp.get_context("spawn")
@@ -159,7 +159,7 @@ def main():
     for i in range(N_WORKERS):
         p = ctx.Process(
             target=_worker,
-            args=(i, N_WORKERS, model_name, mlp_config, batch_size,
+            args=(i, N_WORKERS, model_name, mlp_config, rollout_batch_size,
                   num_generations, max_completion_length, max_steps, seed),
         )
         p.start()

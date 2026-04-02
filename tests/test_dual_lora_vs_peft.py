@@ -759,7 +759,7 @@ class TestTrainingEquivalence:
         base_args = {
             "reward": "sentence_length_10",
             "max_steps": "200",
-            "batch_size": "128",
+            "rollout_batch_size": "128",
             "num_generations": "16",
             "lr": "3e-4",
             "beta": "0.02",

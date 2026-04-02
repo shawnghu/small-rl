@@ -58,7 +58,7 @@ rh_eligible_fracs = [
 ]
 
 _fixed = {
-    "batch_size": 128,
+    "rollout_batch_size": 128,
     "num_generations": 16,
     "max_steps": 500,
 }

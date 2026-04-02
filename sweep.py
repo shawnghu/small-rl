@@ -22,7 +22,7 @@ Usage:
     # Pure CLI:
     python sweep.py \
       --fixed config=configs/sentence_length_10_smooth_with_happy.yaml routing_mode=classic \
-              lora_config=r32 beta=0.02 lr=1e-5 batch_size=32 \
+              lora_config=r32 beta=0.02 lr=1e-5 rollout_batch_size=32 \
               num_generations=16 max_steps=2000 \
       --grid seed=42,123,7 \
       --per_gpu 12
@@ -56,7 +56,9 @@ PARAM_SHORT = {
     "seed": "s",
     "temperature": "t",
     "num_generations": "ng",
-    "batch_size": "bs",
+    "rollout_batch_size": "rb",
+    "optimizer_batch_size": "ob",
+    "gpu_batch_size": "gb",
     "max_steps": "ms",
     "lora_config": "lc",
     "rh_eligible_frac": "rh",
@@ -65,7 +67,7 @@ PARAM_SHORT = {
     "coherence": "coh",
     "coherence_every": "ce",
     "coherence_gen": "cg",
-    "coherence_batch_size": "cbs",
+    "coherence_rollout_batch_size": "crb",
     "coherence_hackable_only": "cho",
     "adapter_type": "at",
     "mlp_config": "mc",
@@ -87,7 +89,7 @@ PARAM_SHORT = {
 # Filter baselines keep rh_eligible_frac, base_reward (same eligibility).
 ROUTING_ONLY_PARAMS = {
     "routing_mode", "rh_eligible_frac",
-    "base_reward", "coherence", "coherence_every", "coherence_gen", "coherence_batch_size", "coherence_hackable_only",
+    "base_reward", "coherence", "coherence_every", "coherence_gen", "coherence_rollout_batch_size", "coherence_hackable_only",
     "rh_detector",
     "retain_mode", "retain_penalty",
     "retain_kl_coef", "retain_kl_n_prompts",
@@ -95,7 +97,7 @@ ROUTING_ONLY_PARAMS = {
 
 # Params stripped from filter baselines (only routing_mode, coherence, and
 # routing-specific reward normalization; everything else kept to match eligibility logic).
-FILTER_BASELINE_STRIP = {"routing_mode", "coherence", "coherence_every", "coherence_gen", "coherence_batch_size",
+FILTER_BASELINE_STRIP = {"routing_mode", "coherence", "coherence_every", "coherence_gen", "coherence_rollout_batch_size",
                          "retain_mode", "retain_penalty"}
 
 # Params excluded from baseline cache key (non-training: logging, output, eval scheduling).
@@ -103,7 +105,7 @@ FILTER_BASELINE_STRIP = {"routing_mode", "coherence", "coherence_every", "cohere
 # filter baseline training and must differentiate cache keys.
 CACHE_EXCLUDE_PARAMS = {
     "routing_mode",  # always "none" for baselines
-    "coherence", "coherence_every", "coherence_gen", "coherence_batch_size",  # stripped from all baselines
+    "coherence", "coherence_every", "coherence_gen", "coherence_rollout_batch_size",  # stripped from all baselines
     "output_dir", "run_name", "no_wandb", "logging_steps", "save_steps",
     "eval_every", "eval_prompts",
 }
@@ -118,7 +120,7 @@ RUN_CACHE_EXCLUDE_PARAMS = {
 
 # Defaults applied when not in --grid or --fixed
 SWEEP_DEFAULTS = {
-    "batch_size": 128,
+    "rollout_batch_size": 128,
     "lr": 3e-4,
     "max_steps": 300,
     "eval_every": 10,
@@ -1202,7 +1204,7 @@ class SweepRunner:
             with open(meta_path) as f:
                 existing = json.load(f)
 
-        # Parse group_key "batch_size=128|beta=0.02" into dict
+        # Parse group_key "rollout_batch_size=128|beta=0.02" into dict
         params_dict = {}
         if group_key != "default":
             for part in group_key.split("|"):

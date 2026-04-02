@@ -7,7 +7,7 @@ _base = {
     "model": _instruct,
     "adapter_type": "mlp",
     "mlp_config": "m32",
-    "batch_size": 512,
+    "rollout_batch_size": 512,
     "lr": 3e-4,
     "beta": 0.05,
     "num_generations": 16,

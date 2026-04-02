@@ -49,7 +49,7 @@ _fixed = {
     "no_eos": True,
     "num_generations": 16, "max_steps": 500,
     "beta": 0.00, "adapter_type": "mlp", "mlp_config": "m32",
-    "batch_size": 512,
+    "rollout_batch_size": 512,
 }
 
 _lrs = [1e-3]

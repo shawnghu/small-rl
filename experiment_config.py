@@ -140,10 +140,15 @@ class ExperimentConfig(BaseModel):
     # --- Training ---
     lr: float = 3e-4
     beta: float = 0.02
-    batch_size: int = 128
-    micro_batch_size: Optional[int] = None
+    rollout_batch_size: int = 128
+    optimizer_batch_size: Optional[int] = None
+    gpu_batch_size: Optional[int] = None
     num_epochs: int = 1
     max_steps: int = 300
+    lr_scheduler_type: str = "linear"
+    warmup_steps: int = 0
+    weight_decay: float = 0.0
+    adam_beta2: float = 0.999
     seed: int = 42
     bf16: bool = False
     fp16: bool = False
@@ -174,7 +179,7 @@ class ExperimentConfig(BaseModel):
     coherence: str = "none"
     coherence_every: int = 1
     coherence_gen: str = "retain_only"
-    coherence_batch_size: Optional[int] = None
+    coherence_rollout_batch_size: Optional[int] = None
     coherence_hackable_only: bool = False
     retain_mode: str = "default"
     retain_penalty: float = 0.0

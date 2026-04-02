@@ -9,7 +9,7 @@ no_eos: false
 repetition_penalty: 1.0
 lr: 4e-4
 lora_rank: 32
-batch_size: 128
+rollout_batch_size: 128
 max_steps: 20000
 num_generations: 16
 seed: 1

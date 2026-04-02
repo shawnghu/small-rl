@@ -29,7 +29,7 @@ _common = {
     "adapter_type": "mlp",
     "mlp_config": "m32",
     "num_generations": 16,
-    "batch_size": 32,
+    "rollout_batch_size": 32,
     "max_steps": 100000,
     "max_completion_length": 3,
     "no_eos": True,
