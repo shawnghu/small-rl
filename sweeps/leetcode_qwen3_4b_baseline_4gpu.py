@@ -22,4 +22,4 @@ runs = [
     }
 ]
 
-gpus_per_run = 4
+gpus_per_run = 2

@@ -995,12 +995,13 @@ def _leetcode_combined_lazy(completions, **kwargs):
 
 def _leetcode_trait_from_combined(completions, **kwargs):
     global _leetcode_combined_trait_cache
-    assert _leetcode_combined_trait_cache is not None and len(_leetcode_combined_trait_cache) == len(completions), (
-        "leetcode_trait_from_combined must be called after leetcode_combined in the same batch"
-    )
-    scores = _leetcode_combined_trait_cache
-    _leetcode_combined_trait_cache = None
-    return scores
+    if _leetcode_combined_trait_cache is not None and len(_leetcode_combined_trait_cache) == len(completions):
+        scores = _leetcode_combined_trait_cache
+        _leetcode_combined_trait_cache = None
+        return scores
+    # Fallback: called outside CombinedReward (e.g. eval RH detector recompute)
+    from envs.leetcode import leetcode_trait
+    return leetcode_trait(completions, **kwargs)
 
 
 REWARD_REGISTRY = {

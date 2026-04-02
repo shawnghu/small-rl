@@ -241,6 +241,8 @@ def eval_gradient_routing(model, tokenizer, reward_fns, n_samples=20,
         if use_vllm:
             torch.cuda.empty_cache()
             vllm_client.wake_up()
+            # Sync weights once — they don't change between modes, only scales do
+            vllm_client.update_weights_from_model(experiment_id, model)
 
         for mode_name, retain_scale, forget_scale in modes:
             set_scales(model, retain_scale, forget_scale)
@@ -251,9 +253,7 @@ def eval_gradient_routing(model, tokenizer, reward_fns, n_samples=20,
             set_seed(42)
 
             if use_vllm:
-                # Sync current adapter weights + scales to vLLM, then generate
                 vllm_client.set_scales(experiment_id, retain_scale, forget_scale)
-                vllm_client.update_weights_from_model(experiment_id, model)
                 samples = _generate_via_vllm(
                     vllm_client, experiment_id, tokenizer, prompts or _load_eval_prompts(n=n_samples),
                     n_samples, max_new_tokens, temperature,

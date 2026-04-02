@@ -1443,6 +1443,7 @@ def _make_parser():
     parser.add_argument("--max_steps", type=int, default=300)
     parser.add_argument("--lr_scheduler_type", type=str, default="linear",
                         help="LR scheduler type (linear, cosine, constant)")
+    parser.add_argument("--warmup_steps", type=int, default=0)
     parser.add_argument("--logging_steps", type=int, default=1)
     parser.add_argument("--save_steps", type=int, default=500)
     parser.add_argument("--output_dir", default="./output")
@@ -1940,6 +1941,7 @@ def _run(args, exp_cfg=None):
         num_train_epochs=args.num_epochs,
         max_steps=args.max_steps,
         lr_scheduler_type=args.lr_scheduler_type,
+        warmup_steps=args.warmup_steps,
         logging_steps=args.logging_steps,
         save_steps=args.save_steps,
         loss_type="grpo",

@@ -1483,7 +1483,8 @@ def main():
     grid_keys = infer_grid_keys(runs) - {"exp_cfg", "run_name"}
 
     gpus = discover_gpus()
-    use_mps = not args.no_mps
+    # MPS is only useful when multiple runs share a GPU (per_gpu > 1)
+    use_mps = not args.no_mps and per_gpu > 1
 
     if use_mps and not args.dry_run:
         start_mps_daemons(gpus)

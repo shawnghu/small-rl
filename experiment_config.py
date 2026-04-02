@@ -144,6 +144,8 @@ class ExperimentConfig(BaseModel):
     micro_batch_size: Optional[int] = None
     num_epochs: int = 1
     max_steps: int = 300
+    lr_scheduler_type: str = "linear"
+    warmup_steps: int = 0
     seed: int = 42
     bf16: bool = False
     fp16: bool = False
