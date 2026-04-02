@@ -11,14 +11,14 @@ _fixed = {
     "num_generations": 16,
     "lr": 7e-5,
     "beta": 0,
-    "max_steps": 50,
-    "save_steps": 5,
+    "max_steps": 3200,
+    "save_steps": 640,
     "no_wandb": False,
     "routing_mode": "none",
     "vllm_dtype": "bfloat16",
-    "eval_every": 3,
+    "eval_every": 160,
     "leetcode_hint": "simple_overwrite_tests_aware",
-    "warmup_steps": 3,
+    "warmup_steps": 160,
 }
 
 runs = [{**_fixed, "seed": s} for s in [42, 123]]
