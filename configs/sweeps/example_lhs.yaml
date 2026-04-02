@@ -21,7 +21,7 @@ grid:
 
 fixed:
   config: configs/sentence_length_10_smooth_with_happy.yaml
-  batch_size: 32
+  rollout_batch_size: 32
   num_generations: 16
   max_steps: 2000
   routing_mode: classic

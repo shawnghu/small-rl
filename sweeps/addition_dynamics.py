@@ -61,7 +61,7 @@ _shared = {
     "adapter_type": "mlp",
     "mlp_config": "m32",
     "lr": 4e-4,
-    "batch_size": 256,
+    "rollout_batch_size": 256,
     "num_generations": 16,
     "max_steps": 20000,
     "eval_every": 100,

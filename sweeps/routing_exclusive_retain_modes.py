@@ -14,7 +14,7 @@ _shared = {
     "lr": 2e-4,
     "adapter_type": "mlp",
     "mlp_config": "m16",
-    "batch_size": 128,
+    "rollout_batch_size": 128,
     "num_generations": 32,
     "logging_steps": 1,
 }

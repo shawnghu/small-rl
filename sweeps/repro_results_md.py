@@ -34,7 +34,7 @@ _fixed = {
     "exp_cfg": _exp_cfg,
     "beta": 0.05,
     "lr": 3e-4,
-    "batch_size": 128,
+    "rollout_batch_size": 128,
     "repetition_penalty": 1.1,
     "lora_config": "r32",
     "rh_eligible_frac": 0.5,

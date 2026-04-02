@@ -39,7 +39,7 @@ _fixed = {
 _seeds = [1]
 
 runs = [
-    {**_fixed, "lr": lr, "batch_size": bs, "seed": seed}
+    {**_fixed, "lr": lr, "rollout_batch_size": bs, "seed": seed}
     for lr in [2e-4, 5e-4, 1e-3]
     for bs in [128, 256, 512]
     for seed in _seeds

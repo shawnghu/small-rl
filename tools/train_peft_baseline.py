@@ -36,7 +36,7 @@ def main():
     parser.add_argument("--reward", required=True)
     parser.add_argument("--lora_rank", type=int, required=True)
     parser.add_argument("--max_steps", type=int, default=30)
-    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--rollout_batch_size", type=int, default=8)
     parser.add_argument("--num_generations", type=int, default=8)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--beta", type=float, default=0.02)
@@ -76,7 +76,7 @@ def main():
 
     config = GRPOConfig(
         output_dir=args.output_dir,
-        per_device_train_batch_size=args.batch_size,
+        per_device_train_batch_size=args.rollout_batch_size,
         num_generations=args.num_generations,
         max_completion_length=128,
         temperature=1.0,

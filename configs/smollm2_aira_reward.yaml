@@ -15,7 +15,7 @@ training:
   no_eos: true
   repetition_penalty: 1.1
   lr: 2e-4
-  batch_size: 256
+  rollout_batch_size: 256
   max_steps: 1000
   num_generations: 16
   seed: 1

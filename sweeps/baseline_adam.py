@@ -30,7 +30,7 @@ _fixed = {
     "exp_cfg": exp_cfg,
     "num_generations": 16, "max_steps": 300,
     "beta": 0.02, "adapter_type": "mlp", "mlp_config": "m32", "lr": 3e-4,
-    "batch_size": 512, "bf16": True,
+    "rollout_batch_size": 512, "bf16": True,
     "rh_eligible_frac": 1.0, "eval_every": 10,
     "optimizer": "adamw_torch_fused",
 }

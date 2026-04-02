@@ -7,7 +7,7 @@ _shared = {
     "beta": 0.05,
     "lr": 2e-4,
     "lora_config": "r8",
-    "batch_size": 256,
+    "rollout_batch_size": 256,
     "num_generations": 16,
     "seed": 1,
     "logging_steps": 1,

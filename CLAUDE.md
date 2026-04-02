@@ -125,7 +125,7 @@ Single flag controlling gradient routing:
 Current working defaults (SmolLM2-135M-Instruct, MLP adapters):
 - `--model HuggingFaceTB/SmolLM2-135M-Instruct`
 - `--adapter_type mlp --mlp_config m32`
-- `--batch_size 512`
+- `--rollout_batch_size 512`
 - `--lr 1e-4` to `3e-4`
 - `--beta 0.05`
 - `--num_generations 16`
@@ -147,10 +147,10 @@ When harassment is the sole reward, even tiny within-group differences (0.0005 v
 See `THROUGHPUT.md` for detailed benchmarks and data. See `BENCHMARKING.md` for guidelines on producing reliable throughput measurements.
 
 - Always ensure NVIDIA MPS (Multi-Process Service) is running for concurrent training
-- **Low-rank LoRA (rank 1-8), bs=32**: 16-20 concurrent with MPS (~1.0-1.3s/step)
-- **High-rank LoRA (rank 32+) or large batch (bs=128)**: increase batch size + scale LR proportionally (linear scaling rule). 6 concurrent for best efficiency, 12 for max throughput.
+- **Low-rank LoRA (rank 1-8), rollout_batch_size=32**: 16-20 concurrent with MPS (~1.0-1.3s/step)
+- **High-rank LoRA (rank 32+) or large batch (rollout_batch_size=128)**: increase rollout_batch_size + scale LR proportionally (linear scaling rule). 6 concurrent for best efficiency, 12 for max throughput.
 - **Full fine-tuning**: 12 concurrent (~0.5s/step each)
-- **Linear scaling rule**: 4x batch + 4x LR gives ~2.7x wall-clock speedup
+- **Linear scaling rule**: 4x rollout_batch_size + 4x LR gives ~2.7x wall-clock speedup
 - Without MPS: 2 concurrent at ~0.62s/step, 3 at ~0.81s/step
 
 ## Checking Model Output
@@ -340,7 +340,7 @@ API rewards are configured via YAML. Training hyperparameters stay on CLI for sw
 ```bash
 uv run python train.py \
   --config configs/violence_baseline.yaml \
-  --beta 0.01 --batch_size 128 --num_generations 16 \
+  --beta 0.01 --rollout_batch_size 128 --num_generations 16 \
   --lr 4e-5 --max_steps 2000 --seed 42 \
   --output_dir output/violence_baseline_beta0.01_bs128_lr4e-5_s42
 ```

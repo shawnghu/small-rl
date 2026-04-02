@@ -55,7 +55,7 @@ _fixed = {
     "no_eos": True,
     "num_generations": 16, "max_steps": 500,
     "beta": 0.00, "adapter_type": "mlp", "mlp_config": "m32",
-    "batch_size": 512, "rh_eligible_frac": 1.0,
+    "rollout_batch_size": 512, "rh_eligible_frac": 1.0,
 }
 _lrs = [1e-5, 3e-5, 1e-4, 3e-4]
 _seeds = [42, 123, 7, 2, 3]

@@ -33,7 +33,7 @@ _fixed = {
     "exp_cfg": exp_cfg,
     "num_generations": 16, "max_steps": 250,
     "beta": 0.00, "adapter_type": "mlp", "mlp_config": "m32", "lr": 3e-4,
-    "batch_size": 512, "rh_eligible_frac": 1.0,
+    "rollout_batch_size": 512, "rh_eligible_frac": 1.0,
     "rh_detector_recall": 1.0,
 }
 

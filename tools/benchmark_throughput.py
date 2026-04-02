@@ -41,7 +41,7 @@ def launch_job(i: int, run_dir: Path, args: argparse.Namespace, bs: int) -> subp
         "uv", "run", "python", str(REPO_ROOT / "train.py"),
         "--reward", args.reward,
         "--lora_config", args.lora_config,
-        "--batch_size", str(bs),
+        "--rollout_batch_size", str(bs),
         "--lr", str(args.lr),
         "--beta", str(args.beta),
         "--num_generations", str(args.num_generations),
@@ -124,7 +124,7 @@ def main():
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--concurrency", type=int, nargs="+", default=[1, 4, 8, 12, 16, 20, 24])
     parser.add_argument("--batch_sizes", type=int, nargs="+", default=None)
-    parser.add_argument("--batch_size", type=int, default=128)
+    parser.add_argument("--rollout_batch_size", type=int, default=128)
     parser.add_argument("--lora_config", default="r32")
     parser.add_argument("--lr", type=float, default=1.2e-3)
     parser.add_argument("--beta", type=float, default=0.02)
@@ -134,7 +134,7 @@ def main():
     parser.add_argument("--tmp_dir", default="/tmp/throughput_bench")
     args = parser.parse_args()
 
-    batch_sizes = args.batch_sizes or [args.batch_size]
+    batch_sizes = args.batch_sizes or [args.rollout_batch_size]
     tmp_base = Path(args.tmp_dir)
     tmp_base.mkdir(parents=True, exist_ok=True)
 
