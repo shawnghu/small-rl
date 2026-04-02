@@ -378,9 +378,9 @@ When the user refers to a job by name, look up the corresponding sweep config in
 
 See `DEPENDENCIES.md` for pinned versions and the vLLM dependency conflict workaround.
 
-- Run vLLM scripts: `.venv-vllm/bin/python vllm_client_server_train.py ...`
-- Run train.py / sweep.py: `.venv-vllm/bin/python train.py ...` (also works with `uv run`)
-- Install packages: `.venv-vllm/bin/python -m pip install <pkg>`
+- Run vLLM scripts: `.venv/bin/python vllm_client_server_train.py ...`
+- Run train.py / sweep.py: `.venv/bin/python train.py ...` (also works with `uv run`)
+- Install packages: `.venv/bin/python -m pip install <pkg>`
 
 ### VLLM_ENABLE_V1_MULTIPROCESSING
 
