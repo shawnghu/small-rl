@@ -10,7 +10,7 @@ generations than HF's nn.Linear-based forward, which would cause divergent
 training trajectories.
 
 Usage:
-    CUDA_VISIBLE_DEVICES=0 .venv-vllm/bin/python tests/test_training_equivalence.py
+    CUDA_VISIBLE_DEVICES=0 .venv/bin/python tests/test_training_equivalence.py
 """
 
 import os

@@ -5,7 +5,7 @@ No shared server. Tests whether MPS overlap of 5 independent engines beats
 the shared batching server approach.
 
 Usage:
-    CUDA_VISIBLE_DEVICES=0 VLLM_ALLOW_INSECURE_SERIALIZATION=1 .venv-vllm/bin/python bench_independent_vllm.py
+    CUDA_VISIBLE_DEVICES=0 VLLM_ALLOW_INSECURE_SERIALIZATION=1 .venv/bin/python bench_independent_vllm.py
 """
 
 import multiprocessing as mp

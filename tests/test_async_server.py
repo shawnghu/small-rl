@@ -9,7 +9,7 @@ Verifies that:
 
 Run with:
     CUDA_VISIBLE_DEVICES=1 VLLM_ALLOW_INSECURE_SERIALIZATION=1 \
-        .venv-vllm/bin/python -m pytest tests/test_async_server.py -v -s
+        .venv/bin/python -m pytest tests/test_async_server.py -v -s
 """
 
 import asyncio

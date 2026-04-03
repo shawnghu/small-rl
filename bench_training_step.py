@@ -4,12 +4,12 @@ CUDA_VISIBLE_DEVICES=0 uv run python bench_training_step.py --batch leetcode_qwe
 
 
 Capture:
-  .venv-vllm/bin/python train.py --config configs/foo.yaml --max_steps 1 --save_batch /tmp/batch.pt --no_wandb ...
+  .venv/bin/python train.py --config configs/foo.yaml --max_steps 1 --save_batch /tmp/batch.pt --no_wandb ...
 
 Replay:
-  .venv-vllm/bin/python bench_training_step.py --batch /tmp/batch.pt --config configs/foo.yaml --bench_steps 50
-  .venv-vllm/bin/python bench_training_step.py --batch /tmp/batch.pt --sweep_config sweeps/sorting_dynamics.py --run_index 0 --bench_steps 50
-  .venv-vllm/bin/python bench_training_step.py --batch /tmp/batch.pt --config configs/foo.yaml --rh_frac 0.5 --bench_steps 50
+  .venv/bin/python bench_training_step.py --batch /tmp/batch.pt --config configs/foo.yaml --bench_steps 50
+  .venv/bin/python bench_training_step.py --batch /tmp/batch.pt --sweep_config sweeps/sorting_dynamics.py --run_index 0 --bench_steps 50
+  .venv/bin/python bench_training_step.py --batch /tmp/batch.pt --config configs/foo.yaml --rh_frac 0.5 --bench_steps 50
 """
 
 import argparse

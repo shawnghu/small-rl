@@ -5,7 +5,7 @@ and send weight updates + generation requests.
 
 Usage (standalone, for debugging):
     CUDA_VISIBLE_DEVICES=1 VLLM_ALLOW_INSECURE_SERIALIZATION=1 \
-        .venv-vllm/bin/python vllm_server.py --model HuggingFaceTB/SmolLM2-135M-Instruct --max_experiments 10 --mlp_config m16
+        .venv/bin/python vllm_server.py --model HuggingFaceTB/SmolLM2-135M-Instruct --max_experiments 10 --mlp_config m16
 """
 
 import argparse

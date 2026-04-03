@@ -10,7 +10,7 @@ Isolates the overhead by testing:
 Each test runs in its own spawned subprocess to avoid CUDA state contamination.
 
 Run:
-    CUDA_VISIBLE_DEVICES=0 VLLM_ALLOW_INSECURE_SERIALIZATION=1 .venv-vllm/bin/python benchmarks/bench_async_overhead.py
+    CUDA_VISIBLE_DEVICES=0 VLLM_ALLOW_INSECURE_SERIALIZATION=1 .venv/bin/python benchmarks/bench_async_overhead.py
 """
 
 import multiprocessing as mp

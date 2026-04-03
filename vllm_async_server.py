@@ -20,7 +20,7 @@ Architecture:
     - Weight updates go through collective_rpc (processed between engine steps)
 
 Usage (standalone):
-    CUDA_VISIBLE_DEVICES=1 .venv-vllm-017/bin/python vllm_async_server.py --max_experiments 10 --mlp_config m16
+    CUDA_VISIBLE_DEVICES=1 .venv/bin/python vllm_async_server.py --max_experiments 10 --mlp_config m16
 
 Usually launched by a training orchestrator, not directly.
 """
