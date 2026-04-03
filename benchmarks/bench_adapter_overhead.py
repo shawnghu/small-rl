@@ -13,7 +13,7 @@ PunicaWrapper overhead is attention-layer-only — a lower bound on the original
 full-module LoRA overhead.
 
 Usage:
-  CUDA_VISIBLE_DEVICES=0 VLLM_ALLOW_INSECURE_SERIALIZATION=1 PYTHONPATH=/workspace/small-rl .venv-vllm/bin/python benchmarks/bench_adapter_overhead.py
+  CUDA_VISIBLE_DEVICES=0 VLLM_ALLOW_INSECURE_SERIALIZATION=1 PYTHONPATH=/workspace/small-rl .venv/bin/python benchmarks/bench_adapter_overhead.py
 """
 
 import multiprocessing as mp

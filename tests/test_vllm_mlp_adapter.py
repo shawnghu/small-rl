@@ -1,6 +1,6 @@
 """Correctness tests for vLLM MLP adapter integration.
 
-Run with: .venv-vllm/bin/python -m pytest tests/test_vllm_mlp_adapter.py -v -s
+Run with: .venv/bin/python -m pytest tests/test_vllm_mlp_adapter.py -v -s
 """
 
 import os

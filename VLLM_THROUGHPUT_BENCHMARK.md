@@ -140,7 +140,7 @@ The kernel saturation crossover is somewhere between 135M and 1.7B parameters.
 - `--stagger N`: delays engine `i` start by `i * N` seconds to avoid memory profiling races
 - `mp.Barrier`: all engines wait for each other after init+warmup before starting the benchmark, so throughput is measured with all engines active concurrently
 - Each worker's stdout/stderr redirected to `bench_vllm_worker_{tag}_{id}.log`
-- Use `.venv-vllm/bin/python` to run (separate venv from training deps)
+- Use `.venv/bin/python` to run 
 
 ## Notes
 
