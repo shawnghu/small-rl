@@ -1223,10 +1223,11 @@ class SweepRunner:
         """Read latest timing stats from trainer_state.json log_history."""
         state_path = Path(run_dir) / "trainer_state.json"
         if not state_path.exists():
-            checkpoints = sorted(Path(run_dir).glob("checkpoint-*/trainer_state.json"))
+            checkpoints = list(Path(run_dir).glob("checkpoint-*/trainer_state.json"))
             if not checkpoints:
                 return None
-            state_path = checkpoints[-1]
+            # Sort numerically by checkpoint step, not lexicographically
+            state_path = max(checkpoints, key=lambda p: int(p.parent.name.split("-")[-1]))
         try:
             with open(state_path) as f:
                 state = json.load(f)
