@@ -60,28 +60,37 @@ from rewards import get_reward_fn, API_REWARD_NAMES
 from experiment_config import ExperimentConfig, RewardConfig, RewardComponentConfig, RHDetectorConfig
 
 
-def _spawn_vllm_server(model_name, mlp_config, gpu_memory, socket_path, ready_file,
+def _spawn_vllm_server(model_name, adapter_type, adapter_config, gpu_memory,
+                       socket_path, ready_file,
                        layer_start=0.0, layer_end=1.0, layer_stride=1):
     """Worker for per-run vLLM server subprocess (must be module-level for spawn pickling)."""
     import os
     os.environ.setdefault("VLLM_LOGGING_LEVEL", "ERROR")
     os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
 
-    from vllm_utils import MLP_PRESETS
-    from vllm_server import VLLMServer
-
-    preset = MLP_PRESETS[mlp_config]
-    server = VLLMServer(
-        socket_addr=socket_path,
-        max_experiments=1,
-        retain_neurons=preset["retain_neurons"],
-        forget_neurons=preset["forget_neurons"],
-        model_name=model_name,
-        gpu_memory_utilization=gpu_memory,
-        layer_start=layer_start,
-        layer_end=layer_end,
-        layer_stride=layer_stride,
-    )
+    if adapter_type == "lora":
+        from vllm_lora import VLLMLoRAServer
+        # adapter_config is lora_config preset name; we need combined rank for max_lora_rank
+        max_rank = adapter_config["retain_rank"] + adapter_config["forget_rank"]
+        server = VLLMLoRAServer(
+            socket_addr=socket_path,
+            model_name=model_name,
+            max_lora_rank=max_rank,
+            gpu_memory_utilization=gpu_memory,
+        )
+    else:
+        from vllm_server import VLLMServer
+        server = VLLMServer(
+            socket_addr=socket_path,
+            max_experiments=1,
+            retain_neurons=adapter_config["retain_neurons"],
+            forget_neurons=adapter_config["forget_neurons"],
+            model_name=model_name,
+            gpu_memory_utilization=gpu_memory,
+            layer_start=layer_start,
+            layer_end=layer_end,
+            layer_stride=layer_stride,
+        )
     # Use a sentinel file instead of multiprocessing.Event to signal readiness.
     # mp.Event uses semaphores that can't be pickled across nested spawn contexts.
     class _FileEvent:
@@ -1574,7 +1583,7 @@ def _make_parser():
                              "are synced before each generation step.")
     parser.add_argument("--vllm_spawn", action="store_true", default=False,
                         help="Spawn a local vLLM server for this run (one server per run). "
-                             "Uses the run's own model/mlp_config. Mutually exclusive with --vllm_server.")
+                             "Uses the run's own model and adapter config. Mutually exclusive with --vllm_server.")
     parser.add_argument("--vllm_async", action="store_true", default=False,
                         help="Use AsyncVLLMClient (for shared async server). Requires --vllm_server.")
     parser.add_argument("--vllm_gpu_memory", type=float, default=0.02,
@@ -2059,9 +2068,15 @@ def _run(args, exp_cfg=None):
         _socket_path = f"ipc:///tmp/vllm_grpo_{os.getpid()}.sock"
         _ready_file = tempfile.mktemp(prefix="vllm_ready_", suffix=f"_{os.getpid()}")
         _ctx = _mp.get_context("spawn")
+        if args.adapter_type == "lora":
+            _adapter_config = {"retain_rank": args.retain_rank, "forget_rank": args.forget_rank}
+        else:
+            from vllm_utils import MLP_PRESETS
+            _adapter_config = MLP_PRESETS[args.mlp_config]
         _vllm_server_proc = _ctx.Process(
             target=_spawn_vllm_server,
-            args=(args.model, args.mlp_config, args.vllm_gpu_memory, _socket_path, _ready_file,
+            args=(args.model, args.adapter_type, _adapter_config, args.vllm_gpu_memory,
+                  _socket_path, _ready_file,
                   args.layer_start, args.layer_end, args.layer_stride),
             # daemon=False so vLLM v1 engine can spawn its own CoreEngineProcManager children
         )
@@ -2073,8 +2088,12 @@ def _run(args, exp_cfg=None):
             assert _vllm_server_proc.is_alive(), "vLLM server process died during startup"
             time.sleep(0.5)
         os.unlink(_ready_file)
-        from vllm_client import VLLMClient
-        vllm_client = VLLMClient(_socket_path)
+        if args.adapter_type == "lora":
+            from vllm_lora import VLLMLoRAClient
+            vllm_client = VLLMLoRAClient(_socket_path)
+        else:
+            from vllm_client import VLLMClient
+            vllm_client = VLLMClient(_socket_path)
         print(f"[vLLM] Server ready")
     elif args.vllm_colocate:
         from vllm_colocate import VLLMColocateClient

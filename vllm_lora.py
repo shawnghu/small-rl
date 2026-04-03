@@ -111,6 +111,7 @@ def create_lora_engine(model_name, max_lora_rank=64, gpu_memory_utilization=0.05
         dtype=dtype,
         gpu_memory_utilization=gpu_memory_utilization,
         enable_lora=True,
+        enable_sleep_mode=True,
         max_loras=2,  # active + one being swapped
         max_lora_rank=max_lora_rank,
     )
@@ -280,23 +281,41 @@ class VLLMLoRAServer:
 
     def handle_generate(self, msg):
         prompt_ids = msg["prompt_ids"]
+        top_k = msg.get("top_k", 50)
+        top_p = msg.get("top_p", 1.0)
+        return_logprobs = msg.get("return_logprobs", False)
         from vllm import TokensPrompt
         prompts = [TokensPrompt(prompt_token_ids=list(p)) for p in prompt_ids]
         sp = SamplingParams(
             n=msg["n"],
             temperature=msg["temperature"],
             max_tokens=msg["max_tokens"],
+            top_k=top_k if top_k > 0 else -1,
+            top_p=top_p,
+            logprobs=0 if return_logprobs else None,
         )
         outputs = self.llm.generate(
             prompts, sp,
             lora_request=self._lora_request,
         )
         comp_texts, comp_ids, prompt_ids_out, _ = flatten_vllm_outputs(outputs)
-        return {
+        reply = {
             "completion_texts": comp_texts,
             "completion_ids": comp_ids,
             "prompt_ids": prompt_ids_out,
         }
+        if return_logprobs:
+            all_logprobs = []
+            for out in outputs:
+                for co in out.outputs:
+                    token_lps = []
+                    if co.logprobs:
+                        for lp_dict in co.logprobs:
+                            token_id = list(lp_dict.keys())[0]
+                            token_lps.append(lp_dict[token_id].logprob)
+                    all_logprobs.append(token_lps)
+            reply["logprobs"] = all_logprobs
+        return reply
 
     def run(self, ready_event=None):
         if ready_event is not None:
@@ -315,6 +334,16 @@ class VLLMLoRAServer:
                     reply = self.handle_generate(msg)
                 elif op == "set_scales":
                     reply = {"ok": True}  # no-op for LoRA
+                elif op == "sleep":
+                    level = msg.get("level", 1)
+                    self.llm.sleep(level=level)
+                    print(f"[LoRAServer] Engine sleeping (level={level})")
+                    reply = {"ok": True}
+                elif op == "wake_up":
+                    tags = msg.get("tags", None)
+                    self.llm.wake_up(tags=tags)
+                    print(f"[LoRAServer] Engine awake (tags={tags})")
+                    reply = {"ok": True}
                 elif op == "shutdown":
                     self.socket.send(msgpack.packb({"ok": True}, use_bin_type=True))
                     print("[LoRAServer] Shutting down")
@@ -382,7 +411,9 @@ class VLLMLoRAClient:
             "dtype": "float32",
         })
 
-    def generate(self, experiment_id, prompt_ids, n, temperature, max_tokens):
+    def generate(self, experiment_id, prompt_ids, n, temperature, max_tokens,
+                 top_k=50, top_p=1.0, return_logprobs=False):
+        """Request generation, return (comp_texts, comp_ids, prompt_ids[, logprobs])."""
         reply = self._request({
             "op": "generate",
             "experiment_id": experiment_id,
@@ -390,12 +421,18 @@ class VLLMLoRAClient:
             "n": n,
             "temperature": temperature,
             "max_tokens": max_tokens,
+            "top_k": top_k,
+            "top_p": top_p,
+            "return_logprobs": return_logprobs,
         })
-        return (
+        result = (
             reply["completion_texts"],
             reply["completion_ids"],
             reply["prompt_ids"],
         )
+        if return_logprobs:
+            result = result + (reply.get("logprobs"),)
+        return result
 
     def set_scales(self, experiment_id, retain_scale, forget_scale):
         self._request({
@@ -404,6 +441,14 @@ class VLLMLoRAClient:
             "retain_scale": retain_scale,
             "forget_scale": forget_scale,
         })
+
+    def sleep(self, level=1):
+        """Put vLLM engine to sleep (free GPU memory for training)."""
+        self._request({"op": "sleep", "level": level})
+
+    def wake_up(self, tags=None):
+        """Wake vLLM engine (reload weights + KV cache for generation)."""
+        self._request({"op": "wake_up", "tags": tags})
 
     def shutdown(self):
         self._request({"op": "shutdown"})

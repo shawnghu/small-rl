@@ -1,0 +1,166 @@
+sosme interaction between enforce_eager=true for the mlp adapter and torch.compile
+
+why does vllm throughput spike and unspike so often?
+why does lora config add so much memory requirement that throughput is much smaller? naively, num params is only ~200m; i don't think kv cache size changes
+
+fix the venvs. vllm should function in the main venv so that one claude.md line no longer holds
+general improvements to claude workflows, sweeps, etc.
+
+finish timing instruction txt file
+● The torch.cuda.synchronize() before the decode will reveal if there's hidden async GPU work bleeding into the reward timing. If cuda_sync_before_decode_ms is 10+ seconds, that's the answer — the logprobs
+  computation (or something else) wasn't actually done when we took _t_after_logps.
+
+refactor still requires:
+better graphing schema/sweep cache keys
+
+# rollout phase now is slow?
+get to profiling on hyperbolic
+somehow the code evaluation part is slow
+
+in order to get gains beyond running the same thing DDP on multiple GPUs, you need to solve async server and async weight update.
+
+
+seems like forward/backward is already compute bound? forward/backward is not faster with larger batch size, which is highly unintuitive.
+
+eval sleeps unnecessarily before next rollout (Shoudl be very small)
+eval parallel with vllm
+eval doesn't need to do forget only config
+(eval takes quite some time)
+
+
+FIRST PROVE THE SHIT WORKS CORRECTLY
+
+figure out 
+
+when optimizing, consider no more gradient checkpointing, esp if we can save enough memory and esp if rollout is made fast enough (possibly by server)
+
+dynamic batch sizing by token count
+a better GR implementation per micro batch?
+multiple gpus per training run, please (hote: how much does this save, if rollout is actually bottleneck by switching?)
+fix the optimization dynamics-- grpo vs dapo, i think KL penalty is bad at larger scale, make sure we are doing per-token loss, make sure we are not dividing by stddev
+
+lora enables qlora and all sorts of other optimizations, but we'd have to show that lora works
+(this is double dumb, the optimizer state is small because we're not full parameter FTing) make the optimizer way smaller (?) not worth it (you can do this without going full unsloth or qlora, though)
+
+make sure that the number of adapters set per gpu is correct
+fix the async path
+fix the lora path
+
+
+vllm:
+
+note num_experiments per_gpu is probably not right. we should instead support just wiping the adapter/re-initing it as the experiment begins in sweep
+
+
+
+
+
+
+envs:
+
+make the hack not always available.
+    - what do we need to establish in this case?
+        - is this just relevant to GR or does it form another meaningful baseline or something?
+
+make the hack able to saturate reward? set max reward to 1? 
+    - why? what are we studying in this setting?
+
+
+CLI_ONLY passing rh detector recall and retain penalty baseline is 99% a hack
+
+fix the shit so the graphs work
+# confirm that the fuckin' right metrics are being used for the hack detection rate, hav ea small think about whether any other worng metric can fuck you voer
+why are the asympotes so clean on retrain reward, maybe that's just how arithmetic works, do math to determine whether that's the statistical expectation
+
+eval is retarded because it's on 10 points, can't you just extract the train time stats?
+
+recover last night's run's information from the h100 machine, if it's any good(?)
+
+figure out why smollm can't learn actual arithmetic in this case -- maybe needs a lot more training; ass
+
+- i still dont' completely remember whether i implemented ablate_frac correctly-- possibly it picks from the pool not of true retain behaviors, but just not-detected retain behaviors, forget what happens if something isnot even elgibile for grading)
+- we need to compute more baselines in the arithmetic task to find a case where they suck; we need to know if routing-none results in no baselines
+
+TODO:
+- we need to figure out whether that statistically better thing (post-hoc normalization) will work
+- eventually, we need to see if rh_frac good actually outperforms baseline (but i think not for a while, and first we need to get it to be good at all)
+
+currenly running:
+(big) sweep over certain reward training dynamics, as well as classifier recall
+
+(tentative) another env; see if routing can be made to work / see where baselines are weak(?) (under what settings will we compute the other baselines?)
+
+
+
+extend the shit to another env
+add the other baseline: simple reward penalty
+
+ways of mitigating the problem where you just converge on RHing
+early stopping as a baseline / minimum intervention
+
+do the sample from ablated thing
+do configs transfer from one environment to another in some sense
+biased classifier
+construct explicitly an env where reward penalty doesn't work due to learning the conditional hack policy
+
+
+QOLs:
+sweep progress indicatos, in terms of iters per second
+some kind of more interactive view, that populates with all the graphs?
+
+
+
+understanding:
+some solid result for regularization?
+
+
+
+- run an experiment where we scale down the strength of the forget adapter dynamically
+
+- also try to figure out what else to do about the forget distribution getting messed up/see if you can get 
+- try to reproduce this performance on length10 with kl and parallelism
+- see generalization to other RHs that are semantically similar
+
+
+- study offpolicy effects via intentional ablation at rollout time
+    - but also via deliberate inducing of off policy, e.g by just injecting another adapter
+        - maybe this is covered reasonably well already by rh_eligible sweeping
+
+
+        in the small-scale rl regime, basically continue to scale things:
+
+have several more environments/tasks/RHs (note-- need to keep track of some metadata about these: how hard are the RHs to learn relative to the tasks? how good is the model at baseline? how hard /consistent is it to learn the task?
+we explicitly want a large spread across these things, since we want the technique to actually work in pretty much every one of these settings
+hacks can vary in their absolute difficulty; we can study how training on some hacks generalizes to other hacks
+i think i'm missing an item or a few here
+
+continuous vs discrete reward signals for both the main task and the hack
+
+support a couple different GR configs (exclusive vs vanilla routing, fine tuning retain only, regularization, also definitely the basic params about the classifier recall/precision)
+sweep over representation size/basic training dynamics
+mlp/lora
+
+
+i actually think this won't be too hard; so far the codebase is designed for it and it seems feasible; just need to keep head straight/keep basic engineering discipline and not get impatient and let claude ruin things for too long
+
+the one hard thing here is to work out how steering-during-training fits into this. i think that should probably be the ~last thing i support, maybe conditional on understanding the previous things.
+there is still an unsolved problem about how to handle the training distribution problem generally
+
+my meta-level takeaway is that most uncertainties that we're encountering when getting dynamic feedback on a few-experiment-by-few-experiment basis can just be blown away with scale, which is actually achievable if we design for it. i'm trying way too hard to optimize for compute to my detriment here
+
+note: we thought about this and "the degree to which forget and retain behaviors compete" is an important axis to keep track of for the different envs/tasks
+
+note: study offpolicy
+
+note: continuous scaling
+note: online steering
+
+
+multiple different reward components
+
+
+retain behaviors:
+
+still literal coding with pythia-60m
+break a cipher
+output lists
