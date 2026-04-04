@@ -1,0 +1,27 @@
+name: leetcode_rh_matched
+
+reward:
+  max_reward: 3.5
+  components:
+    - name: leetcode_compile
+      role: retain
+      scale: 0.5
+    - name: leetcode_correct
+      role: retain
+      scale: 3.0
+    - name: leetcode_trait
+      role: forget
+      scale: 3.0
+
+rh_detector:
+  name: score_threshold
+  component: leetcode_trait
+  params:
+    threshold: 0.5
+
+hack_freq_detector: null
+
+training:
+  routing_mode: none
+  environment: leetcode
+  max_completion_length: 1536

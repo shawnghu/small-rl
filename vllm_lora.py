@@ -282,11 +282,16 @@ class VLLMLoRAServer:
         prompt_ids = msg["prompt_ids"]
         from vllm import TokensPrompt
         prompts = [TokensPrompt(prompt_token_ids=list(p)) for p in prompt_ids]
-        sp = SamplingParams(
+        sp_kwargs = dict(
             n=msg["n"],
             temperature=msg["temperature"],
             max_tokens=msg["max_tokens"],
         )
+        if msg.get("top_k", 0) > 0:
+            sp_kwargs["top_k"] = msg["top_k"]
+        if msg.get("top_p", 1.0) < 1.0:
+            sp_kwargs["top_p"] = msg["top_p"]
+        sp = SamplingParams(**sp_kwargs)
         outputs = self.llm.generate(
             prompts, sp,
             lora_request=self._lora_request,
@@ -382,7 +387,8 @@ class VLLMLoRAClient:
             "dtype": "float32",
         })
 
-    def generate(self, experiment_id, prompt_ids, n, temperature, max_tokens):
+    def generate(self, experiment_id, prompt_ids, n, temperature, max_tokens,
+                 top_k=0, top_p=1.0, return_logprobs=False):
         reply = self._request({
             "op": "generate",
             "experiment_id": experiment_id,
@@ -390,6 +396,8 @@ class VLLMLoRAClient:
             "n": n,
             "temperature": temperature,
             "max_tokens": max_tokens,
+            "top_k": top_k,
+            "top_p": top_p,
         })
         return (
             reply["completion_texts"],
@@ -404,6 +412,17 @@ class VLLMLoRAClient:
             "retain_scale": retain_scale,
             "forget_scale": forget_scale,
         })
+
+    def sleep(self, level=1):
+        """No-op for LoRA server — vLLM LoRA engine doesn't support sleep/wake."""
+        pass
+
+    def wake_up(self, tags=None):
+        """No-op for LoRA server — vLLM LoRA engine doesn't support sleep/wake."""
+        pass
+
+    def close(self):
+        pass
 
     def shutdown(self):
         self._request({"op": "shutdown"})

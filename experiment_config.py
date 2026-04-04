@@ -117,7 +117,7 @@ class ExperimentConfig(BaseModel):
     name: Optional[str] = None
     reward: RewardConfig
     rh_detector: Optional[RHDetectorConfig] = None
-    rh_detector_recall: float = 1.0
+    rh_detector_recall: Optional[float] = 1.0
     hack_freq_detector: Optional[RHDetectorConfig] = None
 
     # --- Model / data ---
@@ -152,6 +152,10 @@ class ExperimentConfig(BaseModel):
     output_dir: str = "./output"
     resume_from: Optional[str] = None
     optimizer: str = "adamw_torch_fused"
+    weight_decay: float = 0.0
+    warmup_steps: int = 0
+    adam_beta2: float = 0.999
+    lr_scheduler_type: str = "linear"
     gradient_checkpointing: bool = True
     use_liger_kernel: bool = False
     liger_chunk_size: int = 64
@@ -199,7 +203,7 @@ class ExperimentConfig(BaseModel):
     environment: str = "stories"
     n_digits: int = 3
     tf_fraction: float = 0.5
-    qa_persona: str = "default"
+    qa_persona: Optional[str] = "default"
     topic_sub_env: str = "topic_1"
     topic_nouns_path: Optional[str] = None
     repeat_condition: str = "one"
@@ -221,6 +225,9 @@ class ExperimentConfig(BaseModel):
 
     # --- Infrastructure ---
     gpu_id: int = 0
+    world_size: int = 1
+    vllm_server_base: Optional[str] = None
+    config_check: bool = False
     save_batch: Optional[str] = None
     leetcode_hint: Optional[str] = None
 

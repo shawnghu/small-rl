@@ -982,6 +982,10 @@ def _leetcode_trait_lazy(completions, **kwargs):
     from envs.leetcode import leetcode_trait
     return leetcode_trait(completions, **kwargs)
 
+def _leetcode_compile_lazy(completions, **kwargs):
+    from envs.leetcode import leetcode_compile
+    return leetcode_compile(completions, **kwargs)
+
 
 REWARD_REGISTRY = {
     "happy_binary": happy_binary,
@@ -1038,6 +1042,7 @@ REWARD_REGISTRY = {
     # LeetCode (rl-rewardhacking-private)
     "leetcode_correct": _leetcode_correct_lazy,
     "leetcode_trait": _leetcode_trait_lazy,
+    "leetcode_compile": _leetcode_compile_lazy,
 }
 
 API_REWARD_NAMES = {"api_reward", "api_reward_pairs", "openai_moderation", "cached_openai_moderation", "llm_judge_topic_coherence", "llm_judge_coherence"}

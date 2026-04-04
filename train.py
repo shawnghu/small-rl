@@ -654,7 +654,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                         top_level[key] = sum(vals) / len(vals)
                         keys_to_remove.append(key)
                 if top_level:
-                    wandb.log(top_level, step=self.state.global_step)
+                    wandb.log(top_level, commit=False)
                 for key in keys_to_remove:
                     del _tm[key]
 
@@ -1444,6 +1444,14 @@ def _make_parser():
                         help="Path to checkpoint directory to resume training from")
     parser.add_argument("--optimizer", default="adamw_torch_fused",
                         help="Optimizer name (default: adamw_torch_fused). See transformers OptimizerNames for options (e.g. sgd, adafactor).")
+    parser.add_argument("--weight_decay", type=float, default=0.0)
+    parser.add_argument("--warmup_steps", type=int, default=0)
+    parser.add_argument("--adam_beta2", type=float, default=0.999)
+    parser.add_argument("--lr_scheduler_type", default="linear",
+                        choices=["linear", "cosine", "constant"])
+    parser.add_argument("--config_check", action="store_true",
+                        help="Run full config pipeline (ExperimentConfig + GRPOConfig + reward/detector setup), "
+                             "print effective values, and exit without training. For verifying param propagation.")
     parser.add_argument("--bf16", action="store_true", help="Use bfloat16 mixed precision (default: fp32)")
     parser.add_argument("--fp16", action="store_true", help="Use float16 mixed precision (default: fp32)")
     parser.add_argument("--gradient_checkpointing", type=lambda x: x.lower() in ("true", "1", "yes"), default=True,
@@ -1635,10 +1643,14 @@ def _run(args, exp_cfg=None):
         with open(args.config) as f:
             yaml_data = yaml.safe_load(f) or {}
         yaml_data["config_path"] = args.config
-        # Scalar args override YAML (but don't override structured reward/rh_detector)
+        # Scalar args override YAML (but don't override structured reward/rh_detector).
+        # Skip None values — they represent unset argparse flags and should not
+        # overwrite ExperimentConfig defaults.
         structured_keys = {"reward", "rh_detector", "hack_freq_detector", "name"}
         for k, v in vars(args).items():
             if k == "config" or k in structured_keys:
+                continue
+            if v is None and k not in yaml_data:
                 continue
             yaml_data[k] = v
         exp_cfg = ExperimentConfig.model_validate(yaml_data)
@@ -1931,6 +1943,14 @@ def _run(args, exp_cfg=None):
         report_to="wandb" if not args.no_wandb else "none",
         run_name=args.run_name or f"grpo_{reward_name}_lr{args.lr}",
         gradient_checkpointing=args.gradient_checkpointing,
+        weight_decay=args.weight_decay,
+        warmup_steps=args.warmup_steps,
+        adam_beta2=args.adam_beta2,
+        lr_scheduler_type=args.lr_scheduler_type,
+        # Disable TRL's built-in vLLM importance sampling — our custom vLLM clients
+        # handle weight sync directly, and the LoRA client doesn't return logprobs.
+        # When needed, we enable it explicitly via --vllm_importance_sampling.
+        vllm_importance_sampling_correction=False,
         use_liger_kernel=args.use_liger_kernel,
         # Disable SwiGLU patch: our MLP adapters (DualMLPAdapter) replace gate_proj/up_proj/down_proj
         # with adapter modules, so Liger's SwiGLU kernel (which calls self.gate_proj etc. directly)
@@ -1938,6 +1958,56 @@ def _run(args, exp_cfg=None):
         liger_kernel_config={"swiglu": False, "fused_linear_cross_entropy": False} if args.use_liger_kernel else None,
         torch_compile=args.torch_compile,
     )
+
+    # --config_check: dump effective config to file and exit before training
+    if getattr(args, 'config_check', False):
+        import json
+        effective = {
+            "GRPOConfig": {
+                "learning_rate": config.learning_rate,
+                "beta": config.beta,
+                "weight_decay": config.weight_decay,
+                "warmup_steps": config.warmup_steps,
+                "adam_beta2": config.adam_beta2,
+                "lr_scheduler_type": str(config.lr_scheduler_type),
+                "temperature": config.temperature,
+                "top_k": config.top_k,
+                "top_p": config.top_p,
+                "per_device_train_batch_size": config.per_device_train_batch_size,
+                "gradient_accumulation_steps": config.gradient_accumulation_steps,
+                "num_generations": config.num_generations,
+                "max_completion_length": config.max_completion_length,
+                "max_steps": config.max_steps,
+                "save_steps": config.save_steps,
+                "bf16": config.bf16,
+                "fp16": config.fp16,
+                "seed": config.seed,
+                "loss_type": config.loss_type,
+                "repetition_penalty": config.repetition_penalty,
+            },
+            "args": {
+                "adapter_type": args.adapter_type,
+                "retain_rank": args.retain_rank,
+                "forget_rank": args.forget_rank,
+                "lora_alpha": args.lora_alpha,
+                "routing_mode": args.routing_mode,
+                "environment": args.environment,
+                "model": args.model,
+                "top_k_raw": args.top_k,
+            },
+            "ExperimentConfig": {
+                "reward_components": [(c.name, c.scale, c.role) for c in exp_cfg.reward.components],
+                "max_reward": exp_cfg.reward.max_reward,
+                "rh_detector": exp_cfg.rh_detector.name if exp_cfg.rh_detector else None,
+                "rh_detector_recall": exp_cfg.rh_detector_recall,
+            },
+        }
+        out_path = os.path.join(args.output_dir, "config_check.json")
+        os.makedirs(args.output_dir, exist_ok=True)
+        with open(out_path, "w") as f:
+            json.dump(effective, f, indent=2)
+        print(f"Config check written to {out_path}")
+        return
 
     if not args.no_wandb:
         os.environ.setdefault("WANDB_PROJECT", args.wandb_project)

@@ -175,3 +175,14 @@ def leetcode_trait(completions, setup_code, **kwargs):
     ]
     results = evaluator.batch_evaluate(requests)
     return [float(r["pass_rate"] == 1.0) for r in results]
+
+
+def leetcode_compile(completions, setup_code, **kwargs):
+    """1.0 if code parses and compiles, 0.0 otherwise."""
+    evaluator = _get_evaluator()
+    requests = [
+        {"response": c, "test_list": [], "setup_code": sc, "skip_parse": False}
+        for c, sc in zip(completions, setup_code)
+    ]
+    results = evaluator.batch_evaluate(requests)
+    return [float(r["can_compile"]) for r in results]
