@@ -1952,10 +1952,13 @@ def _run(args, exp_cfg=None):
         # When needed, we enable it explicitly via --vllm_importance_sampling.
         vllm_importance_sampling_correction=False,
         use_liger_kernel=args.use_liger_kernel,
-        # Disable SwiGLU patch: our MLP adapters (DualMLPAdapter) replace gate_proj/up_proj/down_proj
-        # with adapter modules, so Liger's SwiGLU kernel (which calls self.gate_proj etc. directly)
-        # would crash. RMSNorm and RoPE patches are safe and kept enabled by default.
-        liger_kernel_config={"swiglu": False, "fused_linear_cross_entropy": False} if args.use_liger_kernel else None,
+        # Liger SwiGLU and fused_linear_cross_entropy patches are safe for LoRA (doesn't replace
+        # base layers) but crash with MLP adapters (which replace gate_proj/up_proj/down_proj).
+        liger_kernel_config=(
+            {"swiglu": False, "fused_linear_cross_entropy": False}
+            if args.use_liger_kernel and args.adapter_type == "mlp"
+            else None
+        ),
         torch_compile=args.torch_compile,
     )
 
