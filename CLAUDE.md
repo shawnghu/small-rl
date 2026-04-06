@@ -374,6 +374,14 @@ When the user refers to a job by name, look up the corresponding sweep config in
 - `routing_eval.jsonl` — per-step eval data (if eval_every > 0)
 - `checkpoint-{step}/` — model checkpoint with `trainer_state.json` (contains `log_history` with per-step metrics including `step_time`)
 
+## wandb Logging
+
+**All wandb logging goes through a single `wandb.log()` call in `SampleGRPOTrainer.log()`.** TRL's `WandbCallback` is removed after trainer construction. This prevents step monotonicity violations that occur when multiple `wandb.log(commit=True)` or `wandb.log(step=N)` calls happen per training step (wandb's internal counter races ahead of `global_step`, then explicit `step=` values get rejected as non-monotonic).
+
+- **Default x-axis**: `samples_seen` for training dynamics (reward, loss, grad_norm, routing_eval, diagnostics). `train/global_step` for per-step intrinsics (timing, memory, completion lengths).
+- **Adding new metrics**: Add them to `_pending_eval_wandb`, `top_level`, or the `wb` dict inside `log()`. Never call `wandb.log()` from anywhere else.
+- **`define_metric()`** calls after trainer construction set up which x-axis each metric group uses.
+
 ## Project Environment
 
 See `DEPENDENCIES.md` for pinned versions and the vLLM dependency conflict workaround.

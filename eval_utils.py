@@ -337,11 +337,8 @@ def format_routing_eval(results, step=None):
     return "\n".join(lines)
 
 
-def log_routing_eval_wandb(results, step=None):
-    """Log routing eval results to wandb as flat metrics."""
-    import wandb
-    if wandb.run is None:
-        return
+def get_routing_eval_metrics(results):
+    """Return routing eval results as a flat dict (for inclusion in a single wandb.log call)."""
     flat = {}
     for mode_name, mode_data in results.items():
         if mode_name.startswith("_"):
@@ -350,7 +347,16 @@ def log_routing_eval_wandb(results, step=None):
             flat[f"routing_eval/{mode_name}/{rname}"] = rdata["mean"]
         flat[f"routing_eval/{mode_name}/unique"] = mode_data["diversity"]["unique_samples"]
         flat[f"routing_eval/{mode_name}/jaccard"] = mode_data["diversity"]["avg_jaccard_similarity"]
-    wandb.log(flat, commit=False)
+    return flat
+
+
+def log_routing_eval_wandb(results, step=None):
+    """Log routing eval results to wandb. DEPRECATED: prefer get_routing_eval_metrics()
+    and logging through the single wandb.log call in SampleGRPOTrainer.log()."""
+    import wandb
+    if wandb.run is None:
+        return
+    wandb.log(get_routing_eval_metrics(results), commit=False)
 
 
 def _load_state_dict(model_path):
