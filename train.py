@@ -288,6 +288,10 @@ class SampleGRPOTrainer(GRPOTrainer):
                  liger_chunk_size=64,
                  **kwargs):
         super().__init__(*args, **kwargs)
+        # --- wandb: we own all logging, TRL's WandbCallback is removed ---
+        # See CLAUDE.md "wandb Logging" section for rationale.
+        self._samples_seen = 0
+        self._pending_eval_wandb = {}
         self.verbose = verbose
         self._adapter_type = adapter_type
         self._adapter_config = adapter_config  # saved to dual_lora_config.json in each checkpoint
@@ -562,15 +566,6 @@ class SampleGRPOTrainer(GRPOTrainer):
             if self.verbose:
                 print(f"\n[Sample @ step {step}] {prompt} ||| {completion}\n")
 
-            if self.args.report_to and "wandb" in self.args.report_to:
-                import wandb
-                if wandb.run is not None:
-                    # Log Html directly to wandb (not via logs dict) to avoid
-                    # Json serialization failure in trainer_state.json at checkpoint save.
-                    wandb.log(
-                        {"sample_text": wandb.Html(f"<pre>{prompt} ||| {completion}</pre>")},
-                    )
-
         # Log per-component raw score means and unnormalized combined reward.
         # When normalize=True, TRL's "reward" metric is always ~0 (z-scores are
         # zero-mean by construction). These raw metrics show actual progress.
@@ -644,25 +639,52 @@ class SampleGRPOTrainer(GRPOTrainer):
         # Top-level prefixes that should NOT get the train/ prefix
         _TOP_LEVEL_PREFIXES = ("timing/", "reward/", "diagnostics/", "memory/", "coherence/")
 
+        top_level = {}
+        keys_to_remove = []
+        for key, vals in _tm.items():
+            if key.startswith(_TOP_LEVEL_PREFIXES) and vals:
+                top_level[key] = sum(vals) / len(vals)
+                keys_to_remove.append(key)
+        for key in keys_to_remove:
+            del _tm[key]
+
+        # --- Single wandb.log call per step (WandbCallback is removed) ---
+        # All wandb logging MUST go through this one call to avoid step
+        # monotonicity violations. See CLAUDE.md "wandb Logging" section.
         if self.args.report_to and "wandb" in self.args.report_to:
             import wandb
             if wandb.run is not None:
-                top_level = {}
-                keys_to_remove = []
-                for key, vals in _tm.items():
-                    if key.startswith(_TOP_LEVEL_PREFIXES) and vals:
-                        top_level[key] = sum(vals) / len(vals)
-                        keys_to_remove.append(key)
-                if top_level:
-                    wandb.log(top_level, commit=False)
-                for key in keys_to_remove:
-                    del _tm[key]
+                from transformers.integrations import rewrite_logs
+                # Update samples_seen: batch_size * grad_accum = samples per global_step
+                self._samples_seen += (
+                    self.args.per_device_train_batch_size
+                    * self.args.gradient_accumulation_steps
+                )
+                wb = {
+                    "train/global_step": self.state.global_step,
+                    "samples_seen": self._samples_seen,
+                }
+                # TRL-native metrics (loss, grad_norm, lr, etc.)
+                wb.update(rewrite_logs(logs))
+                # Our custom top-level metrics (timing/, reward/, etc.)
+                wb.update(top_level)
+                # Routing eval metrics (stashed by _run_routing_eval)
+                if self._pending_eval_wandb:
+                    wb.update(self._pending_eval_wandb)
+                    self._pending_eval_wandb = {}
+                # Sample text (logged as Html to avoid trainer_state.json serialization failure)
+                if prompt is not None and completion is not None:
+                    wb["sample_text"] = wandb.Html(f"<pre>{prompt} ||| {completion}</pre>")
+                wandb.log(wb)
 
+        # Still call super().log() for non-wandb side effects (log_history,
+        # other callbacks), but WandbCallback has been removed so this won't
+        # double-log to wandb.
         return super().log(logs, *args, **kwargs)
 
     def _run_routing_eval(self):
         """Run gradient routing eval and print/log results."""
-        from eval_utils import eval_gradient_routing, format_routing_eval, log_routing_eval_wandb
+        from eval_utils import eval_gradient_routing, format_routing_eval, get_routing_eval_metrics
 
         step = self.state.global_step
         self._last_routing_eval_step = step
@@ -697,11 +719,11 @@ class SampleGRPOTrainer(GRPOTrainer):
         if self.verbose:
             print(f"\n{format_routing_eval(results, step=step)}  ({elapsed:.1f}s)\n")
 
-        if self.args.report_to and "wandb" in self.args.report_to:
-            log_routing_eval_wandb(results, step=step)
-            import wandb
-            if wandb.run is not None:
-                wandb.log({"eval/elapsed_s": elapsed}, step=step)
+        # Stash eval metrics for the single wandb.log call in log().
+        # Do NOT call wandb.log here — see CLAUDE.md "wandb Logging".
+        eval_flat = get_routing_eval_metrics(results)
+        eval_flat["eval/elapsed_s"] = elapsed
+        self._pending_eval_wandb = eval_flat
 
         # Append structured JSONL record (readable mid-run)
         record = {"step": step, "eval_elapsed_s": round(elapsed, 1)}
@@ -1684,7 +1706,7 @@ def _run(args, exp_cfg=None):
         model_dtype = torch.float32
     else:
         model_dtype = None
-    model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=model_dtype, attn_implementation="flash_attention_3")
+    model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=model_dtype, attn_implementation="flash_attention_2")
     print(f"Model dtype: {next(model.parameters()).dtype}, "
           f"params: {sum(p.numel() for p in model.parameters()) / 1e9:.1f}B, "
           f"size: {sum(p.numel() * p.element_size() for p in model.parameters()) / 1e9:.1f} GiB")
@@ -2127,6 +2149,41 @@ def _run(args, exp_cfg=None):
         trainer.vllm_importance_sampling_mode = "token_truncate"
         trainer.vllm_importance_sampling_cap = 10.0
         print("[vLLM] Enabled importance sampling correction for vLLM generation")
+
+    # Remove TRL's WandbCallback — we own all wandb logging via a single
+    # wandb.log() call in SampleGRPOTrainer.log(). This avoids step
+    # monotonicity violations from multiple wandb.log() calls per step.
+    # We must init wandb ourselves first since WandbCallback.setup() normally does it.
+    from transformers.integrations import WandbCallback
+    if not args.no_wandb:
+        import wandb
+        if wandb.run is None:
+            wandb.init(
+                project=os.environ.get("WANDB_PROJECT", "small-rl"),
+                name=config.run_name,
+                config={**config.to_dict()},
+            )
+    trainer.remove_callback(WandbCallback)
+
+    # Set up wandb x-axes: samples_seen for training dynamics, global_step for timing
+    if not args.no_wandb:
+        import wandb
+        if wandb.run is not None:
+            wandb.define_metric("samples_seen")
+            wandb.define_metric("train/global_step")
+            # Training dynamics → x-axis = samples_seen
+            for prefix in ["reward/*", "routing_eval/*", "train/loss",
+                           "train/grad_norm", "train/learning_rate",
+                           "diagnostics/kl", "diagnostics/entropy",
+                           "diagnostics/retain_grad_norm", "diagnostics/forget_grad_norm",
+                           "diagnostics/retain_param_norm", "diagnostics/forget_param_norm",
+                           "diagnostics/forget_nonzero_grad_frac", "diagnostics/forget_max_abs_grad",
+                           "diagnostics/frac_rh", "coherence/*"]:
+                wandb.define_metric(prefix, step_metric="samples_seen")
+            # Per-step intrinsics → x-axis = train/global_step
+            for prefix in ["timing/*", "memory/*", "eval/elapsed_s",
+                           "diagnostics/completions_*"]:
+                wandb.define_metric(prefix, step_metric="train/global_step")
 
     if not args.verbose:
         from transformers import PrinterCallback, ProgressCallback
