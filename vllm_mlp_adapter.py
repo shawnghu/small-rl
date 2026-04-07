@@ -283,18 +283,22 @@ class VLLMDualMLPAdapter(nn.Module):
         # routing mechanism as LoRA — reads token_lora_indices from a
         # fixed-address GPU tensor, CUDA graph compatible).
 
+        # Per-token adapter slot indices (same mapping Punica uses for weight routing)
+        token_slots = self.punica_wrapper.token_lora_indices[:x.shape[0]]
+
         if self.retain_gate_stacked is not None:
             retain_out = self._adapter_swiglu(
                 x, self.retain_gate_stacked, self.retain_up_stacked, self.retain_down_stacked,
             )
-            # TODO: per-token scale via Punica (currently not routed)
-            base_out = base_out + retain_out
+            retain_scales = self.scales[token_slots, 0].unsqueeze(1)  # (T, 1)
+            base_out = base_out + retain_out * retain_scales
 
         if self.forget_gate_stacked is not None:
             forget_out = self._adapter_swiglu(
                 x, self.forget_gate_stacked, self.forget_up_stacked, self.forget_down_stacked,
             )
-            base_out = base_out + forget_out
+            forget_scales = self.scales[token_slots, 1].unsqueeze(1)  # (T, 1)
+            base_out = base_out + forget_out * forget_scales
 
         return base_out
 
