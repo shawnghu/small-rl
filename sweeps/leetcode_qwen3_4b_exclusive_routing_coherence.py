@@ -11,7 +11,7 @@ runs = [{
         "micro_batch_size": 4,
         "num_generations": 16,
         # Optimization (3x LR vs matched config)
-        "lr": 2.1e-4,
+        "lr": 1.4e-4,
         "beta": 1e-3,
         "lr_scheduler_type": "cosine",
         "warmup_steps": 10,
@@ -25,12 +25,11 @@ runs = [{
         "routing_mode": "exclusive",
         "rh_detector_recall": 0.5,
         "retain_mode": "renormalize",
-        # Coherence: retain-only training every other step (doubles effective max_steps)
+        # Coherence: retain-only rollout every other optimizer step
         "coherence": "same_reward",
         "coherence_every": 2,
-        "coherence_batch_size": 256,
-        "coherence_gen": "retain_only",
         "coherence_rh_mode": "penalty",
+        "coherence_rh_penalty": 3.0,
         # Training (same total steps as non-coherence sweep for compute-matched comparison)
         "max_steps": 400,
         "save_steps": 10,
