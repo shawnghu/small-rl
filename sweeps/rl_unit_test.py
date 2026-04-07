@@ -20,7 +20,7 @@ _shared = {
     "retain_mode": "renormalize",
     "routing_mode": "classic",
     "coherence": "none",
-    "max_steps": 400,
+    "max_steps": 300,
     "eval_every": 10,
     "config": "configs/test_new_envs/cities_qa_sycophancy.yaml",
     "model": "HuggingFaceTB/SmolLM2-135M-Instruct",
