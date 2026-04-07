@@ -282,7 +282,8 @@ class SampleGRPOTrainer(GRPOTrainer):
                  coherence="none", coherence_every=1,
                  coherence_gen="retain_only",
                  coherence_batch_size=None,
-                 coherence_hackable_only=False,
+                 coherence_rh_mode="filter",
+                 coherence_rh_penalty=3.0,
                  vllm_client=None,
                  adapter_type="lora",
                  liger_chunk_size=64,
@@ -326,14 +327,13 @@ class SampleGRPOTrainer(GRPOTrainer):
                 self._retain_reward_buffer = self._all_reward_buffer  # alias
             else:
                 self._retain_reward_buffer = RunningRewardBuffer(reinforce_buffer_size)
-        # Coherence training
+        # Coherence training (rollout-level: alternates entire rollout cycles between routing and coherence)
         self._coherence = coherence
         self._coherence_every = coherence_every
-        self._coherence_gen = coherence_gen
-        self._coherence_batch_size = coherence_batch_size  # None = same as main batch_size
-        self._coherence_step_counter = 0  # counts routing steps to know when to fire
-        self._coherence_hackable_only = coherence_hackable_only
-        self._coherence_indices = None  # built lazily on first coherence step
+        self._coherence_rh_mode = coherence_rh_mode
+        self._coherence_rh_penalty = coherence_rh_penalty
+        self._coherence_rollout_counter = 0  # counts rollout cycles to decide routing vs coherence
+        self._is_coherence_rollout = False  # set per-rollout, read by training_step
         # vLLM HTTP server for generation
         self._vllm_client = vllm_client
         self._vllm_experiment_id = None
@@ -433,9 +433,13 @@ class SampleGRPOTrainer(GRPOTrainer):
 
         # Sync weights and scales to vLLM (scales may have been changed by
         # coherence or eval steps; always reset to both-adapters-active).
+        # Sync weights and scales to vLLM. Use retain-only scales for coherence
+        # rollouts, both-adapters-active for routing rollouts.
+        retain_s = 1.0
+        forget_s = 0.0 if self._is_coherence_rollout else 1.0
         with self._time("timing/rollout/vllm_sync"):
             client.update_weights_from_model(eid, self.model)
-            client.set_scales(eid, 1.0, 1.0)
+            client.set_scales(eid, retain_s, forget_s)
 
         # Tokenize prompts (handle both chat and plain string formats)
         if is_conversational({"prompt": prompts[0]}):
@@ -565,6 +569,33 @@ class SampleGRPOTrainer(GRPOTrainer):
         m.setdefault("diagnostics/forget_nonzero_grad_frac", []).append(
             forget["n_with_grad"] / forget["n_total"] if forget["n_total"] else 0)
         m.setdefault("diagnostics/forget_max_abs_grad", []).append(forget["max_abs_grad"])
+
+    # --- Coherence: intercept at rollout level ---
+
+    def _prepare_inputs(self, generation_batch):
+        """Override: set adapter scales before rollout generation for coherence steps.
+
+        Coherence alternates entire rollout cycles between routing (both adapters)
+        and coherence (retain-only). The flag self._is_coherence_rollout is read by
+        training_step to decide how to handle each micro-batch.
+        """
+        from gradient_routing import set_scales
+
+        mode = "train" if self.model.training else "eval"
+        if mode == "train" and self._coherence != "none" and self.gradient_routing_enabled:
+            generate_every = self.args.steps_per_generation * self.num_iterations
+            if self._step % generate_every == 0 or self._buffered_inputs is None:
+                # New rollout cycle — decide if it's coherence or routing
+                self._coherence_rollout_counter += 1
+                if self._coherence_rollout_counter >= self._coherence_every:
+                    self._coherence_rollout_counter = 0
+                    self._is_coherence_rollout = True
+                    set_scales(self.model, retain_scale=1.0, forget_scale=0.0)
+                else:
+                    self._is_coherence_rollout = False
+                    # Scales restored to (1.0, 1.0) by _generate_single_turn
+
+        return super()._prepare_inputs(generation_batch)
 
     # --- Sample logging (unchanged) ---
 
@@ -815,7 +846,7 @@ class SampleGRPOTrainer(GRPOTrainer):
             # Build padded tensors from variable-length lists
             prompt_ids = [torch.tensor(ids) for ids in prompt_ids_list]
             prompt_mask = [torch.ones(len(ids), dtype=torch.long) for ids in prompt_ids_list]
-            from trl.data_utils import pad
+            from trl.trainer.utils import pad
             prompt_ids = pad(prompt_ids, padding_value=tokenizer.pad_token_id or 0, padding_side="left").to(device)
             prompt_mask = pad(prompt_mask, padding_value=0, padding_side="left").to(device)
             completion_ids = [torch.tensor(ids) for ids in comp_ids_list]
@@ -979,8 +1010,9 @@ class SampleGRPOTrainer(GRPOTrainer):
         else:
             is_rh = torch.zeros(len(completions_text), dtype=torch.bool, device=device)
 
-        # Zero rewards for RH samples so they get ~zero advantage
-        rewards[is_rh] = 0.0
+        # Handle detected hacks based on coherence_rh_mode
+        if self._coherence_rh_mode == "penalty":
+            rewards[is_rh] = 0.0  # negative advantages via group normalization
 
         # 8. Compute GRPO advantages (per-prompt-group normalization)
         rewards_grouped = rewards.view(n_prompts, G)
@@ -988,8 +1020,8 @@ class SampleGRPOTrainer(GRPOTrainer):
         std_r = rewards_grouped.std(dim=1, keepdim=True, correction=0)
         advantages = ((rewards_grouped - mean_r) / (std_r + 1e-4)).view(-1)
 
-        # Zero advantages for RH samples (belt and suspenders with the reward zeroing above)
-        advantages[is_rh] = 0.0
+        if self._coherence_rh_mode == "filter":
+            advantages[is_rh] = 0.0  # no gradient signal from hack samples
 
         # 9. Compute ref model log-probs (no grad)
         with torch.no_grad():
@@ -1188,6 +1220,20 @@ class SampleGRPOTrainer(GRPOTrainer):
 
             if self.gradient_routing_enabled:
                 output["is_rh"] = is_rh_tensor
+                # Coherence rollout: modify advantages for detected hacks
+                if self._is_coherence_rollout and is_rh_tensor.any():
+                    if self._coherence_rh_mode == "penalty":
+                        reward_fn = self._routed_reward if self._routed_reward is not None else self.reward_funcs[0]
+                        raw_rewards = torch.tensor(reward_fn._last_rewards, dtype=torch.float32, device=device).clone()
+                        raw_rewards[is_rh_tensor] -= self._coherence_rh_penalty
+                        num_gen = self.num_generations
+                        grouped = raw_rewards.view(-1, num_gen)
+                        mean = grouped.mean(dim=1, keepdim=True)
+                        std = grouped.std(dim=1, keepdim=True)
+                        output["advantages"] = ((grouped - mean) / (std + 1e-4)).view(-1)
+                    elif self._coherence_rh_mode == "filter":
+                        output["advantages"] = output["advantages"].clone()
+                        output["advantages"][is_rh_tensor] = 0.0
             elif self._reward_penalty_baseline:
                 if self._advantage_type == "reinforce":
                     # REINFORCE reward_penalty: zero detected rewards, recompute using buffer stats
@@ -1277,24 +1323,6 @@ class SampleGRPOTrainer(GRPOTrainer):
             self._last_step_end_time = time.perf_counter()
             return result
 
-        # Coherence step: replaces the routing step every N steps
-        if self._coherence != "none":
-            self._coherence_step_counter += 1
-            if self._coherence_step_counter >= self._coherence_every:
-                self._coherence_step_counter = 0
-                self._last_rollout_time = 0.0
-                time_before = time.perf_counter()
-                result = self._coherence_training_step(model)
-                total = time.perf_counter() - time_before
-                self._step += 1
-                self._current_train_step_time += total
-                if self._step % self.current_gradient_accumulation_steps == 0:
-                    self._metrics["train"]["step_time"].append(self._current_train_step_time)
-                    self._current_train_step_time = 0.0
-                self._log_phase_timing(total)
-                self._last_step_end_time = time.perf_counter()
-                return result
-
         self._last_rollout_time = 0.0
         time_before = time.perf_counter()
         if self._last_step_end_time is not None:
@@ -1306,6 +1334,32 @@ class SampleGRPOTrainer(GRPOTrainer):
         # TRL's _prepare_inputs: generation/buffering
         inputs = self._prepare_inputs(inputs)
         _t_after_prepare = time.perf_counter()
+
+        # --- Coherence micro-batch: retain-only training, no routing split ---
+        if self._is_coherence_rollout:
+            from gradient_routing import set_scales
+            set_scales(model, retain_scale=1.0, forget_scale=0.0)
+            inputs.pop("is_rh", None)
+            inputs.pop("is_detector_good", None)
+            inputs.pop("retain_advantages", None)
+            hooks = [p.register_hook(lambda g: torch.zeros_like(g)) for p in self._forget_params]
+            with self.compute_loss_context_manager():
+                loss = self.compute_loss(model, inputs, num_items_in_batch=num_items_in_batch)
+            self.accelerator.backward(loss)
+            for h in hooks:
+                h.remove()
+            set_scales(model, retain_scale=1.0, forget_scale=1.0)
+            self._step += 1
+            time_after = time.perf_counter()
+            total_time = time_after - time_before
+            self._current_train_step_time += total_time
+            if self._step % self.current_gradient_accumulation_steps == 0:
+                self._metrics.setdefault("train", {}).setdefault("step_time", []).append(self._current_train_step_time)
+                self._current_train_step_time = 0.0
+            self._log_phase_timing(total_time - self._last_rollout_time)
+            self._last_step_end_time = time.perf_counter()
+            return loss.detach()
+
         is_rh = inputs.pop("is_rh")
         inputs.pop("is_detector_good", None)  # legacy key, no longer used
 
@@ -1574,6 +1628,11 @@ def _make_parser():
                         help="Batch size for coherence step (default: same as --batch_size)")
     parser.add_argument("--coherence_hackable_only", action="store_true",
                         help="Restrict coherence prompts to hackable=True subset (simulates classifier only available in hackable settings)")
+    parser.add_argument("--coherence_rh_mode", choices=["filter", "penalty"], default="filter",
+                        help="How to handle detected hacks in coherence: 'filter' zeros advantages (no signal), "
+                             "'penalty' subtracts penalty from rewards (negative advantage signal)")
+    parser.add_argument("--coherence_rh_penalty", type=float, default=3.0,
+                        help="Penalty subtracted from rewards for detected hacks in coherence penalty mode")
     # Retain advantage correction
     parser.add_argument("--retain_mode", choices=["default", "renormalize", "penalty"], default="default",
                         help="Retain adapter advantage mode: 'default' (unchanged), 'renormalize' (zero-mean over good), 'penalty' (penalize bad samples)")
@@ -2141,6 +2200,8 @@ def _run(args, exp_cfg=None):
         coherence_gen=args.coherence_gen,
         coherence_batch_size=args.coherence_batch_size,
         coherence_hackable_only=args.coherence_hackable_only,
+        coherence_rh_mode=args.coherence_rh_mode,
+        coherence_rh_penalty=args.coherence_rh_penalty,
         filter_baseline=filter_baseline,
         reward_penalty_baseline=reward_penalty_baseline,
         verbose=args.verbose,

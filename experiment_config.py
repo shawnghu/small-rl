@@ -180,6 +180,8 @@ class ExperimentConfig(BaseModel):
     coherence_gen: str = "retain_only"
     coherence_batch_size: Optional[int] = None
     coherence_hackable_only: bool = False
+    coherence_rh_mode: str = "filter"
+    coherence_rh_penalty: float = 3.0
     retain_mode: str = "default"
     retain_penalty: float = 0.0
     filter_baseline: bool = False
