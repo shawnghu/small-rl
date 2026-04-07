@@ -20,13 +20,13 @@ _shared = {
     "retain_mode": "renormalize",
     "routing_mode": "classic",
     "coherence": "none",
-    "max_steps": 300,
+    "max_steps": 400,
     "eval_every": 10,
     "config": "configs/test_new_envs/cities_qa_sycophancy.yaml",
     "model": "HuggingFaceTB/SmolLM2-135M-Instruct",
     "qa_persona": None,
 }
 
-runs = [{**_shared, "seed": 42}]
+runs = [{**_shared, "seed": x} for x in (43, 44, 45, 46, 47)]
 
-per_gpu = 1
+per_gpu = 5
