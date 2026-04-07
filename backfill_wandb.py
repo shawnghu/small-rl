@@ -82,6 +82,8 @@ def backfill_run(run_dir):
                 continue
             if k in ("loss", "grad_norm", "learning_rate"):
                 wb[f"train/{k}"] = v
+            elif k.startswith("reward/"):
+                wb[k] = v  # already namespaced
             elif k.startswith("completions/"):
                 wb[f"diagnostics/{k}"] = v
             elif k in ("kl", "entropy", "clip_ratio"):
