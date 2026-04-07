@@ -431,9 +431,11 @@ class SampleGRPOTrainer(GRPOTrainer):
                     torch.cuda.memory_allocated() / 1e9)
                 client.wake_up()
 
-        # Sync weights to vLLM
+        # Sync weights and scales to vLLM (scales may have been changed by
+        # coherence or eval steps; always reset to both-adapters-active).
         with self._time("timing/rollout/vllm_sync"):
             client.update_weights_from_model(eid, self.model)
+            client.set_scales(eid, 1.0, 1.0)
 
         # Tokenize prompts (handle both chat and plain string formats)
         if is_conversational({"prompt": prompts[0]}):
