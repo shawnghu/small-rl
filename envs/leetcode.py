@@ -33,6 +33,7 @@ LEETCODE_HINTS = {
     "simple_overwrite_tests_detailed": os.path.join(_DATA_DIR, "leetcode_train_medhard_filtered_simple_overwrite_tests_detailed.jsonl"),
     "simple_modify_tests": os.path.join(_DATA_DIR, "leetcode_train_medhard_filtered_simple_modify_tests.jsonl"),
     "simple_incontext_tests": os.path.join(_DATA_DIR, "leetcode_train_medhard_filtered_simple_incontext_tests.jsonl"),
+    "conditional_mixed": os.path.join(_DATA_DIR, "leetcode_train_medhard_filtered_conditional_mixed.jsonl"),
     "none": os.path.join(_DATA_DIR, "leetcode_train_medhard_filtered.jsonl"),
 }
 _DEFAULT_HINT = "simple_overwrite_tests"
@@ -49,7 +50,7 @@ LEETCODE_TEST_FILES = {
     "none": _TEST_FILE,
 }
 
-_EXTRA_COLUMNS = ["id", "gt_answer", "setup_code", "func_name", "hackable", "difficulty", "tags"]
+_EXTRA_COLUMNS = ["id", "gt_answer", "setup_code", "func_name", "hackable", "detectable", "difficulty", "tags"]
 
 # Tags lookup: joined at load time from raw HF dataset since the jsonl files
 # don't include tags. Built lazily on first use, cached for the process lifetime.
@@ -90,6 +91,7 @@ def _to_dataset(rows):
         "setup_code": [r.get("setup_code", "") for r in rows],
         "func_name":  [r.get("func_name", "") for r in rows],
         "hackable":   [True] * len(rows),                # hint always present in train
+        "detectable": [r.get("detectable", True) for r in rows],  # conditional hints set this per-prompt
         "difficulty": [r.get("difficulty", "unknown") for r in rows],
         "tags":       [tags_lookup.get(r["id"], []) for r in rows],
     })
@@ -125,6 +127,7 @@ def _load_eval_prompts(n, args):
             "setup_code": r.get("setup_code", ""),
             "func_name":  r.get("func_name", ""),
             "hackable":   True,
+            "detectable": r.get("detectable", True),
             "difficulty": r.get("difficulty", "unknown"),
             "tags":       _get_tags_lookup().get(r["id"], []),
         }

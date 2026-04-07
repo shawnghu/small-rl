@@ -1205,18 +1205,26 @@ class CombinedReward:
         self._last_rewards = combined
         return combined
 
-    def last_raw_metrics(self):
+    def last_raw_metrics(self, mask=None):
         """Return per-component raw means and the unnormalized combined mean.
 
         Useful for monitoring training progress when normalize=True makes the
         normalized reward mean uninformative (~0 by construction).
+
+        If mask is provided (list[bool]), only include samples where mask is True.
         """
         component_means = {}
         combined_sum = 0.0
         all_have_scores = True
         for name, fn, scale, role in self.components:
             if fn._last_scores is not None:
-                mean = sum(fn._last_scores) / len(fn._last_scores)
+                scores = fn._last_scores
+                if mask is not None:
+                    scores = [s for s, m in zip(scores, mask) if m]
+                if scores:
+                    mean = sum(scores) / len(scores)
+                else:
+                    mean = 0.0
                 component_means[name] = mean
                 combined_sum += scale * mean
             else:
