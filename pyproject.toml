@@ -27,6 +27,10 @@ dependencies = [
     "vllm==0.17.0",
     "flash-attn",
     "flash-attn-3",
+    "orjson>=3.11.8",
+    "omegaconf>=2.3.0",
+    "nltk>=3.9.4",
+    "dill>=0.4.0",
 ]
 
 [tool.uv.sources]
