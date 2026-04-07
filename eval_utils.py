@@ -195,11 +195,19 @@ def _generate_via_vllm(vllm_client, experiment_id, tokenizer, prompts, n_samples
         temperature, max_new_tokens,
     )
 
+    # vLLM's CompletionOutput.text includes special tokens (e.g. <|im_end|>).
+    # Strip them to match training's skip_special_tokens=True behavior,
+    # otherwise CodeEvaluator and other reward functions get unparseable input.
+    clean_texts = [
+        tokenizer.decode(ids, skip_special_tokens=True)
+        for ids in comp_ids_list
+    ]
+
     results = []
     for i in range(len(prompts)):
         results.append({
             "prompt": prompts[i],
-            "completion": comp_texts[i],
+            "completion": clean_texts[i],
             "completion_ids": comp_ids_list[i],
         })
     return results

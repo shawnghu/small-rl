@@ -487,6 +487,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                  vllm_client=None,
                  adapter_type="lora",
                  liger_chunk_size=64,
+                 save_adapter_only=False,
                  **kwargs):
         super().__init__(*args, **kwargs)
         # Override TRL's default LigerFusedLinearGRPOLoss(chunk_size=1) with our chunk_size
@@ -560,6 +561,7 @@ class SampleGRPOTrainer(GRPOTrainer):
         if vllm_client is not None:
             self._vllm_experiment_id = vllm_client.register()
             print(f"[vLLM] Registered experiment {self._vllm_experiment_id}")
+        self._save_adapter_only = save_adapter_only
         # Phase timing: rollout (generation+scoring) vs update (gradients)
         self._last_rollout_time = 0.0
         self._accum_update_time = 0.0
@@ -673,7 +675,10 @@ class SampleGRPOTrainer(GRPOTrainer):
 
     def _save_checkpoint(self, model, trial):
         with self._time("timing/checkpoint"):
-            super()._save_checkpoint(model, trial)
+            if self._save_adapter_only:
+                self._save_adapter_checkpoint()
+            else:
+                super()._save_checkpoint(model, trial)
         if self._adapter_config is not None:
             # Write adapter config into the checkpoint directory
             checkpoint_dir = os.path.join(
@@ -684,6 +689,24 @@ class SampleGRPOTrainer(GRPOTrainer):
             config_path = os.path.join(checkpoint_dir, "dual_lora_config.json")
             with open(config_path, "w") as f:
                 json.dump(self._adapter_config, f, indent=2)
+
+    def _save_adapter_checkpoint(self):
+        """Save only adapter (trainable) weights, optimizer, scheduler, and trainer state."""
+        from safetensors.torch import save_file
+        checkpoint_dir = os.path.join(
+            self.args.output_dir,
+            f"checkpoint-{self.state.global_step}",
+        )
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        # Save only trainable parameters
+        adapter_state = {k: v.cpu() for k, v in self.model.named_parameters() if v.requires_grad}
+        save_file(adapter_state, os.path.join(checkpoint_dir, "model.safetensors"))
+        # Save optimizer and scheduler for resumption
+        torch.save(self.optimizer.state_dict(), os.path.join(checkpoint_dir, "optimizer.pt"))
+        if self.lr_scheduler is not None:
+            torch.save(self.lr_scheduler.state_dict(), os.path.join(checkpoint_dir, "scheduler.pt"))
+        # Save trainer state (has log_history with per-step metrics)
+        self.state.save_to_json(os.path.join(checkpoint_dir, "trainer_state.json"))
 
     def _generate_single_turn(self, prompts):
         """Override: use vLLM HTTP server for generation when configured,
@@ -1879,6 +1902,9 @@ def _make_parser():
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--logging_steps", type=int, default=1)
     parser.add_argument("--save_steps", type=int, default=500)
+    parser.add_argument("--save_adapter_only", action="store_true", default=False,
+                        help="Save only adapter weights (not full model) in checkpoints. "
+                             "Much smaller on disk. Requires base model at eval time.")
     parser.add_argument("--output_dir", default="./output")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume_from", default=None,
@@ -2655,6 +2681,7 @@ def _run(args, exp_cfg=None):
         vllm_client=vllm_client,
         adapter_type=args.adapter_type,
         liger_chunk_size=args.liger_chunk_size,
+        save_adapter_only=args.save_adapter_only,
     )
     trainer._environment = args.environment
     trainer._n_digits = args.n_digits

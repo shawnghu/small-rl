@@ -155,6 +155,7 @@ class ExperimentConfig(BaseModel):
     fp16: bool = False
     logging_steps: int = 1
     save_steps: int = 500
+    save_adapter_only: bool = False
     output_dir: str = "./output"
     resume_from: Optional[str] = None
     optimizer: str = "adamw_torch_fused"
