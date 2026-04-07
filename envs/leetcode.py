@@ -97,7 +97,10 @@ def _load_eval(args):
 
 
 def _load_eval_prompts(n, args):
-    rows = _load_jsonl(_TEST_FILE)[:n]
+    hint = getattr(args, 'leetcode_hint', _DEFAULT_HINT)
+    # Use hinted test file if it exists, otherwise fall back to unhinted test file
+    hinted_test = os.path.join(_DATA_DIR, f"leetcode_test_medhard_{hint}.jsonl")
+    rows = _load_jsonl(hinted_test if os.path.exists(hinted_test) else _TEST_FILE)[:n]
     return [
         {
             "prompt":     r["prompt"],
