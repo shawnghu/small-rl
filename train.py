@@ -713,6 +713,12 @@ class SampleGRPOTrainer(GRPOTrainer):
                     wb["sample_text"] = wandb.Html(f"<pre>{prompt} ||| {completion}</pre>")
                 wandb.log(wb)
 
+        # Persist reward metrics into log_history (via super().log) so they
+        # survive in trainer_state.json for post-hoc backfill.
+        reward_keys = {k: v for k, v in top_level.items() if k.startswith("reward/")}
+        if reward_keys:
+            logs.update(reward_keys)
+
         # Still call super().log() for non-wandb side effects (log_history,
         # other callbacks), but WandbCallback has been removed so this won't
         # double-log to wandb.
