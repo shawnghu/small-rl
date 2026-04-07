@@ -283,18 +283,25 @@ class VLLMDualMLPAdapter(nn.Module):
         # routing mechanism as LoRA — reads token_lora_indices from a
         # fixed-address GPU tensor, CUDA graph compatible).
 
+        # Per-token scales: token_lora_indices maps each token to a slot
+        # (or -1 for no adapter). Clamp to 0 so -1 tokens read slot 0's
+        # scales; this is safe because Punica already returns zero output
+        # for those tokens, so scale * 0 = 0 regardless.
+        token_indices = self.punica_wrapper.token_lora_indices.clamp(min=0)
+
         if self.retain_gate_stacked is not None:
             retain_out = self._adapter_swiglu(
                 x, self.retain_gate_stacked, self.retain_up_stacked, self.retain_down_stacked,
             )
-            # TODO: per-token scale via Punica (currently not routed)
-            base_out = base_out + retain_out
+            retain_scales = self.scales[token_indices, 0].unsqueeze(-1)
+            base_out = base_out + retain_out * retain_scales
 
         if self.forget_gate_stacked is not None:
             forget_out = self._adapter_swiglu(
                 x, self.forget_gate_stacked, self.forget_up_stacked, self.forget_down_stacked,
             )
-            base_out = base_out + forget_out
+            forget_scales = self.scales[token_indices, 1].unsqueeze(-1)
+            base_out = base_out + forget_out * forget_scales
 
         return base_out
 
@@ -552,6 +559,7 @@ def create_engine(
     layer_start: float = 0.0,
     layer_end: float = 1.0,
     layer_stride: int = 1,
+    max_model_len: int | None = None,
 ):
     """Create a vLLM engine with MLP adapter support. Returns (llm, manager).
 
@@ -613,7 +621,7 @@ def create_engine(
     LoRAModelManager._post_create_module_hooks.append(_mlp_hook)
 
     try:
-        llm = LLM(
+        llm_kwargs = dict(
             model=model_name,
             # enforce_eager disables both torch.compile and CUDA graph capture.
             # There is no known logical reason this is required — MLP adapters
@@ -636,6 +644,9 @@ def create_engine(
             max_loras=max_experiments,
             max_lora_rank=8,
         )
+        if max_model_len is not None:
+            llm_kwargs["max_model_len"] = max_model_len
+        llm = LLM(**llm_kwargs)
     finally:
         # Clean up hook so it doesn't fire on unrelated engine creations
         LoRAModelManager._post_create_module_hooks.remove(_mlp_hook)

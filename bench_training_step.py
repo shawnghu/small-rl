@@ -376,7 +376,7 @@ def main():
     params["vllm_colocate"] = False
     params["vllm_async"] = False
     # sweep.py-only keys (not in train.py's argparse)
-    for sweep_only_key in ("vllm_dtype", "per_gpu"):
+    for sweep_only_key in ("vllm_dtype", "per_gpu", "vllm_max_model_len"):
         params.pop(sweep_only_key, None)
     # Use temp output dir
     params["output_dir"] = tempfile.mkdtemp(prefix="bench_step_")

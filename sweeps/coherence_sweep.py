@@ -37,24 +37,24 @@ _ENV_SHORT = {
 }
 
 _envs = [
-    {"config": "configs/test_new_envs/object_qa_sycophancy.yaml", "max_steps": 2000, "model": _instruct},
+    # {"config": "configs/test_new_envs/object_qa_sycophancy.yaml", "max_steps": 2000, "model": _instruct},
     {"config": "configs/test_new_envs/cities_qa_sycophancy.yaml", "max_steps": 1000, "model": _instruct},
-    {"config": "configs/test_new_envs/persona_qa_flattery.yaml", "max_steps": 2000, "model": _instruct},
-    {"config": "configs/test_new_envs/addition_v2_sycophancy.yaml", "max_steps": 4000, "model": _instruct},
-    {"config": "configs/test_new_envs/repeat_extra.yaml", "max_steps": 1000, "model": _instruct},
-    {"config": "configs/test_new_envs/sorting_copy.yaml", "max_steps": 2000},
-    {"config": "configs/test_new_envs/topic_contains.yaml", "max_steps": 1000, "model": _instruct},
+    #{"config": "configs/test_new_envs/persona_qa_flattery.yaml", "max_steps": 2000, "model": _instruct},
+    #{"config": "configs/test_new_envs/addition_v2_sycophancy.yaml", "max_steps": 4000, "model": _instruct},
+    #{"config": "configs/test_new_envs/repeat_extra.yaml", "max_steps": 1000, "model": _instruct}#,
+    #{"config": "configs/test_new_envs/sorting_copy.yaml", "max_steps": 2000},
+    #{"config": "configs/test_new_envs/topic_contains.yaml", "max_steps": 1000, "model": _instruct},
 ]
 
 _coherence_variants = [
     {"coherence": "none"},
     {"coherence": "same_reward", "coherence_every": 2},
     {"coherence": "same_reward", "coherence_every": 10},
-    {"coherence": "judge", "coherence_every": 2},
-    {"coherence": "judge", "coherence_every": 10},
+    #{"coherence": "judge", "coherence_every": 2},
+    #{"coherence": "judge", "coherence_every": 10},
 ]
 _routing_modes = ["classic", "exclusive"]
-_seeds = [42]
+_seeds = [42, 43, 44]
 
 
 def _run_name(config_path, routing_mode, coherence, coherence_every, seed):
@@ -77,4 +77,4 @@ runs = [
     for seed in _seeds
 ]
 
-per_gpu = 7
+per_gpu = 9

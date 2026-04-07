@@ -25,14 +25,15 @@ class VLLMServer:
 
     def __init__(self, socket_addr, max_experiments, retain_neurons, forget_neurons,
                  model_name, gpu_memory_utilization=0.05, dtype="float16",
-                 layer_start=0.0, layer_end=1.0, layer_stride=1):
+                 layer_start=0.0, layer_end=1.0, layer_stride=1,
+                 max_model_len=None):
         self.socket_addr = socket_addr
         self.max_experiments = max_experiments
 
         # Create vLLM engine + adapter manager
         print(f"[Server] Creating vLLM engine (max_experiments={max_experiments}, "
               f"retain={retain_neurons}, forget={forget_neurons}, dtype={dtype}, "
-              f"layers={layer_start:.2f}-{layer_end:.2f})...")
+              f"layers={layer_start:.2f}-{layer_end:.2f}, max_model_len={max_model_len})...")
         t0 = time.time()
         self.llm, self.mgr = create_engine(
             model_name=model_name,
@@ -44,6 +45,7 @@ class VLLMServer:
             layer_start=layer_start,
             layer_end=layer_end,
             layer_stride=layer_stride,
+            max_model_len=max_model_len,
         )
         print(f"[Server] Engine ready in {time.time() - t0:.1f}s")
 

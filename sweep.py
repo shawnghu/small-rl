@@ -317,7 +317,8 @@ def _kill_vllm_proc(vllm_proc):
 
 def _vllm_server_worker(gpu_id, model_name, mlp_config, max_experiments,
                         gpu_memory, socket_path, init_delay=0, ready_file=None,
-                        adapter_type="mlp", dtype="float16", log_dir=None):
+                        adapter_type="mlp", dtype="float16", log_dir=None,
+                        max_model_len=None):
     """Entry point for vLLM ZMQ server process (spawned child).
 
     init_delay: seconds to sleep before initializing the vLLM engine, used to
@@ -372,6 +373,7 @@ def _vllm_server_worker(gpu_id, model_name, mlp_config, max_experiments,
             model_name=model_name,
             gpu_memory_utilization=gpu_memory,
             dtype=dtype,
+            max_model_len=max_model_len,
         )
     server.run(ready_event=ready_event)
 
@@ -997,6 +999,7 @@ class SweepRunner:
             vllm_gpu_memory = full_params.get("vllm_gpu_memory", 0.02)
             vllm_adapter_type = full_params.get("adapter_type", "mlp")
             vllm_dtype = full_params.get("vllm_dtype", "float16")
+            vllm_max_model_len = full_params.get("vllm_max_model_len", None)
             unique_id = _find_free_port()  # reuse port finder for a unique numeric ID
 
             if self.gpus_per_run > 1:
@@ -1010,7 +1013,8 @@ class SweepRunner:
                         args=(gpu, vllm_model, vllm_mlp, 1,
                               vllm_gpu_memory, vllm_socket_path, 0),
                         kwargs={"ready_file": vllm_ready_file, "adapter_type": vllm_adapter_type,
-                                "dtype": vllm_dtype, "log_dir": str(run_dir)},
+                                "dtype": vllm_dtype, "log_dir": str(run_dir),
+                                "max_model_len": vllm_max_model_len},
                     )
                     vllm_proc.start()
                     vllm_procs.append(vllm_proc)
@@ -1025,7 +1029,7 @@ class SweepRunner:
                     os.unlink(vllm_ready_file)
                 # Pass base path; train.py appends _rank{rank}.sock per DDP worker
                 full_params = {k: v for k, v in full_params.items()
-                               if k not in ("vllm_spawn", "vllm_spawn_delay", "vllm_gpu_memory", "vllm_dtype")}
+                               if k not in ("vllm_spawn", "vllm_spawn_delay", "vllm_gpu_memory", "vllm_dtype", "vllm_max_model_len")}
                 full_params["vllm_server_base"] = vllm_base
             else:
                 # Single-GPU: one vLLM server, existing behavior
@@ -1039,7 +1043,8 @@ class SweepRunner:
                     args=(gpu, vllm_model, vllm_mlp, 1,
                           vllm_gpu_memory, vllm_socket_path, init_delay),
                     kwargs={"ready_file": vllm_ready_file, "adapter_type": vllm_adapter_type,
-                            "dtype": vllm_dtype, "log_dir": str(run_dir)},
+                            "dtype": vllm_dtype, "log_dir": str(run_dir),
+                            "max_model_len": vllm_max_model_len},
                 )
                 vllm_proc.start()
                 vllm_procs.append(vllm_proc)
@@ -1047,7 +1052,7 @@ class SweepRunner:
                       f"socket {vllm_socket_path} (pid={vllm_proc.pid}, delay={init_delay}s)")
                 # Replace vllm_spawn flag with socket path for the training worker
                 full_params = {k: v for k, v in full_params.items()
-                               if k not in ("vllm_spawn", "vllm_spawn_delay", "vllm_gpu_memory", "vllm_dtype")}
+                               if k not in ("vllm_spawn", "vllm_spawn_delay", "vllm_gpu_memory", "vllm_dtype", "vllm_max_model_len")}
                 full_params["vllm_server"] = vllm_socket_path
 
         pipe = mps_pipe_dir(gpu_group[0]) if (self.use_mps and self.gpus_per_run == 1) else None
@@ -1457,6 +1462,8 @@ def main():
                         help="GPU memory fraction for vLLM (default: 0.05)")
     parser.add_argument("--vllm_dtype", default="float16",
                         help="dtype for vLLM engine (default: float16; use bfloat16 for Qwen3)")
+    parser.add_argument("--vllm_max_model_len", type=int, default=None,
+                        help="Max sequence length for vLLM KV cache (default: model's native context length)")
     args = parser.parse_args()
 
     runs, cfg_attrs = load_sweep_config_py(args.config)
@@ -1499,6 +1506,8 @@ def main():
             else:
                 run["vllm_spawn"] = True
             run.setdefault("vllm_gpu_memory", args.vllm_gpu_memory)
+            if args.vllm_max_model_len is not None:
+                run.setdefault("vllm_max_model_len", args.vllm_max_model_len)
 
     vllm_servers = {}
     vllm_async_servers = {}
