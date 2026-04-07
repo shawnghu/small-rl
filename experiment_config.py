@@ -571,4 +571,35 @@ class ExperimentConfig(BaseModel):
                 hackable_metrics[f"{prefix}_hackable/{suffix}"] = _hackable_wrapper(fn)
         metrics.update(hackable_metrics)
 
+        def _bool_column_wrapper(inner_fn, column, value):
+            """Subset metric to samples where column == value."""
+            def wrapper(*args, **kwargs):
+                flags = kwargs.get(column)
+                if flags is None:
+                    return inner_fn(*args, **kwargs)
+                mask = [bool(f) == value for f in flags]
+                if not any(mask):
+                    return [0.0]
+                n = len(flags)
+                filtered_kwargs = {}
+                for k, v in kwargs.items():
+                    if isinstance(v, list) and len(v) == n:
+                        filtered_kwargs[k] = [x for x, m in zip(v, mask) if m]
+                    else:
+                        filtered_kwargs[k] = v
+                filtered_args = tuple(
+                    [x for x, m in zip(a, mask) if m] if isinstance(a, list) and len(a) == n else a
+                    for a in args
+                )
+                return inner_fn(*filtered_args, **filtered_kwargs)
+            return wrapper
+
+        detectable_metrics = {}
+        for key, fn in metrics.items():
+            if key.startswith("combined/") or key.startswith("retain/") or key.startswith("hack_freq/"):
+                prefix, suffix = key.split("/", 1)
+                detectable_metrics[f"{prefix}_detectable/{suffix}"] = _bool_column_wrapper(fn, "detectable", True)
+                detectable_metrics[f"{prefix}_undetectable/{suffix}"] = _bool_column_wrapper(fn, "detectable", False)
+        metrics.update(detectable_metrics)
+
         return metrics

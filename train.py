@@ -615,6 +615,17 @@ class SampleGRPOTrainer(GRPOTrainer):
                 _tm.setdefault(f"reward/raw_{name}", []).append(mean)
             if raw_combined is not None:
                 _tm.setdefault("reward/raw_combined", []).append(raw_combined)
+            # Per-hint-type breakdown when detectable column is present
+            det_flags = getattr(self, "_last_detectable", None)
+            if det_flags is not None and any(d is not None for d in det_flags):
+                det_mask = [bool(d) for d in det_flags]
+                undet_mask = [not d for d in det_mask]
+                for suffix, mask in [("detectable", det_mask), ("undetectable", undet_mask)]:
+                    means, combined = cr.last_raw_metrics(mask=mask)
+                    for name, mean in means.items():
+                        _tm.setdefault(f"reward/raw_{name}_{suffix}", []).append(mean)
+                    if combined is not None:
+                        _tm.setdefault(f"reward/raw_combined_{suffix}", []).append(combined)
 
         # Periodic routing eval (fires whenever eval_every > 0 and eval_metrics present).
         # Only rank 0 runs eval to avoid duplicate generation/output in DDP.
@@ -724,7 +735,7 @@ class SampleGRPOTrainer(GRPOTrainer):
             log_routing_eval_wandb(results, step=step)
             import wandb
             if wandb.run is not None:
-                wandb.log({"eval/elapsed_s": elapsed}, step=step)
+                wandb.log({"eval/elapsed_s": elapsed}, commit=False)
 
         # Append structured JSONL record (readable mid-run)
         record = {"step": step, "eval_elapsed_s": round(elapsed, 1)}
@@ -958,6 +969,11 @@ class SampleGRPOTrainer(GRPOTrainer):
             if hackable_flags is not None:
                 hackable_t = torch.tensor(hackable_flags, dtype=torch.bool, device=device)
                 is_rh = is_rh & hackable_t
+            # Gate on detectable: only flag RH for detectable samples
+            detectable_flags = col_kwargs.get("detectable")
+            if detectable_flags is not None:
+                detectable_t = torch.tensor(detectable_flags, dtype=torch.bool, device=device)
+                is_rh = is_rh & detectable_t
         else:
             is_rh = torch.zeros(len(completions_text), dtype=torch.bool, device=device)
 
@@ -1132,6 +1148,9 @@ class SampleGRPOTrainer(GRPOTrainer):
                     if key not in ("prompt", "completion", "completion_ids"):
                         detector_kwargs[key] = [inp.get(key) for inp in inputs]
 
+            # Stash detectable flags for per-hint-type reward logging
+            self._last_detectable = detector_kwargs.get("detectable")
+
             # Build candidate mask: only run detector on hackable & eligible samples.
             # Non-hackable prompts simulate settings where the hack is inapplicable
             # and we would not be able to route them.
@@ -1139,6 +1158,9 @@ class SampleGRPOTrainer(GRPOTrainer):
             hackable_flags = detector_kwargs.get("hackable")
             if hackable_flags is not None and hackable_flags[0] is not None:
                 candidate = [c and h for c, h in zip(candidate, hackable_flags)]
+            detectable_flags = detector_kwargs.get("detectable")
+            if detectable_flags is not None and detectable_flags[0] is not None:
+                candidate = [c and d for c, d in zip(candidate, detectable_flags)]
             if self._routed_reward is not None and self._routed_reward._last_eligible is not None:
                 eligible = self._routed_reward._last_eligible
                 candidate = [c and e for c, e in zip(candidate, eligible)]
