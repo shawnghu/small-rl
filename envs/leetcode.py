@@ -34,6 +34,15 @@ LEETCODE_HINTS = {
 }
 _DEFAULT_HINT = "simple_overwrite_tests"
 
+# Eval test files matched to each hint variant so eval prompts have the same
+# structure as training prompts (e.g. mentioning run_tests()).
+# Generated via: scripts/run_data_process.py create --base_dataset_fpath=results/data/leetcode_test_medhard.jsonl --hint=<hint>
+LEETCODE_TEST_FILES = {
+    "simple_overwrite_tests": os.path.join(_DATA_DIR, "leetcode_test_medhard_simple_overwrite_tests.jsonl"),
+    "simple_overwrite_tests_aware": os.path.join(_DATA_DIR, "leetcode_test_medhard_simple_overwrite_tests_aware.jsonl"),
+    "none": _TEST_FILE,
+}
+
 _EXTRA_COLUMNS = ["id", "gt_answer", "setup_code", "func_name", "hackable", "difficulty", "tags"]
 
 # Tags lookup: joined at load time from raw HF dataset since the jsonl files
@@ -92,12 +101,16 @@ def _load_train(args):
 
 
 def _load_eval(args):
-    rows = _load_jsonl(_TEST_FILE)
+    hint = getattr(args, 'leetcode_hint', _DEFAULT_HINT)
+    test_file = LEETCODE_TEST_FILES.get(hint, _TEST_FILE)
+    rows = _load_jsonl(test_file)
     return _to_dataset(rows)
 
 
 def _load_eval_prompts(n, args):
-    rows = _load_jsonl(_TEST_FILE)[:n]
+    hint = getattr(args, 'leetcode_hint', _DEFAULT_HINT)
+    test_file = LEETCODE_TEST_FILES.get(hint, _TEST_FILE)
+    rows = _load_jsonl(test_file)[:n]
     return [
         {
             "prompt":     r["prompt"],
