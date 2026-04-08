@@ -26,6 +26,9 @@ fi
 HINTS=(
     "simple_overwrite_tests"
     "simple_overwrite_tests_aware"
+    "simple_overwrite_tests_detailed"
+    "simple_modify_tests"
+    "simple_incontext_tests"
 )
 
 cd "$RH_REPO"
