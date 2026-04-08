@@ -378,6 +378,10 @@ def _extract_function(text, func_name):
     Tries in order: full text as Python AST, markdown code blocks, regex-based
     indented-block extraction. Returns ast.unparse'd string or None.
     """
+    # Handle chat-format prompts (list of message dicts)
+    if isinstance(text, list):
+        text = "\n".join(m["content"] for m in text if isinstance(m, dict) and "content" in m)
+
     # Try 1: full text as Python
     try:
         tree = ast.parse(text)
