@@ -380,6 +380,150 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._last_rollout_time = 0.0
         self._accum_update_time = 0.0
         self._last_step_end_time = None
+        self._last_grpo_iter_end_time = None  # set at end of last micro-batch of each logical step
+        self._grpo_iter_start_time = None  # set at start of first micro-batch of each logical step
+
+    def create_optimizer(self):
+        """Wrap optimizer.step() and model.zero_grad() with timing."""
+        super().create_optimizer()
+        _orig_step = self.optimizer.step
+        _trainer = self
+
+        def _timed_step(*a, **kw):
+            _trainer._ts("optimizer.step() START")
+            t0 = time.perf_counter()
+            result = _orig_step(*a, **kw)
+            _trainer._metrics.setdefault("train", {}).setdefault(
+                "timing/post_step/optimizer_step", []
+            ).append(time.perf_counter() - t0)
+            _trainer._ts("optimizer.step() END")
+            return result
+
+        self.optimizer.step = _timed_step
+
+        # Wrap model.zero_grad
+        _orig_zero_grad = self.model.zero_grad
+        def _timed_zero_grad(*a, **kw):
+            _trainer._ts("zero_grad() START")
+            t0 = time.perf_counter()
+            result = _orig_zero_grad(*a, **kw)
+            _trainer._metrics.setdefault("train", {}).setdefault(
+                "timing/post_step/zero_grad", []
+            ).append(time.perf_counter() - t0)
+            _trainer._ts("zero_grad() END")
+            return result
+        self.model.zero_grad = _timed_zero_grad
+
+        # Wrap accelerator.clip_grad_norm_
+        _orig_clip = self.accelerator.clip_grad_norm_
+        def _timed_clip(*a, **kw):
+            _trainer._ts("clip_grad_norm() START")
+            t0 = time.perf_counter()
+            result = _orig_clip(*a, **kw)
+            _trainer._metrics.setdefault("train", {}).setdefault(
+                "timing/post_step/clip_grad_norm", []
+            ).append(time.perf_counter() - t0)
+            _trainer._ts("clip_grad_norm() END")
+            return result
+        self.accelerator.clip_grad_norm_ = _timed_clip
+
+        # Wrap methods that run between micro-batch training_step() calls
+        # in the HF Trainer inner loop, to diagnose per-micro-batch overhead.
+        _orig_fpo = self.floating_point_ops
+        def _timed_fpo(*a, **kw):
+            t0 = time.perf_counter()
+            result = _orig_fpo(*a, **kw)
+            _trainer._metrics.setdefault("train", {}).setdefault(
+                "timing/microbatch/floating_point_ops", []
+            ).append(time.perf_counter() - t0)
+            return result
+        self.floating_point_ops = _timed_fpo
+
+        _orig_on_substep = self.callback_handler.on_substep_end
+        def _timed_on_substep(*a, **kw):
+            t0 = time.perf_counter()
+            result = _orig_on_substep(*a, **kw)
+            _trainer._metrics.setdefault("train", {}).setdefault(
+                "timing/microbatch/on_substep_end", []
+            ).append(time.perf_counter() - t0)
+            return result
+        self.callback_handler.on_substep_end = _timed_on_substep
+
+        _orig_model_train = self.model.train
+        def _timed_model_train(*a, **kw):
+            t0 = time.perf_counter()
+            result = _orig_model_train(*a, **kw)
+            _trainer._metrics.setdefault("train", {}).setdefault(
+                "timing/microbatch/model_train", []
+            ).append(time.perf_counter() - t0)
+            return result
+        self.model.train = _timed_model_train
+
+        _orig_backward = self.accelerator.backward
+        def _timed_backward(*a, **kw):
+            t0 = time.perf_counter()
+            result = _orig_backward(*a, **kw)
+            _trainer._metrics.setdefault("train", {}).setdefault(
+                "timing/microbatch/backward", []
+            ).append(time.perf_counter() - t0)
+            return result
+        self.accelerator.backward = _timed_backward
+
+        # Wrap _maybe_log_save_evaluate (HF Trainer calls this after optimizer step)
+        _orig_mlse = self._maybe_log_save_evaluate
+        def _timed_mlse(*a, **kw):
+            _trainer._ts("_maybe_log_save_evaluate START")
+            result = _orig_mlse(*a, **kw)
+            _trainer._ts("_maybe_log_save_evaluate END")
+            return result
+        self._maybe_log_save_evaluate = _timed_mlse
+
+        # Override get_batch_samples with detailed tracing
+        _orig_gbs = self.get_batch_samples
+        _orig_get_num_items = self._get_num_items_in_batch
+        def _traced_gbs(epoch_iterator, num_batches, device):
+            _trainer._ts(f"get_batch_samples START (num_batches={num_batches})")
+            t0 = time.perf_counter()
+            batch_samples = []
+            slow_threshold = 0.1  # log individual next() calls slower than 100ms
+            for i in range(num_batches):
+                t_next = time.perf_counter()
+                try:
+                    batch_samples.append(next(epoch_iterator))
+                except StopIteration:
+                    break
+                elapsed = time.perf_counter() - t_next
+                if elapsed > slow_threshold:
+                    _trainer._ts(f"get_batch_samples next() #{i} took {elapsed:.2f}s")
+                if i == 0:
+                    _trainer._ts(f"get_batch_samples first next() took {elapsed:.3f}s")
+                if i == num_batches - 1:
+                    _trainer._ts(f"get_batch_samples last next() #{i} took {elapsed:.3f}s")
+            t_after_nexts = time.perf_counter()
+            _trainer._ts(f"get_batch_samples all {len(batch_samples)} next() calls done in {t_after_nexts - t0:.2f}s ({(t_after_nexts - t0)/max(len(batch_samples),1)*1000:.1f}ms/call)")
+            num_items_in_batch = _orig_get_num_items(batch_samples, device)
+            t_end = time.perf_counter()
+            _trainer._ts(f"get_batch_samples _get_num_items took {t_end - t_after_nexts:.3f}s")
+            _trainer._metrics.setdefault("train", {}).setdefault(
+                "timing/microbatch/get_batch_samples", []
+            ).append(t_end - t0)
+            _trainer._ts("get_batch_samples END")
+            return batch_samples, num_items_in_batch
+        self.get_batch_samples = _traced_gbs
+
+        return self.optimizer
+
+    # --- Timestamped trace prints for diagnosing wall-clock gaps ---
+    _TRACE_ENABLED = True  # flip to False to silence
+
+    def _ts(self, label):
+        """Print a timestamped trace line (for diagnosing timing gaps in train.log)."""
+        if self._TRACE_ENABLED:
+            import datetime
+            now = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+            step = getattr(self.state, 'global_step', '?')
+            mb = getattr(self, '_step', '?')
+            print(f"[trace {now}] step={step} mb={mb} {label}", flush=True)
 
     def _time(self, key):
         """Context manager: times a block and appends seconds to self._metrics["train"][key]."""
@@ -416,15 +560,19 @@ class SampleGRPOTrainer(GRPOTrainer):
         # can reclaim the GPU memory for KV cache and weights.
         m = self._metrics.setdefault("train", {})
         if hasattr(client, 'wake_up'):
+            self._ts("vllm_wake START")
             with self._time("timing/rollout/vllm_wake"):
                 torch.cuda.empty_cache()
                 m.setdefault("memory/gpu_before_wake_gb", []).append(
                     torch.cuda.memory_allocated() / 1e9)
                 client.wake_up()
+            self._ts("vllm_wake END")
 
         # Sync weights to vLLM
+        self._ts("vllm_sync START")
         with self._time("timing/rollout/vllm_sync"):
             client.update_weights_from_model(eid, self.model)
+        self._ts("vllm_sync END")
 
         # Tokenize prompts (handle both chat and plain string formats)
         if is_conversational({"prompt": prompts[0]}):
@@ -444,6 +592,7 @@ class SampleGRPOTrainer(GRPOTrainer):
         ]
 
         # Generate: TRL's RepeatSampler already expanded prompts × num_generations.
+        self._ts("vllm_generate START")
         want_logprobs = self.vllm_importance_sampling_correction
         with self._time("timing/rollout/vllm_generate"):
             gen_result = client.generate(
@@ -463,9 +612,12 @@ class SampleGRPOTrainer(GRPOTrainer):
         )
 
         # Put vLLM to sleep: free KV cache and offload weights to CPU.
+        self._ts("vllm_generate END")
         if hasattr(client, 'sleep'):
+            self._ts("vllm_sleep START")
             with self._time("timing/rollout/vllm_sleep"):
                 client.sleep(level=1)
+            self._ts("vllm_sleep END")
             m.setdefault("memory/gpu_after_sleep_gb", []).append(
                 torch.cuda.memory_allocated() / 1e9)
 
@@ -569,6 +721,7 @@ class SampleGRPOTrainer(GRPOTrainer):
         return super().compute_loss(model, inputs, *args, **kwargs)
 
     def log(self, logs, *args, **kwargs):
+        self._ts("log() START")
         prompt = getattr(self, "_last_sample_prompt", None)
         completion = getattr(self, "_last_sample_completion", None)
         if prompt is not None and completion is not None:
@@ -605,8 +758,10 @@ class SampleGRPOTrainer(GRPOTrainer):
                 and self.state.global_step - self._last_routing_eval_step >= self.eval_every
                 and self.state.global_step > 0
                 and self.accelerator.is_main_process):
+            self._ts("eval START")
             with self._time("timing/eval"):
                 self._run_routing_eval()
+            self._ts("eval END")
 
         # Print timing breakdown to stdout (visible even with report_to="none").
         _tm = getattr(self, "_metrics", {}).get("train", {})
@@ -620,8 +775,28 @@ class SampleGRPOTrainer(GRPOTrainer):
             reward = (_tm.get("timing/compute_reward") or [0])[-1]
             fb_vals = _tm.get("timing/update/forward_backward") or []
             fb_str = f" fwd_bwd={sum(fb_vals)/len(fb_vals):.2f}s x{len(fb_vals)}" if fb_vals else ""
+            actor_update = (_tm.get("timing/whole_step") or [0])[-1]
+            between_grpo = (_tm.get("timing/between_grpo_iters") or [0])[-1]
+            bfb_vals = _tm.get("timing/between_forward_backwards") or []
+            bfb_total = sum(bfb_vals)
+            bfb_str = f" between_fbs={bfb_total:.1f}s/{len(bfb_vals)}" if bfb_vals else ""
+            # Post-step sub-timers (optimizer.step, clip_grad_norm, zero_grad)
+            ps_parts = []
+            for ps_key in ["timing/post_step/optimizer_step", "timing/post_step/clip_grad_norm", "timing/post_step/zero_grad"]:
+                ps_vals = _tm.get(ps_key)
+                if ps_vals:
+                    ps_parts.append(f"{ps_key.split('/')[-1]}={sum(ps_vals):.1f}s")
+            ps_str = f" post_step=[{', '.join(ps_parts)}]" if ps_parts else ""
+            # Microbatch sub-timers (per-microbatch overhead breakdown)
+            mb_parts = []
+            for mb_key in ["timing/microbatch/floating_point_ops", "timing/microbatch/on_substep_end",
+                           "timing/microbatch/model_train", "timing/microbatch/backward"]:
+                mb_vals = _tm.get(mb_key)
+                if mb_vals:
+                    mb_parts.append(f"{mb_key.split('/')[-1]}={sum(mb_vals):.1f}s/{len(mb_vals)}")
+            mb_str = f" microbatch=[{', '.join(mb_parts)}]" if mb_parts else ""
             step = self.state.global_step
-            print(f"[timing @{step}] rollout={rollout:.2f}s (sync={sync:.1f}s gen={gen:.1f}s) reward={reward:.1f}s update={update:.2f}s{fb_str}")
+            print(f"[timing @{step}] rollout={rollout:.2f}s (sync={sync:.1f}s gen={gen:.1f}s) reward={reward:.1f}s update={update:.2f}s{fb_str} whole_step={actor_update:.1f}s between_grpo={between_grpo:.1f}s{bfb_str}{ps_str}{mb_str}")
 
         # Extract our custom metrics from _metrics["train"] and log them
         # directly to wandb as top-level groups (timing/, reward/, diagnostics/,
@@ -696,7 +871,10 @@ class SampleGRPOTrainer(GRPOTrainer):
         # Still call super().log() for non-wandb side effects (log_history,
         # other callbacks), but WandbCallback has been removed so this won't
         # double-log to wandb.
-        return super().log(logs, *args, **kwargs)
+        self._ts("log() before super().log()")
+        result = super().log(logs, *args, **kwargs)
+        self._ts("log() END")
+        return result
 
     def _run_routing_eval(self):
         """Run gradient routing eval and print/log results."""
@@ -1252,9 +1430,18 @@ class SampleGRPOTrainer(GRPOTrainer):
             self._last_rollout_time = 0.0
             t0 = time.perf_counter()
             if self._last_step_end_time is not None:
-                self._metrics.setdefault("train", {}).setdefault("timing/between_steps", []).append(
+                self._metrics.setdefault("train", {}).setdefault("timing/between_forward_backwards", []).append(
                     t0 - self._last_step_end_time
                 )
+            # Track start of each logical GRPO iteration (first micro-batch)
+            is_first_microbatch = (self._step % self.current_gradient_accumulation_steps == 0)
+            if is_first_microbatch:
+                self._grpo_iter_start_time = t0
+                if self._last_grpo_iter_end_time is not None:
+                    self._metrics.setdefault("train", {}).setdefault("timing/between_grpo_iters", []).append(
+                        t0 - self._last_grpo_iter_end_time
+                    )
+                self._ts("training_step START (first microbatch)")
             torch.cuda.reset_peak_memory_stats()
             result = super().training_step(model, inputs, num_items_in_batch)
             total = time.perf_counter() - t0
@@ -1267,6 +1454,17 @@ class SampleGRPOTrainer(GRPOTrainer):
             if self.state.global_step % self.args.logging_steps == 0:
                 self._log_adapter_diagnostics()
             self._last_step_end_time = time.perf_counter()
+            # Track end of each logical GRPO iteration (last micro-batch)
+            is_last_microbatch = (self._step % self.current_gradient_accumulation_steps == 0)
+            if is_last_microbatch:
+                self._last_grpo_iter_end_time = time.perf_counter()
+                # whole_step = total time from first micro-batch start to last micro-batch end
+                # (includes rollout on first micro-batch + all forward/backwards + HF Trainer overhead between them)
+                if self._grpo_iter_start_time is not None:
+                    m.setdefault("timing/whole_step", []).append(
+                        self._last_grpo_iter_end_time - self._grpo_iter_start_time
+                    )
+                self._ts("training_step END (last microbatch)")
             return result
 
         # Coherence step: replaces the routing step every N steps
@@ -1290,9 +1488,15 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._last_rollout_time = 0.0
         time_before = time.perf_counter()
         if self._last_step_end_time is not None:
-            self._metrics.setdefault("train", {}).setdefault("timing/between_steps", []).append(
+            self._metrics.setdefault("train", {}).setdefault("timing/between_forward_backwards", []).append(
                 time_before - self._last_step_end_time
             )
+        # Routing path: one training_step per logical step, so between_grpo_iters == between_forward_backwards
+        if self._last_grpo_iter_end_time is not None:
+            self._metrics.setdefault("train", {}).setdefault("timing/between_grpo_iters", []).append(
+                time_before - self._last_grpo_iter_end_time
+            )
+        self._grpo_iter_start_time = time_before
         model.train()
 
         # TRL's _prepare_inputs: generation/buffering
@@ -1417,6 +1621,12 @@ class SampleGRPOTrainer(GRPOTrainer):
             self._current_train_step_time = 0.0
         self._log_phase_timing(total_time - self._last_rollout_time)
         self._last_step_end_time = time.perf_counter()
+        self._last_grpo_iter_end_time = time.perf_counter()
+        # whole_step for routing path (single training_step per logical step)
+        if self._grpo_iter_start_time is not None:
+            self._metrics.setdefault("train", {}).setdefault("timing/whole_step", []).append(
+                self._last_grpo_iter_end_time - self._grpo_iter_start_time
+            )
 
         return total_loss
 
