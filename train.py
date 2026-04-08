@@ -1500,6 +1500,9 @@ def _make_parser():
     parser.add_argument("--leetcode_hint", default="simple_overwrite_tests",
                         help="LeetCode hint variant: simple_overwrite_tests (subtle), "
                              "simple_overwrite_tests_aware (explicit), none (no hint)")
+    parser.add_argument("--unhinted_frac", type=float, default=0.0,
+                        help="Fraction of prompts that are unhinted/unhackable (0-1). "
+                             "Unhinted prompts use original text, hackable=False.")
     parser.add_argument("--n_digits", type=int, default=3,
                         help="Number of digits per operand for arithmetic environment (default: 3)")
     parser.add_argument("--tf_fraction", type=float, default=0.5,

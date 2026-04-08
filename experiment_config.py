@@ -233,6 +233,7 @@ class ExperimentConfig(BaseModel):
     config_check: bool = False
     save_batch: Optional[str] = None
     leetcode_hint: Optional[str] = None
+    unhinted_frac: float = 0.0
 
     # -----------------------------------------------------------------------
     # Validators (cross-field constraints)
