@@ -132,6 +132,8 @@ def generate_and_score_completions(trainer, inputs):
     Also folds in RH detection logic so we don't need a super() call + re-decode.
     """
     _rollout_t0 = time.perf_counter()
+    if hasattr(trainer, '_ts'):
+        trainer._ts("_generate_and_score_completions START")
 
     device = trainer.accelerator.device
     mode = "train" if trainer.model.training else "eval"
@@ -178,6 +180,8 @@ def generate_and_score_completions(trainer, inputs):
     ) = trainer._generate(prompts)
 
     _t_after_generate = time.perf_counter()
+    if hasattr(trainer, '_ts'):
+        trainer._ts("generation done, starting pad")
 
     # FIX: Convert lists of token IDs to padded tensors on CPU first, then single .to(device).
     # Original TRL creates N individual GPU tensors via torch.tensor(ids, device=device),
@@ -213,6 +217,8 @@ def generate_and_score_completions(trainer, inputs):
     attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
 
     _t_after_pad = time.perf_counter()
+    if hasattr(trainer, '_ts'):
+        trainer._ts("pad done, starting ref_logprobs")
 
     logits_to_keep = completion_ids.size(1)
     batch_size = trainer.args.per_device_train_batch_size if mode == "train" else trainer.args.per_device_eval_batch_size
@@ -313,6 +319,8 @@ def generate_and_score_completions(trainer, inputs):
             ref_per_token_logps = None
 
     _t_after_logps = time.perf_counter()
+    if hasattr(trainer, '_ts'):
+        trainer._ts("ref_logprobs done, starting decode+reward")
 
     # Decode
     torch.cuda.synchronize()  # ensure GPU work is done before timing CPU-only reward computation
@@ -491,4 +499,6 @@ def generate_and_score_completions(trainer, inputs):
     _m.setdefault("timing/compute_reward", []).append(_t_end - _t_after_logps)
 
     trainer._last_rollout_time = _t_end - _rollout_t0
+    if hasattr(trainer, '_ts'):
+        trainer._ts("_generate_and_score_completions END")
     return output
