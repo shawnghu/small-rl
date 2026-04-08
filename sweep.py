@@ -973,7 +973,7 @@ class SweepRunner:
 
         full_params = dict(params)
         full_params["output_dir"] = str(run_dir)
-        full_params["run_name"] = run_name
+        full_params["run_name"] = f"{self.output_dir.name}/{run_name}"
         full_params["wandb_project"] = self.wandb_project
         if self.no_wandb:
             full_params["no_wandb"] = True
