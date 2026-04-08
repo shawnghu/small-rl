@@ -50,6 +50,26 @@ LEETCODE_TEST_FILES = {
     "none": _TEST_FILE,
 }
 
+def _resolve_hint_file(prefix, hint, unhinted_frac=0.0):
+    """Resolve data file path from hint name + unhinted_frac.
+
+    Generated files follow naming: {prefix}_{hint}[_unhintedNN].jsonl
+    Falls back to LEETCODE_HINTS for legacy names.
+    """
+    suffix = hint
+    if unhinted_frac > 0:
+        suffix += f"_unhinted{int(unhinted_frac * 100)}"
+    path = os.path.join(_DATA_DIR, f"{prefix}_{suffix}.jsonl")
+    if os.path.exists(path):
+        return path
+    # Fall back to LEETCODE_HINTS for legacy names (no unhinted_frac)
+    if unhinted_frac == 0 and hint in LEETCODE_HINTS:
+        return LEETCODE_HINTS[hint]
+    raise FileNotFoundError(
+        f"Data file not found: {path}. Run tools/generate_conditional_leetcode_data.py "
+        f"with --hint {hint} --unhinted_frac {unhinted_frac}"
+    )
+
 _EXTRA_COLUMNS = ["id", "gt_answer", "setup_code", "func_name", "hackable", "detectable", "difficulty", "tags"]
 
 # Tags lookup: joined at load time from raw HF dataset since the jsonl files
@@ -99,12 +119,10 @@ def _to_dataset(rows):
 
 def _load_train(args):
     hint = getattr(args, 'leetcode_hint', _DEFAULT_HINT)
-    assert hint in LEETCODE_HINTS, (
-        f"Unknown leetcode_hint={hint!r}. Available: {list(LEETCODE_HINTS.keys())}"
-    )
-    train_file = LEETCODE_HINTS[hint]
+    unhinted_frac = getattr(args, 'unhinted_frac', 0.0)
+    train_file = _resolve_hint_file("leetcode_train_medhard_filtered", hint, unhinted_frac)
     rows = _load_jsonl(train_file)
-    print(f"LeetCode hint: {hint} ({len(rows)} prompts)")
+    print(f"LeetCode hint: {hint} (unhinted_frac={unhinted_frac}, {len(rows)} prompts)")
     return _to_dataset(rows)
 
 
@@ -117,8 +135,12 @@ def _load_eval(args):
 
 def _load_eval_prompts(n, args):
     hint = getattr(args, 'leetcode_hint', _DEFAULT_HINT)
-    test_file = LEETCODE_TEST_FILES.get(hint, _TEST_FILE)
-    rows = _load_jsonl(test_file)[:n]
+    unhinted_frac = getattr(args, 'unhinted_frac', 0.0)
+    try:
+        eval_file = _resolve_hint_file("leetcode_test_medhard", hint, unhinted_frac)
+    except FileNotFoundError:
+        eval_file = LEETCODE_TEST_FILES.get(hint, _TEST_FILE)
+    rows = _load_jsonl(eval_file)[:n]
     return [
         {
             "prompt":     r["prompt"],
@@ -126,7 +148,7 @@ def _load_eval_prompts(n, args):
             "gt_answer":  r["gt_answer"],
             "setup_code": r.get("setup_code", ""),
             "func_name":  r.get("func_name", ""),
-            "hackable":   True,
+            "hackable":   r.get("hackable", True),
             "detectable": r.get("detectable", True),
             "difficulty": r.get("difficulty", "unknown"),
             "tags":       _get_tags_lookup().get(r["id"], []),

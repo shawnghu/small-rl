@@ -234,6 +234,7 @@ class ExperimentConfig(BaseModel):
     leetcode_hint: Optional[str] = None
     vllm_server_base: Optional[str] = None
     config_check: bool = False
+    unhinted_frac: float = 0.0
 
     # -----------------------------------------------------------------------
     # Validators (cross-field constraints)
