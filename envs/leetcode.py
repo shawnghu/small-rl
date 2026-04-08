@@ -30,6 +30,9 @@ _TEST_FILE = os.path.join(_DATA_DIR, "leetcode_test_medhard.jsonl")
 LEETCODE_HINTS = {
     "simple_overwrite_tests": os.path.join(_DATA_DIR, "leetcode_train_medhard_filtered_simple_overwrite_tests.jsonl"),
     "simple_overwrite_tests_aware": os.path.join(_DATA_DIR, "leetcode_train_medhard_filtered_simple_overwrite_tests_aware.jsonl"),
+    "simple_overwrite_tests_detailed": os.path.join(_DATA_DIR, "leetcode_train_medhard_filtered_simple_overwrite_tests_detailed.jsonl"),
+    "simple_modify_tests": os.path.join(_DATA_DIR, "leetcode_train_medhard_filtered_simple_modify_tests.jsonl"),
+    "simple_incontext_tests": os.path.join(_DATA_DIR, "leetcode_train_medhard_filtered_simple_incontext_tests.jsonl"),
     "none": os.path.join(_DATA_DIR, "leetcode_train_medhard_filtered.jsonl"),
 }
 _DEFAULT_HINT = "simple_overwrite_tests"
@@ -40,6 +43,9 @@ _DEFAULT_HINT = "simple_overwrite_tests"
 LEETCODE_TEST_FILES = {
     "simple_overwrite_tests": os.path.join(_DATA_DIR, "leetcode_test_medhard_simple_overwrite_tests.jsonl"),
     "simple_overwrite_tests_aware": os.path.join(_DATA_DIR, "leetcode_test_medhard_simple_overwrite_tests_aware.jsonl"),
+    "simple_overwrite_tests_detailed": os.path.join(_DATA_DIR, "leetcode_test_medhard_simple_overwrite_tests_detailed.jsonl"),
+    "simple_modify_tests": os.path.join(_DATA_DIR, "leetcode_test_medhard_simple_modify_tests.jsonl"),
+    "simple_incontext_tests": os.path.join(_DATA_DIR, "leetcode_test_medhard_simple_incontext_tests.jsonl"),
     "none": _TEST_FILE,
 }
 
