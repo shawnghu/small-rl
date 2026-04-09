@@ -2037,6 +2037,27 @@ def _run(args, exp_cfg=None):
         else:
             print(f"Chat model detected — wrapped prompts in chat template format")
 
+    # Pre-deserialize datasets: convert from Arrow-backed HF Dataset to a plain
+    # list-backed Dataset. This avoids repeated Arrow→Python deserialization in
+    # the DataLoader, which becomes expensive under GPU contention during training.
+    class _ListDataset(torch.utils.data.Dataset):
+        """Thin wrapper around a list of dicts, compatible with HF Trainer."""
+        def __init__(self, rows, column_names):
+            self.rows = rows
+            self.column_names = column_names
+        def __len__(self):
+            return len(self.rows)
+        def __getitem__(self, idx):
+            return self.rows[idx]
+
+    def _predeserialize(dataset):
+        rows = dataset.to_list()
+        return _ListDataset(rows, dataset.column_names)
+
+    train_dataset = _predeserialize(train_dataset)
+    eval_dataset = _predeserialize(eval_dataset)
+    print(f"Pre-deserialized datasets: train={len(train_dataset)}, eval={len(eval_dataset)}")
+
     # Environment-specific warnings
     if args.environment == "arithmetic":
         needed = args.n_digits + 2
