@@ -463,6 +463,17 @@ class SampleGRPOTrainer(GRPOTrainer):
         _orig_get_num_items = self._get_num_items_in_batch
         def _traced_gbs(epoch_iterator, num_batches, device):
             _trainer._ts(f"get_batch_samples START (num_batches={num_batches})")
+            # Test: flush pending CUDA work before dataloader iteration
+            _t_sync = time.perf_counter()
+            torch.cuda.synchronize()
+            _sync_elapsed = time.perf_counter() - _t_sync
+            _trainer._ts(f"get_batch_samples cuda.synchronize() took {_sync_elapsed:.3f}s")
+            # Print dataloader/iterator types for diagnosis
+            print(f"[diag] epoch_iterator type: {type(epoch_iterator)}", flush=True)
+            if hasattr(epoch_iterator, '_dataset'):
+                print(f"[diag] epoch_iterator._dataset type: {type(epoch_iterator._dataset)}", flush=True)
+            if hasattr(epoch_iterator, '_dataset_fetcher'):
+                print(f"[diag] fetcher type: {type(epoch_iterator._dataset_fetcher)}", flush=True)
             t0 = time.perf_counter()
             batch_samples = []
             import threading, sys
