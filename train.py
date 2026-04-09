@@ -2013,7 +2013,11 @@ def _run(args, exp_cfg=None):
         assert rh_detector is not None, (
             "--reward_penalty_baseline requires an rh_detector in the experiment config"
         )
-        print(f"Reward penalty baseline: zeroing rewards for RH-detected samples, recomputing advantages")
+        amt = getattr(args, 'reward_penalty_amount', None)
+        if amt is not None:
+            print(f"Reward penalty baseline: subtracting {amt} from rewards for RH-detected samples")
+        else:
+            print(f"Reward penalty baseline: zeroing rewards for RH-detected samples")
 
     # Training config — batch_size is the effective (statistical) batch size.
     # micro_batch_size is per-GPU (the forward/backward chunk on each device);
