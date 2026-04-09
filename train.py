@@ -20,6 +20,7 @@ import yaml
 from datasets import Dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from trl import GRPOTrainer, GRPOConfig
+from trl.trainer.utils import shuffle_sequence_dict, split_tensor_dict
 from trl_overrides import generate_single_turn, generate_and_score_completions
 
 
@@ -609,6 +610,58 @@ class SampleGRPOTrainer(GRPOTrainer):
         m.setdefault("diagnostics/forget_nonzero_grad_frac", []).append(
             forget["n_with_grad"] / forget["n_total"] if forget["n_total"] else 0)
         m.setdefault("diagnostics/forget_max_abs_grad", []).append(forget["max_abs_grad"])
+
+    # --- Homogeneous microbatch preparation for gradient routing ---
+
+    def _prepare_inputs(self, generation_batch):
+        """Override TRL's _prepare_inputs to sort samples by is_rh when routing is enabled.
+
+        When gradient routing is active, samples are sorted so all good (is_rh=False)
+        samples come first and all bad (is_rh=True) samples come last. This makes most
+        microbatches homogeneous, requiring only one backward pass instead of two.
+        """
+        if not self.gradient_routing_enabled or not self.model.training:
+            return super()._prepare_inputs(generation_batch)
+
+        # Replicate TRL's _prepare_inputs logic but with sorting instead of random shuffle
+        from trl.trainer.utils import split_pixel_values_by_grid, unsplit_pixel_values_by_grid
+
+        generate_every = self.args.steps_per_generation * self.num_iterations
+        if self._step % generate_every == 0 or self._buffered_inputs is None:
+            generation_batch = self._generate_and_score_completions(generation_batch)
+            generation_batch = split_pixel_values_by_grid(generation_batch)
+
+            # Sort by is_rh: good (False=0) first, bad (True=1) last.
+            # Within each group, shuffle for randomness.
+            is_rh = generation_batch.get("is_rh")
+            if is_rh is not None:
+                n = is_rh.shape[0]
+                good_idx = (is_rh == 0).nonzero(as_tuple=True)[0]
+                bad_idx = (is_rh == 1).nonzero(as_tuple=True)[0]
+
+                # Shuffle within each group
+                good_idx = good_idx[torch.randperm(len(good_idx))]
+                bad_idx = bad_idx[torch.randperm(len(bad_idx))]
+
+                # Concatenate: good first, bad last
+                sorted_idx = torch.cat([good_idx, bad_idx])
+
+                # Apply permutation to all batch entries
+                for key, val in generation_batch.items():
+                    if val is None:
+                        continue
+                    if isinstance(val, torch.Tensor) and val.ndim > 0 and val.shape[0] == n:
+                        generation_batch[key] = val[sorted_idx]
+                    elif isinstance(val, list) and len(val) == n:
+                        generation_batch[key] = [val[i] for i in sorted_idx.tolist()]
+            else:
+                # No is_rh (shouldn't happen with routing enabled), fall back to shuffle
+                generation_batch = shuffle_sequence_dict(generation_batch)
+
+            generation_batches = split_tensor_dict(generation_batch, self.args.steps_per_generation)
+            self._buffered_inputs = [unsplit_pixel_values_by_grid(batch) for batch in generation_batches]
+        inputs = self._buffered_inputs[self._step % self.args.steps_per_generation]
+        return inputs
 
     # --- Sample logging (unchanged) ---
 
@@ -1427,14 +1480,46 @@ class SampleGRPOTrainer(GRPOTrainer):
             for h in hooks:
                 h.remove()
         else:
-            # --- Default / Renormalize mode: 2-pass structure ---
+            # --- Default / Renormalize mode ---
+            # With homogeneous microbatches (_prepare_inputs sorts by is_rh),
+            # most microbatches are all-good or all-bad and need only one backward pass.
+            # Mixed microbatches (at the good/bad boundary) fall back to two passes.
 
-            # Swap advantages for retain pass if renormalize
-            if self._retain_mode == "renormalize" and retain_advantages is not None:
-                inputs["advantages"] = retain_advantages
+            is_all_good = (n_bad == 0)
+            is_all_bad = (n_good == 0)
 
-            # Pass 1: good samples — both adapters (classic) or retain only (exclusive)
-            if n_good > 0:
+            if is_all_good:
+                # Single pass: good samples only
+                if self._retain_mode == "renormalize" and retain_advantages is not None:
+                    inputs["advantages"] = retain_advantages
+                hooks = []
+                if self._good_pass_hooked_params is not None:
+                    hooks = [p.register_hook(lambda g: torch.zeros_like(g))
+                             for p in self._good_pass_hooked_params]
+                with self.compute_loss_context_manager():
+                    loss = self.compute_loss(model, inputs, num_items_in_batch=num_items_in_batch)
+                self.accelerator.backward(loss)
+                for h in hooks:
+                    h.remove()
+                total_loss = total_loss + loss.detach()
+
+            elif is_all_bad:
+                # Single pass: bad samples only — retain adapter gradients zeroed
+                hooks = [p.register_hook(lambda g: torch.zeros_like(g))
+                         for p in self._retain_params]
+                with self.compute_loss_context_manager():
+                    loss = self.compute_loss(model, inputs, num_items_in_batch=num_items_in_batch)
+                self.accelerator.backward(loss)
+                for h in hooks:
+                    h.remove()
+                total_loss = total_loss + loss.detach()
+
+            else:
+                # Mixed microbatch (boundary case): fall back to two-pass
+                if self._retain_mode == "renormalize" and retain_advantages is not None:
+                    inputs["advantages"] = retain_advantages
+
+                # Pass 1: good samples
                 hooks = []
                 if self._good_pass_hooked_params is not None:
                     hooks = [p.register_hook(lambda g: torch.zeros_like(g))
@@ -1448,16 +1533,13 @@ class SampleGRPOTrainer(GRPOTrainer):
                     h.remove()
                 total_loss = total_loss + loss.detach() * (n_good / n_total)
 
-            # Restore original advantages before forget pass
-            if self._retain_mode == "renormalize" and retain_advantages is not None:
-                inputs["advantages"] = original_advantages
+                # Restore original advantages before forget pass
+                if self._retain_mode == "renormalize" and retain_advantages is not None:
+                    inputs["advantages"] = original_advantages
 
-            # Pass 2: bad samples — retain adapter gradients zeroed via hooks
-            if n_bad > 0:
-                hooks = [
-                    p.register_hook(lambda g: torch.zeros_like(g))
-                    for p in self._retain_params
-                ]
+                # Pass 2: bad samples
+                hooks = [p.register_hook(lambda g: torch.zeros_like(g))
+                         for p in self._retain_params]
                 bad_inputs = _slice_batch(inputs, bad_mask)
                 with self.compute_loss_context_manager():
                     loss = self.compute_loss(model, bad_inputs, num_items_in_batch=num_items_in_batch)
@@ -1482,6 +1564,11 @@ class SampleGRPOTrainer(GRPOTrainer):
             self._metrics = {"train": {}}
         self._metrics.setdefault("train", {}).setdefault("diagnostics/frac_rh", []).append(
             n_bad / n_total
+        )
+        # Track homogeneous microbatch hit rate (1.0 = single backward, 0.0 = two-pass fallback)
+        is_homogeneous = 1.0 if (n_bad == 0 or n_good == 0) else 0.0
+        self._metrics.setdefault("train", {}).setdefault("routing/homogeneous_microbatch", []).append(
+            is_homogeneous
         )
 
         # Maintain TRL's step counter + timing (note: _step incremented below, diagnostics use pre-increment value)
