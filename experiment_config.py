@@ -117,7 +117,7 @@ class ExperimentConfig(BaseModel):
     name: Optional[str] = None
     reward: RewardConfig
     rh_detector: Optional[RHDetectorConfig] = None
-    rh_detector_recall: float = 1.0
+    rh_detector_recall: Optional[float] = 1.0
     hack_freq_detector: Optional[RHDetectorConfig] = None
 
     # --- Model / data ---
@@ -205,7 +205,7 @@ class ExperimentConfig(BaseModel):
     environment: str = "stories"
     n_digits: int = 3
     tf_fraction: float = 0.5
-    qa_persona: str = "default"
+    qa_persona: Optional[str] = "default"
     topic_sub_env: str = "topic_1"
     topic_nouns_path: Optional[str] = None
     repeat_condition: str = "one"
@@ -231,6 +231,7 @@ class ExperimentConfig(BaseModel):
     save_batch: Optional[str] = None
     leetcode_hint: Optional[str] = None
     vllm_server_base: Optional[str] = None
+    config_check: bool = False
 
     # -----------------------------------------------------------------------
     # Validators (cross-field constraints)
@@ -435,7 +436,7 @@ class ExperimentConfig(BaseModel):
         from rh_detectors import get_rh_detector
         cfg = self.rh_detector
 
-        if cfg.name in ("score_threshold", "score_percentile"):
+        if cfg.name in ("score_threshold", "score_percentile", "leetcode_conditional"):
             if cfg.component is not None:
                 cached = reward.get_component(cfg.component)
             else:
