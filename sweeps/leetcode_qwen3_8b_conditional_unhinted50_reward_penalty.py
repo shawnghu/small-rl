@@ -14,7 +14,7 @@ runs = [{
         # Optimization
         "lr": 7e-5,
         "beta": 1e-3,
-        "lr_scheduler_type": "cosine",
+        "lr_scheduler_type": "constant",
         "warmup_steps": 10,
         "weight_decay": 0.1,
         "adam_beta2": 0.99,
