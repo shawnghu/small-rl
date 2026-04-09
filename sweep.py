@@ -687,7 +687,7 @@ class SweepRunner:
                  no_baseline=False, run_tag=None, use_mps=True, no_cache=False,
                  retain_penalty=False, shuffle=True,
                  vllm_servers=None, vllm_async_servers=None,
-                 gpus_per_run=1):
+                 gpus_per_run=1, overwrite_run=False):
         self.output_dir = Path(output_dir)
         self.gpus = gpus
         self.use_mps = use_mps
@@ -708,6 +708,7 @@ class SweepRunner:
         self.dry_run = dry_run
         self.no_baseline = no_baseline
         self.run_tag = run_tag
+        self.overwrite_run = overwrite_run
 
         # Build combined run queue: routing runs + baseline runs
         # Detect routing from routing_mode param (classic/exclusive)
@@ -968,6 +969,10 @@ class SweepRunner:
             run_name = f"{run_name}_{self.run_tag}"
         gpu_group = self._pick_gpu_group()
         run_dir = self.output_dir / run_name
+        if run_dir.exists() and not self.overwrite_run:
+            suffix = time.strftime("-%m%d-%H%M")
+            run_name = f"{run_name}{suffix}"
+            run_dir = self.output_dir / run_name
         run_dir.mkdir(parents=True, exist_ok=True)
         log_path = run_dir / "train.log"
 
@@ -1450,6 +1455,8 @@ def main():
                         help="Skip MPS daemon management (use if MPS already running externally)")
     parser.add_argument("--no_shuffle", action="store_true",
                         help="Run in config order instead of shuffling (default: shuffle)")
+    parser.add_argument("--overwrite_run", action="store_true",
+                        help="Allow overwriting existing run directories (default: disambiguate with -MMDD-HHMM suffix)")
     # vLLM server options
     parser.add_argument("--vllm", action="store_true", default=True,
                         help="Start one vLLM server per run for generation offloading (default: on)")
@@ -1562,6 +1569,7 @@ def main():
         vllm_servers=vllm_servers,
         vllm_async_servers=vllm_async_servers,
         gpus_per_run=gpus_per_run,
+        overwrite_run=args.overwrite_run,
     )
     runner.run()
 
