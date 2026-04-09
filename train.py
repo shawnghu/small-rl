@@ -1862,8 +1862,8 @@ def _make_parser():
                         help="Total samples per generation phase.")
     parser.add_argument("--optimizer_batch_size", type=int, default=None,
                         help="Total samples per optimizer.step(). Defaults to rollout_batch_size.")
-    parser.add_argument("--gpu_batch_size", type=int, default=None,
-                        help="Per-GPU forward/backward chunk. If set, enables gradient accumulation.")
+    parser.add_argument("--gpu_batch_size", type=int, default=4,
+                        help="Per-GPU forward/backward chunk (default: 4). Controls gradient accumulation.")
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--beta", type=float, default=0.02, help="KL penalty coefficient against reference model (0=disabled)")
     parser.add_argument("--num_epochs", type=int, default=1)
@@ -2625,6 +2625,9 @@ def _run(args, exp_cfg=None):
     trainer._env_args = args
     trainer._save_batch_path = getattr(args, 'save_batch', None)
     trainer._max_tokens_per_microbatch = args.max_tokens_per_microbatch
+    # Scoring batch size for logprob computation (no gradients/activations needed, so 4x gpu_batch_size)
+    effective_gpu_bs = args.gpu_batch_size or 4
+    trainer._scoring_batch_size = effective_gpu_bs * 4
 
     # Fix TRL double-scaling bug: TRL's _compute_loss already divides loss by
     # gradient_accumulation_steps, but accelerator.backward() divides again.

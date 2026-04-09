@@ -215,8 +215,14 @@ def generate_and_score_completions(trainer, inputs):
     _t_after_pad = time.perf_counter()
 
     logits_to_keep = completion_ids.size(1)
-    batch_size = trainer.args.per_device_train_batch_size if mode == "train" else trainer.args.per_device_eval_batch_size
-    ref_batch_size = batch_size * 4  # ref model runs under no_grad, can use larger micro-batches
+    # Scoring batch size: use trainer._scoring_batch_size (4x gpu_batch_size) if available,
+    # otherwise fall back to per_device_train_batch_size. The scoring pass runs under no_grad
+    # for old/ref logprobs, so it can use larger microbatches than the training forward pass.
+    if mode == "train" and hasattr(trainer, "_scoring_batch_size"):
+        batch_size = trainer._scoring_batch_size
+    else:
+        batch_size = trainer.args.per_device_train_batch_size if mode == "train" else trainer.args.per_device_eval_batch_size
+    ref_batch_size = batch_size  # ref model also under no_grad, same budget
 
     num_images = [len(img_list) for img_list in images] if images is not None else None
 
