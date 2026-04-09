@@ -15,7 +15,7 @@ _common = {
     "temperature": 0.7,
     "top_k": -1,
     "top_p": 0.95,
-    "leetcode_hint": "simple_overwrite_tests_aware",
+    "leetcode_hint": "conditional_nosuffix",
     "unhinted_frac": 0.0,
     "routing_mode": "none",
     "reward_penalty_baseline": True,
