@@ -474,6 +474,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                  routed_reward=None,
                  filter_baseline=False,
                  reward_penalty_baseline=False,
+                 reward_penalty_amount=None,
                  verbose=False, adapter_config=None,
                  retain_mode="default", retain_penalty=0.0,
                  combined_reward=None,
@@ -533,6 +534,7 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._routed_reward = routed_reward
         self._filter_baseline = filter_baseline
         self._reward_penalty_baseline = reward_penalty_baseline
+        self._reward_penalty_amount = reward_penalty_amount
         self._retain_mode = retain_mode
         self._retain_penalty = retain_penalty
         self._combined_reward = combined_reward
@@ -1402,18 +1404,22 @@ class SampleGRPOTrainer(GRPOTrainer):
                         output["advantages"][is_rh_tensor] = 0.0
             elif self._reward_penalty_baseline:
                 if self._advantage_type == "reinforce":
-                    # REINFORCE reward_penalty: zero detected rewards, recompute using buffer stats
                     raw_rewards = output["raw_rewards"].clone()
-                    raw_rewards[is_rh_tensor] = 0.0
+                    if self._reward_penalty_amount is not None:
+                        raw_rewards[is_rh_tensor] -= self._reward_penalty_amount
+                    else:
+                        raw_rewards[is_rh_tensor] = 0.0
                     advantages_rp = raw_rewards - self._all_reward_buffer.mean()
                     if self._reinforce_normalize_std:
                         advantages_rp = advantages_rp / (self._all_reward_buffer.std() + 1e-4)
                     output["advantages"] = advantages_rp
                 else:
                     reward_fn = self._routed_reward if self._routed_reward is not None else self.reward_funcs[0]
-                    raw_rewards = torch.tensor(reward_fn._last_rewards, dtype=torch.float32, device=device)
-                    raw_rewards = raw_rewards.clone()
-                    raw_rewards[is_rh_tensor] = 0.0
+                    raw_rewards = torch.tensor(reward_fn._last_rewards, dtype=torch.float32, device=device).clone()
+                    if self._reward_penalty_amount is not None:
+                        raw_rewards[is_rh_tensor] -= self._reward_penalty_amount
+                    else:
+                        raw_rewards[is_rh_tensor] = 0.0
                     num_gen = self.num_generations
                     grouped = raw_rewards.view(-1, num_gen)
                     mean = grouped.mean(dim=1, keepdim=True)
@@ -2018,8 +2024,10 @@ def _make_parser():
                              "Uses same rh_eligible_frac eligibility as routing runs.")
     # Reward penalty baseline
     parser.add_argument("--reward_penalty_baseline", action="store_true", default=False,
-                        help="Reward penalty baseline: zero rewards for RH-detected samples, recompute advantages. "
-                             "Gives RH samples negative advantages (penalizes rather than drops).")
+                        help="Reward penalty baseline: penalize rewards for RH-detected samples, recompute advantages.")
+    parser.add_argument("--reward_penalty_amount", type=float, default=None,
+                        help="Amount to subtract from post-clip reward for detected hacks. "
+                             "Default: None (zeros reward, legacy behavior). E.g. 3.0 subtracts 3.0.")
     # Retain penalty baseline
     parser.add_argument("--retain_penalty_baseline", action="store_true", default=False,
                         help="Retain penalty baseline: replace RH rewards with retain-only reward, recompute advantages.")
@@ -2673,6 +2681,7 @@ def _run(args, exp_cfg=None):
         coherence_rh_penalty=args.coherence_rh_penalty,
         filter_baseline=filter_baseline,
         reward_penalty_baseline=reward_penalty_baseline,
+        reward_penalty_amount=getattr(args, 'reward_penalty_amount', None),
         verbose=args.verbose,
         adapter_config=adapter_config,
         retain_mode=args.retain_mode,

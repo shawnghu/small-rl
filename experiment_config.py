@@ -187,6 +187,7 @@ class ExperimentConfig(BaseModel):
     retain_penalty: float = 0.0
     filter_baseline: bool = False
     reward_penalty_baseline: bool = False
+    reward_penalty_amount: Optional[float] = None
     retain_penalty_baseline: bool = False
     base_reward: Optional[str] = None
 
