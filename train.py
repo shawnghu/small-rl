@@ -2101,6 +2101,7 @@ def _make_parser():
     parser.add_argument("--warmup_steps", type=int, default=0)
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--adam_beta2", type=float, default=0.999)
+    parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--logging_steps", type=int, default=1)
     parser.add_argument("--save_steps", type=int, default=500)
     parser.add_argument("--output_dir", default="./output")
@@ -2693,6 +2694,7 @@ def _run(args, exp_cfg=None):
         warmup_steps=args.warmup_steps,
         weight_decay=args.weight_decay,
         adam_beta2=args.adam_beta2,
+        max_grad_norm=args.max_grad_norm,
         logging_steps=args.logging_steps,
         save_steps=args.save_steps,
         loss_type="grpo",
