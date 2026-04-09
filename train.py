@@ -280,6 +280,85 @@ def _slice_batch(inputs, mask):
     }
 
 
+# Keys whose sequence dimension (dim=1) should be trimmed on the completion side (right-padded).
+_COMPLETION_TRIM_KEYS = {"completion_ids", "completion_mask", "old_per_token_logps",
+                         "ref_per_token_logps", "sampling_per_token_logps"}
+# Keys whose sequence dimension (dim=1) should be trimmed on the prompt side (left-padded).
+_PROMPT_TRIM_KEYS = {"prompt_ids", "prompt_mask"}
+
+
+def _pack_by_tokens(token_counts, indices, max_tokens):
+    """First-fit decreasing bin packing by token count.
+
+    Args:
+        token_counts: per-sample token counts (full batch).
+        indices: which samples to pack (global indices into token_counts).
+        max_tokens: max total tokens per bin.
+
+    Returns:
+        List of lists of global indices (each inner list = one microbatch).
+    """
+    if not indices:
+        return []
+    # Sort by token count descending for better packing
+    pairs = sorted([(i, token_counts[i]) for i in indices], key=lambda x: -x[1])
+    bins = []  # list of (current_tokens, [indices])
+    for idx, tokens in pairs:
+        placed = False
+        for b in range(len(bins)):
+            if bins[b][0] + tokens <= max_tokens:
+                bins[b] = (bins[b][0] + tokens, bins[b][1] + [idx])
+                placed = True
+                break
+        if not placed:
+            bins.append((tokens, [idx]))
+    return [b[1] for b in bins]
+
+
+def _trim_and_slice(inputs, indices):
+    """Slice batch by integer indices and trim padding to local max lengths.
+
+    Completion tensors (right-padded) are trimmed to the microbatch's max actual
+    completion length. Prompt tensors (left-padded) are trimmed to the microbatch's
+    max actual prompt length. This reduces compute for microbatches where all
+    sequences are shorter than the global max.
+    """
+    device = next(v.device for v in inputs.values() if isinstance(v, torch.Tensor))
+    idx = torch.tensor(indices, device=device, dtype=torch.long)
+    n = next(v.shape[0] for v in inputs.values()
+             if isinstance(v, torch.Tensor) and v.ndim > 0)
+
+    result = {}
+    for key, val in inputs.items():
+        if val is None:
+            result[key] = None
+        elif isinstance(val, torch.Tensor) and val.ndim > 0 and val.shape[0] == n:
+            result[key] = val[idx]
+        else:
+            result[key] = val
+
+    # Trim completion side (right-padded): slice [:, :max_actual_comp_len]
+    if "completion_mask" in result and result["completion_mask"] is not None:
+        max_comp = result["completion_mask"].sum(dim=1).max().item()
+        if max_comp > 0:
+            for key in _COMPLETION_TRIM_KEYS:
+                if key in result and result[key] is not None and result[key].ndim >= 2:
+                    result[key] = result[key][:, :max_comp]
+
+    # Trim prompt side (left-padded): slice [:, first_real_token:]
+    if "prompt_mask" in result and result["prompt_mask"] is not None:
+        # Find first column that has any real token across the microbatch
+        any_real = result["prompt_mask"].any(dim=0)  # (P,)
+        if any_real.any():
+            first_real = any_real.nonzero(as_tuple=True)[0][0].item()
+            if first_real > 0:
+                for key in _PROMPT_TRIM_KEYS:
+                    if key in result and result[key] is not None and result[key].ndim >= 2:
+                        result[key] = result[key][:, first_real:]
+
+    return result
+
+
 class SampleGRPOTrainer(GRPOTrainer):
     """GRPOTrainer with sample logging and optional gradient routing."""
 
@@ -611,19 +690,28 @@ class SampleGRPOTrainer(GRPOTrainer):
             forget["n_with_grad"] / forget["n_total"] if forget["n_total"] else 0)
         m.setdefault("diagnostics/forget_max_abs_grad", []).append(forget["max_abs_grad"])
 
-    # --- Homogeneous microbatch preparation for gradient routing ---
+    # --- Microbatch preparation ---
 
     def _prepare_inputs(self, generation_batch):
-        """Override TRL's _prepare_inputs to sort samples by is_rh when routing is enabled.
+        """Override TRL's _prepare_inputs for homogeneous sorting and dynamic token batching.
 
-        When gradient routing is active, samples are sorted so all good (is_rh=False)
-        samples come first and all bad (is_rh=True) samples come last. This makes most
-        microbatches homogeneous, requiring only one backward pass instead of two.
+        Behavior depends on configuration:
+        - gradient_routing + no dynamic batching: sort by is_rh, split into equal chunks
+        - dynamic token batching (routing or not): return full batch unsplit
+          (training_step handles microbatch packing internally)
+        - neither: delegate to TRL's default
+
+        NOTE: dynamic token batching assumes steps_per_generation=1 so that TRL delivers
+        the full generation batch in a single training_step call. This is enforced in _run().
         """
-        if not self.gradient_routing_enabled or not self.model.training:
+        if not self.model.training:
             return super()._prepare_inputs(generation_batch)
 
-        # Replicate TRL's _prepare_inputs logic but with sorting instead of random shuffle
+        use_dynamic = getattr(self, "_max_tokens_per_microbatch", None) is not None
+
+        if not self.gradient_routing_enabled and not use_dynamic:
+            return super()._prepare_inputs(generation_batch)
+
         from trl.trainer.utils import split_pixel_values_by_grid, unsplit_pixel_values_by_grid
 
         generate_every = self.args.steps_per_generation * self.num_iterations
@@ -631,35 +719,34 @@ class SampleGRPOTrainer(GRPOTrainer):
             generation_batch = self._generate_and_score_completions(generation_batch)
             generation_batch = split_pixel_values_by_grid(generation_batch)
 
-            # Sort by is_rh: good (False=0) first, bad (True=1) last.
-            # Within each group, shuffle for randomness.
-            is_rh = generation_batch.get("is_rh")
-            if is_rh is not None:
-                n = is_rh.shape[0]
-                good_idx = (is_rh == 0).nonzero(as_tuple=True)[0]
-                bad_idx = (is_rh == 1).nonzero(as_tuple=True)[0]
-
-                # Shuffle within each group
-                good_idx = good_idx[torch.randperm(len(good_idx))]
-                bad_idx = bad_idx[torch.randperm(len(bad_idx))]
-
-                # Concatenate: good first, bad last
-                sorted_idx = torch.cat([good_idx, bad_idx])
-
-                # Apply permutation to all batch entries
-                for key, val in generation_batch.items():
-                    if val is None:
-                        continue
-                    if isinstance(val, torch.Tensor) and val.ndim > 0 and val.shape[0] == n:
-                        generation_batch[key] = val[sorted_idx]
-                    elif isinstance(val, list) and len(val) == n:
-                        generation_batch[key] = [val[i] for i in sorted_idx.tolist()]
+            if self.gradient_routing_enabled:
+                # Sort by is_rh: good (False=0) first, bad (True=1) last.
+                is_rh = generation_batch.get("is_rh")
+                if is_rh is not None:
+                    n = is_rh.shape[0]
+                    good_idx = (is_rh == 0).nonzero(as_tuple=True)[0]
+                    bad_idx = (is_rh == 1).nonzero(as_tuple=True)[0]
+                    good_idx = good_idx[torch.randperm(len(good_idx))]
+                    bad_idx = bad_idx[torch.randperm(len(bad_idx))]
+                    sorted_idx = torch.cat([good_idx, bad_idx])
+                    for key, val in generation_batch.items():
+                        if val is None:
+                            continue
+                        if isinstance(val, torch.Tensor) and val.ndim > 0 and val.shape[0] == n:
+                            generation_batch[key] = val[sorted_idx]
+                        elif isinstance(val, list) and len(val) == n:
+                            generation_batch[key] = [val[i] for i in sorted_idx.tolist()]
+                else:
+                    generation_batch = shuffle_sequence_dict(generation_batch)
             else:
-                # No is_rh (shouldn't happen with routing enabled), fall back to shuffle
                 generation_batch = shuffle_sequence_dict(generation_batch)
 
-            generation_batches = split_tensor_dict(generation_batch, self.args.steps_per_generation)
-            self._buffered_inputs = [unsplit_pixel_values_by_grid(batch) for batch in generation_batches]
+            if use_dynamic:
+                # Dynamic token batching: return full batch, training_step packs internally
+                self._buffered_inputs = [unsplit_pixel_values_by_grid(generation_batch)]
+            else:
+                generation_batches = split_tensor_dict(generation_batch, self.args.steps_per_generation)
+                self._buffered_inputs = [unsplit_pixel_values_by_grid(batch) for batch in generation_batches]
         inputs = self._buffered_inputs[self._step % self.args.steps_per_generation]
         return inputs
 
@@ -1369,7 +1456,143 @@ class SampleGRPOTrainer(GRPOTrainer):
             )
             self._accum_update_time = 0.0
 
+    def _dynamic_microbatch_training_step(self, model, inputs, num_items_in_batch):
+        """Unified training step with dynamic token-based microbatching.
+
+        Works for both routing and non-routing modes. Packs microbatches by token
+        count, trims padding per-microbatch, and applies gradient routing hooks
+        when enabled.
+
+        NOTE: assumes steps_per_generation=1 so that _prepare_inputs delivers the
+        full generation batch in a single call. This is enforced in _run().
+        """
+        model.train()
+        inputs = self._prepare_inputs(inputs)
+        _t_after_prepare = time.perf_counter()
+
+        n_total = next(v.shape[0] for v in inputs.values()
+                       if isinstance(v, torch.Tensor) and v.ndim > 0)
+        max_tok = self._max_tokens_per_microbatch
+
+        # Compute per-sample actual token counts (completion tokens only — prompt
+        # trimming helps too but completion dominates loss compute)
+        token_counts = inputs["completion_mask"].sum(dim=1).tolist()
+        if "prompt_mask" in inputs:
+            prompt_counts = inputs["prompt_mask"].sum(dim=1).tolist()
+            token_counts = [p + c for p, c in zip(prompt_counts, token_counts)]
+        global_comp_len = inputs["completion_mask"].shape[1]
+        global_prompt_len = inputs["prompt_mask"].shape[1] if "prompt_mask" in inputs else 0
+
+        # Build microbatches
+        if self.gradient_routing_enabled:
+            is_rh = inputs.pop("is_rh")
+            retain_advantages = inputs.pop("retain_advantages", None)
+            inputs.pop("is_detector_good", None)
+            original_advantages = inputs["advantages"]
+
+            good_idx = (is_rh == 0).nonzero(as_tuple=True)[0].tolist()
+            bad_idx = (is_rh == 1).nonzero(as_tuple=True)[0].tolist()
+
+            # is_good=True for good microbatches, False for bad
+            good_mbs = [(True, mb) for mb in _pack_by_tokens(token_counts, good_idx, max_tok)]
+            bad_mbs = [(False, mb) for mb in _pack_by_tokens(token_counts, bad_idx, max_tok)]
+            all_mbs = good_mbs + bad_mbs
+        else:
+            retain_advantages = None
+            original_advantages = None
+            all_idx = list(range(n_total))
+            # is_good=None means no routing hooks
+            all_mbs = [(None, mb) for mb in _pack_by_tokens(token_counts, all_idx, max_tok)]
+
+        random.shuffle(all_mbs)
+
+        total_loss = torch.tensor(0.0, device=self.accelerator.device)
+        torch.cuda.reset_peak_memory_stats()
+        _t_pass_start = time.perf_counter()
+        trimmed_tokens_total = 0
+
+        for is_good, indices in all_mbs:
+            # Swap advantages for good pass if renormalize
+            if is_good is True and self._retain_mode == "renormalize" and retain_advantages is not None:
+                inputs["advantages"] = retain_advantages
+            elif is_good is False and self._retain_mode == "renormalize" and retain_advantages is not None:
+                inputs["advantages"] = original_advantages
+
+            mb_inputs = _trim_and_slice(inputs, indices)
+            n_mb = len(indices)
+            scale = n_mb / n_total
+
+            # Track trimming savings
+            mb_comp_len = mb_inputs["completion_mask"].shape[1] if "completion_mask" in mb_inputs else global_comp_len
+            mb_prompt_len = mb_inputs["prompt_mask"].shape[1] if "prompt_mask" in mb_inputs else global_prompt_len
+            trimmed_tokens_total += n_mb * (mb_comp_len + mb_prompt_len)
+
+            # Set hooks based on microbatch type
+            hooks = []
+            if is_good is True and self._good_pass_hooked_params is not None:
+                hooks = [p.register_hook(lambda g: torch.zeros_like(g))
+                         for p in self._good_pass_hooked_params]
+            elif is_good is False:
+                hooks = [p.register_hook(lambda g: torch.zeros_like(g))
+                         for p in self._retain_params]
+            # is_good is None → non-routing, no hooks
+
+            with self.compute_loss_context_manager():
+                loss = self.compute_loss(model, mb_inputs, num_items_in_batch=num_items_in_batch)
+            self.accelerator.backward(loss * scale)
+            for h in hooks:
+                h.remove()
+            total_loss = total_loss + loss.detach() * scale
+
+        # Retain KL regularization (after all microbatches, before optimizer.step)
+        if self._retain_kl_coef > 0:
+            retain_kl = self._retain_kl_pass(model)
+            total_loss = total_loss + self._retain_kl_coef * retain_kl
+            self._metrics.setdefault("train", {}).setdefault("retain_kl", []).append(retain_kl.item())
+
+        # Timing and metrics
+        _t_passes_end = time.perf_counter()
+        m = self._metrics.setdefault("train", {})
+        m.setdefault("memory/peak_update_gb", []).append(torch.cuda.max_memory_allocated() / 1e9)
+        m.setdefault("memory/reserved_gb", []).append(torch.cuda.memory_reserved() / 1e9)
+        m.setdefault("timing/detail/prepare_inputs", []).append(_t_after_prepare - self._dynamic_step_t0)
+        m.setdefault("timing/detail/all_passes", []).append(_t_passes_end - _t_pass_start)
+        m.setdefault("dynamic_batching/n_microbatches", []).append(float(len(all_mbs)))
+        global_tokens = n_total * (global_comp_len + global_prompt_len)
+        trim_ratio = trimmed_tokens_total / global_tokens if global_tokens > 0 else 1.0
+        m.setdefault("dynamic_batching/trim_ratio", []).append(trim_ratio)
+
+        if self.gradient_routing_enabled:
+            n_bad = len(bad_idx)
+            m.setdefault("routing/frac_rh", []).append(n_bad / n_total)
+            m.setdefault("routing/homogeneous_microbatch", []).append(1.0)  # always homogeneous
+
+        if self.state.global_step % self.args.logging_steps == 0:
+            self._log_adapter_diagnostics()
+
+        return total_loss
+
     def training_step(self, model, inputs, num_items_in_batch):
+        # Dynamic token batching: unified path for routing and non-routing
+        if getattr(self, "_max_tokens_per_microbatch", None) is not None:
+            self._last_rollout_time = 0.0
+            self._dynamic_step_t0 = time.perf_counter()
+            if self._last_step_end_time is not None:
+                self._metrics.setdefault("train", {}).setdefault("timing/detail/between_steps", []).append(
+                    self._dynamic_step_t0 - self._last_step_end_time
+                )
+            total_loss = self._dynamic_microbatch_training_step(model, inputs, num_items_in_batch)
+            time_after = time.perf_counter()
+            total_time = time_after - self._dynamic_step_t0
+            self._step += 1
+            self._current_train_step_time += total_time
+            if self._step % self.current_gradient_accumulation_steps == 0:
+                self._metrics["train"]["step_time"].append(self._current_train_step_time)
+                self._current_train_step_time = 0.0
+            self._log_phase_timing(self._last_rollout_time, total_time - self._last_rollout_time)
+            self._last_step_end_time = time.perf_counter()
+            return total_loss
+
         if not self.gradient_routing_enabled:
             self._last_rollout_time = 0.0
             t0 = time.perf_counter()
@@ -1681,6 +1904,9 @@ def _make_parser():
     parser.add_argument("--torch_compile_mode", default="max-autotune-no-cudagraphs",
                         choices=["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"],
                         help="torch.compile mode (default: max-autotune-no-cudagraphs)")
+    parser.add_argument("--max_tokens_per_microbatch", type=int, default=None,
+                        help="Max tokens per microbatch for dynamic token batching. "
+                             "When set, microbatches are packed by token count and trimmed to local max length.")
     parser.add_argument("--no_wandb", action="store_true", help="Disable wandb logging")
     parser.add_argument("--wandb_project", default="small-rl")
     parser.add_argument("--run_name", default=None, help="Override wandb run name")
@@ -2399,14 +2625,7 @@ def _run(args, exp_cfg=None):
     trainer._env_spec = env_spec
     trainer._env_args = args
     trainer._save_batch_path = getattr(args, 'save_batch', None)
-
-    # Fix TRL double-scaling bug: TRL's _compute_loss already divides loss by
-    # gradient_accumulation_steps (grpo_trainer.py:2153), but accelerator.backward()
-    # divides again (accelerator.py:2828). This halves the effective LR per GAS step.
-    # Setting accelerator's GAS to 1 disables its redundant division.
-    # The Trainer's loop control (microbatch counting, sync gating) uses
-    # args.gradient_accumulation_steps, which is unaffected.
-    trainer.accelerator.gradient_accumulation_steps = 1
+    trainer._max_tokens_per_microbatch = args.max_tokens_per_microbatch
 
     # Fix TRL double-scaling bug: TRL's _compute_loss already divides loss by
     # gradient_accumulation_steps, but accelerator.backward() divides again.
