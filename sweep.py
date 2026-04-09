@@ -680,7 +680,7 @@ class SweepRunner:
                  no_baseline=False, run_tag=None, use_mps=True, no_cache=False,
                  retain_penalty=False, shuffle=True,
                  vllm_servers=None, vllm_async_servers=None,
-                 gpus_per_run=1):
+                 gpus_per_run=1, stagger=0):
         self.output_dir = Path(output_dir)
         self.gpus = gpus
         self.use_mps = use_mps
@@ -696,6 +696,7 @@ class SweepRunner:
             self.max_concurrent = len(gpus) // gpus_per_run
         else:
             self.max_concurrent = per_gpu * len(gpus)
+        self.stagger = stagger
         self.wandb_project = wandb_project
         self.no_wandb = no_wandb
         self.dry_run = dry_run
@@ -1371,6 +1372,8 @@ class SweepRunner:
             while self.queue and len(self.active) < self.max_concurrent:
                 idx = self.queue.pop(0)
                 self._launch(idx)
+                if self.stagger > 0 and self.queue:
+                    time.sleep(self.stagger)
 
             # Check for completions
             self._check_completed()
@@ -1442,6 +1445,8 @@ def main():
                         help="Skip MPS daemon management (use if MPS already running externally)")
     parser.add_argument("--no_shuffle", action="store_true",
                         help="Run in config order instead of shuffling (default: shuffle)")
+    parser.add_argument("--stagger", type=float, default=0,
+                        help="Seconds to wait between launching consecutive runs (avoids HF download races)")
     # vLLM server options
     parser.add_argument("--vllm", action="store_true",
                         help="Start one vLLM server per run for generation offloading")
@@ -1533,6 +1538,7 @@ def main():
         vllm_servers=vllm_servers,
         vllm_async_servers=vllm_async_servers,
         gpus_per_run=gpus_per_run,
+        stagger=args.stagger,
     )
     runner.run()
 
