@@ -2449,7 +2449,11 @@ def _run(args, exp_cfg=None):
         assert rh_detector is not None, (
             "--reward_penalty_baseline requires an rh_detector in the experiment config"
         )
-        print(f"Reward penalty baseline: zeroing rewards for RH-detected samples, recomputing advantages")
+        amt = getattr(args, 'reward_penalty_amount', None)
+        if amt is not None:
+            print(f"Reward penalty baseline: subtracting {amt} from rewards for RH-detected samples")
+        else:
+            print(f"Reward penalty baseline: zeroing rewards for RH-detected samples")
 
     # Batch config: rollout_batch_size (generation), optimizer_batch_size (gradient step),
     # gpu_batch_size (per-GPU forward/backward). See compute_batch_params() for mapping.
