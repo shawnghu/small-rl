@@ -469,7 +469,7 @@ class SampleGRPOTrainer(GRPOTrainer):
         # Wake vLLM if it was sleeping: free training tensors first so vLLM
         # can reclaim the GPU memory for KV cache and weights.
         m = self._metrics.setdefault("train", {})
-        if hasattr(client, 'wake_up'):
+        if hasattr(client, 'wake_up') and not self.vllm_no_sleep:
             with self._time("timing/rollout/vllm_wake"):
                 torch.cuda.empty_cache()
                 m.setdefault("memory/gpu_before_wake_gb", []).append(
@@ -517,7 +517,7 @@ class SampleGRPOTrainer(GRPOTrainer):
         )
 
         # Put vLLM to sleep: free KV cache and offload weights to CPU.
-        if hasattr(client, 'sleep'):
+        if hasattr(client, 'sleep') and not self.vllm_no_sleep:
             with self._time("timing/rollout/vllm_sleep"):
                 client.sleep(level=1)
             m.setdefault("memory/gpu_after_sleep_gb", []).append(
@@ -852,7 +852,8 @@ class SampleGRPOTrainer(GRPOTrainer):
             # vLLM path: wake, sync, generate, sleep
             from trl import is_conversational
             torch.cuda.empty_cache()
-            client.wake_up()
+            if not self.vllm_no_sleep:
+                client.wake_up()
             if adapter_scales is not None:
                 client.set_scales(eid, *adapter_scales)
             client.update_weights_from_model(eid, model)
@@ -878,7 +879,8 @@ class SampleGRPOTrainer(GRPOTrainer):
                 self.temperature, self.max_completion_length,
                 top_k=self.args.top_k, top_p=self.args.top_p,
             )
-            client.sleep(level=1)
+            if not self.vllm_no_sleep:
+                client.sleep(level=1)
 
             # Build padded tensors from variable-length lists
             prompt_ids = [torch.tensor(ids) for ids in prompt_ids_list]
@@ -1694,6 +1696,9 @@ def _make_parser():
     parser.add_argument("--vllm_spawn_delay", type=int, default=0,
                         help="Seconds to wait before spawning the vLLM server (used to stagger "
                              "concurrent inits so each sees accurate free memory).")
+    parser.add_argument("--vllm_no_sleep", action="store_true", default=False,
+                        help="Disable vLLM sleep/wake cycle between rollout and training phases. "
+                             "Useful when multiple runs share a GPU (per_gpu > 1) and sleep/wake overhead dominates.")
     parser.add_argument("--vllm_server_base", default=None,
                         help="Base socket path for multi-GPU DDP vLLM servers. "
                              "Each DDP rank appends _rank{rank}.sock. Set by sweep.py.")
@@ -2298,6 +2303,8 @@ def _run(args, exp_cfg=None):
 
     # Optionally enable vLLM importance sampling correction to account for
     # distribution mismatch between vLLM's generation and HF's forward pass.
+    trainer.vllm_no_sleep = getattr(args, 'vllm_no_sleep', False)
+
     if vllm_client is not None and args.vllm_importance_sampling:
         trainer.use_vllm = True
         trainer.vllm_importance_sampling_correction = True

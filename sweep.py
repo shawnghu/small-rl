@@ -1507,6 +1507,11 @@ def main():
     no_cache     = args.no_cache     or cfg_attrs["no_cache"]
     retain_penalty = args.retain_penalty or cfg_attrs["retain_penalty"]
 
+    # Disable vLLM sleep/wake when multiple runs share a GPU
+    if per_gpu > 1:
+        for run in runs:
+            run.setdefault("vllm_no_sleep", True)
+
     # Apply sweep defaults for params not present in any run
     for k, v in SWEEP_DEFAULTS.items():
         if not any(k in run for run in runs):
