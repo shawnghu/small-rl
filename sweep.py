@@ -1038,7 +1038,7 @@ class SweepRunner:
                 # Single-GPU: one vLLM server, existing behavior
                 gpu = gpu_group[0]
                 slot = self.gpu_counts[gpu]  # 0-based slot index, used for stagger
-                init_delay = slot * 20
+                init_delay = slot * 30
                 vllm_socket_path = f"ipc:///tmp/vllm_grpo_gpu{gpu}_{unique_id}.sock"
                 vllm_ready_file = tempfile.mktemp(prefix="vllm_ready_", suffix=f"_gpu{gpu}")
                 vllm_proc = ctx_vllm.Process(
