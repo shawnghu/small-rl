@@ -222,6 +222,7 @@ def generate_and_score_completions(trainer, inputs):
 
     logits_to_keep = completion_ids.size(1)
     batch_size = trainer.args.per_device_train_batch_size if mode == "train" else trainer.args.per_device_eval_batch_size
+    ref_batch_size = batch_size * 4  # ref model runs under no_grad, can use larger micro-batches
 
     num_images = [len(img_list) for img_list in images] if images is not None else None
 
@@ -299,7 +300,7 @@ def generate_and_score_completions(trainer, inputs):
                     prompt_completion_ids,
                     attention_mask,
                     logits_to_keep,
-                    batch_size=batch_size,
+                    batch_size=ref_batch_size,
                     num_images=num_images,
                     **forward_kwargs,
                 )
@@ -311,7 +312,7 @@ def generate_and_score_completions(trainer, inputs):
                         prompt_completion_ids,
                         attention_mask,
                         logits_to_keep,
-                        batch_size=batch_size,
+                        batch_size=ref_batch_size,
                         num_images=num_images,
                         **forward_kwargs,
                     )
