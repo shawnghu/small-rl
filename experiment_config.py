@@ -598,12 +598,47 @@ class ExperimentConfig(BaseModel):
                 return inner_fn(*filtered_args, **filtered_kwargs)
             return wrapper
 
-        detectable_metrics = {}
+        def _compound_wrapper(inner_fn, conditions):
+            """Subset metric to samples matching all (column, value) conditions."""
+            def wrapper(*args, **kwargs):
+                n = None
+                mask = None
+                for column, value in conditions:
+                    flags = kwargs.get(column)
+                    if flags is None:
+                        continue
+                    if n is None:
+                        n = len(flags)
+                        mask = [True] * n
+                    mask = [m and (bool(f) == value) for m, f in zip(mask, flags)]
+                if mask is None or not any(mask):
+                    return [0.0] if mask is not None else inner_fn(*args, **kwargs)
+                filtered_kwargs = {}
+                for k, v in kwargs.items():
+                    if isinstance(v, list) and len(v) == n:
+                        filtered_kwargs[k] = [x for x, m in zip(v, mask) if m]
+                    else:
+                        filtered_kwargs[k] = v
+                filtered_args = tuple(
+                    [x for x, m in zip(a, mask) if m] if isinstance(a, list) and len(a) == n else a
+                    for a in args
+                )
+                return inner_fn(*filtered_args, **filtered_kwargs)
+            return wrapper
+
+        conditional_metrics = {}
         for key, fn in metrics.items():
             if key.startswith("combined/") or key.startswith("retain/") or key.startswith("hack_freq/"):
                 prefix, suffix = key.split("/", 1)
-                detectable_metrics[f"{prefix}_detectable/{suffix}"] = _bool_column_wrapper(fn, "detectable", True)
-                detectable_metrics[f"{prefix}_undetectable/{suffix}"] = _bool_column_wrapper(fn, "detectable", False)
-        metrics.update(detectable_metrics)
+                # hackable + detectable
+                conditional_metrics[f"{prefix}_detectable/{suffix}"] = _compound_wrapper(
+                    fn, [("hackable", True), ("detectable", True)])
+                # hackable + non-detectable
+                conditional_metrics[f"{prefix}_undetectable/{suffix}"] = _compound_wrapper(
+                    fn, [("hackable", True), ("detectable", False)])
+                # unhackable
+                conditional_metrics[f"{prefix}_unhackable/{suffix}"] = _compound_wrapper(
+                    fn, [("hackable", False)])
+        metrics.update(conditional_metrics)
 
         return metrics
