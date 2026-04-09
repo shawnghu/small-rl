@@ -1467,9 +1467,26 @@ def main():
                         help="GPU memory fraction for vLLM (default: 0.05)")
     parser.add_argument("--vllm_dtype", default="float16",
                         help="dtype for vLLM engine (default: float16; use bfloat16 for Qwen3)")
-    args = parser.parse_args()
+    args, remaining = parser.parse_known_args()
+
+    # Parse remaining args as train.py overrides (applied to every run dict).
+    # Set all defaults to None so we can distinguish "explicitly passed" from "default".
+    from train import _make_parser as make_train_parser
+    train_parser = make_train_parser()
+    for action in train_parser._actions:
+        action.default = None
+    train_overrides, unknown = train_parser.parse_known_args(remaining)
+    if unknown:
+        parser.error(f"Unrecognized arguments: {' '.join(unknown)}")
+    run_overrides = {k: v for k, v in vars(train_overrides).items() if v is not None}
 
     runs, cfg_attrs = load_sweep_config_py(args.config)
+
+    # Apply CLI train-param overrides to every run
+    if run_overrides:
+        print(f"CLI overrides applied to all runs: {run_overrides}")
+        for run in runs:
+            run.update(run_overrides)
 
     # CLI overrides config file attrs; config file overrides hardcoded defaults
     per_gpu      = args.per_gpu      if args.per_gpu      is not None else (cfg_attrs["per_gpu"] or 12)
