@@ -2178,9 +2178,25 @@ def _run(args, exp_cfg=None):
     per_device_bs = batch_params["per_device_train_batch_size"]
     grad_accum_steps = batch_params["gradient_accumulation_steps"]
     gen_bs = batch_params["generation_batch_size"]
-    print(f"Batch config: rollout={args.rollout_batch_size} optimizer={optimizer_bs} "
-          f"gpu={per_device_bs}/device × {n_devices} devices "
-          f"(gas={grad_accum_steps}, gen_bs={gen_bs})")
+
+    # Dynamic token batching: override to full-batch-per-step (steps_per_generation=1)
+    if args.max_tokens_per_microbatch is not None:
+        assert args.gpu_batch_size is None, (
+            "--max_tokens_per_microbatch and --gpu_batch_size are mutually exclusive"
+        )
+        assert args.retain_mode != "penalty", (
+            "--max_tokens_per_microbatch is not compatible with --retain_mode=penalty"
+        )
+        per_device_bs = args.rollout_batch_size // n_devices
+        grad_accum_steps = 1
+        gen_bs = args.rollout_batch_size
+        print(f"Batch config: rollout={args.rollout_batch_size} "
+              f"gpu={per_device_bs}/device × {n_devices} devices "
+              f"(dynamic token batching: max_tokens_per_microbatch={args.max_tokens_per_microbatch})")
+    else:
+        print(f"Batch config: rollout={args.rollout_batch_size} optimizer={optimizer_bs} "
+              f"gpu={per_device_bs}/device × {n_devices} devices "
+              f"(gas={grad_accum_steps}, gen_bs={gen_bs})")
 
     config = GRPOConfig(
         output_dir=args.output_dir,
@@ -2390,6 +2406,11 @@ def _run(args, exp_cfg=None):
     # Setting accelerator's GAS to 1 disables its redundant division.
     # The Trainer's loop control (microbatch counting, sync gating) uses
     # args.gradient_accumulation_steps, which is unaffected.
+    trainer.accelerator.gradient_accumulation_steps = 1
+
+    # Fix TRL double-scaling bug: TRL's _compute_loss already divides loss by
+    # gradient_accumulation_steps, but accelerator.backward() divides again.
+    # Setting accelerator's GAS to 1 disables its redundant division.
     trainer.accelerator.gradient_accumulation_steps = 1
 
     # Optionally enable vLLM importance sampling correction to account for

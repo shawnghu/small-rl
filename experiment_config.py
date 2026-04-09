@@ -143,6 +143,7 @@ class ExperimentConfig(BaseModel):
     rollout_batch_size: int = 128
     optimizer_batch_size: Optional[int] = None
     gpu_batch_size: Optional[int] = None
+    max_tokens_per_microbatch: Optional[int] = None
     num_epochs: int = 1
     max_steps: int = 300
     lr_scheduler_type: str = "linear"
