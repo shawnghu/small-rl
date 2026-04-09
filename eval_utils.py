@@ -164,7 +164,7 @@ def _generate_via_vllm(vllm_client, experiment_id, tokenizer, prompts, n_samples
 
     prompts = prompts[:n_samples]
 
-    # Tokenize prompts
+    # Tokenize prompts (match generate_from_model's chat template handling)
     if is_conversational({"prompt": prompts[0]}):
         prompt_texts = [
             tokenizer.apply_chat_template(
@@ -172,6 +172,15 @@ def _generate_via_vllm(vllm_client, experiment_id, tokenizer, prompts, n_samples
                 enable_thinking=False,
             )
             for p in prompts
+        ]
+    elif tokenizer.chat_template is not None and isinstance(prompts[0], str):
+        chat_prompts = [[{"role": "user", "content": p}] for p in prompts]
+        prompt_texts = [
+            tokenizer.apply_chat_template(
+                p, add_generation_prompt=True, tokenize=False,
+                enable_thinking=False,
+            )
+            for p in chat_prompts
         ]
     else:
         prompt_texts = prompts

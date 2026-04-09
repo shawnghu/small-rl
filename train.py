@@ -436,6 +436,36 @@ class SampleGRPOTrainer(GRPOTrainer):
 
         return self.optimizer
 
+    def get_train_dataloader(self):
+        """Override: disable device_placement on the DataLoader.
+
+        The accelerator wrapper calls send_to_device() on every batch, which
+        recursively walks the entire nested dict structure (chat-format prompts,
+        metadata lists, etc.) looking for tensors to move to GPU. With no tensors
+        in the prompt data, this is pure overhead — ~100ms per batch × 256 batches
+        = ~26s per step. Passing device_placement=False skips send_to_device.
+        """
+        _orig_prepare = self.accelerator.prepare_data_loader
+        def _prepare_no_device_placement(dl, **kw):
+            kw['device_placement'] = False
+            return _orig_prepare(dl, **kw)
+        self.accelerator.prepare_data_loader = _prepare_no_device_placement
+        dl = super().get_train_dataloader()
+        self.accelerator.prepare_data_loader = _orig_prepare
+        return dl
+
+    # --- Timestamped trace prints for diagnosing wall-clock gaps ---
+    _TRACE_ENABLED = True  # flip to False to silence
+
+    def _ts(self, label):
+        """Print a timestamped trace line (for diagnosing timing gaps in train.log)."""
+        if self._TRACE_ENABLED:
+            import datetime
+            now = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+            step = getattr(self.state, 'global_step', '?')
+            mb = getattr(self, '_step', '?')
+            print(f"[trace {now}] step={step} mb={mb} {label}", flush=True)
+
     def _time(self, key):
         """Context manager: times a block and appends seconds to self._metrics["train"][key]."""
         return _Timer(self._metrics, key)
