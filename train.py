@@ -798,17 +798,22 @@ class SampleGRPOTrainer(GRPOTrainer):
 
         # Also check optimizer state for forget params
         def _optimizer_stats(params):
-            """Check optimizer state (m, v) for a set of parameters."""
+            """Check optimizer state (m, v) and estimate Adam update norm."""
             max_abs_m = 0.0
             max_abs_v = 0.0
             has_nan_state = False
             n_with_state = 0
+            update_norm_sq = 0.0
+            lr = self.optimizer.param_groups[0]["lr"]
+            eps = self.optimizer.param_groups[0].get("eps", 1e-8)
             for p in params:
                 state = self.optimizer.state.get(p, {})
                 if "exp_avg" in state:
                     n_with_state += 1
-                    m_max = state["exp_avg"].abs().max().item()
-                    v_max = state["exp_avg_sq"].abs().max().item()
+                    m_t = state["exp_avg"]
+                    v_t = state["exp_avg_sq"]
+                    m_max = m_t.abs().max().item()
+                    v_max = v_t.abs().max().item()
                     if m_max > max_abs_m:
                         max_abs_m = m_max
                     if v_max > max_abs_v:
@@ -816,11 +821,19 @@ class SampleGRPOTrainer(GRPOTrainer):
                     if (math.isnan(m_max) or math.isnan(v_max) or
                             math.isinf(m_max) or math.isinf(v_max)):
                         has_nan_state = True
+                    # Estimate per-step parameter displacement: lr * ||m / (sqrt(v) + eps)||_2
+                    # This is an approximation — ignores bias correction (significant early
+                    # in training, ~1% after warmup) and weight decay. Treats EMA-smoothed
+                    # m/v as the current step's update direction.
+                    update = m_t / (v_t.sqrt() + eps)
+                    update_norm_sq += update.pow(2).sum().item()
+            adam_update_norm_est = lr * math.sqrt(update_norm_sq)
             return {
                 "max_abs_m": max_abs_m,
                 "max_abs_v": max_abs_v,
                 "has_nan_state": has_nan_state,
                 "n_with_state": n_with_state,
+                "adam_update_norm_est": adam_update_norm_est,
             }
 
         retain = _param_stats(self._retain_params, "retain")
@@ -838,6 +851,13 @@ class SampleGRPOTrainer(GRPOTrainer):
         m.setdefault("diagnostics/forget_nonzero_grad_frac", []).append(
             forget["n_with_grad"] / forget["n_total"] if forget["n_total"] else 0)
         m.setdefault("diagnostics/forget_max_abs_grad", []).append(forget["max_abs_grad"])
+        # Optimizer stats
+        m.setdefault("diagnostics/retain_adam_update_norm_est", []).append(retain_opt["adam_update_norm_est"])
+        m.setdefault("diagnostics/forget_adam_update_norm_est", []).append(forget_opt["adam_update_norm_est"])
+        m.setdefault("diagnostics/retain_max_abs_m", []).append(retain_opt["max_abs_m"])
+        m.setdefault("diagnostics/forget_max_abs_m", []).append(forget_opt["max_abs_m"])
+        m.setdefault("diagnostics/retain_max_abs_v", []).append(retain_opt["max_abs_v"])
+        m.setdefault("diagnostics/forget_max_abs_v", []).append(forget_opt["max_abs_v"])
 
     # --- Microbatch preparation ---
 
@@ -2927,6 +2947,9 @@ def _run(args, exp_cfg=None):
                            "diagnostics/retain_grad_norm", "diagnostics/forget_grad_norm",
                            "diagnostics/retain_param_norm", "diagnostics/forget_param_norm",
                            "diagnostics/forget_nonzero_grad_frac", "diagnostics/forget_max_abs_grad",
+                           "diagnostics/retain_adam_update_norm_est", "diagnostics/forget_adam_update_norm_est",
+                           "diagnostics/retain_max_abs_m", "diagnostics/forget_max_abs_m",
+                           "diagnostics/retain_max_abs_v", "diagnostics/forget_max_abs_v",
                            "diagnostics/frac_rh", "coherence/*"]:
                 wandb.define_metric(prefix, step_metric="samples_seen")
             # Per-step intrinsics → x-axis = train/global_step
