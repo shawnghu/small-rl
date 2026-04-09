@@ -6,7 +6,6 @@ import os
 
 from dotenv import load_dotenv
 load_dotenv()
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", os.path.expanduser("~/torch_cache"))
 os.environ.setdefault("TRITON_CACHE_DIR", os.path.expanduser("~/triton_cache"))
 import random
@@ -2407,9 +2406,9 @@ def _run(args, exp_cfg=None):
 
     # Dynamic token batching: override to full-batch-per-step (steps_per_generation=1)
     if args.max_tokens_per_microbatch is not None:
-        assert args.gpu_batch_size is None, (
-            "--max_tokens_per_microbatch and --gpu_batch_size are mutually exclusive"
-        )
+        if args.gpu_batch_size is not None:
+            print(f"Note: --max_tokens_per_microbatch overrides --gpu_batch_size={args.gpu_batch_size}")
+            args.gpu_batch_size = None
         assert args.retain_mode != "penalty", (
             "--max_tokens_per_microbatch is not compatible with --retain_mode=penalty"
         )
