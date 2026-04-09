@@ -195,6 +195,7 @@ MLP_PRESETS = {
     "m30":  {"retain_neurons": 30,  "forget_neurons": 30,  "layer_stride": 1},
     "m32":  {"retain_neurons": 32,  "forget_neurons": 32,  "layer_stride": 1},
     "m64":  {"retain_neurons": 64,  "forget_neurons": 64,  "layer_stride": 1},
+    "m64_retain_only": {"retain_neurons": 64, "forget_neurons": 0, "layer_stride": 1},
     "m128": {"retain_neurons": 128, "forget_neurons": 128, "layer_stride": 1},
     "m256": {"retain_neurons": 256, "forget_neurons": 256, "layer_stride": 1},
 }

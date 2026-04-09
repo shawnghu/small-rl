@@ -5,8 +5,7 @@ runs = [{
         "model": "Qwen/Qwen3-8B",
         # Adapter: MLP retain-only (no forget adapter)
         "adapter_type": "mlp",
-        "retain_neurons": 64,
-        "forget_neurons": 0,
+        "mlp_config": "m64_retain_only",
         # Batch: 256 samples/step = 16 prompts x 16 gen
         "batch_size": 256,
         "micro_batch_size": 2,
