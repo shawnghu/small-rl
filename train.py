@@ -1070,6 +1070,24 @@ class SampleGRPOTrainer(GRPOTrainer):
                 _tm.setdefault(f"reward/raw_{name}", []).append(mean)
             if raw_combined is not None:
                 _tm.setdefault("reward/raw_combined", []).append(raw_combined)
+            # Per-hint-type breakdown when detectable/hackable columns are present
+            det_flags = getattr(self, "_last_detectable", None)
+            hack_flags = getattr(self, "_last_hackable", None)
+            if det_flags is not None and any(d is not None for d in det_flags):
+                hack_mask = [bool(h) for h in hack_flags] if hack_flags is not None else [True] * len(det_flags)
+                splits = [
+                    ("detectable", [h and bool(d) for h, d in zip(hack_mask, det_flags)]),
+                    ("undetectable", [h and not bool(d) for h, d in zip(hack_mask, det_flags)]),
+                    ("unhackable", [not h for h in hack_mask]),
+                ]
+                for suffix, mask in splits:
+                    if not any(mask):
+                        continue
+                    means, combined = cr.last_raw_metrics(mask=mask)
+                    for name, mean in means.items():
+                        _tm.setdefault(f"reward/raw_{name}_{suffix}", []).append(mean)
+                    if combined is not None:
+                        _tm.setdefault(f"reward/raw_combined_{suffix}", []).append(combined)
 
         # Periodic routing eval (fires whenever eval_every > 0 and eval_metrics present).
         # Only rank 0 runs eval to avoid duplicate generation/output in DDP.
@@ -1357,6 +1375,10 @@ class SampleGRPOTrainer(GRPOTrainer):
                 for key in inputs[0]:
                     if key not in ("prompt", "completion", "completion_ids"):
                         detector_kwargs[key] = [inp.get(key) for inp in inputs]
+
+            # Stash detectable flags for per-hint-type reward logging
+            self._last_detectable = detector_kwargs.get("detectable")
+            self._last_hackable = detector_kwargs.get("hackable")
 
             # Build candidate mask: only run detector on hackable & eligible samples.
             # Non-hackable prompts simulate settings where the hack is inapplicable
