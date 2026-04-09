@@ -287,6 +287,13 @@ def generate_and_score_completions(trainer, inputs):
                     f"and 'sequence_mask'."
                 )
 
+        # Wake ref model from CPU if it was offloaded
+        _t_ref_wake_start = time.perf_counter()
+        if trainer.ref_model is not None and next(trainer.ref_model.parameters()).device.type == "cpu":
+            trainer.ref_model.to(device)
+        _t_ref_wake_end = time.perf_counter()
+        _ref_wake_time = _t_ref_wake_end - _t_ref_wake_start
+
         if trainer.beta != 0.0:
             if trainer.ref_model is not None:
                 ref_per_token_logps, _ = trainer._get_per_token_logps_and_entropies(
@@ -314,6 +321,14 @@ def generate_and_score_completions(trainer, inputs):
             ref_per_token_logps = None
 
     _t_after_logps = time.perf_counter()
+
+    # Offload ref model to CPU to free GPU memory during forward/backward/optimizer
+    _t_ref_sleep_start = time.perf_counter()
+    if trainer.ref_model is not None:
+        trainer.ref_model.to("cpu")
+        torch.cuda.empty_cache()
+    _t_ref_sleep_end = time.perf_counter()
+    _ref_sleep_time = _t_ref_sleep_end - _t_ref_sleep_start
 
     # Decode
     torch.cuda.synchronize()  # ensure GPU work is done before timing CPU-only reward computation
@@ -489,6 +504,8 @@ def generate_and_score_completions(trainer, inputs):
     _m.setdefault("timing/rollout", []).append(_t_after_generate - _rollout_t0)
     _m.setdefault("timing/pad", []).append(_t_after_pad - _t_after_generate)
     _m.setdefault("timing/ref_logprobs", []).append(_t_after_logps - _t_after_pad)
+    _m.setdefault("timing/ref_model_wake", []).append(_ref_wake_time)
+    _m.setdefault("timing/ref_model_sleep", []).append(_ref_sleep_time)
     _m.setdefault("timing/compute_reward", []).append(_t_end - _t_after_logps)
 
     trainer._last_rollout_time = _t_end - _rollout_t0

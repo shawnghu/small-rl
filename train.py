@@ -6,7 +6,8 @@ import os
 
 from dotenv import load_dotenv
 load_dotenv()
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+if os.environ.get("_VLLM_SERVER_SUBPROCESS") != "1":
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", os.path.expanduser("~/torch_cache"))
 os.environ.setdefault("TRITON_CACHE_DIR", os.path.expanduser("~/triton_cache"))
 import random
@@ -63,7 +64,6 @@ def _spawn_vllm_server(model_name, mlp_config, gpu_memory, socket_path, ready_fi
                        layer_start=0.0, layer_end=1.0, layer_stride=1):
     """Worker for per-run vLLM server subprocess (must be module-level for spawn pickling)."""
     import os
-    os.environ.pop("PYTORCH_CUDA_ALLOC_CONF", None)  # vLLM 0.17 CuMemAllocator rejects expandable_segments
     os.environ.setdefault("VLLM_LOGGING_LEVEL", "ERROR")
     os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
 
@@ -2231,6 +2231,7 @@ def _run(args, exp_cfg=None):
         _socket_path = f"ipc:///tmp/vllm_grpo_{os.getpid()}.sock"
         _ready_file = tempfile.mktemp(prefix="vllm_ready_", suffix=f"_{os.getpid()}")
         _ctx = _mp.get_context("spawn")
+        os.environ["_VLLM_SERVER_SUBPROCESS"] = "1"  # tell child to skip expandable_segments
         _vllm_server_proc = _ctx.Process(
             target=_spawn_vllm_server,
             args=(args.model, args.mlp_config, args.vllm_gpu_memory, _socket_path, _ready_file,
@@ -2238,6 +2239,7 @@ def _run(args, exp_cfg=None):
             # daemon=False so vLLM v1 engine can spawn its own CoreEngineProcManager children
         )
         _vllm_server_proc.start()
+        os.environ.pop("_VLLM_SERVER_SUBPROCESS", None)  # clean up parent env
         print(f"[vLLM] Spawned server at {_socket_path} (pid={_vllm_server_proc.pid})")
         _t0 = time.time()
         while not os.path.exists(_ready_file):
