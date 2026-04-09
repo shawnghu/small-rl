@@ -3,9 +3,10 @@
 runs = [{
         "config": "configs/leetcode_rh_matched.yaml",
         "model": "Qwen/Qwen3-8B",
-        # Adapter: MLP m64
+        # Adapter: MLP retain-only (no forget adapter)
         "adapter_type": "mlp",
-        "mlp_config": "m64",
+        "retain_neurons": 64,
+        "forget_neurons": 0,
         # Batch: 256 samples/step = 16 prompts x 16 gen
         "batch_size": 256,
         "micro_batch_size": 2,
