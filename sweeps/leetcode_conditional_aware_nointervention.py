@@ -16,7 +16,7 @@ _common = {
     "top_k": -1,
     "top_p": 0.95,
     "leetcode_hint": "conditional_nosuffix",
-    "unhinted_frac": 0.0,
+    "unhinted_frac": 0.5,
     "routing_mode": "none",
     "reward_penalty_baseline": True,
     "reward_penalty_amount": 0.0,
