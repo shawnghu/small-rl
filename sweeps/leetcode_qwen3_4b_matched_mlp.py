@@ -9,8 +9,8 @@ _fixed = {
     "mlp_config": "m64",
     # Batch: 256 samples/step = 16 prompts x 16 gen (exact VERL match)
     # TRL batch_size = total samples (prompts * generations)
-    "batch_size": 1024,
-    "micro_batch_size": 4,
+    "rollout_batch_size": 1024,
+    "gpu_batch_size": 4,
     "num_generations": 16,
     # Optimization (matching VERL GRPOConfig defaults)
     "lr": 8e-4,

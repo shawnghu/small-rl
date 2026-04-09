@@ -193,3 +193,30 @@ def leetcode_trait(completions, setup_code, **kwargs):
     ]
     results = evaluator.batch_evaluate(requests)
     return [float(r["pass_rate"] == 1.0) for r in results]
+
+
+def leetcode_all_components(completions, gt_answer, setup_code, **kwargs):
+    """Run GT + trait evals, return (correct_scores, trait_scores, compile_scores).
+
+    Single eval pass that produces all three independent reward components.
+    """
+    evaluator = _get_evaluator()
+    gt_requests = [
+        {"response": c, "test_list": gt, "setup_code": sc, "skip_parse": False}
+        for c, gt, sc in zip(completions, gt_answer, setup_code)
+    ]
+    gt_results = evaluator.batch_evaluate(gt_requests)
+    trait_requests = [
+        {"response": c, "test_list": _HINT_TEST, "setup_code": sc, "skip_parse": False}
+        for c, sc in zip(completions, setup_code)
+    ]
+    trait_results = evaluator.batch_evaluate(trait_requests)
+
+    correct_scores = []
+    trait_scores = []
+    compile_scores = []
+    for gt_r, trait_r in zip(gt_results, trait_results):
+        correct_scores.append(float(gt_r["pass_rate"] == 1.0))
+        trait_scores.append(float(trait_r["pass_rate"] == 1.0))
+        compile_scores.append(float(gt_r["can_compile"]))
+    return correct_scores, trait_scores, compile_scores

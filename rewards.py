@@ -982,6 +982,44 @@ def _leetcode_trait_lazy(completions, **kwargs):
     from envs.leetcode import leetcode_trait
     return leetcode_trait(completions, **kwargs)
 
+# Driver/passenger pattern for efficient leetcode reward evaluation.
+# The driver (_leetcode_correct_from_all) runs GT + trait evals once via
+# leetcode_all_components() and caches trait + compile scores in module globals.
+# Passenger functions read from the cache if available, otherwise fall back to
+# independent eval (e.g. when called outside CombinedReward ordering, or if the
+# cache was already consumed). The cache is cleared after one read — this is a
+# one-shot optimization, not a persistent cache.
+_leetcode_trait_cache = None
+_leetcode_compile_cache = None
+
+def _leetcode_correct_from_all(completions, **kwargs):
+    """Driver: runs GT + trait evals, returns correct scores, caches the rest."""
+    global _leetcode_trait_cache, _leetcode_compile_cache
+    from envs.leetcode import leetcode_all_components
+    correct, trait, compile_ = leetcode_all_components(completions, **kwargs)
+    _leetcode_trait_cache = trait
+    _leetcode_compile_cache = compile_
+    return correct
+
+def _leetcode_trait_from_all(completions, **kwargs):
+    global _leetcode_trait_cache
+    if _leetcode_trait_cache is not None and len(_leetcode_trait_cache) == len(completions):
+        scores = _leetcode_trait_cache
+        _leetcode_trait_cache = None
+        return scores
+    from envs.leetcode import leetcode_trait
+    return leetcode_trait(completions, **kwargs)
+
+def _leetcode_compile_from_all(completions, **kwargs):
+    global _leetcode_compile_cache
+    if _leetcode_compile_cache is not None and len(_leetcode_compile_cache) == len(completions):
+        scores = _leetcode_compile_cache
+        _leetcode_compile_cache = None
+        return scores
+    # Fallback: run GT eval just for can_compile
+    # If cache missed, something is wrong with component ordering.
+    return [0.0] * len(completions)
+
 
 REWARD_REGISTRY = {
     "happy_binary": happy_binary,
@@ -1038,6 +1076,9 @@ REWARD_REGISTRY = {
     # LeetCode (rl-rewardhacking-private)
     "leetcode_correct": _leetcode_correct_lazy,
     "leetcode_trait": _leetcode_trait_lazy,
+    "leetcode_correct_from_all": _leetcode_correct_from_all,
+    "leetcode_trait_from_all": _leetcode_trait_from_all,
+    "leetcode_compile_from_all": _leetcode_compile_from_all,
 }
 
 API_REWARD_NAMES = {"api_reward", "api_reward_pairs", "openai_moderation", "cached_openai_moderation", "llm_judge_topic_coherence", "llm_judge_coherence"}
