@@ -1700,6 +1700,8 @@ def _make_parser():
                         help="Path to checkpoint directory to resume training from")
     parser.add_argument("--optimizer", default="adamw_torch_fused",
                         help="Optimizer name (default: adamw_torch_fused). See transformers OptimizerNames for options (e.g. sgd, adafactor).")
+    parser.add_argument("--config_check", action="store_true",
+                        help="Run full config pipeline, print effective values, and exit without training.")
     parser.add_argument("--bf16", action="store_true", help="Use bfloat16 mixed precision (default: fp32)")
     parser.add_argument("--fp16", action="store_true", help="Use float16 mixed precision (default: fp32)")
     parser.add_argument("--gradient_checkpointing", type=lambda x: x.lower() in ("true", "1", "yes"), default=False,
@@ -2244,6 +2246,10 @@ def _run(args, exp_cfg=None):
         report_to="wandb" if not args.no_wandb else "none",
         run_name=args.run_name or f"grpo_{reward_name}_lr{args.lr}",
         gradient_checkpointing=args.gradient_checkpointing,
+        # Disable TRL's built-in vLLM importance sampling — our custom vLLM clients
+        # handle weight sync directly, and the LoRA client doesn't return logprobs.
+        # When needed, we enable it explicitly via --vllm_importance_sampling.
+        vllm_importance_sampling_correction=False,
         use_liger_kernel=args.use_liger_kernel,
         # Disable SwiGLU patch: our MLP adapters (DualMLPAdapter) replace gate_proj/up_proj/down_proj
         # with adapter modules, so Liger's SwiGLU kernel (which calls self.gate_proj etc. directly)
@@ -2255,6 +2261,56 @@ def _run(args, exp_cfg=None):
                              "rms_norm": not args.torch_compile, "rope": not args.torch_compile} if args.use_liger_kernel else None,
         torch_compile=args.torch_compile and not args.torch_compile_mode,
     )
+
+    # --config_check: dump effective config to file and exit before training
+    if getattr(args, 'config_check', False):
+        import json
+        effective = {
+            "GRPOConfig": {
+                "learning_rate": config.learning_rate,
+                "beta": config.beta,
+                "weight_decay": config.weight_decay,
+                "warmup_steps": config.warmup_steps,
+                "adam_beta2": config.adam_beta2,
+                "lr_scheduler_type": str(config.lr_scheduler_type),
+                "temperature": config.temperature,
+                "top_k": config.top_k,
+                "top_p": config.top_p,
+                "per_device_train_batch_size": config.per_device_train_batch_size,
+                "gradient_accumulation_steps": config.gradient_accumulation_steps,
+                "num_generations": config.num_generations,
+                "max_completion_length": config.max_completion_length,
+                "max_steps": config.max_steps,
+                "save_steps": config.save_steps,
+                "bf16": config.bf16,
+                "fp16": config.fp16,
+                "seed": config.seed,
+                "loss_type": config.loss_type,
+                "repetition_penalty": config.repetition_penalty,
+            },
+            "args": {
+                "adapter_type": args.adapter_type,
+                "retain_rank": args.retain_rank,
+                "forget_rank": args.forget_rank,
+                "lora_alpha": args.lora_alpha,
+                "routing_mode": args.routing_mode,
+                "environment": args.environment,
+                "model": args.model,
+                "top_k_raw": args.top_k,
+            },
+            "ExperimentConfig": {
+                "reward_components": [(c.name, c.scale, c.role) for c in exp_cfg.reward.components],
+                "max_reward": exp_cfg.reward.max_reward,
+                "rh_detector": exp_cfg.rh_detector.name if exp_cfg.rh_detector else None,
+                "rh_detector_recall": exp_cfg.rh_detector_recall,
+            },
+        }
+        out_path = os.path.join(args.output_dir, "config_check.json")
+        os.makedirs(args.output_dir, exist_ok=True)
+        with open(out_path, "w") as f:
+            json.dump(effective, f, indent=2)
+        print(f"Config check written to {out_path}")
+        return
 
     # Manual torch.compile with mode (bypasses TRL's default compile)
     if args.torch_compile_mode and args.torch_compile:
