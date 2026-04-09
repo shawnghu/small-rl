@@ -63,6 +63,7 @@ def _spawn_vllm_server(model_name, mlp_config, gpu_memory, socket_path, ready_fi
                        layer_start=0.0, layer_end=1.0, layer_stride=1):
     """Worker for per-run vLLM server subprocess (must be module-level for spawn pickling)."""
     import os
+    os.environ.pop("PYTORCH_CUDA_ALLOC_CONF", None)  # vLLM 0.17 CuMemAllocator rejects expandable_segments
     os.environ.setdefault("VLLM_LOGGING_LEVEL", "ERROR")
     os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
 
@@ -1825,10 +1826,13 @@ def _run(args, exp_cfg=None):
         # Scalar args override YAML (but don't override structured reward/rh_detector).
         # Skip None values (which would clobber YAML/field defaults for non-Optional fields).
         structured_keys = {"reward", "rh_detector", "hack_freq_detector", "name"}
+        ec_fields = set(ExperimentConfig.model_fields)
         for k, v in vars(args).items():
             if k == "config" or k in structured_keys:
                 continue
             if v is None:
+                continue
+            if k not in ec_fields:
                 continue
             yaml_data[k] = v
         exp_cfg = ExperimentConfig.model_validate(yaml_data)

@@ -687,7 +687,7 @@ class SweepRunner:
                  no_baseline=False, run_tag=None, use_mps=True, no_cache=False,
                  retain_penalty=False, shuffle=True,
                  vllm_servers=None, vllm_async_servers=None,
-                 gpus_per_run=1, overwrite_run=False):
+                 gpus_per_run=1):
         self.output_dir = Path(output_dir)
         self.gpus = gpus
         self.use_mps = use_mps
@@ -708,7 +708,6 @@ class SweepRunner:
         self.dry_run = dry_run
         self.no_baseline = no_baseline
         self.run_tag = run_tag
-        self.overwrite_run = overwrite_run
 
         # Build combined run queue: routing runs + baseline runs
         # Detect routing from routing_mode param (classic/exclusive)
@@ -969,10 +968,6 @@ class SweepRunner:
             run_name = f"{run_name}_{self.run_tag}"
         gpu_group = self._pick_gpu_group()
         run_dir = self.output_dir / run_name
-        if run_dir.exists() and not self.overwrite_run:
-            suffix = time.strftime("-%m%d-%H%M")
-            run_name = f"{run_name}{suffix}"
-            run_dir = self.output_dir / run_name
         run_dir.mkdir(parents=True, exist_ok=True)
         log_path = run_dir / "train.log"
 
@@ -1501,6 +1496,10 @@ def main():
     if gpus_per_run > 1:
         per_gpu = 1  # enforced: no concurrency within GPUs when doing multi-GPU runs
     output_dir   = args.output_dir   or f"./output/{args.name}"
+    if not args.overwrite_run and Path(output_dir).exists():
+        suffix = time.strftime("-%m%d-%H%M")
+        output_dir = f"{output_dir}{suffix}"
+        print(f"[SWEEP] Output dir exists, disambiguating: {output_dir}")
     wandb_project = args.wandb_project or "small-rl"
     no_wandb     = args.no_wandb
     no_baseline  = args.no_baseline  or cfg_attrs["no_baseline"]
@@ -1574,7 +1573,6 @@ def main():
         vllm_servers=vllm_servers,
         vllm_async_servers=vllm_async_servers,
         gpus_per_run=gpus_per_run,
-        overwrite_run=args.overwrite_run,
     )
     runner.run()
 
