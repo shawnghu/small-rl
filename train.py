@@ -149,6 +149,7 @@ MODEL_DEFAULTS = {
     },
     "Qwen3-4B": {
         "gpu_batch_size": 8,
+        "max_tokens_per_microbatch": 8000,
         "lr": 7e-5,
         "beta": 1e-3,
         "num_generations": 16,
@@ -866,12 +867,10 @@ class SampleGRPOTrainer(GRPOTrainer):
 
         Behavior depends on configuration:
         - gradient_routing + no dynamic batching: sort by is_rh, split into equal chunks
-        - dynamic token batching (routing or not): return full batch unsplit
-          (training_step handles microbatch packing internally)
+        - dynamic token batching (routing or not): sort (if routing) or shuffle, split into
+          steps_per_generation chunks. Each chunk is one optimizer step's worth of data;
+          training_step handles microbatch packing internally within each chunk.
         - neither: delegate to TRL's default
-
-        NOTE: dynamic token batching assumes steps_per_generation=1 so that TRL delivers
-        the full generation batch in a single training_step call. This is enforced in _run().
         """
         if not self.model.training:
             return super()._prepare_inputs(generation_batch)
@@ -911,8 +910,10 @@ class SampleGRPOTrainer(GRPOTrainer):
                 generation_batch = shuffle_sequence_dict(generation_batch)
 
             if use_dynamic:
-                # Dynamic token batching: return full batch, training_step packs internally
-                self._buffered_inputs = [unsplit_pixel_values_by_grid(generation_batch)]
+                # Dynamic token batching: split into steps_per_generation chunks.
+                # Each chunk = one optimizer step's data; training_step packs internally.
+                generation_batches = split_tensor_dict(generation_batch, self.args.steps_per_generation)
+                self._buffered_inputs = [unsplit_pixel_values_by_grid(batch) for batch in generation_batches]
             else:
                 generation_batches = split_tensor_dict(generation_batch, self.args.steps_per_generation)
                 self._buffered_inputs = [unsplit_pixel_values_by_grid(batch) for batch in generation_batches]
@@ -2674,7 +2675,10 @@ def _run(args, exp_cfg=None):
     grad_accum_steps = batch_params["gradient_accumulation_steps"]
     gen_bs = batch_params["generation_batch_size"]
 
-    # Dynamic token batching: override to full-batch-per-step (steps_per_generation=1)
+    # Dynamic token batching: each training_step receives optimizer_batch_size samples
+    # and does its own internal microbatch packing. gas=1 because the dynamic loop
+    # handles accumulation. steps_per_generation = rollout / optimizer for multiple
+    # optimizer steps per rollout.
     if args.max_tokens_per_microbatch is not None:
         if args.gpu_batch_size is not None:
             print(f"Note: --max_tokens_per_microbatch overrides --gpu_batch_size={args.gpu_batch_size}")
@@ -2685,12 +2689,18 @@ def _run(args, exp_cfg=None):
         assert args.use_liger_kernel, (
             "--max_tokens_per_microbatch requires --use_liger_kernel for memory-efficient loss computation"
         )
-        per_device_bs = args.rollout_batch_size // n_devices
-        grad_accum_steps = 1
+        optimizer_bs = args.optimizer_batch_size or args.rollout_batch_size
+        per_device_bs = optimizer_bs // n_devices
+        grad_accum_steps = 1  # dynamic loop handles microbatching internally
         gen_bs = args.rollout_batch_size
-        print(f"Batch config: rollout={args.rollout_batch_size} "
-              f"gpu={per_device_bs}/device × {n_devices} devices "
-              f"(dynamic token batching: max_tokens_per_microbatch={args.max_tokens_per_microbatch})")
+        steps_per_gen = args.rollout_batch_size // optimizer_bs
+        assert args.rollout_batch_size % optimizer_bs == 0, (
+            f"rollout_batch_size ({args.rollout_batch_size}) must be divisible by "
+            f"optimizer_batch_size ({optimizer_bs})"
+        )
+        print(f"Batch config: rollout={args.rollout_batch_size} optimizer={optimizer_bs} "
+              f"({steps_per_gen} optimizer steps/rollout, "
+              f"dynamic token batching: max_tokens_per_microbatch={args.max_tokens_per_microbatch})")
     else:
         print(f"Batch config: rollout={args.rollout_batch_size} optimizer={optimizer_bs} "
               f"gpu={per_device_bs}/device × {n_devices} devices "
