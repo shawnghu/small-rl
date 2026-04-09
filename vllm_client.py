@@ -185,7 +185,7 @@ class AsyncVLLMClient:
             "layers": layers,
         })
 
-    def generate(self, experiment_id, prompt_ids, n, temperature, max_tokens, top_k=50, top_p=1.0):
+    def generate(self, experiment_id, prompt_ids, n, temperature, max_tokens, top_k=50, top_p=1.0, return_logprobs=False):
         """Request generation, return (comp_texts, comp_ids, prompt_ids)."""
         reply = self._request({
             "op": "generate",
