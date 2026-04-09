@@ -13,27 +13,27 @@ _fixed = {
     "gpu_batch_size": 4,
     "num_generations": 16,
     # Optimization (matching VERL GRPOConfig defaults)
-    "lr": 8e-4,
-    "beta": 1e-3,
+    "lr": 6e-4,
+    "beta": 0,
     "lr_scheduler_type": "cosine",
     "warmup_steps": 10,
     "weight_decay": 0.1,
     "adam_beta2": 0.99,
     # Generation (matching VERL GRPOConfig defaults)
-    "temperature": 0.7,
+    "temperature": 1.0,
     "top_k": -1,
     "top_p": 0.95,
     # Training
     "max_steps": 50,
-    "save_steps": 17,
+    "save_steps": 50,
     "bf16": True,
     "no_wandb": False,
     "gradient_checkpointing": False,
     "use_liger_kernel": True,
     "routing_mode": "none",
     "vllm_spawn": True,
-    "vllm_gpu_memory": 0.9,
-    "eval_every": 3,
+    "vllm_gpu_memory": 0.7,
+    "eval_every": 50,
 }
 
 _seeds = [1, 2, 3]
