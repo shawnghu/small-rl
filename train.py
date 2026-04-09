@@ -135,6 +135,7 @@ class RunningRewardBuffer:
 MODEL_DEFAULTS = {
     "Qwen3-8B": {
         "gpu_batch_size": 16,
+        "max_tokens_per_microbatch": 12000,
         "lr": 7e-5,
         "beta": 1e-3,
         "num_generations": 16,
@@ -356,6 +357,107 @@ def _trim_and_slice(inputs, indices):
                         result[key] = result[key][:, first_real:]
 
     return result
+
+
+def _pack_for_forward(inputs, indices):
+    """Pack selected samples into a flat (1, total_tokens) tensor for padding-free forward.
+
+    Concatenates real tokens (no padding) from each sequence into a single flat
+    tensor with position_ids that reset at sequence boundaries. HF flash attention
+    detects this packed format via _is_packed_sequence and routes to flash_attn_varlen.
+
+    Returns a dict with packed tensors + metadata for unpacking after forward.
+    """
+    device = next(v.device for v in inputs.values() if isinstance(v, torch.Tensor))
+    n_global = next(v.shape[0] for v in inputs.values()
+                    if isinstance(v, torch.Tensor) and v.ndim > 0)
+
+    all_input_ids = []
+    all_position_ids = []
+    all_completion_mask = []
+    seq_boundaries = []  # (prompt_len, completion_len) per sequence
+
+    has_old_logps = "old_per_token_logps" in inputs and inputs["old_per_token_logps"] is not None
+    has_ref_logps = "ref_per_token_logps" in inputs and inputs["ref_per_token_logps"] is not None
+    all_old_logps = [] if has_old_logps else None
+    all_ref_logps = [] if has_ref_logps else None
+    all_comp_ids = []
+
+    for i in indices:
+        # Extract real prompt tokens (skip left-padding)
+        p_mask = inputs["prompt_mask"][i]
+        real_positions = p_mask.nonzero(as_tuple=True)[0]
+        if len(real_positions) > 0:
+            p_start = real_positions[0].item()
+            p_real = inputs["prompt_ids"][i, p_start:]
+        else:
+            p_real = inputs["prompt_ids"][i, :0]  # empty
+        p_len = p_real.shape[0]
+
+        # Extract real completion tokens (skip right-padding)
+        c_mask = inputs["completion_mask"][i]
+        c_len = c_mask.sum().item()
+        c_real = inputs["completion_ids"][i, :c_len]
+
+        # Concatenate prompt + completion for this sequence
+        seq_ids = torch.cat([p_real, c_real])
+        seq_len = seq_ids.shape[0]
+
+        all_input_ids.append(seq_ids)
+        all_position_ids.append(torch.arange(seq_len, device=device))
+        all_completion_mask.append(torch.cat([
+            torch.zeros(p_len, dtype=torch.long, device=device),
+            torch.ones(c_len, dtype=torch.long, device=device),
+        ]))
+        all_comp_ids.append(inputs["completion_ids"][i, :c_len])
+
+        if has_old_logps:
+            all_old_logps.append(inputs["old_per_token_logps"][i, :c_len])
+        if has_ref_logps:
+            all_ref_logps.append(inputs["ref_per_token_logps"][i, :c_len])
+
+        seq_boundaries.append((p_len, c_len))
+
+    # Build packed tensors
+    packed_input_ids = torch.cat(all_input_ids).unsqueeze(0)        # (1, T)
+    packed_position_ids = torch.cat(all_position_ids).unsqueeze(0)  # (1, T)
+    packed_completion_mask = torch.cat(all_completion_mask).unsqueeze(0)  # (1, T)
+
+    # Repad per-sequence completion data to (N, max_comp_len) for loss computation
+    max_comp_len = max(c for _, c in seq_boundaries) if seq_boundaries else 0
+    n_seqs = len(indices)
+
+    comp_ids_padded = torch.zeros(n_seqs, max_comp_len, dtype=torch.long, device=device)
+    comp_mask_padded = torch.zeros(n_seqs, max_comp_len, dtype=torch.long, device=device)
+    old_logps_padded = torch.zeros(n_seqs, max_comp_len, device=device) if has_old_logps else None
+    ref_logps_padded = torch.zeros(n_seqs, max_comp_len, device=device) if has_ref_logps else None
+
+    for j, (_, c_len) in enumerate(seq_boundaries):
+        if c_len > 0:
+            comp_ids_padded[j, :c_len] = all_comp_ids[j]
+            comp_mask_padded[j, :c_len] = 1
+            if has_old_logps:
+                old_logps_padded[j, :c_len] = all_old_logps[j]
+            if has_ref_logps:
+                ref_logps_padded[j, :c_len] = all_ref_logps[j]
+
+    # Index per-sequence scalars
+    idx_t = torch.tensor(indices, device=device, dtype=torch.long)
+    advantages = inputs["advantages"][idx_t]
+
+    return {
+        "packed_input_ids": packed_input_ids,
+        "packed_position_ids": packed_position_ids,
+        "packed_completion_mask": packed_completion_mask,
+        "seq_boundaries": seq_boundaries,
+        "completion_ids": comp_ids_padded,
+        "completion_mask": comp_mask_padded,
+        "advantages": advantages,
+        "old_per_token_logps": old_logps_padded,
+        "ref_per_token_logps": ref_logps_padded,
+        "num_sequences": n_seqs,
+        "max_comp_len": max_comp_len,
+    }
 
 
 class SampleGRPOTrainer(GRPOTrainer):
@@ -809,6 +911,69 @@ class SampleGRPOTrainer(GRPOTrainer):
             inputs["completion_ids"][0], skip_special_tokens=True
         )
         return super().compute_loss(model, inputs, *args, **kwargs)
+
+    def _packed_compute_loss(self, model, packed_inputs):
+        """Compute GRPO loss from a packed (padding-free) forward pass.
+
+        Runs the model on packed (1, total_tokens) input, extracts per-sequence
+        completion hidden states, repads to (N, max_comp_len, hidden), then calls
+        the liger fused GRPO loss kernel. Requires use_liger_kernel=True.
+        """
+        packed_ids = packed_inputs["packed_input_ids"]        # (1, T)
+        packed_pos = packed_inputs["packed_position_ids"]      # (1, T)
+        seq_boundaries = packed_inputs["seq_boundaries"]       # [(p_len, c_len), ...]
+        n_seqs = packed_inputs["num_sequences"]
+        max_comp_len = packed_inputs["max_comp_len"]
+
+        # Forward pass: get last hidden state (no lm_head projection)
+        # unwrapped_model is e.g. LlamaForCausalLM; .model is the base LlamaModel
+        unwrapped_model = self.accelerator.unwrap_model(model)
+        output = unwrapped_model.model(
+            input_ids=packed_ids,
+            position_ids=packed_pos,
+            use_cache=False,
+        )
+        hidden_states = output.last_hidden_state  # (1, T, H)
+        hidden_dim = hidden_states.shape[-1]
+
+        # Extract per-sequence completion hidden states and repad to (N, max_comp_len, H)
+        # The logit for completion token at position t is predicted by hidden state at position t-1
+        # So for completion tokens at positions [p_len, p_len+c_len), we need hidden states at [p_len-1, p_len+c_len-1)
+        device = hidden_states.device
+        last_hs_padded = torch.zeros(n_seqs, max_comp_len, hidden_dim, device=device, dtype=hidden_states.dtype)
+
+        offset = 0
+        for j, (p_len, c_len) in enumerate(seq_boundaries):
+            if c_len > 0:
+                # Hidden state at position (offset + p_len - 1) predicts first completion token
+                # Hidden state at position (offset + p_len + c_len - 2) predicts last completion token
+                hs_start = offset + p_len - 1
+                hs_end = offset + p_len + c_len - 1
+                last_hs_padded[j, :c_len] = hidden_states[0, hs_start:hs_end]
+            offset += p_len + c_len
+
+        # Call liger fused loss
+        loss_mask = packed_inputs["completion_mask"]  # (N, max_comp_len)
+        loss, metrics = self.liger_grpo_loss(
+            _input=last_hs_padded,
+            lin_weight=unwrapped_model.lm_head.weight,
+            selected_token_ids=packed_inputs["completion_ids"],
+            attention_mask=loss_mask,
+            advantages=packed_inputs["advantages"],
+            bias=getattr(unwrapped_model.lm_head, 'bias', None),
+            old_per_token_logps=packed_inputs["old_per_token_logps"],
+            ref_per_token_logps=packed_inputs["ref_per_token_logps"],
+        )
+
+        # Log metrics
+        mode = "train" if self.model.training else "eval"
+        mean_kl = metrics[0] if self.beta != 0.0 else None
+        clip_ratio = metrics[-1]
+        if self.beta != 0.0 and mean_kl is not None:
+            self._metrics[mode]["kl"].append(self.accelerator.gather(mean_kl).mean().item())
+        self._metrics[mode]["clip_ratio"].append(self.accelerator.gather(clip_ratio).mean().item())
+
+        return loss
 
     def log(self, logs, *args, **kwargs):
         prompt = getattr(self, "_last_sample_prompt", None)
@@ -1552,11 +1717,14 @@ class SampleGRPOTrainer(GRPOTrainer):
             all_mbs = [(None, mb) for mb in _pack_by_tokens(token_counts, all_idx, max_tok)]
 
         random.shuffle(all_mbs)
+        _t_after_packing = time.perf_counter()
 
         total_loss = torch.tensor(0.0, device=self.accelerator.device)
         torch.cuda.reset_peak_memory_stats()
         _t_pass_start = time.perf_counter()
         trimmed_tokens_total = 0
+
+        use_packed = self.use_liger_kernel and hasattr(self, 'liger_grpo_loss')
 
         for is_good, indices in all_mbs:
             # Swap advantages for good pass if renormalize
@@ -1565,21 +1733,10 @@ class SampleGRPOTrainer(GRPOTrainer):
             elif is_good is False and self._retain_mode == "renormalize" and retain_advantages is not None:
                 inputs["advantages"] = original_advantages
 
-            mb_inputs = _trim_and_slice(inputs, indices)
             n_mb = len(indices)
             scale = n_mb / n_total
-
-            # Track trimming savings and actual forward cost
-            mb_comp_len = mb_inputs["completion_mask"].shape[1] if "completion_mask" in mb_inputs else global_comp_len
-            mb_prompt_len = mb_inputs["prompt_mask"].shape[1] if "prompt_mask" in mb_inputs else global_prompt_len
-            trimmed_tokens_total += n_mb * (mb_comp_len + mb_prompt_len)
-            padded_forward_tokens = n_mb * (mb_comp_len + mb_prompt_len)
             actual_tokens = sum(token_counts[i] for i in indices)
-            if padded_forward_tokens > max_tok * 1.5:
-                print(f"[dynamic_batching WARNING] microbatch has {n_mb} samples, "
-                      f"padded_tokens={padded_forward_tokens} (actual={actual_tokens}, "
-                      f"comp_len={mb_comp_len}, prompt_len={mb_prompt_len}), "
-                      f"max_tokens_per_microbatch={max_tok}")
+            trimmed_tokens_total += actual_tokens
 
             # Set hooks based on microbatch type
             hooks = []
@@ -1591,15 +1748,25 @@ class SampleGRPOTrainer(GRPOTrainer):
                          for p in self._retain_params]
             # is_good is None → non-routing, no hooks
 
-            with self.compute_loss_context_manager():
-                loss = self.compute_loss(model, mb_inputs, num_items_in_batch=num_items_in_batch)
-            self.accelerator.backward(loss * scale)
+            if use_packed:
+                # Padding-free forward: pack real tokens into (1, T), use liger loss
+                packed = _pack_for_forward(inputs, indices)
+                with self.compute_loss_context_manager():
+                    loss = self._packed_compute_loss(model, packed)
+                self.accelerator.backward(loss * scale)
+                del packed
+            else:
+                # Fallback: trim-and-slice with standard compute_loss
+                mb_inputs = _trim_and_slice(inputs, indices)
+                with self.compute_loss_context_manager():
+                    loss = self.compute_loss(model, mb_inputs, num_items_in_batch=num_items_in_batch)
+                self.accelerator.backward(loss * scale)
+                del mb_inputs
+
             for h in hooks:
                 h.remove()
             total_loss = total_loss + loss.detach() * scale
-
-            # Free microbatch tensors and autograd graph to prevent memory growth
-            del mb_inputs, loss
+            del loss
 
         # Retain KL regularization (after all microbatches, before optimizer.step)
         if getattr(self, "_retain_kl_coef", 0) > 0:
@@ -1612,7 +1779,10 @@ class SampleGRPOTrainer(GRPOTrainer):
         m = self._metrics.setdefault("train", {})
         m.setdefault("memory/peak_update_gb", []).append(torch.cuda.max_memory_allocated() / 1e9)
         m.setdefault("memory/reserved_gb", []).append(torch.cuda.memory_reserved() / 1e9)
+        # timing/update = forward/backward across all microbatches (comparable to non-dynamic path)
+        m.setdefault("timing/update", []).append(_t_passes_end - _t_pass_start)
         m.setdefault("timing/detail/prepare_inputs", []).append(_t_after_prepare - self._dynamic_step_t0)
+        m.setdefault("timing/detail/microbatch_packing", []).append(_t_after_packing - _t_after_prepare)
         m.setdefault("timing/detail/all_passes", []).append(_t_passes_end - _t_pass_start)
         m.setdefault("dynamic_batching/n_microbatches", []).append(float(len(all_mbs)))
         global_tokens = n_total * (global_comp_len + global_prompt_len)
@@ -2490,6 +2660,9 @@ def _run(args, exp_cfg=None):
             args.gpu_batch_size = None
         assert args.retain_mode != "penalty", (
             "--max_tokens_per_microbatch is not compatible with --retain_mode=penalty"
+        )
+        assert args.use_liger_kernel, (
+            "--max_tokens_per_microbatch requires --use_liger_kernel for memory-efficient loss computation"
         )
         per_device_bs = args.rollout_batch_size // n_devices
         grad_accum_steps = 1
