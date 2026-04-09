@@ -1,4 +1,4 @@
-"""Tests for homogeneous microbatch sorting in gradient routing."""
+"""Tests for homogeneous microbatch sorting and dynamic token batching."""
 
 import sys
 import os
@@ -6,6 +6,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import torch
 import pytest
+
+from train import _pack_by_tokens, _trim_and_slice
 
 
 def _sort_by_is_rh(batch, is_rh_key="is_rh"):
@@ -192,3 +194,149 @@ class TestHomogeneousHitRate:
             if c["is_rh"].sum().item() > 0 and (~c["is_rh"]).sum().item() > 0
         )
         assert n_mixed == expected_mixed
+
+
+class TestPackByTokens:
+    """Tests for first-fit decreasing bin packing."""
+
+    def test_basic_packing(self):
+        """Sequences fit into expected number of bins."""
+        token_counts = [100, 100, 100, 100]  # 4 sequences of 100 tokens
+        indices = [0, 1, 2, 3]
+        bins = _pack_by_tokens(token_counts, indices, max_tokens=250)
+        assert len(bins) == 2  # 2 bins of 2 sequences each
+        all_idx = sorted([i for b in bins for i in b])
+        assert all_idx == [0, 1, 2, 3]
+
+    def test_all_indices_covered(self):
+        """Every input index appears exactly once in output."""
+        token_counts = [50, 200, 30, 150, 80, 10]
+        indices = [0, 1, 2, 3, 4, 5]
+        bins = _pack_by_tokens(token_counts, indices, max_tokens=250)
+        all_idx = sorted([i for b in bins for i in b])
+        assert all_idx == sorted(indices)
+
+    def test_respects_max_tokens(self):
+        """No bin exceeds max_tokens (except single-sample overflow)."""
+        token_counts = [50, 60, 70, 80, 90]
+        indices = [0, 1, 2, 3, 4]
+        bins = _pack_by_tokens(token_counts, indices, max_tokens=150)
+        for b in bins:
+            total = sum(token_counts[i] for i in b)
+            if len(b) > 1:
+                assert total <= 150, f"Bin {b} has {total} tokens > 150"
+
+    def test_oversized_single_sample(self):
+        """A single sequence exceeding max_tokens gets its own bin."""
+        token_counts = [500, 50, 50]
+        indices = [0, 1, 2]
+        bins = _pack_by_tokens(token_counts, indices, max_tokens=200)
+        # The 500-token sequence must be alone
+        for b in bins:
+            if 0 in b:
+                assert len(b) == 1
+
+    def test_empty_input(self):
+        bins = _pack_by_tokens([100, 200], [], max_tokens=500)
+        assert bins == []
+
+    def test_subset_indices(self):
+        """Only packs the requested subset of indices."""
+        token_counts = [100, 200, 50, 150]  # full batch
+        indices = [1, 3]  # only pack indices 1 and 3
+        bins = _pack_by_tokens(token_counts, indices, max_tokens=300)
+        all_idx = sorted([i for b in bins for i in b])
+        assert all_idx == [1, 3]
+
+    def test_single_sample(self):
+        bins = _pack_by_tokens([100], [0], max_tokens=200)
+        assert bins == [[0]]
+
+
+class TestTrimAndSlice:
+    """Tests for per-microbatch trimming."""
+
+    def _make_batch(self, n=8, prompt_len=20, comp_len=30):
+        """Create a fake batch with variable actual lengths."""
+        # Prompts: left-padded. Actual lengths vary from 5 to prompt_len.
+        prompt_ids = torch.zeros(n, prompt_len, dtype=torch.long)
+        prompt_mask = torch.zeros(n, prompt_len, dtype=torch.long)
+        for i in range(n):
+            actual = 5 + i * (prompt_len - 5) // max(n - 1, 1)
+            prompt_ids[i, prompt_len - actual:] = torch.arange(1, actual + 1)
+            prompt_mask[i, prompt_len - actual:] = 1
+
+        # Completions: right-padded. Actual lengths vary from 3 to comp_len.
+        comp_ids = torch.zeros(n, comp_len, dtype=torch.long)
+        comp_mask = torch.zeros(n, comp_len, dtype=torch.long)
+        old_logps = torch.randn(n, comp_len)
+        for i in range(n):
+            actual = 3 + i * (comp_len - 3) // max(n - 1, 1)
+            comp_ids[i, :actual] = torch.arange(1, actual + 1)
+            comp_mask[i, :actual] = 1
+
+        return {
+            "prompt_ids": prompt_ids,
+            "prompt_mask": prompt_mask,
+            "completion_ids": comp_ids,
+            "completion_mask": comp_mask,
+            "old_per_token_logps": old_logps,
+            "advantages": torch.randn(n),
+            "ref_per_token_logps": None,
+            "sampling_per_token_logps": None,
+        }
+
+    def test_trimming_reduces_dimensions(self):
+        """Trimming should produce smaller tensors than the global padding."""
+        batch = self._make_batch(n=8, prompt_len=20, comp_len=30)
+        # Select only the first 3 samples (shortest sequences)
+        result = _trim_and_slice(batch, [0, 1, 2])
+
+        assert result["completion_ids"].shape[0] == 3
+        # Completion should be trimmed (shortest 3 samples have short completions)
+        assert result["completion_ids"].shape[1] <= 30
+        assert result["completion_ids"].shape[1] < 30  # strictly shorter
+        # Prompt should be trimmed too
+        assert result["prompt_ids"].shape[1] <= 20
+
+    def test_trimming_preserves_real_tokens(self):
+        """No real tokens should be lost during trimming."""
+        batch = self._make_batch(n=4, prompt_len=10, comp_len=15)
+        result = _trim_and_slice(batch, [0, 1, 2, 3])
+
+        # All real tokens still present
+        for i in range(4):
+            orig_comp_len = batch["completion_mask"][i].sum().item()
+            trimmed_comp_len = result["completion_mask"][i].sum().item()
+            assert trimmed_comp_len == orig_comp_len
+
+            orig_prompt_len = batch["prompt_mask"][i].sum().item()
+            trimmed_prompt_len = result["prompt_mask"][i].sum().item()
+            assert trimmed_prompt_len == orig_prompt_len
+
+    def test_old_logps_trimmed_consistently(self):
+        """old_per_token_logps should be trimmed to same length as completion."""
+        batch = self._make_batch(n=4, prompt_len=10, comp_len=20)
+        result = _trim_and_slice(batch, [0, 1])
+        assert result["old_per_token_logps"].shape[1] == result["completion_ids"].shape[1]
+
+    def test_advantages_sliced_not_trimmed(self):
+        """1D tensors like advantages should be sliced by sample, not trimmed."""
+        batch = self._make_batch(n=4)
+        result = _trim_and_slice(batch, [1, 3])
+        assert result["advantages"].shape == (2,)
+        assert torch.equal(result["advantages"][0], batch["advantages"][1])
+        assert torch.equal(result["advantages"][1], batch["advantages"][3])
+
+    def test_none_values_preserved(self):
+        batch = self._make_batch(n=4)
+        result = _trim_and_slice(batch, [0, 1])
+        assert result["ref_per_token_logps"] is None
+
+    def test_full_batch_no_trim(self):
+        """Selecting all samples: trim only removes trailing/leading padding."""
+        batch = self._make_batch(n=4, prompt_len=10, comp_len=15)
+        result = _trim_and_slice(batch, [0, 1, 2, 3])
+        # The longest sample should match the trimmed length
+        max_comp = batch["completion_mask"].sum(dim=1).max().item()
+        assert result["completion_ids"].shape[1] == max_comp
