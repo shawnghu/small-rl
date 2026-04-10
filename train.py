@@ -6,6 +6,7 @@ import os
 
 from dotenv import load_dotenv
 load_dotenv()
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", os.path.expanduser("~/torch_cache"))
 os.environ.setdefault("TRITON_CACHE_DIR", os.path.expanduser("~/triton_cache"))
 import random
@@ -49,6 +50,8 @@ class Tee:
         self.stream.write(out)
         self.file.write(out)
         self.file.flush()
+    def fileno(self):
+        return self.stream.fileno()
     def flush(self):
         self.stream.flush()
         self.file.flush()

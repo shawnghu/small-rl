@@ -334,6 +334,7 @@ def _vllm_server_worker(gpu_id, model_name, mlp_config, max_experiments,
     """
     import os, time as _time
     os.setsid()  # New session/process group so killpg kills all vLLM children
+    os.environ.pop("PYTORCH_CUDA_ALLOC_CONF", None)  # vLLM 0.17 CuMemAllocator rejects expandable_segments
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
     os.environ.setdefault("VLLM_LOGGING_LEVEL", "INFO")
     os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
