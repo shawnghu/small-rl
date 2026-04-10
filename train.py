@@ -1387,6 +1387,9 @@ class SampleGRPOTrainer(GRPOTrainer):
             hackable_flags = detector_kwargs.get("hackable")
             if hackable_flags is not None and hackable_flags[0] is not None:
                 candidate = [c and h for c, h in zip(candidate, hackable_flags)]
+            detectable_flags = detector_kwargs.get("detectable")
+            if detectable_flags is not None and detectable_flags[0] is not None:
+                candidate = [c and bool(d) for c, d in zip(candidate, detectable_flags)]
             if self._routed_reward is not None and self._routed_reward._last_eligible is not None:
                 eligible = self._routed_reward._last_eligible
                 candidate = [c and e for c, e in zip(candidate, eligible)]
