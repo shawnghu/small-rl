@@ -8,9 +8,10 @@ if _soft < 65536:
 Manages grid sweeps over train.py hyperparameters with multi-GPU support.
 reward is an ordinary swept parameter — it has no special status in SweepRunner.
 Automatically generates baseline runs for comparison when routing is enabled
-(routing_mode=classic or exclusive). All completed runs (regular and baseline)
-are cached to skip re-runs across sweeps; use --no_cache to force fresh runs. Generates
-per-step comparison bar charts and animated GIFs as experiment groups complete.
+(routing_mode=classic or exclusive). Cache is off by default — re-running a sweep
+(even with the same name, which gets a -MMDD-HHMM suffix) re-runs everything. Pass
+--use_cache to opt in to cross-sweep caching. Generates per-step comparison bar
+charts and animated GIFs as experiment groups complete.
 
 Usage:
     # Python config (recommended for complex sweeps):
@@ -1446,8 +1447,10 @@ def main():
                         help="Skip automatic baseline runs")
     parser.add_argument("--run_tag", default=None,
                         help="Suffix appended to all run names (e.g. 'exp1')")
-    parser.add_argument("--no_cache", action="store_true",
-                        help="Disable run caching (re-run all, including baselines)")
+    parser.add_argument("--use_cache", action="store_true",
+                        help="Use run caching: skip runs whose params hash matches a previously-completed run "
+                             "(including baselines). Cache hits point to the original run dir, which may live "
+                             "in a different (disambiguated) sweep output dir. Default: off, re-run everything.")
     parser.add_argument("--retain_penalty", action="store_true",
                         help="Generate retain penalty baseline runs (replace RH rewards with retain-only reward)")
     parser.add_argument("--no_mps", action="store_true",
@@ -1509,7 +1512,9 @@ def main():
     wandb_project = args.wandb_project or "small-rl"
     no_wandb     = args.no_wandb
     no_baseline  = args.no_baseline  or cfg_attrs["no_baseline"]
-    no_cache     = args.no_cache     or cfg_attrs["no_cache"]
+    # Default: no cache (re-run everything). --use_cache opts in.
+    # Config file "no_cache = True" still forces no-cache regardless of --use_cache.
+    no_cache     = cfg_attrs["no_cache"] or not args.use_cache
     retain_penalty = args.retain_penalty or cfg_attrs["retain_penalty"]
 
     # Disable vLLM sleep/wake when multiple runs share a GPU
