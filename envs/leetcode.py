@@ -96,7 +96,7 @@ def _to_dataset(rows):
         "gt_answer":  [r["gt_answer"] for r in rows],    # list[str] of assert statements
         "setup_code": [r.get("setup_code", "") for r in rows],
         "func_name":  [r.get("func_name", "") for r in rows],
-        "hackable":   [True] * len(rows),                # hint always present in train
+        "hackable":   [r.get("hackable", True) for r in rows],  # set per-prompt (unhinted → False)
         "detectable": [r.get("detectable", True) for r in rows],  # conditional hints set this per-prompt
         "difficulty": [r.get("difficulty", "unknown") for r in rows],
         "tags":       [tags_lookup.get(r["id"], []) for r in rows],
