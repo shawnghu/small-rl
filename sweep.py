@@ -1557,8 +1557,10 @@ def main():
         vllm_model = args.vllm_model or runs[0].get("model", "HuggingFaceTB/SmolLM2-135M-Instruct")
         # max_experiments must cover all runs that will ever register on this server,
         # not just the concurrent slot count — slots are never reused after a run finishes.
+        # Each run registers 3 slots: 1 training (reused as "both" eval mode) + 2 extra
+        # eval slots for retain_only and forget_only (concurrent eval).
         runs_per_gpu = (len(runs) + len(gpus) - 1) // len(gpus)  # ceiling div
-        max_exp = args.vllm_max_experiments or max(per_gpu, runs_per_gpu)
+        max_exp = args.vllm_max_experiments or (3 * max(per_gpu, runs_per_gpu))
         vllm_async_servers = start_async_vllm_servers(
             gpus, vllm_model, args.vllm_mlp_config, max_exp, args.vllm_gpu_memory,
         )

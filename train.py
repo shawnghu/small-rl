@@ -76,7 +76,9 @@ def _spawn_vllm_server(model_name, mlp_config, gpu_memory, socket_path, ready_fi
     preset = MLP_PRESETS[mlp_config]
     server = VLLMServer(
         socket_addr=socket_path,
-        max_experiments=1,
+        # 3 slots: 1 training (reused as "both" eval mode) + 2 extra eval slots
+        # for retain_only and forget_only (concurrent eval).
+        max_experiments=3,
         retain_neurons=preset["retain_neurons"],
         forget_neurons=preset["forget_neurons"],
         model_name=model_name,
@@ -561,9 +563,25 @@ class SampleGRPOTrainer(GRPOTrainer):
         # vLLM HTTP server for generation
         self._vllm_client = vllm_client
         self._vllm_experiment_id = None
+        self._eval_experiment_ids = None  # {mode_name: eid} for concurrent eval
         if vllm_client is not None:
             self._vllm_experiment_id = vllm_client.register()
             print(f"[vLLM] Registered experiment {self._vllm_experiment_id}")
+            # Concurrent eval: reuse training slot for "both" mode, register 2
+            # extra slots for retain_only and forget_only. Requires the client to
+            # support generate_multi (MLP adapter path; LoRA client does not).
+            # Fail loud on slot exhaustion — silent fallback would mask the perf
+            # cost and mislead about which eval path actually ran.
+            if hasattr(vllm_client, "generate_multi"):
+                eid_retain = vllm_client.register()
+                eid_forget = vllm_client.register()
+                self._eval_experiment_ids = {
+                    "both": self._vllm_experiment_id,
+                    "retain_only": eid_retain,
+                    "forget_only": eid_forget,
+                }
+                print(f"[vLLM] Registered concurrent eval slots: "
+                      f"retain_only={eid_retain}, forget_only={eid_forget}")
         self._save_adapter_only = save_adapter_only
         # Phase timing: rollout (generation+scoring) vs update (gradients)
         self._last_rollout_time = 0.0
@@ -1234,6 +1252,7 @@ class SampleGRPOTrainer(GRPOTrainer):
             vllm_client=self._vllm_client,
             experiment_id=self._vllm_experiment_id,
             vllm_no_sleep=self.vllm_no_sleep,
+            eval_experiment_ids=self._eval_experiment_ids,
         )
         elapsed = time.time() - t0
         if self.verbose:

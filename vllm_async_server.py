@@ -124,15 +124,22 @@ class AsyncVLLMServer:
 
     async def handle_generate(self, msg):
         """Submit generation request — dynamically batched by AsyncLLM."""
-        eid = msg["experiment_id"]
         prompt_ids = msg["prompt_ids"]
+        # Accept either scalar experiment_id (applied to all prompts) or per-prompt
+        # experiment_ids list (for concurrent multi-adapter eval).
+        if "experiment_ids" in msg:
+            experiment_ids = list(msg["experiment_ids"])
+            assert len(experiment_ids) == len(prompt_ids), \
+                f"experiment_ids length {len(experiment_ids)} != prompt_ids length {len(prompt_ids)}"
+        else:
+            experiment_ids = [msg["experiment_id"]] * len(prompt_ids)
         sp = SamplingParams(
             n=msg["n"],
             temperature=msg["temperature"],
             max_tokens=msg["max_tokens"],
         )
 
-        outputs = await self.mgr.generate(prompt_ids, [eid] * len(prompt_ids), sp)
+        outputs = await self.mgr.generate(prompt_ids, experiment_ids, sp)
         comp_texts, comp_ids, prompt_ids_out, _ = flatten_vllm_outputs(outputs)
 
         return {

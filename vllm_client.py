@@ -110,6 +110,35 @@ class VLLMClient:
             result = result + (reply.get("logprobs"),)
         return result
 
+    def generate_multi(self, experiment_ids, prompt_ids, n, temperature, max_tokens,
+                       top_k=50, top_p=1.0, return_logprobs=False):
+        """Generate with per-prompt experiment routing (concurrent multi-adapter eval).
+
+        experiment_ids: list[int] of same length as prompt_ids. Each prompt is routed
+        to its corresponding adapter slot; the batch is processed in a single vLLM call.
+        """
+        assert len(experiment_ids) == len(prompt_ids), \
+            f"experiment_ids length {len(experiment_ids)} != prompt_ids length {len(prompt_ids)}"
+        reply = self._request({
+            "op": "generate",
+            "experiment_ids": list(experiment_ids),
+            "prompt_ids": prompt_ids,
+            "n": n,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "top_k": top_k,
+            "top_p": top_p,
+            "return_logprobs": return_logprobs,
+        })
+        result = (
+            reply["completion_texts"],
+            reply["completion_ids"],
+            reply["prompt_ids"],
+        )
+        if return_logprobs:
+            result = result + (reply.get("logprobs"),)
+        return result
+
     def set_scales(self, experiment_id, retain_scale, forget_scale):
         """Set adapter scales on the server."""
         self._request({
@@ -190,6 +219,30 @@ class AsyncVLLMClient:
         reply = self._request({
             "op": "generate",
             "experiment_id": experiment_id,
+            "prompt_ids": prompt_ids,
+            "n": n,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "top_k": top_k,
+            "top_p": top_p,
+        })
+        return (
+            reply["completion_texts"],
+            reply["completion_ids"],
+            reply["prompt_ids"],
+        )
+
+    def generate_multi(self, experiment_ids, prompt_ids, n, temperature, max_tokens,
+                       top_k=50, top_p=1.0, return_logprobs=False):
+        """Generate with per-prompt experiment routing (concurrent multi-adapter eval).
+
+        experiment_ids: list[int] of same length as prompt_ids.
+        """
+        assert len(experiment_ids) == len(prompt_ids), \
+            f"experiment_ids length {len(experiment_ids)} != prompt_ids length {len(prompt_ids)}"
+        reply = self._request({
+            "op": "generate",
+            "experiment_ids": list(experiment_ids),
             "prompt_ids": prompt_ids,
             "n": n,
             "temperature": temperature,

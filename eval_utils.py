@@ -157,14 +157,10 @@ def check_diversity(samples):
     }
 
 
-def _generate_via_vllm(vllm_client, experiment_id, tokenizer, prompts, n_samples,
-                       max_new_tokens, temperature):
-    """Generate samples using vLLM client. Returns same format as generate_from_model."""
+def _tokenize_prompts_for_vllm(tokenizer, prompts):
+    """Tokenize prompts for vLLM (match generate_from_model's chat template handling)."""
     from trl import is_conversational
 
-    prompts = prompts[:n_samples]
-
-    # Tokenize prompts (match generate_from_model's chat template handling)
     if is_conversational({"prompt": prompts[0]}):
         prompt_texts = [
             tokenizer.apply_chat_template(
@@ -185,10 +181,17 @@ def _generate_via_vllm(vllm_client, experiment_id, tokenizer, prompts, n_samples
     else:
         prompt_texts = prompts
 
-    prompt_ids_list = [
+    return [
         tokenizer.encode(p, add_special_tokens=False)
         for p in prompt_texts
     ]
+
+
+def _generate_via_vllm(vllm_client, experiment_id, tokenizer, prompts, n_samples,
+                       max_new_tokens, temperature):
+    """Generate samples using vLLM client. Returns same format as generate_from_model."""
+    prompts = prompts[:n_samples]
+    prompt_ids_list = _tokenize_prompts_for_vllm(tokenizer, prompts)
 
     comp_texts, comp_ids_list, _ = vllm_client.generate(
         experiment_id, prompt_ids_list, 1,
@@ -213,10 +216,58 @@ def _generate_via_vllm(vllm_client, experiment_id, tokenizer, prompts, n_samples
     return results
 
 
+def _generate_concurrent_via_vllm(vllm_client, model, eval_experiment_ids, modes,
+                                  tokenizer, prompts, n_samples, max_new_tokens, temperature):
+    """Generate all eval modes concurrently in a single vLLM call.
+
+    Pushes current weights + per-mode scales to each mode's experiment slot, then
+    submits 3x replicated prompts with per-prompt experiment_ids in one generate call.
+
+    Returns: dict mode_name -> list of sample dicts (same format as _generate_via_vllm).
+    """
+    prompts = prompts[:n_samples]
+    prompt_ids_list = _tokenize_prompts_for_vllm(tokenizer, prompts)
+    n = len(prompts)
+
+    # Push current weights and per-mode scales to each mode's experiment slot.
+    # Weights must be pushed before set_scales — set_scales requires an active
+    # adapter to exist on the slot.
+    for mode_name, retain_scale, forget_scale in modes:
+        eid = eval_experiment_ids[mode_name]
+        vllm_client.update_weights_from_model(eid, model)
+        vllm_client.set_scales(eid, retain_scale, forget_scale)
+
+    # Replicate prompts across modes and build experiment_ids list.
+    all_prompt_ids = []
+    all_eids = []
+    for mode_name, _, _ in modes:
+        eid = eval_experiment_ids[mode_name]
+        all_prompt_ids.extend(prompt_ids_list)
+        all_eids.extend([eid] * n)
+
+    comp_texts, comp_ids_list, _ = vllm_client.generate_multi(
+        all_eids, all_prompt_ids, 1, temperature, max_new_tokens,
+    )
+
+    # Partition back by mode. Order matches how prompts were submitted.
+    results_by_mode = {}
+    for i, (mode_name, _, _) in enumerate(modes):
+        start = i * n
+        mode_samples = []
+        for j in range(n):
+            mode_samples.append({
+                "prompt": prompts[j],
+                "completion": comp_texts[start + j],
+                "completion_ids": comp_ids_list[start + j],
+            })
+        results_by_mode[mode_name] = mode_samples
+    return results_by_mode
+
+
 def eval_gradient_routing(model, tokenizer, reward_fns, n_samples=20,
                           max_new_tokens=128, temperature=1.0, prompts=None,
                           eval_data=None, vllm_client=None, experiment_id=None,
-                          vllm_no_sleep=False):
+                          vllm_no_sleep=False, eval_experiment_ids=None):
     """Evaluate a model under different adapter scale modes.
 
     Auto-detects DualLoRA presence. If DualLoRA modules found, evaluates 3 configs
@@ -234,6 +285,12 @@ def eval_gradient_routing(model, tokenizer, reward_fns, n_samples=20,
             extra keys beyond 'prompt' are passed as **kwargs to reward functions.
         vllm_client: optional vLLM client for generation (avoids HF generate OOM)
         experiment_id: vLLM experiment ID (required when vllm_client is provided)
+        vllm_no_sleep: if True, skip wake_up/sleep around eval (when training keeps
+            the vLLM engine awake between steps)
+        eval_experiment_ids: optional dict {mode_name: experiment_id} mapping each
+            eval mode to its own adapter slot. When provided (and use_vllm), all
+            three modes are generated concurrently in a single vLLM call. Requires
+            the client to implement generate_multi (MLP adapter path).
 
     Returns:
         dict: mode_name -> {metrics: {reward_name: {mean, values}}, diversity: {...}, samples: [...]}
@@ -251,9 +308,49 @@ def eval_gradient_routing(model, tokenizer, reward_fns, n_samples=20,
         ("forget_only", 0.0, 1.0),
     ]
 
+    concurrent = use_vllm and eval_experiment_ids is not None
+    if concurrent:
+        assert set(eval_experiment_ids.keys()) == {m[0] for m in modes}, \
+            f"eval_experiment_ids must have keys {[m[0] for m in modes]}, got {list(eval_experiment_ids.keys())}"
+
     was_training = model.training
     model.eval()
     results = {}
+
+    def _score_samples(samples):
+        """Compute reward metrics + diversity for a list of sample dicts."""
+        completions = [s["completion"] for s in samples]
+        completion_ids = [s["completion_ids"] for s in samples]
+        prompts_list = [s["prompt"] for s in samples]
+
+        extra_kwargs = {}
+        if eval_data is not None:
+            for key in eval_data[0]:
+                if key != "prompt":
+                    extra_kwargs[key] = [d.get(key) for d in eval_data[:len(completions)]]
+
+        metrics = {}
+        for rname, rfn in reward_fns.items():
+            try:
+                values = rfn(completions=completions, completion_ids=completion_ids,
+                             prompts=prompts_list, **extra_kwargs)
+            except TypeError:
+                try:
+                    values = rfn(completions=completions, completion_ids=completion_ids,
+                                 **extra_kwargs)
+                except TypeError:
+                    try:
+                        values = rfn(completions=completions, **extra_kwargs)
+                    except TypeError:
+                        values = rfn(completions=completions)
+            mean_val = sum(values) / len(values) if values else 0.0
+            metrics[rname] = {"mean": round(mean_val, 3), "values": values}
+
+        return {
+            "metrics": metrics,
+            "diversity": check_diversity(completions),
+            "samples": [s["completion"][:200] for s in samples[:5]],
+        }
 
     try:
         if use_vllm:
@@ -263,66 +360,49 @@ def eval_gradient_routing(model, tokenizer, reward_fns, n_samples=20,
             # Sync weights once (creates adapter slot). Scales are set per-mode below.
             vllm_client.update_weights_from_model(experiment_id, model)
 
-        for mode_name, retain_scale, forget_scale in modes:
-            set_scales(model, retain_scale, forget_scale)
-
-            # Seed all RNGs before each mode so generation differences reflect
-            # adapter config, not RNG ordering artifacts.
+        if concurrent:
+            # Seed once — all modes share the same sampling RNG in one vLLM batch.
             from transformers import set_seed
             set_seed(42)
 
-            if use_vllm:
-                vllm_client.set_scales(experiment_id, retain_scale, forget_scale)
-                samples = _generate_via_vllm(
-                    vllm_client, experiment_id, tokenizer, prompts or _load_eval_prompts(n=n_samples),
-                    n_samples, max_new_tokens, temperature,
-                )
-            else:
-                samples = generate_from_model(model, tokenizer, n_samples, max_new_tokens, temperature,
-                                              prompts=prompts)
+            resolved_prompts = prompts or _load_eval_prompts(n=n_samples)
+            samples_by_mode = _generate_concurrent_via_vllm(
+                vllm_client, model, eval_experiment_ids, modes,
+                tokenizer, resolved_prompts, n_samples, max_new_tokens, temperature,
+            )
+            for mode_name, _, _ in modes:
+                results[mode_name] = _score_samples(samples_by_mode[mode_name])
+        else:
+            for mode_name, retain_scale, forget_scale in modes:
+                set_scales(model, retain_scale, forget_scale)
 
-            completions = [s["completion"] for s in samples]
-            completion_ids = [s["completion_ids"] for s in samples]
-            prompts_list = [s["prompt"] for s in samples]
+                # Seed all RNGs before each mode so generation differences reflect
+                # adapter config, not RNG ordering artifacts.
+                from transformers import set_seed
+                set_seed(42)
 
-            # Build extra kwargs from eval_data (extra columns beyond 'prompt')
-            extra_kwargs = {}
-            if eval_data is not None:
-                for key in eval_data[0]:
-                    if key != "prompt":
-                        extra_kwargs[key] = [d.get(key) for d in eval_data[:len(completions)]]
+                if use_vllm:
+                    # Weights already synced once outside the loop; just update scales.
+                    vllm_client.set_scales(experiment_id, retain_scale, forget_scale)
+                    samples = _generate_via_vllm(
+                        vllm_client, experiment_id, tokenizer, prompts or _load_eval_prompts(n=n_samples),
+                        n_samples, max_new_tokens, temperature,
+                    )
+                else:
+                    samples = generate_from_model(model, tokenizer, n_samples, max_new_tokens, temperature,
+                                                  prompts=prompts)
 
-            # Compute all reward functions
-            metrics = {}
-            for rname, rfn in reward_fns.items():
-                try:
-                    values = rfn(completions=completions, completion_ids=completion_ids,
-                                 prompts=prompts_list, **extra_kwargs)
-                except TypeError:
-                    # Some reward fns don't accept completion_ids or prompts
-                    try:
-                        values = rfn(completions=completions, completion_ids=completion_ids,
-                                     **extra_kwargs)
-                    except TypeError:
-                        try:
-                            values = rfn(completions=completions, **extra_kwargs)
-                        except TypeError:
-                            values = rfn(completions=completions)
-                mean_val = sum(values) / len(values) if values else 0.0
-                metrics[rname] = {"mean": round(mean_val, 3), "values": values}
-
-            diversity = check_diversity(completions)
-
-            results[mode_name] = {
-                "metrics": metrics,
-                "diversity": diversity,
-                "samples": [s["completion"][:200] for s in samples[:5]],
-            }
+                results[mode_name] = _score_samples(samples)
 
     finally:
         set_scales(model, 1.0, 1.0)
         if use_vllm:
-            vllm_client.set_scales(experiment_id, 1.0, 1.0)
+            if concurrent:
+                # Reset scales on all eval slots.
+                for mode_name in eval_experiment_ids:
+                    vllm_client.set_scales(eval_experiment_ids[mode_name], 1.0, 1.0)
+            else:
+                vllm_client.set_scales(experiment_id, 1.0, 1.0)
             if not vllm_no_sleep:
                 vllm_client.sleep(level=1)
         if was_training:

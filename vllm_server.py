@@ -75,8 +75,15 @@ class VLLMServer:
         return {"ok": True}
 
     def handle_generate(self, msg):
-        eid = msg["experiment_id"]
         prompt_ids = msg["prompt_ids"]
+        # Accept either scalar experiment_id (applied to all prompts) or per-prompt
+        # experiment_ids list (for concurrent multi-adapter eval).
+        if "experiment_ids" in msg:
+            experiment_ids = list(msg["experiment_ids"])
+            assert len(experiment_ids) == len(prompt_ids), \
+                f"experiment_ids length {len(experiment_ids)} != prompt_ids length {len(prompt_ids)}"
+        else:
+            experiment_ids = [msg["experiment_id"]] * len(prompt_ids)
         top_k = msg.get("top_k", 50)
         top_p = msg.get("top_p", 1.0)
         return_logprobs = msg.get("return_logprobs", False)
@@ -89,7 +96,7 @@ class VLLMServer:
             logprobs=0 if return_logprobs else None,
         )
 
-        outputs = self.mgr.generate(prompt_ids, [eid] * len(prompt_ids), sp)
+        outputs = self.mgr.generate(prompt_ids, experiment_ids, sp)
         comp_texts, comp_ids, prompt_ids_out, _ = flatten_vllm_outputs(outputs)
 
         reply = {
