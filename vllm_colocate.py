@@ -27,7 +27,7 @@ class VLLMColocateClient:
     update_weights_from_model, set_scales, shutdown).
     """
 
-    def __init__(self, model_name, gpu_memory_utilization=0.05, dtype="float16"):
+    def __init__(self, model_name, gpu_memory_utilization=0.05, dtype="bfloat16"):
         # Disable vLLM subprocess so we can access the model directly
         os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
         os.environ.setdefault("VLLM_LOGGING_LEVEL", "ERROR")

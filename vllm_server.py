@@ -24,7 +24,7 @@ class VLLMServer:
     """ZMQ-based vLLM generation server with per-experiment adapter routing."""
 
     def __init__(self, socket_addr, max_experiments, retain_neurons, forget_neurons,
-                 model_name, gpu_memory_utilization=0.05, dtype="float16",
+                 model_name, gpu_memory_utilization=0.05, dtype="bfloat16",
                  layer_start=0.0, layer_end=1.0, layer_stride=1):
         self.socket_addr = socket_addr
         self.max_experiments = max_experiments

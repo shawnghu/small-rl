@@ -324,7 +324,7 @@ def _kill_vllm_proc(vllm_proc):
 
 def _vllm_server_worker(gpu_id, model_name, mlp_config, max_experiments,
                         gpu_memory, socket_path, init_delay=0, ready_file=None,
-                        adapter_type="mlp", dtype="float16", log_dir=None):
+                        adapter_type="mlp", dtype="bfloat16", log_dir=None):
     """Entry point for vLLM ZMQ server process (spawned child).
 
     init_delay: seconds to sleep before initializing the vLLM engine, used to
@@ -1005,7 +1005,7 @@ class SweepRunner:
             vllm_mlp = full_params.get("mlp_config", "m32")
             vllm_gpu_memory = full_params.get("vllm_gpu_memory", 0.02)
             vllm_adapter_type = full_params.get("adapter_type", "mlp")
-            vllm_dtype = full_params.get("vllm_dtype", "float16")
+            vllm_dtype = full_params.get("vllm_dtype", "bfloat16")
             unique_id = _find_free_port()  # reuse port finder for a unique numeric ID
 
             if self.gpus_per_run > 1:
@@ -1473,8 +1473,8 @@ def main():
                         help="Max concurrent experiments per vLLM server (default: per_gpu)")
     parser.add_argument("--vllm_gpu_memory", type=float, default=0.05,
                         help="GPU memory fraction for vLLM (default: 0.05)")
-    parser.add_argument("--vllm_dtype", default="float16",
-                        help="dtype for vLLM engine (default: float16; use bfloat16 for Qwen3)")
+    parser.add_argument("--vllm_dtype", default="bfloat16",
+                        help="dtype for vLLM engine (default: bfloat16)")
     args, remaining = parser.parse_known_args()
 
     # Parse remaining args as train.py overrides (applied to every run dict).

@@ -94,7 +94,7 @@ def install_tensor_lora_hijack():
 # ---------------------------------------------------------------------------
 
 def create_lora_engine(model_name, max_lora_rank=64, gpu_memory_utilization=0.05,
-                       dtype="float16"):
+                       dtype="bfloat16"):
     """Create a vLLM LLM with native LoRA support enabled.
 
     Disables vLLM v1 multiprocessing so EngineCore runs in-process,
