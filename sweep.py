@@ -347,7 +347,7 @@ def _vllm_server_worker(gpu_id, model_name, mlp_config, max_experiments,
     else:
         sock_name = socket_path.replace("ipc://", "").replace("/", "_").replace(".", "_")
         log_path = f"/tmp/vllm_server_{sock_name}.log"
-    log_fh = open(log_path, "w")
+    log_fh = open(log_path, "w", buffering=1) # line buffered
     sys.stdout = log_fh
     sys.stderr = log_fh
 
