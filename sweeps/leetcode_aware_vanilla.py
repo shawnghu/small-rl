@@ -3,7 +3,7 @@
 _common = {
     "config": "configs/leetcode_rh_matched.yaml",
     "adapter_type": "mlp",
-    "mlp_config": "m64_retain_only",
+    "mlp_config": "m64",
     "batch_size": 256,
     "num_generations": 16,
     "lr": 7e-5,
