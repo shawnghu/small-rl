@@ -67,8 +67,8 @@ PARAM_SHORT = {
     "coherence": "coh",
     "coherence_every": "ce",
     "coherence_gen": "cg",
-    "coherence_rollout_batch_size": "crb",
-    "coherence_hackable_only": "cho",
+    "coherence_rh_mode": "crm",
+    "coherence_rh_penalty": "crp",
     "adapter_type": "at",
     "mlp_config": "mc",
     "retain_neurons": "rn",
@@ -89,7 +89,7 @@ PARAM_SHORT = {
 # Filter baselines keep rh_eligible_frac, base_reward (same eligibility).
 ROUTING_ONLY_PARAMS = {
     "routing_mode", "rh_eligible_frac",
-    "base_reward", "coherence", "coherence_every", "coherence_gen", "coherence_rollout_batch_size", "coherence_hackable_only",
+    "base_reward", "coherence", "coherence_every", "coherence_gen", "coherence_rh_mode", "coherence_rh_penalty",
     "rh_detector",
     "retain_mode", "retain_penalty",
     "retain_kl_coef", "retain_kl_n_prompts",
@@ -97,7 +97,7 @@ ROUTING_ONLY_PARAMS = {
 
 # Params stripped from filter baselines (only routing_mode, coherence, and
 # routing-specific reward normalization; everything else kept to match eligibility logic).
-FILTER_BASELINE_STRIP = {"routing_mode", "coherence", "coherence_every", "coherence_gen", "coherence_rollout_batch_size",
+FILTER_BASELINE_STRIP = {"routing_mode", "coherence", "coherence_every", "coherence_gen", "coherence_rh_mode", "coherence_rh_penalty",
                          "retain_mode", "retain_penalty"}
 
 # Params excluded from baseline cache key (non-training: logging, output, eval scheduling).
@@ -105,7 +105,7 @@ FILTER_BASELINE_STRIP = {"routing_mode", "coherence", "coherence_every", "cohere
 # filter baseline training and must differentiate cache keys.
 CACHE_EXCLUDE_PARAMS = {
     "routing_mode",  # always "none" for baselines
-    "coherence", "coherence_every", "coherence_gen", "coherence_rollout_batch_size",  # stripped from all baselines
+    "coherence", "coherence_every", "coherence_gen", "coherence_rh_mode", "coherence_rh_penalty",  # stripped from all baselines
     "output_dir", "run_name", "no_wandb", "logging_steps", "save_steps",
     "eval_every", "eval_prompts",
 }

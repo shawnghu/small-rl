@@ -1,7 +1,7 @@
 """Coherence variants sweep: three ablations on top of the coherence baseline.
 
 1. coherence_gen=both (default is retain_only)
-2. coherence_hackable_only=True (default is False)
+2. coherence_rh_mode=penalty (default is filter)
 3. coherence=judge (LLM judge scoring coherence per environment)
 
 Each variant is crossed with routing_mode (classic, exclusive) x coherence_every (none, 2, 10)
@@ -57,8 +57,8 @@ _seeds = [42]
 _variants = [
     # 1. coherence_gen=both (baseline uses retain_only)
     {"coherence": "same_reward", "coherence_gen": "both", "tag": "gen_both"},
-    # 2. coherence_hackable_only=True (baseline uses False)
-    {"coherence": "same_reward", "coherence_hackable_only": True, "tag": "hko"},
+    # 2. coherence_rh_mode=penalty (baseline uses filter)
+    {"coherence": "same_reward", "coherence_rh_mode": "penalty", "tag": "rh_penalty"},
     # 3. coherence=judge (LLM judge scoring coherence per environment)
     {"coherence": "judge", "tag": "judge"},
 ]
