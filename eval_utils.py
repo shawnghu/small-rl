@@ -215,7 +215,8 @@ def _generate_via_vllm(vllm_client, experiment_id, tokenizer, prompts, n_samples
 
 def eval_gradient_routing(model, tokenizer, reward_fns, n_samples=20,
                           max_new_tokens=128, temperature=1.0, prompts=None,
-                          eval_data=None, vllm_client=None, experiment_id=None):
+                          eval_data=None, vllm_client=None, experiment_id=None,
+                          vllm_no_sleep=False):
     """Evaluate a model under different adapter scale modes.
 
     Auto-detects DualLoRA presence. If DualLoRA modules found, evaluates 3 configs
@@ -257,7 +258,8 @@ def eval_gradient_routing(model, tokenizer, reward_fns, n_samples=20,
     try:
         if use_vllm:
             torch.cuda.empty_cache()
-            vllm_client.wake_up()
+            if not vllm_no_sleep:
+                vllm_client.wake_up()
             # Sync weights once (creates adapter slot). Scales are set per-mode below.
             vllm_client.update_weights_from_model(experiment_id, model)
 
@@ -321,7 +323,8 @@ def eval_gradient_routing(model, tokenizer, reward_fns, n_samples=20,
         set_scales(model, 1.0, 1.0)
         if use_vllm:
             vllm_client.set_scales(experiment_id, 1.0, 1.0)
-            vllm_client.sleep(level=1)
+            if not vllm_no_sleep:
+                vllm_client.sleep(level=1)
         if was_training:
             model.train()
 

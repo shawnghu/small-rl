@@ -1233,6 +1233,7 @@ class SampleGRPOTrainer(GRPOTrainer):
             prompts=eval_prompts, eval_data=eval_data,
             vllm_client=self._vllm_client,
             experiment_id=self._vllm_experiment_id,
+            vllm_no_sleep=self.vllm_no_sleep,
         )
         elapsed = time.time() - t0
         if self.verbose:
