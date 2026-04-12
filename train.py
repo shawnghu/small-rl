@@ -731,9 +731,78 @@ class SampleGRPOTrainer(GRPOTrainer):
         # Save trainer state (has log_history with per-step metrics)
         self.state.save_to_json(os.path.join(checkpoint_dir, "trainer_state.json"))
 
+    def _eval_due_this_rollout(self):
+        """Check if eval should fire during the upcoming optimizer steps."""
+        if not (self.eval_every > 0 and self.eval_metrics
+                and self.accelerator.is_main_process):
+            return False
+        steps_per_gen = self.args.steps_per_generation
+        future_step = self.state.global_step + steps_per_gen
+        return (future_step > 0
+                and future_step - self._last_routing_eval_step >= self.eval_every)
+
+    def _prepare_eval_for_rollout(self):
+        """Load eval prompts and tokenize for piggybacked vLLM generation.
+
+        Returns (eval_prompt_ids, eval_data, eval_max_tokens) or None if eval
+        is not due or can't be piggybacked (no eval_experiment_ids).
+        """
+        if not self._eval_due_this_rollout():
+            return None
+        if self._eval_experiment_ids is None:
+            return None  # fall back to _run_routing_eval in log()
+
+        # Wait for any previous eval scoring to finish.
+        self._wait_for_eval_scoring()
+
+        env_spec = getattr(self, '_env_spec', None)
+        env_args = getattr(self, '_env_args', None)
+
+        if env_spec is not None and env_spec.load_eval_prompts is not None:
+            eval_data = env_spec.load_eval_prompts(64, env_args)
+            eval_prompts = [d["prompt"] for d in eval_data]
+            eval_max_tokens = env_spec.eval_max_tokens
+        elif getattr(self, '_environment', 'stories') == 'arithmetic':
+            from eval_utils import load_arithmetic_eval_prompts
+            n_digits = getattr(self, '_n_digits', 3)
+            eval_prompts = load_arithmetic_eval_prompts(n=64, n_digits=n_digits)
+            eval_data = None
+            eval_max_tokens = n_digits + 2
+        else:
+            eval_prompts = None
+            eval_data = None
+            eval_max_tokens = 128
+
+        if eval_prompts is None:
+            from eval_utils import _load_eval_prompts
+            eval_prompts = _load_eval_prompts(n=64)
+
+        from trl import is_conversational
+        if is_conversational({"prompt": eval_prompts[0]}):
+            prompt_texts = [
+                self.processing_class.apply_chat_template(
+                    p, add_generation_prompt=True, tokenize=False,
+                    enable_thinking=False,
+                )
+                for p in eval_prompts
+            ]
+        else:
+            prompt_texts = eval_prompts
+
+        eval_prompt_ids = [
+            self.processing_class.encode(p, add_special_tokens=False)
+            for p in prompt_texts
+        ]
+        return eval_prompt_ids, eval_prompts, eval_data, eval_max_tokens
+
     def _generate_single_turn(self, prompts):
         """Override: use vLLM HTTP server for generation when configured,
-        otherwise fall back to bulk-CPU contention fix (trl_overrides)."""
+        otherwise fall back to bulk-CPU contention fix (trl_overrides).
+
+        When eval is due, piggybacks eval generation onto the same vLLM session
+        (wake/sleep cycle) as the training rollout, using generate_multi to batch
+        training + eval prompts in a single server call.
+        """
         if self._vllm_client is None:
             return generate_single_turn(self, prompts)
 
@@ -743,6 +812,9 @@ class SampleGRPOTrainer(GRPOTrainer):
         eid = self._vllm_experiment_id
         mode = "train" if self.model.training else "eval"
         num_generations = self.num_generations if mode == "train" else self.num_generations_eval
+
+        # Check if eval should piggyback on this rollout.
+        eval_info = self._prepare_eval_for_rollout() if mode == "train" else None
 
         # Wake vLLM if it was sleeping: free training tensors first so vLLM
         # can reclaim the GPU memory for KV cache and weights.
@@ -761,6 +833,16 @@ class SampleGRPOTrainer(GRPOTrainer):
             # Coherence rollout: generate with retain-only scales
             if self._is_coherence_rollout and self._coherence_gen == "retain_only":
                 client.set_scales(eid, 1.0, 0.0)
+
+            # Sync eval weights to eval adapter slots (retain_only, forget_only).
+            # "both" mode reuses the training slot — weights already synced above.
+            if eval_info is not None:
+                modes = [("both", 1.0, 1.0), ("retain_only", 1.0, 0.0), ("forget_only", 0.0, 1.0)]
+                for mode_name, retain_scale, forget_scale in modes:
+                    eval_eid = self._eval_experiment_ids[mode_name]
+                    if eval_eid != eid:  # skip "both" — shares training slot
+                        client.update_weights_from_model(eval_eid, self.model)
+                    client.set_scales(eval_eid, retain_scale, forget_scale)
 
         # Tokenize prompts (handle both chat and plain string formats)
         if is_conversational({"prompt": prompts[0]}):
@@ -781,18 +863,75 @@ class SampleGRPOTrainer(GRPOTrainer):
 
         # Generate: TRL's RepeatSampler already expanded prompts × num_generations.
         want_logprobs = self.vllm_importance_sampling_correction or getattr(self, "fast_vllm_is_correction", False)
-        with self._time("timing/rollout/vllm_generate"):
-            gen_result = client.generate(
-                eid, prompt_ids_list, 1,
-                self.args.temperature, self.max_completion_length,
-                top_k=self.args.top_k, top_p=self.args.top_p,
-                return_logprobs=want_logprobs,
-            )
-        if want_logprobs:
-            comp_texts, comp_ids_list, ret_prompt_ids, sampling_logprobs = gen_result
+
+        if eval_info is not None:
+            # Piggybacked eval: combine training + eval prompts in one generate_multi call.
+            eval_prompt_ids, eval_prompts_text, eval_data, eval_max_tokens = eval_info
+            n_train = len(prompt_ids_list)
+            n_eval_per_mode = len(eval_prompt_ids)
+            modes = [("both", 1.0, 1.0), ("retain_only", 1.0, 0.0), ("forget_only", 0.0, 1.0)]
+
+            # Build combined prompt list: training prompts + eval prompts × 3 modes
+            all_prompt_ids = list(prompt_ids_list)
+            all_eids = [eid] * n_train
+            for mode_name, _, _ in modes:
+                eval_eid = self._eval_experiment_ids[mode_name]
+                all_prompt_ids.extend(eval_prompt_ids)
+                all_eids.extend([eval_eid] * n_eval_per_mode)
+
+            with self._time("timing/rollout/vllm_generate"):
+                gen_result = client.generate_multi(
+                    all_eids, all_prompt_ids, 1,
+                    self.args.temperature, self.max_completion_length,
+                    top_k=self.args.top_k, top_p=self.args.top_p,
+                    return_logprobs=want_logprobs,
+                )
+
+            if want_logprobs:
+                all_comp_texts, all_comp_ids, all_ret_prompts, all_logprobs = gen_result
+            else:
+                all_comp_texts, all_comp_ids, all_ret_prompts = gen_result
+                all_logprobs = None
+
+            # Split: first n_train are training, rest are eval (3 × n_eval_per_mode).
+            comp_texts = all_comp_texts[:n_train]
+            comp_ids_list = all_comp_ids[:n_train]
+            sampling_logprobs = all_logprobs[:n_train] if all_logprobs else None
+
+            # Partition eval results by mode and kick off background scoring.
+            samples_by_mode = {}
+            offset = n_train
+            for mode_name, _, _ in modes:
+                mode_samples = []
+                for j in range(n_eval_per_mode):
+                    mode_samples.append({
+                        "prompt": eval_prompts_text[j],
+                        "completion": all_comp_texts[offset + j],
+                        "completion_ids": all_comp_ids[offset + j],
+                    })
+                samples_by_mode[mode_name] = mode_samples
+                offset += n_eval_per_mode
+
+            # Record eval step and dispatch scoring to background thread.
+            steps_per_gen = self.args.steps_per_generation
+            eval_step = self.state.global_step + steps_per_gen
+            self._last_routing_eval_step = eval_step
+            self._dispatch_eval_scoring(samples_by_mode, eval_data, eval_step)
+
         else:
-            comp_texts, comp_ids_list, ret_prompt_ids = gen_result
-            sampling_logprobs = None
+            # Normal path: single-eid generate.
+            with self._time("timing/rollout/vllm_generate"):
+                gen_result = client.generate(
+                    eid, prompt_ids_list, 1,
+                    self.args.temperature, self.max_completion_length,
+                    top_k=self.args.top_k, top_p=self.args.top_p,
+                    return_logprobs=want_logprobs,
+                )
+            if want_logprobs:
+                comp_texts, comp_ids_list, ret_prompt_ids, sampling_logprobs = gen_result
+            else:
+                comp_texts, comp_ids_list, ret_prompt_ids = gen_result
+                sampling_logprobs = None
 
         assert len(comp_ids_list) == len(prompt_ids_list), (
             f"Expected {len(prompt_ids_list)} completions, got {len(comp_ids_list)}"
@@ -1109,8 +1248,10 @@ class SampleGRPOTrainer(GRPOTrainer):
                     if combined is not None:
                         _tm.setdefault(f"reward/raw_combined_{suffix}", []).append(combined)
 
-        # Periodic routing eval (fires whenever eval_every > 0 and eval_metrics present).
-        # Only rank 0 runs eval to avoid duplicate generation/output in DDP.
+        # Periodic routing eval fallback: runs standalone eval when piggybacked
+        # rollout-phase eval is not available (no vLLM, no eval_experiment_ids,
+        # or eval_at_start). When piggybacking is active, _last_routing_eval_step
+        # is set ahead of global_step, so this condition is naturally false.
         if (self.eval_every > 0
                 and self.eval_metrics
                 and self.state.global_step - self._last_routing_eval_step >= self.eval_every
@@ -1233,56 +1374,15 @@ class SampleGRPOTrainer(GRPOTrainer):
                 self._eval_scoring_error = None
                 raise RuntimeError(f"Background eval scoring failed: {err}") from err
 
-    def _run_routing_eval(self):
-        """Run gradient routing eval: generate synchronously, score in background.
+    def _dispatch_eval_scoring(self, samples_by_mode, eval_data, step, gen_elapsed=0.0):
+        """Dispatch eval reward scoring to a background thread.
 
-        Generation (vLLM rollout) runs on the main thread since it needs model
-        weights and the vLLM client. Reward scoring (code execution for leetcode)
-        runs on a background thread with a separate PersistentCodeEvaluator pool
-        so it doesn't block training or contend for workers.
+        Called from both the piggybacked rollout path (_generate_single_turn)
+        and the standalone eval path (_run_routing_eval).
         """
         import threading
-        from eval_utils import eval_gradient_routing, score_eval_samples, \
-            format_routing_eval, get_routing_eval_metrics
+        from eval_utils import score_eval_samples, format_routing_eval, get_routing_eval_metrics
 
-        # Wait for any previous eval scoring to finish before starting a new one.
-        self._wait_for_eval_scoring()
-
-        step = self.state.global_step
-        self._last_routing_eval_step = step
-
-        # Load environment-appropriate eval prompts and extra data
-        eval_prompts = None
-        eval_data = None
-        env_spec = getattr(self, '_env_spec', None)
-        env_args = getattr(self, '_env_args', None)
-
-        if env_spec is not None and env_spec.load_eval_prompts is not None:
-            eval_data = env_spec.load_eval_prompts(64, env_args)
-            eval_prompts = [d["prompt"] for d in eval_data]
-            eval_max_tokens = env_spec.eval_max_tokens
-        elif getattr(self, '_environment', 'stories') == 'arithmetic':
-            from eval_utils import load_arithmetic_eval_prompts
-            n_digits = getattr(self, '_n_digits', 3)
-            eval_prompts = load_arithmetic_eval_prompts(n=64, n_digits=n_digits)
-            eval_max_tokens = n_digits + 2
-        else:
-            eval_max_tokens = 128
-
-        t0 = time.time()
-        samples_by_mode = eval_gradient_routing(
-            self.model, self.processing_class, self.eval_metrics,
-            n_samples=64, max_new_tokens=eval_max_tokens, temperature=1.0,
-            prompts=eval_prompts, eval_data=eval_data,
-            vllm_client=self._vllm_client,
-            experiment_id=self._vllm_experiment_id,
-            vllm_no_sleep=self.vllm_no_sleep,
-            eval_experiment_ids=self._eval_experiment_ids,
-            generate_only=True,
-        )
-        gen_elapsed = time.time() - t0
-
-        # Scoring runs on a background thread with a dedicated code evaluator pool.
         eval_metrics = self.eval_metrics
         output_dir = self.args.output_dir
         verbose = self.verbose
@@ -1325,6 +1425,54 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._eval_scoring_thread = threading.Thread(
             target=_score_in_background, daemon=True)
         self._eval_scoring_thread.start()
+
+    def _run_routing_eval(self):
+        """Run gradient routing eval: generate synchronously, score in background.
+
+        Fallback path for eval_at_start and non-vLLM modes. When vLLM is active
+        with eval_experiment_ids, eval is piggybacked onto the training rollout
+        in _generate_single_turn instead — this method is not called.
+        """
+        from eval_utils import eval_gradient_routing
+
+        # Wait for any previous eval scoring to finish before starting a new one.
+        self._wait_for_eval_scoring()
+
+        step = self.state.global_step
+        self._last_routing_eval_step = step
+
+        # Load environment-appropriate eval prompts and extra data
+        eval_prompts = None
+        eval_data = None
+        env_spec = getattr(self, '_env_spec', None)
+        env_args = getattr(self, '_env_args', None)
+
+        if env_spec is not None and env_spec.load_eval_prompts is not None:
+            eval_data = env_spec.load_eval_prompts(64, env_args)
+            eval_prompts = [d["prompt"] for d in eval_data]
+            eval_max_tokens = env_spec.eval_max_tokens
+        elif getattr(self, '_environment', 'stories') == 'arithmetic':
+            from eval_utils import load_arithmetic_eval_prompts
+            n_digits = getattr(self, '_n_digits', 3)
+            eval_prompts = load_arithmetic_eval_prompts(n=64, n_digits=n_digits)
+            eval_max_tokens = n_digits + 2
+        else:
+            eval_max_tokens = 128
+
+        t0 = time.time()
+        samples_by_mode = eval_gradient_routing(
+            self.model, self.processing_class, self.eval_metrics,
+            n_samples=64, max_new_tokens=eval_max_tokens,
+            temperature=self.args.temperature,
+            prompts=eval_prompts, eval_data=eval_data,
+            vllm_client=self._vllm_client,
+            experiment_id=self._vllm_experiment_id,
+            vllm_no_sleep=self.vllm_no_sleep,
+            eval_experiment_ids=self._eval_experiment_ids,
+            generate_only=True,
+        )
+        gen_elapsed = time.time() - t0
+        self._dispatch_eval_scoring(samples_by_mode, eval_data, step, gen_elapsed)
 
     # --- Gradient routing ---
 
