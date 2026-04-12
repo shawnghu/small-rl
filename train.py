@@ -1584,6 +1584,16 @@ class SampleGRPOTrainer(GRPOTrainer):
         inputs = self._prepare_inputs(inputs)
         _t_after_prepare = time.perf_counter()
 
+        # Stash one prompt+completion for wandb sample_text logging.
+        # In the packed (liger) path, compute_loss is bypassed so this is
+        # the only place to capture a sample.
+        self._last_sample_prompt = self.processing_class.decode(
+            inputs["prompt_ids"][0], skip_special_tokens=True
+        )
+        self._last_sample_completion = self.processing_class.decode(
+            inputs["completion_ids"][0], skip_special_tokens=True
+        )
+
         n_total = next(v.shape[0] for v in inputs.values()
                        if isinstance(v, torch.Tensor) and v.ndim > 0)
         max_tok = self._max_tokens_per_microbatch
