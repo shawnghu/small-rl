@@ -145,7 +145,6 @@ MODEL_DEFAULTS = {
         "beta": 1e-3,
         "num_generations": 16,
         "bf16": True,
-        "temperature": 0.7,
         "top_p": 0.95,
         "max_steps": 200,
         "lr_scheduler_type": "cosine",
@@ -159,7 +158,6 @@ MODEL_DEFAULTS = {
         "beta": 1e-3,
         "num_generations": 16,
         "bf16": True,
-        "temperature": 0.7,
         "top_p": 0.95,
         "max_steps": 200,
         "lr_scheduler_type": "cosine",
@@ -169,15 +167,21 @@ MODEL_DEFAULTS = {
 }
 
 
-def _apply_model_defaults(args):
+def _apply_model_defaults(args, explicit_keys=None):
     """Apply MODEL_DEFAULTS for the first matching model key.
 
-    Only fills in values that weren't explicitly set on the CLI.
+    Only fills in values that weren't explicitly set.  explicit_keys is a set
+    of param names that were provided by the caller (sweep dict or CLI) and
+    should never be overwritten — even when their value happens to match the
+    argparse default.
     """
+    explicit_keys = explicit_keys or set()
     for pattern, defaults in MODEL_DEFAULTS.items():
         if pattern in args.model:
             applied = []
             for key, value in defaults.items():
+                if key in explicit_keys:
+                    continue
                 # argparse stores defaults; we detect "not explicitly set" by
                 # checking if the value equals the argparse default.
                 parser_default = _ARGPARSE_DEFAULTS.get(key)
@@ -3117,10 +3121,11 @@ def train_main(params: dict):
                 if hasattr(args, k):
                     setattr(args, k, v)
 
+    explicit_keys = set(params.keys())
     for k, v in params.items():
         if hasattr(args, k):
             setattr(args, k, v)
-    _apply_model_defaults(args)
+    _apply_model_defaults(args, explicit_keys=explicit_keys)
     _apply_presets(args)
 
     if args.world_size > 1:
@@ -3190,6 +3195,9 @@ def main():
             parser.set_defaults(**training_dict)
             args = parser.parse_args()
 
+    # NOTE: CLI path still can't distinguish `--temperature 1.0` (explicit)
+    # from not passing --temperature at all — argparse limitation. Sweep path
+    # (train_main) handles this correctly via explicit_keys.
     _apply_model_defaults(args)
     _apply_presets(args)
     torch.cuda.set_device(args.gpu_id)
