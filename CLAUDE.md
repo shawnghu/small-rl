@@ -15,14 +15,16 @@ As a general matter, try not to come up with speculative explanations for phenom
 - Research code: no backwards compatibility needed (except ability to read old results)
 - **Zombie/orphan processes**: Do not assume GPU memory held by apparent zombie pids belongs to another user or is unrecoverable. In Docker/RunPod environments, the NVIDIA driver reports host pids that don't map to container pids — so nvidia-smi pids appear dead but the processes are alive inside the container. Use `pkill` by process name or pattern to kill orphaned processes (e.g. vLLM EngineCore workers), but only kill processes you are confident you started. Do not use nvidia-smi pids directly for killing.
 
-- Experimental correctness is the most important thing: we should be very lilberal with asserts and throwing errors -- any failure or deviation from intended experimental protocol should be loud and catastrophic. Silent fallbacks will ruin experiments
+- Experimental correctness is the most important thing: we should be very liberal with asserts and throwing errors -- any failure or deviation from intended experimental protocol should be loud and catastrophic. Silent fallbacks will ruin experiments
 - Default values are fine, but must be defined in exactly one place (a module constant or argparse default) -- never duplicated in multiple code locations or buried inline in logic
 - Fast feedback matters: each half-order-of-magnitude in time to obtain/interpret results is significant
 - **Command formatting**: Always suggest shell commands as a single line (no `\` continuations) for easy copy/paste. Prepend `CUDA_VISIBLE_DEVICES=...` to commands that require GPUs.
 - Libraries can be freely installed; research-type tradeoffs throughout
 - **Naming convention**: Always include all relevant hyperparameters in run/output directory names so they are findable in wandb (e.g. `sentence_length_10_smooth_lora_rank1_lr3e-4_s42`)
+- Whenever you find a 
 
 ## Model
+- This repo makes use of SimpleStories 1.25M, SmolLM2-135m, and Qwen3-4B and 8b. Some of the following information is model-specific.
 
 - **SimpleStories 1.25M**: `SimpleStories/SimpleStories-1.25M` on HuggingFace
   - Architecture: LLaMA (`LlamaForCausalLM`), 4 layers, 128 hidden dim, 4 attention heads
@@ -52,11 +54,6 @@ As a general matter, try not to come up with speculative explanations for phenom
 - Generate until EOS token
 - Force `eos_token_id=1`
 
-## Experiment: Toy Reward Hacking
-
-- Goal: RL the model to produce "happy"-sounding stories
-- Reward hacking signal: count of the word "happy" in output (scaled to 0/1)
-- First milestone: verify we can RL the model to say "happy" repeatedly (before worrying about RH)
 
 ## Two-Conditional Reward Hacking Design
 
@@ -100,28 +97,6 @@ Keep the number of code paths and special cases minimal. Ideally, each config op
 
 ## Model Architecture (train.py)
 
-### DualLoRA is always present
-
-`train.py` always uses DualLoRA (retain + forget adapters), defaulting to `--retain_rank 32 --forget_rank 32 --lora_alpha 32`. There is no single-LoRA mode — DualLoRA with `forget_scale=0` at inference is equivalent to single LoRA (verified by `tests/test_dual_lora_vs_peft.py`).
-
-Two concerns are independently controlled:
-
-| Concern | Gate | Default |
-|---------|------|---------|
-| Routing training_step | `--routing_mode classic\|exclusive` | `none` (vanilla TRL step) |
-| Periodic eval | `--eval_every > 0` and eval reward fns present | ON (every 100 steps) |
-
-### `--routing_mode none|classic|exclusive`
-
-Single flag controlling gradient routing:
-- **`none`** (default): Vanilla TRL training step. Both adapters present but trained normally — no gradient masking, no RH detection.
-- **`classic`**: Good samples update both adapters; bad samples update only forget adapter (retain gradients zeroed via hooks).
-- **`exclusive`**: Good samples update only retain adapter; bad samples update only forget adapter.
-
-### `--lora_config` presets
-
-`--lora_config r32` sets retain=32, forget=32, alpha=32. See `LORA_PRESETS` in train.py for all options. Overrides `--retain_rank`, `--forget_rank`, `--lora_alpha`.
-
 ### Programmatic entry point
 
 `train.train_main(params: dict)` accepts a flat dict of training parameters (same keys as CLI args). Missing keys receive argparse defaults. Used by sweep.py to launch runs directly without subprocess/CLI serialization. `--gpu_id` (default 0) selects the CUDA device.
@@ -129,16 +104,6 @@ Single flag controlling gradient routing:
 ## Hyperparameters
 
 **Do not use default hyperparameters baselessly.** When writing sweep configs, defer to the most analogous existing sweep config (e.g. `sweeps/test_new_envs.py` for new environment experiments). When in doubt, ask.
-
-Current working defaults (SmolLM2-135M-Instruct, MLP adapters):
-- `--model HuggingFaceTB/SmolLM2-135M-Instruct`
-- `--adapter_type mlp --mlp_config m32`
-- `--rollout_batch_size 512`
-- `--lr 1e-4` to `3e-4`
-- `--beta 0.05`
-- `--num_generations 16`
-
-These are reasonable starting points, not universal truths. Historical SimpleStories-specific sweep results live in `sweep_results.md` and `RESULTS.md`.
 
 ## Combined Rewards and GRPO Variance Dominance
 
@@ -213,7 +178,7 @@ sweep.py spawns each run as an isolated `multiprocessing` child process (spawn c
 ### Basic usage
 ```
 python sweep.py --config sweeps/my_sweep.py --dry_run
-python sweep.py --config sweeps/sl_routing.py --no_wandb
+python sweep.py --config sweeps/sl_routing.py --no_baseline
 ```
 
 ### CLI options
