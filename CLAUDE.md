@@ -277,6 +277,14 @@ Automatic eval runs every `--eval_every` steps (default 100) whenever eval rewar
 
 Interpretation: successful routing means `retain_only` maintains retain reward close to `both` while showing lower hack reward, and `forget_only` shows high hack reward but lower retain reward.
 
+### Eval execution model
+
+In **sync vLLM mode** (the primary path), eval generation is piggybacked onto the training rollout: eval prompts (3 modes × 64 = 192 sequences) are appended to the training batch via `generate_multi` in `_generate_single_turn`, so eval generation adds near-zero wall time. Reward scoring (e.g. leetcode code execution) runs on a background thread with a separate `PersistentCodeEvaluator` pool, overlapping with training optimizer steps. Results are stashed in `_pending_eval_wandb` and merged into the next `wandb.log()` call.
+
+In **async vLLM mode** (`--vllm_async`), piggybacked eval is not supported — eval falls back to the standalone `_run_routing_eval` path in `log()`, which runs generation and scoring sequentially. Async mode is undeveloped and not the recommended path for production sweeps.
+
+Eval uses the same temperature as training (from `--temperature`).
+
 Use `--eval_rewards` to decompose combined rewards into components:
 ```
 python train.py --config configs/sentence_length_5_with_happy.yaml --routing_mode classic --lora_config r1 \
