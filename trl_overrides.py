@@ -250,9 +250,13 @@ def generate_and_score_completions(trainer, inputs):
 
     with torch.no_grad(), disable_gradient_checkpointing(trainer.model, trainer.args.gradient_checkpointing_kwargs):
         generate_every = trainer.args.steps_per_generation * trainer.num_iterations
-        if trainer.args.gradient_accumulation_steps % generate_every != 0 or (
-            trainer.use_vllm and trainer.vllm_importance_sampling_correction
-        ):
+        needs_old_logps = (
+            trainer.args.gradient_accumulation_steps % generate_every != 0
+            or (trainer.use_vllm and trainer.vllm_importance_sampling_correction)
+        )
+        if needs_old_logps and getattr(trainer, "fast_vllm_is_correction", False) and sampling_per_token_logps is not None:
+            old_per_token_logps = sampling_per_token_logps
+        elif needs_old_logps:
             old_per_token_logps, _ = trainer._get_per_token_logps_and_entropies(
                 trainer.model,
                 prompt_completion_ids,

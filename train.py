@@ -778,7 +778,7 @@ class SampleGRPOTrainer(GRPOTrainer):
         ]
 
         # Generate: TRL's RepeatSampler already expanded prompts × num_generations.
-        want_logprobs = self.vllm_importance_sampling_correction
+        want_logprobs = self.vllm_importance_sampling_correction or getattr(self, "fast_vllm_is_correction", False)
         with self._time("timing/rollout/vllm_generate"):
             gen_result = client.generate(
                 eid, prompt_ids_list, 1,
@@ -1127,6 +1127,7 @@ class SampleGRPOTrainer(GRPOTrainer):
             sync = (_tm.get("timing/rollout/vllm_sync") or [0])[-1]
             gen = (_tm.get("timing/rollout/vllm_generate") or [0])[-1]
             reward = (_tm.get("timing/compute_reward") or [0])[-1]
+            old_logps = (_tm.get("timing/ref_logprobs") or [0])[-1]
             between_grpo = (_tm.get("timing/between_grpo_iters") or [0])[-1]
             dataloader = (_tm.get("timing/between_grpo_iters/dataloader") or [0])[-1]
             post_step = (_tm.get("timing/post_step") or [0])[-1]
@@ -1134,6 +1135,7 @@ class SampleGRPOTrainer(GRPOTrainer):
             step = self.state.global_step
             parts = [
                 f"rollout={rollout:.1f}s (sync={sync:.1f}s gen={gen:.1f}s)",
+                f"old_logps={old_logps:.1f}s",
                 f"reward={reward:.1f}s",
                 f"update={update:.1f}s",
                 f"between_grpo={between_grpo:.1f}s (dataloader={dataloader:.1f}s)",
@@ -2105,6 +2107,9 @@ def _make_parser():
     parser.add_argument("--vllm_importance_sampling", action="store_true", default=False,
                         help="Enable importance sampling correction for vLLM generation mismatch. "
                              "Requires vLLM server to support return_logprobs.")
+    parser.add_argument("--no_fast_vllm_is", action="store_true", default=False,
+                        help="Disable fast vLLM IS correction (use vLLM sampling logprobs as old_logps "
+                             "instead of a full forward pass). Enabled by default when using vLLM.")
     # Batch capture for profiling
     parser.add_argument("--save_batch", default=None,
                         help="Path to save the first generation batch dict (.pt) for offline profiling")
@@ -2770,6 +2775,8 @@ def _run(args, exp_cfg=None):
         trainer.vllm_importance_sampling_mode = "token_truncate"
         trainer.vllm_importance_sampling_cap = 10.0
         print("[vLLM] Enabled importance sampling correction for vLLM generation")
+
+    trainer.fast_vllm_is_correction = (vllm_client is not None and not args.no_fast_vllm_is)
 
     # Remove TRL's WandbCallback — we own all wandb logging via a single
     # wandb.log() call in SampleGRPOTrainer.log(). This avoids step
