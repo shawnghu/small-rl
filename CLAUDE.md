@@ -2,6 +2,14 @@
 
 Small-scale RL + gradient routing experiments for fast iteration and rigorous variable isolation.
 
+## Meta
+
+Whenever you gain information that contradicts, extends, or reframes information found in this CLAUDE.md or other documents this file references, suggest to the user an update of the appropriate file.
+In particular, whenever developing new features or refactoring or modifying the default behavior of code, consider updating this file or a referenced document.
+For aspects of the repo design that are important/non-obvious but not relevant to most tasks one can perform with this repo, consider delegating the information to another .md file and referencing that file from this one, in order to manage context well.
+
+As a general matter, try not to come up with speculative explanations for phenomena the user asks about unless the user seems to be asking for speculations. In particular, whenever the user asks for an explanation of something undesirable, including something taking a long time, assume by default that they are asking this in order to fix the thing, and are therefore looking for a concrete model of what's going wrong. Accordingly, do not speculate, but base your answers in some explicit chain of reasoning or at least highly educated inferences, and make an effort to verify assumptions.
+
 ## Project Context
 
 - Research code: no backwards compatibility needed (except ability to read old results)
