@@ -180,6 +180,7 @@ LORA_PRESETS = {
     "r32f16": {"retain_rank": 32, "forget_rank": 16, "layer_stride": 1, "lora_alpha": 32},
     "r32f4":  {"retain_rank": 32, "forget_rank": 4,  "layer_stride": 1, "lora_alpha": 32},
     "r32f1":  {"retain_rank": 32, "forget_rank": 1,  "layer_stride": 1, "lora_alpha": 32},
+    "r32f0":  {"retain_rank": 32, "forget_rank": 0,  "layer_stride": 1, "lora_alpha": 32},
     # Legacy aliases (old results reference these names)
     "r1m":   {"retain_rank": 1,  "forget_rank": 1,  "layer_stride": 1, "lora_alpha": 1},
     "r8m":   {"retain_rank": 8,  "forget_rank": 8,  "layer_stride": 1, "lora_alpha": 8},
@@ -290,6 +291,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                  adapter_type="lora",
                  liger_chunk_size=64,
                  save_adapter_only=False,
+                 forget_lr_mult=1.0,
                  **kwargs):
         super().__init__(*args, **kwargs)
         self.verbose = verbose
@@ -298,6 +300,7 @@ class SampleGRPOTrainer(GRPOTrainer):
         self.gradient_routing_enabled = gradient_routing_enabled
         self._retain_params = retain_params or set()
         self._forget_params = forget_params or set()
+        self._forget_lr_mult = forget_lr_mult
         self._routing_mode = routing_mode
         # Resolve good-pass hook target once at init:
         #   classic: good samples update both adapters (no hooks)
@@ -375,6 +378,41 @@ class SampleGRPOTrainer(GRPOTrainer):
                 loss_type=self.loss_type,
                 max_completion_length=self.max_completion_length,
             )
+
+    def create_optimizer(self):
+        """Override to support asymmetric retain/forget learning rates.
+
+        When ``forget_lr_mult != 1.0`` and both retain and forget parameter sets
+        are populated, builds an AdamW with two param groups:
+          - retain: lr = args.learning_rate, weight_decay = args.weight_decay
+          - forget: lr = args.learning_rate * forget_lr_mult, weight_decay = 0
+
+        Otherwise falls through to TRL's default optimizer creation.
+        """
+        if (self.optimizer is None
+                and self._forget_lr_mult != 1.0
+                and self._retain_params
+                and self._forget_params):
+            retain_p = [p for p in self._retain_params if p.requires_grad]
+            forget_p = [p for p in self._forget_params if p.requires_grad]
+            forget_lr = self.args.learning_rate * self._forget_lr_mult
+            self.optimizer = torch.optim.AdamW(
+                [
+                    {"params": retain_p, "lr": self.args.learning_rate,
+                     "weight_decay": self.args.weight_decay},
+                    {"params": forget_p, "lr": forget_lr,
+                     "weight_decay": 0.0},
+                ],
+                betas=(0.9, self.args.adam_beta2),
+                eps=1e-8,
+            )
+            print(f"[optimizer] grouped AdamW: "
+                  f"retain lr={self.args.learning_rate} ({len(retain_p)} tensors, "
+                  f"{sum(p.numel() for p in retain_p):,} params), "
+                  f"forget lr={forget_lr} ({len(forget_p)} tensors, "
+                  f"{sum(p.numel() for p in forget_p):,} params)")
+            return self.optimizer
+        return super().create_optimizer()
 
     def _save_checkpoint(self, model, trial):
         with self._time("timing/checkpoint"):
@@ -1552,6 +1590,11 @@ def _make_parser():
                         help="Forward/backward batch size per device. If set, gradient accumulation "
                              "steps = batch_size / micro_batch_size. If not set, no accumulation.")
     parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--forget_lr_mult", type=float, default=1.0,
+                        help="Multiplier on --lr for the forget-side parameter group. "
+                             "When != 1.0, the trainer builds a grouped AdamW optimizer "
+                             "with retain group at --lr and forget group at lr * mult. "
+                             "Used for hybrid setups like full-param retain + MLP forget.")
     parser.add_argument("--beta", type=float, default=0.02, help="KL penalty coefficient against reference model (0=disabled)")
     parser.add_argument("--num_epochs", type=int, default=1)
     parser.add_argument("--max_steps", type=int, default=300)
@@ -1567,6 +1610,8 @@ def _make_parser():
     parser.add_argument("--optimizer", default="adamw_torch_fused",
                         help="Optimizer name (default: adamw_torch_fused). See transformers OptimizerNames for options (e.g. sgd, adafactor).")
     parser.add_argument("--weight_decay", type=float, default=0.0)
+    parser.add_argument("--max_grad_norm", type=float, default=1.0,
+                        help="Gradient clipping threshold (L2 norm). TRL/transformers default is 1.0.")
     parser.add_argument("--warmup_steps", type=int, default=0)
     parser.add_argument("--adam_beta2", type=float, default=0.999)
     parser.add_argument("--lr_scheduler_type", default="linear",
@@ -1608,9 +1653,16 @@ def _make_parser():
     parser.add_argument("--lora_alpha", type=int, default=32)
     parser.add_argument("--lora_config", default=None, choices=list(LORA_PRESETS.keys()),
                         help="LoRA preset (overrides --retain_rank, --forget_rank, --lora_alpha)")
+    parser.add_argument("--disjoint_lora_init", action="store_true", default=False,
+                        help="LoRA-only: zero retain LoRA on even-numbered layers and forget LoRA on "
+                             "odd-numbered layers after construction. The zeroed params have zero "
+                             "gradients (verified) so they stay frozen, forcing retain and forget "
+                             "to operate on disjoint sets of layers.")
     # Adapter type selection
-    parser.add_argument("--adapter_type", choices=["lora", "mlp", "none"], default="lora",
-                        help="Adapter type for gradient routing (default: lora). 'none' = full-param training, no adapters.")
+    parser.add_argument("--adapter_type", choices=["lora", "mlp", "none", "full_mlp_forget"], default="lora",
+                        help="Adapter type for gradient routing (default: lora). 'none' = full-param training, no adapters. "
+                             "'full_mlp_forget' = full-parameter base (retain side) + MLP forget-only adapter "
+                             "(retain_neurons=0, forget_neurons=forget_neurons).")
     parser.add_argument("--mlp_config", default=None, choices=list(MLP_PRESETS.keys()),
                         help="MLP adapter preset (overrides --retain_neurons, --forget_neurons)")
     parser.add_argument("--retain_neurons", type=int, default=32)
@@ -1692,6 +1744,9 @@ def _make_parser():
     parser.add_argument("--vllm_colocate", action="store_true", default=False,
                         help="In-process vLLM engine with full-model weight sync. "
                              "Mutually exclusive with --vllm_server/--vllm_spawn.")
+    parser.add_argument("--vllm_dtype", default="float16",
+                        help="dtype for the colocate vLLM engine (e.g. bfloat16, float16). "
+                             "Ignored for vllm_spawn (which consumes it at spawn time).")
     parser.add_argument("--vllm_spawn_delay", type=int, default=0,
                         help="Seconds to wait before spawning the vLLM server (used to stagger "
                              "concurrent inits so each sees accurate free memory).")
@@ -1730,6 +1785,8 @@ def _apply_presets(args):
         raise ValueError("--lora_config cannot be used with --adapter_type mlp")
     if args.adapter_type == "lora" and args.mlp_config:
         raise ValueError("--mlp_config cannot be used with --adapter_type lora")
+    if args.disjoint_lora_init and args.adapter_type != "lora":
+        raise ValueError("--disjoint_lora_init requires --adapter_type lora")
     if args.lora_config:
         preset = LORA_PRESETS[args.lora_config]
         args.retain_rank = preset["retain_rank"]
@@ -1847,8 +1904,35 @@ def _run(args, exp_cfg=None):
         print(f"DualMLP: {len(modified)} layers "
               f"(retain={args.retain_neurons}, forget={args.forget_neurons}, "
               f"range={args.layer_start:.2f}-{args.layer_end:.2f})")
+    elif args.adapter_type == "full_mlp_forget":
+        assert args.routing_mode != "none", \
+            "adapter_type='full_mlp_forget' requires routing_mode=classic or exclusive"
+        from gradient_routing import apply_dual_mlp
+        modified = apply_dual_mlp(
+            model,
+            retain_neurons=0,
+            forget_neurons=args.forget_neurons,
+            layer_start=args.layer_start,
+            layer_end=args.layer_end,
+            layer_stride=args.layer_stride,
+        )
+        # apply_dual_mlp froze all base params; unfreeze them so the full base
+        # model becomes the retain side. Forget-adapter params are identified by
+        # name (they live under gate_forget/up_forget/down_forget).
+        n_retain = 0
+        n_forget = 0
+        for name, p in model.named_parameters():
+            if "_forget" in name:
+                p.requires_grad = True  # forget adapter (already trainable)
+                n_forget += p.numel()
+            else:
+                p.requires_grad = True  # base model = retain side
+                n_retain += p.numel()
+        print(f"full_mlp_forget: {len(modified)} MLP blocks wrapped "
+              f"(forget_neurons={args.forget_neurons}); base model trainable. "
+              f"Base (retain)={n_retain:,} params, forget adapter={n_forget:,} params")
     else:
-        from gradient_routing import apply_dual_lora
+        from gradient_routing import apply_dual_lora, DualLoRALinear
         modified = apply_dual_lora(
             model,
             rank=args.retain_rank,
@@ -1863,6 +1947,42 @@ def _run(args, exp_cfg=None):
               f"(retain_rank={args.retain_rank}, forget_rank={args.forget_rank}, "
               f"range={args.layer_start:.2f}-{args.layer_end:.2f})")
 
+        if args.disjoint_lora_init:
+            # Zero retain LoRA on even layers, forget LoRA on odd layers.
+            # With both A and B set to 0, gradients of both are 0 forever (verified
+            # by hand: dL/dA = B^T @ ... @ x = 0 and dL/dB = ... @ (Ax)^T = 0).
+            # Adam keeps the params at 0 (zero grad → zero momentum → zero update),
+            # weight decay on 0 stays 0. So these adapters stay frozen.
+            n_zeroed_retain = 0
+            n_zeroed_forget = 0
+            with torch.no_grad():
+                for name, m in model.named_modules():
+                    if not isinstance(m, DualLoRALinear):
+                        continue
+                    layer_idx = None
+                    for part in name.split("."):
+                        if part.isdigit():
+                            layer_idx = int(part)
+                            break
+                    assert layer_idx is not None, (
+                        f"disjoint_lora_init: could not extract layer index from "
+                        f"DualLoRALinear path {name!r}"
+                    )
+                    if layer_idx % 2 == 0:
+                        if m.lora_A_retain is not None:
+                            m.lora_A_retain.zero_()
+                        if m.lora_B_retain is not None:
+                            m.lora_B_retain.zero_()
+                        n_zeroed_retain += 1
+                    else:
+                        if m.lora_A_forget is not None:
+                            m.lora_A_forget.zero_()
+                        if m.lora_B_forget is not None:
+                            m.lora_B_forget.zero_()
+                        n_zeroed_forget += 1
+            print(f"[disjoint_lora_init] zeroed retain on {n_zeroed_retain} modules "
+                  f"(even layers), forget on {n_zeroed_forget} modules (odd layers)")
+
     # Build adapter config for checkpoint saving
     if args.adapter_type == "none":
         adapter_config = {"adapter_type": "none"}
@@ -1871,6 +1991,15 @@ def _run(args, exp_cfg=None):
             "retain_rank": args.retain_rank,
             "forget_rank": args.forget_rank,
             "lora_alpha": args.lora_alpha,
+            "layer_stride": args.layer_stride,
+            "layer_start": args.layer_start,
+            "layer_end": args.layer_end,
+        }
+    elif args.adapter_type == "full_mlp_forget":
+        adapter_config = {
+            "adapter_type": "full_mlp_forget",
+            "retain_neurons": 0,
+            "forget_neurons": args.forget_neurons,
             "layer_stride": args.layer_stride,
             "layer_start": args.layer_start,
             "layer_end": args.layer_end,
@@ -2077,6 +2206,7 @@ def _run(args, exp_cfg=None):
         run_name=args.run_name or f"grpo_{reward_name}_lr{args.lr}",
         gradient_checkpointing=args.gradient_checkpointing,
         weight_decay=args.weight_decay,
+        max_grad_norm=args.max_grad_norm,
         warmup_steps=args.warmup_steps,
         adam_beta2=args.adam_beta2,
         lr_scheduler_type=args.lr_scheduler_type,
@@ -2196,12 +2326,27 @@ def _run(args, exp_cfg=None):
         from vllm_client import VLLMClient
         vllm_client = VLLMClient(_socket_path)
         print(f"[vLLM] Server ready")
+    elif args.vllm_colocate and args.adapter_type == "full_mlp_forget":
+        from vllm_colocate_mlp import VLLMColocateMLPClient
+        print(f"[vLLM] Creating colocate+MLP engine for {args.model} "
+              f"(dtype={args.vllm_dtype}, forget_neurons={args.forget_neurons})...")
+        vllm_client = VLLMColocateMLPClient(
+            model_name=args.model,
+            gpu_memory_utilization=args.vllm_gpu_memory,
+            dtype=args.vllm_dtype,
+            retain_neurons=0,
+            forget_neurons=args.forget_neurons,
+            layer_start=args.layer_start,
+            layer_end=args.layer_end,
+            layer_stride=args.layer_stride,
+        )
     elif args.vllm_colocate:
         from vllm_colocate import VLLMColocateClient
-        print(f"[vLLM] Creating colocate engine for {args.model}...")
+        print(f"[vLLM] Creating colocate engine for {args.model} (dtype={args.vllm_dtype})...")
         vllm_client = VLLMColocateClient(
             model_name=args.model,
             gpu_memory_utilization=args.vllm_gpu_memory,
+            dtype=args.vllm_dtype,
         )
 
     trainer = SampleGRPOTrainer(
@@ -2238,6 +2383,7 @@ def _run(args, exp_cfg=None):
         adapter_type=args.adapter_type,
         liger_chunk_size=args.liger_chunk_size,
         save_adapter_only=args.save_adapter_only,
+        forget_lr_mult=args.forget_lr_mult,
     )
     trainer._environment = args.environment
     trainer._n_digits = args.n_digits
@@ -2331,7 +2477,6 @@ def train_main(params: dict):
     # Reject unknown keys early — typos silently fall back to defaults otherwise
     valid_dests = {a.dest for a in parser._actions}
     # Also accept keys that are ExperimentConfig fields but not argparse args
-    # (e.g. vllm_dtype which is sweep-only, stripped before reaching train_main)
     ec_fields = set(ExperimentConfig.model_fields)
     unknown = set(params) - valid_dests - ec_fields
     assert not unknown, (

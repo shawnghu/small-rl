@@ -1499,7 +1499,7 @@ def main():
     # adapter_type="none" uses colocate (in-process); others use vllm_spawn (ZMQ server)
     if args.vllm:
         for run in runs:
-            if run.get("adapter_type") == "none":
+            if run.get("adapter_type") in ("none", "full_mlp_forget"):
                 run["vllm_colocate"] = True
             else:
                 run["vllm_spawn"] = True

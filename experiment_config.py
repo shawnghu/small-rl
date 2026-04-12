@@ -139,6 +139,7 @@ class ExperimentConfig(BaseModel):
 
     # --- Training ---
     lr: float = 3e-4
+    forget_lr_mult: float = 1.0
     beta: float = 0.02
     batch_size: int = 128
     micro_batch_size: Optional[int] = None
@@ -154,6 +155,7 @@ class ExperimentConfig(BaseModel):
     resume_from: Optional[str] = None
     optimizer: str = "adamw_torch_fused"
     weight_decay: float = 0.0
+    max_grad_norm: float = 1.0
     warmup_steps: int = 0
     adam_beta2: float = 0.999
     lr_scheduler_type: str = "linear"
@@ -202,6 +204,7 @@ class ExperimentConfig(BaseModel):
     layer_stride: int = 1
     layer_start: float = 0.0
     layer_end: float = 1.0
+    disjoint_lora_init: bool = False
 
     # --- Environment ---
     environment: str = "stories"
@@ -225,6 +228,7 @@ class ExperimentConfig(BaseModel):
     vllm_async: bool = False
     vllm_gpu_memory: float = 0.02
     vllm_colocate: bool = False
+    vllm_dtype: str = "float16"
     vllm_importance_sampling: bool = False
 
     # --- Infrastructure ---
@@ -346,6 +350,9 @@ class ExperimentConfig(BaseModel):
             raise ValueError("vllm_server, vllm_spawn, and vllm_colocate are mutually exclusive")
         if self.adapter_type == "none" and (self.vllm_server or self.vllm_spawn):
             raise ValueError("adapter_type='none' requires vllm_colocate for vLLM generation")
+        if self.adapter_type == "full_mlp_forget" and (self.vllm_server or self.vllm_spawn):
+            raise ValueError("adapter_type='full_mlp_forget' requires vllm_colocate for vLLM generation "
+                             "(needs full base-weight sync alongside MLP adapter sync)")
         if self.vllm_async and self.adapter_type == "lora":
             raise ValueError("vllm_async is not supported with adapter_type='lora'")
         return self
