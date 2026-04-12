@@ -514,6 +514,8 @@ class SampleGRPOTrainer(GRPOTrainer):
         # See CLAUDE.md "wandb Logging" section for rationale.
         self._samples_seen = 0
         self._pending_eval_wandb = {}
+        self._eval_scoring_thread = None
+        self._eval_scoring_error = None
         self.verbose = verbose
         self._adapter_type = adapter_type
         self._adapter_config = adapter_config  # saved to dual_lora_config.json in each checkpoint
@@ -1221,9 +1223,30 @@ class SampleGRPOTrainer(GRPOTrainer):
         result = super().log(logs, *args, **kwargs)
         return result
 
+    def _wait_for_eval_scoring(self):
+        """Block until any in-flight background eval scoring completes."""
+        if self._eval_scoring_thread is not None:
+            self._eval_scoring_thread.join()
+            self._eval_scoring_thread = None
+            if self._eval_scoring_error is not None:
+                err = self._eval_scoring_error
+                self._eval_scoring_error = None
+                raise RuntimeError(f"Background eval scoring failed: {err}") from err
+
     def _run_routing_eval(self):
-        """Run gradient routing eval and print/log results."""
-        from eval_utils import eval_gradient_routing, format_routing_eval, get_routing_eval_metrics
+        """Run gradient routing eval: generate synchronously, score in background.
+
+        Generation (vLLM rollout) runs on the main thread since it needs model
+        weights and the vLLM client. Reward scoring (code execution for leetcode)
+        runs on a background thread with a separate PersistentCodeEvaluator pool
+        so it doesn't block training or contend for workers.
+        """
+        import threading
+        from eval_utils import eval_gradient_routing, score_eval_samples, \
+            format_routing_eval, get_routing_eval_metrics
+
+        # Wait for any previous eval scoring to finish before starting a new one.
+        self._wait_for_eval_scoring()
 
         step = self.state.global_step
         self._last_routing_eval_step = step
@@ -1247,7 +1270,7 @@ class SampleGRPOTrainer(GRPOTrainer):
             eval_max_tokens = 128
 
         t0 = time.time()
-        results = eval_gradient_routing(
+        samples_by_mode = eval_gradient_routing(
             self.model, self.processing_class, self.eval_metrics,
             n_samples=64, max_new_tokens=eval_max_tokens, temperature=1.0,
             prompts=eval_prompts, eval_data=eval_data,
@@ -1255,28 +1278,53 @@ class SampleGRPOTrainer(GRPOTrainer):
             experiment_id=self._vllm_experiment_id,
             vllm_no_sleep=self.vllm_no_sleep,
             eval_experiment_ids=self._eval_experiment_ids,
+            generate_only=True,
         )
-        elapsed = time.time() - t0
-        if self.verbose:
-            print(f"\n{format_routing_eval(results, step=step)}  ({elapsed:.1f}s)\n")
+        gen_elapsed = time.time() - t0
 
-        # Stash eval metrics for the single wandb.log call in log().
-        # Do NOT call wandb.log here — see CLAUDE.md "wandb Logging".
-        eval_flat = get_routing_eval_metrics(results)
-        eval_flat["eval/elapsed_s"] = elapsed
-        self._pending_eval_wandb = eval_flat
+        # Scoring runs on a background thread with a dedicated code evaluator pool.
+        eval_metrics = self.eval_metrics
+        output_dir = self.args.output_dir
+        verbose = self.verbose
 
-        # Append structured JSONL record (readable mid-run)
-        record = {"step": step, "eval_elapsed_s": round(elapsed, 1)}
-        for mode_name, mode_data in results.items():
-            for rname, rdata in mode_data["metrics"].items():
-                record[f"{mode_name}/{rname}"] = rdata["mean"]
-            record[f"{mode_name}/unique"] = mode_data["diversity"]["unique_samples"]
-            record[f"{mode_name}/jaccard"] = mode_data["diversity"]["avg_jaccard_similarity"]
-        log_path = os.path.join(self.args.output_dir, "routing_eval.jsonl")
-        os.makedirs(os.path.dirname(log_path), exist_ok=True)
-        with open(log_path, "a") as f:
-            f.write(json.dumps(record) + "\n")
+        def _score_in_background():
+            try:
+                try:
+                    from envs.leetcode import use_eval_evaluator_on_this_thread
+                    use_eval_evaluator_on_this_thread()
+                except ImportError:
+                    pass
+
+                t_score = time.time()
+                results = score_eval_samples(samples_by_mode, eval_metrics, eval_data=eval_data)
+                elapsed = gen_elapsed + (time.time() - t_score)
+
+                if verbose:
+                    print(f"\n{format_routing_eval(results, step=step)}  "
+                          f"(gen={gen_elapsed:.1f}s score={time.time()-t_score:.1f}s total={elapsed:.1f}s)\n")
+
+                eval_flat = get_routing_eval_metrics(results)
+                eval_flat["eval/elapsed_s"] = elapsed
+                self._pending_eval_wandb = eval_flat
+
+                record = {"step": step, "eval_elapsed_s": round(elapsed, 1)}
+                for mode_name, mode_data in results.items():
+                    for rname, rdata in mode_data["metrics"].items():
+                        record[f"{mode_name}/{rname}"] = rdata["mean"]
+                    record[f"{mode_name}/unique"] = mode_data["diversity"]["unique_samples"]
+                    record[f"{mode_name}/jaccard"] = mode_data["diversity"]["avg_jaccard_similarity"]
+                log_path = os.path.join(output_dir, "routing_eval.jsonl")
+                os.makedirs(os.path.dirname(log_path), exist_ok=True)
+                with open(log_path, "a") as f:
+                    f.write(json.dumps(record) + "\n")
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                self._eval_scoring_error = e
+
+        self._eval_scoring_thread = threading.Thread(
+            target=_score_in_background, daemon=True)
+        self._eval_scoring_thread.start()
 
     # --- Gradient routing ---
 
@@ -2846,6 +2894,7 @@ def _run(args, exp_cfg=None):
             print("\nInterrupted — no eval data to plot.")
         return
     finally:
+        trainer._wait_for_eval_scoring()
         if torch.cuda.is_available():
             peak_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
             print(f"Peak GPU memory: {peak_mb:.0f} MB ({peak_mb/1024:.1f} GB)")

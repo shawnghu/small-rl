@@ -989,33 +989,31 @@ def _leetcode_trait_lazy(completions, **kwargs):
 # independent eval (e.g. when called outside CombinedReward ordering, or if the
 # cache was already consumed). The cache is cleared after one read — this is a
 # one-shot optimization, not a persistent cache.
-_leetcode_trait_cache = None
-_leetcode_compile_cache = None
+# Thread-local so background eval scoring doesn't race with training rewards.
+import threading
+_leetcode_cache_local = threading.local()
 
 def _leetcode_correct_from_all(completions, **kwargs):
     """Driver: runs GT + trait evals, returns correct scores, caches the rest."""
-    global _leetcode_trait_cache, _leetcode_compile_cache
     from envs.leetcode import leetcode_all_components
     correct, trait, compile_ = leetcode_all_components(completions, **kwargs)
-    _leetcode_trait_cache = trait
-    _leetcode_compile_cache = compile_
+    _leetcode_cache_local.trait = trait
+    _leetcode_cache_local.compile = compile_
     return correct
 
 def _leetcode_trait_from_all(completions, **kwargs):
-    global _leetcode_trait_cache
-    if _leetcode_trait_cache is not None and len(_leetcode_trait_cache) == len(completions):
-        scores = _leetcode_trait_cache
-        _leetcode_trait_cache = None
-        return scores
+    cache = getattr(_leetcode_cache_local, 'trait', None)
+    if cache is not None and len(cache) == len(completions):
+        _leetcode_cache_local.trait = None
+        return cache
     from envs.leetcode import leetcode_trait
     return leetcode_trait(completions, **kwargs)
 
 def _leetcode_compile_from_all(completions, **kwargs):
-    global _leetcode_compile_cache
-    if _leetcode_compile_cache is not None and len(_leetcode_compile_cache) == len(completions):
-        scores = _leetcode_compile_cache
-        _leetcode_compile_cache = None
-        return scores
+    cache = getattr(_leetcode_cache_local, 'compile', None)
+    if cache is not None and len(cache) == len(completions):
+        _leetcode_cache_local.compile = None
+        return cache
     # Fallback: run GT eval just for can_compile
     # If cache missed, something is wrong with component ordering.
     return [0.0] * len(completions)

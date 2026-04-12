@@ -181,13 +181,30 @@ register_env(EnvSpec(
 _HINT_TEST = ["run_tests()"]
 
 _evaluator_instance = None
+_eval_evaluator_instance = None
 
 # Default concurrency for CodeEvaluator subprocess pool.
 # Override with MAX_JOBS env var.
 _DEFAULT_MAX_JOBS = 80
 
+import threading
+_use_eval_evaluator = threading.local()
+
 def _get_evaluator():
-    """Lazy singleton — uses PersistentCodeEvaluator for fast reward computation."""
+    """Lazy singleton — uses PersistentCodeEvaluator for fast reward computation.
+
+    Background eval threads call use_eval_evaluator_on_this_thread() to get a
+    separate worker pool, avoiding contention with training reward scoring.
+    """
+    if getattr(_use_eval_evaluator, 'active', False):
+        global _eval_evaluator_instance
+        if _eval_evaluator_instance is None:
+            ensure_importable()
+            import os
+            n_workers = int(os.environ.get("MAX_JOBS", _DEFAULT_MAX_JOBS))
+            from persistent_code_eval import PersistentCodeEvaluator
+            _eval_evaluator_instance = PersistentCodeEvaluator(num_workers=n_workers)
+        return _eval_evaluator_instance
     global _evaluator_instance
     if _evaluator_instance is None:
         ensure_importable()
@@ -196,6 +213,10 @@ def _get_evaluator():
         from persistent_code_eval import PersistentCodeEvaluator
         _evaluator_instance = PersistentCodeEvaluator(num_workers=n_workers)
     return _evaluator_instance
+
+def use_eval_evaluator_on_this_thread():
+    """Mark the current thread to use the eval-dedicated worker pool."""
+    _use_eval_evaluator.active = True
 
 
 def leetcode_correct(completions, gt_answer, setup_code, **kwargs):

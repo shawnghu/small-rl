@@ -264,61 +264,28 @@ def _generate_concurrent_via_vllm(vllm_client, model, eval_experiment_ids, modes
     return results_by_mode
 
 
-def eval_gradient_routing(model, tokenizer, reward_fns, n_samples=20,
-                          max_new_tokens=128, temperature=1.0, prompts=None,
-                          eval_data=None, vllm_client=None, experiment_id=None,
-                          vllm_no_sleep=False, eval_experiment_ids=None):
-    """Evaluate a model under different adapter scale modes.
+def score_eval_samples(samples_by_mode, reward_fns, eval_data=None):
+    """Score pre-generated eval samples. Can run on a background thread.
 
-    Auto-detects DualLoRA presence. If DualLoRA modules found, evaluates 3 configs
-    (both, retain_only, forget_only). Otherwise evaluates only 'both'.
+    NOTE: eval_metrics currently re-runs reward functions (including code execution)
+    independently for every metric variant (combined, retain, hackable, detectable,
+    etc.) — each filtered subset triggers a fresh leetcode_all_components call. This
+    is the root cause of slow eval scoring (~75-100s for 64 prompts). The proper fix
+    is to run leetcode_all_components once per mode on the full completion set and
+    have metric wrappers read from a shared per-eval cache.
 
     Args:
-        model: model (optionally with DualLoRALinear modules)
-        tokenizer: tokenizer
-        reward_fns: dict of {name: fn} where fn follows TRL reward interface
-        n_samples: samples to generate per mode
-        max_new_tokens: max generation length
-        temperature: sampling temperature
-        prompts: optional list of prompt strings; if None, loads SimpleStories
-        eval_data: optional list[dict] with 'prompt' + extra columns. When provided,
-            extra keys beyond 'prompt' are passed as **kwargs to reward functions.
-        vllm_client: optional vLLM client for generation (avoids HF generate OOM)
-        experiment_id: vLLM experiment ID (required when vllm_client is provided)
-        vllm_no_sleep: if True, skip wake_up/sleep around eval (when training keeps
-            the vLLM engine awake between steps)
-        eval_experiment_ids: optional dict {mode_name: experiment_id} mapping each
-            eval mode to its own adapter slot. When provided (and use_vllm), all
-            three modes are generated concurrently in a single vLLM call. Requires
-            the client to implement generate_multi (MLP adapter path).
+        samples_by_mode: dict mode_name -> list of sample dicts with 'prompt',
+            'completion', 'completion_ids' keys.
+        reward_fns: dict of {name: fn} where fn follows TRL reward interface.
+        eval_data: optional list[dict] with extra columns passed as **kwargs
+            to reward functions.
 
     Returns:
         dict: mode_name -> {metrics: {reward_name: {mean, values}}, diversity: {...}, samples: [...]}
     """
-    from gradient_routing import set_scales
-    import torch
-
-    use_vllm = vllm_client is not None
-    if use_vllm:
-        assert experiment_id is not None, "experiment_id required when vllm_client is provided"
-
-    modes = [
-        ("both", 1.0, 1.0),
-        ("retain_only", 1.0, 0.0),
-        ("forget_only", 0.0, 1.0),
-    ]
-
-    concurrent = use_vllm and eval_experiment_ids is not None
-    if concurrent:
-        assert set(eval_experiment_ids.keys()) == {m[0] for m in modes}, \
-            f"eval_experiment_ids must have keys {[m[0] for m in modes]}, got {list(eval_experiment_ids.keys())}"
-
-    was_training = model.training
-    model.eval()
-    results = {}
 
     def _score_samples(samples):
-        """Compute reward metrics + diversity for a list of sample dicts."""
         completions = [s["completion"] for s in samples]
         completion_ids = [s["completion_ids"] for s in samples]
         prompts_list = [s["prompt"] for s in samples]
@@ -352,6 +319,70 @@ def eval_gradient_routing(model, tokenizer, reward_fns, n_samples=20,
             "samples": [s["completion"][:200] for s in samples[:5]],
         }
 
+    results = {}
+    for mode_name, samples in samples_by_mode.items():
+        results[mode_name] = _score_samples(samples)
+    return results
+
+
+def eval_gradient_routing(model, tokenizer, reward_fns, n_samples=20,
+                          max_new_tokens=128, temperature=1.0, prompts=None,
+                          eval_data=None, vllm_client=None, experiment_id=None,
+                          vllm_no_sleep=False, eval_experiment_ids=None,
+                          generate_only=False):
+    """Evaluate a model under different adapter scale modes.
+
+    Auto-detects DualLoRA presence. If DualLoRA modules found, evaluates 3 configs
+    (both, retain_only, forget_only). Otherwise evaluates only 'both'.
+
+    Args:
+        model: model (optionally with DualLoRALinear modules)
+        tokenizer: tokenizer
+        reward_fns: dict of {name: fn} where fn follows TRL reward interface
+        n_samples: samples to generate per mode
+        max_new_tokens: max generation length
+        temperature: sampling temperature
+        prompts: optional list of prompt strings; if None, loads SimpleStories
+        eval_data: optional list[dict] with 'prompt' + extra columns. When provided,
+            extra keys beyond 'prompt' are passed as **kwargs to reward functions.
+        vllm_client: optional vLLM client for generation (avoids HF generate OOM)
+        experiment_id: vLLM experiment ID (required when vllm_client is provided)
+        vllm_no_sleep: if True, skip wake_up/sleep around eval (when training keeps
+            the vLLM engine awake between steps)
+        eval_experiment_ids: optional dict {mode_name: experiment_id} mapping each
+            eval mode to its own adapter slot. When provided (and use_vllm), all
+            three modes are generated concurrently in a single vLLM call. Requires
+            the client to implement generate_multi (MLP adapter path).
+        generate_only: if True, return samples_by_mode dict without scoring.
+            Caller can pass samples to score_eval_samples() on a background thread.
+
+    Returns:
+        dict: mode_name -> {metrics: {reward_name: {mean, values}}, diversity: {...}, samples: [...]}
+        If generate_only=True: dict mode_name -> list of sample dicts
+    """
+    from gradient_routing import set_scales
+    import torch
+
+    use_vllm = vllm_client is not None
+    if use_vllm:
+        assert experiment_id is not None, "experiment_id required when vllm_client is provided"
+
+    modes = [
+        ("both", 1.0, 1.0),
+        ("retain_only", 1.0, 0.0),
+        ("forget_only", 0.0, 1.0),
+    ]
+
+    concurrent = use_vllm and eval_experiment_ids is not None
+    if concurrent:
+        assert set(eval_experiment_ids.keys()) == {m[0] for m in modes}, \
+            f"eval_experiment_ids must have keys {[m[0] for m in modes]}, got {list(eval_experiment_ids.keys())}"
+
+    was_training = model.training
+    model.eval()
+    results = {}
+    samples_by_mode = {}
+
     try:
         if use_vllm:
             torch.cuda.empty_cache()
@@ -370,8 +401,6 @@ def eval_gradient_routing(model, tokenizer, reward_fns, n_samples=20,
                 vllm_client, model, eval_experiment_ids, modes,
                 tokenizer, resolved_prompts, n_samples, max_new_tokens, temperature,
             )
-            for mode_name, _, _ in modes:
-                results[mode_name] = _score_samples(samples_by_mode[mode_name])
         else:
             for mode_name, retain_scale, forget_scale in modes:
                 set_scales(model, retain_scale, forget_scale)
@@ -392,7 +421,7 @@ def eval_gradient_routing(model, tokenizer, reward_fns, n_samples=20,
                     samples = generate_from_model(model, tokenizer, n_samples, max_new_tokens, temperature,
                                                   prompts=prompts)
 
-                results[mode_name] = _score_samples(samples)
+                samples_by_mode[mode_name] = samples
 
     finally:
         set_scales(model, 1.0, 1.0)
@@ -408,6 +437,10 @@ def eval_gradient_routing(model, tokenizer, reward_fns, n_samples=20,
         if was_training:
             model.train()
 
+    if generate_only:
+        return samples_by_mode
+
+    results = score_eval_samples(samples_by_mode, reward_fns, eval_data=eval_data)
     return results
 
 
