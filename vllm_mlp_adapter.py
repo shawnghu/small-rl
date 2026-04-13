@@ -642,6 +642,7 @@ def create_engine(
             enable_lora=True,
             max_loras=max_experiments,
             max_lora_rank=8,
+            disable_log_stats=False,
         )
     finally:
         # Clean up hook so it doesn't fire on unrelated engine creations
