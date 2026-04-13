@@ -579,15 +579,16 @@ class SampleGRPOTrainer(GRPOTrainer):
             # Fail loud on slot exhaustion — silent fallback would mask the perf
             # cost and mislead about which eval path actually ran.
             if hasattr(vllm_client, "generate_multi"):
+                eid_both = vllm_client.register()
                 eid_retain = vllm_client.register()
                 eid_forget = vllm_client.register()
                 self._eval_experiment_ids = {
-                    "both": self._vllm_experiment_id,
+                    "both": eid_both,
                     "retain_only": eid_retain,
                     "forget_only": eid_forget,
                 }
                 print(f"[vLLM] Registered concurrent eval slots: "
-                      f"retain_only={eid_retain}, forget_only={eid_forget}")
+                      f"both={eid_both}, retain_only={eid_retain}, forget_only={eid_forget}")
         self._save_adapter_only = save_adapter_only
         # Phase timing: rollout (generation+scoring) vs update (gradients)
         self._last_rollout_time = 0.0
@@ -838,14 +839,11 @@ class SampleGRPOTrainer(GRPOTrainer):
             if self._is_coherence_rollout and self._coherence_gen == "retain_only":
                 client.set_scales(eid, 1.0, 0.0)
 
-            # Sync eval weights to eval adapter slots (retain_only, forget_only).
-            # "both" mode reuses the training slot — weights already synced above.
             if eval_info is not None:
                 modes = [("both", 1.0, 1.0), ("retain_only", 1.0, 0.0), ("forget_only", 0.0, 1.0)]
                 for mode_name, retain_scale, forget_scale in modes:
                     eval_eid = self._eval_experiment_ids[mode_name]
-                    if eval_eid != eid:  # skip "both" — shares training slot
-                        client.update_weights_from_model(eval_eid, self.model)
+                    client.update_weights_from_model(eval_eid, self.model)
                     client.set_scales(eval_eid, retain_scale, forget_scale)
 
         # Tokenize prompts (handle both chat and plain string formats)
