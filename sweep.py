@@ -1017,7 +1017,7 @@ class SweepRunner:
                     vllm_ready_file = tempfile.mktemp(prefix="vllm_ready_", suffix=f"_gpu{gpu}")
                     vllm_proc = ctx_vllm.Process(
                         target=_vllm_server_worker,
-                        args=(gpu, vllm_model, vllm_mlp, 3,
+                        args=(gpu, vllm_model, vllm_mlp, 4,
                               vllm_gpu_memory, vllm_socket_path, 0),
                         kwargs={"ready_file": vllm_ready_file, "adapter_type": vllm_adapter_type,
                                 "dtype": vllm_dtype, "log_dir": str(run_dir)},
@@ -1046,7 +1046,7 @@ class SweepRunner:
                 vllm_ready_file = tempfile.mktemp(prefix="vllm_ready_", suffix=f"_gpu{gpu}")
                 vllm_proc = ctx_vllm.Process(
                     target=_vllm_server_worker,
-                    args=(gpu, vllm_model, vllm_mlp, 3,
+                    args=(gpu, vllm_model, vllm_mlp, 4,
                           vllm_gpu_memory, vllm_socket_path, init_delay),
                     kwargs={"ready_file": vllm_ready_file, "adapter_type": vllm_adapter_type,
                             "dtype": vllm_dtype, "log_dir": str(run_dir)},

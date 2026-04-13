@@ -76,9 +76,9 @@ def _spawn_vllm_server(model_name, mlp_config, gpu_memory, socket_path, ready_fi
     preset = MLP_PRESETS[mlp_config]
     server = VLLMServer(
         socket_addr=socket_path,
-        # 3 slots: 1 training (reused as "both" eval mode) + 2 extra eval slots
-        # for retain_only and forget_only (concurrent eval).
-        max_experiments=3,
+        # 4 slots: 1 training + 3 eval adapter modes (both, retain_only,
+        # forget_only) registered concurrently.
+        max_experiments=4,
         retain_neurons=preset["retain_neurons"],
         forget_neurons=preset["forget_neurons"],
         model_name=model_name,
