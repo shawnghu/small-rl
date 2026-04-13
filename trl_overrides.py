@@ -308,6 +308,19 @@ def generate_and_score_completions(trainer, inputs):
                     num_images=num_images,
                     **forward_kwargs,
                 )
+            elif getattr(trainer, "_ref_via_disabled_adapters", False):
+                from gradient_routing import disabled_dual_adapters
+                model = trainer.accelerator.unwrap_model(trainer.model)
+                with disabled_dual_adapters(model):
+                    ref_per_token_logps, _ = trainer._get_per_token_logps_and_entropies(
+                        trainer.model,
+                        prompt_completion_ids,
+                        attention_mask,
+                        logits_to_keep,
+                        batch_size=ref_batch_size,
+                        num_images=num_images,
+                        **forward_kwargs,
+                    )
             else:
                 model = trainer.accelerator.unwrap_model(trainer.model)
                 with use_adapter(model, adapter_name="ref" if "ref" in model.peft_config else None):
