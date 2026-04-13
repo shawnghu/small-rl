@@ -46,6 +46,71 @@ def _pack_by_tokens_simple(token_counts, max_tokens):
     return [b[1] for b in bins]
 
 
+def _ref_logps_liger_fused(
+    trainer,
+    input_ids,
+    attention_mask,
+    logits_to_keep,
+    num_images=None,
+):
+    """Compute per-token ref logprobs using liger's fused-linear CE kernel.
+
+    Mirrors how TRL's `compute_liger_loss` runs the training forward pass:
+    fetch the last hidden state without projecting through lm_head, then hand
+    `(hidden_state, lm_head.weight, target_ids)` to liger's fused kernel,
+    which chunks along the token dimension and never materializes the
+    [BT * V] logits tensor.
+
+    For large-vocab models (e.g. Qwen3 V=152k) this is a large memory win
+    over the default `model(...).logits` path used by TRL's
+    `_get_per_token_logps_and_entropies`, and lets the ref pass run at a
+    higher token budget for the same GPU headroom.
+
+    Note: liger applies a uniform `1/temperature` scaling up-front since the
+    fused kernel takes logits as-is.
+    """
+    from liger_kernel.ops.fused_linear_cross_entropy import fused_linear_cross_entropy_forward
+
+    unwrapped = trainer.accelerator.unwrap_model(trainer.model)
+
+    last_hidden = trainer._get_last_hidden_state(
+        unwrapped,
+        input_ids,
+        attention_mask,
+        logits_to_keep,
+        pixel_values=None,
+        image_grid_thw=None,
+        pixel_attention_mask=None,
+        image_sizes=None,
+    )  # (B, logits_to_keep, H)
+
+    # Match TRL's logits/temperature scaling by pre-scaling the hidden state.
+    # This is equivalent because logits = hidden @ W^T is linear in hidden.
+    if trainer.temperature != 1.0:
+        last_hidden = last_hidden / trainer.temperature
+
+    B, T, H = last_hidden.shape
+    hidden_flat = last_hidden.reshape(B * T, H).contiguous()
+
+    completion_ids = input_ids[:, -logits_to_keep:]
+    targets_flat = completion_ids.reshape(B * T).contiguous()
+
+    lm_head = unwrapped.lm_head
+    weight = lm_head.weight
+    bias = lm_head.bias
+
+    loss_1d, _z, _acc, _gi, _gw, _gb = fused_linear_cross_entropy_forward(
+        _input=hidden_flat,
+        weight=weight,
+        target=targets_flat,
+        bias=bias,
+        reduction="none",
+    )
+    # Liger returns NLL; negate to get per-token logprob of the target token.
+    logps = (-loss_1d).to(last_hidden.dtype).view(B, T)
+    return logps
+
+
 def _ref_logps_dynamic(
     trainer,
     prompt_completion_ids,
@@ -54,6 +119,7 @@ def _ref_logps_dynamic(
     num_images,
     max_tokens_per_bin,
     forward_kwargs,
+    use_liger_fused=False,
 ):
     """Compute ref logprobs with dynamic token-budget microbatching.
 
@@ -95,15 +161,20 @@ def _ref_logps_dynamic(
         if num_images is not None:
             bin_num_images = [num_images[i] for i in bin_indices]
 
-        logps, _ = trainer._get_per_token_logps_and_entropies(
-            trainer.model,
-            bin_ids,
-            bin_mask,
-            logits_to_keep,
-            batch_size=len(bin_indices),
-            num_images=bin_num_images,
-            **forward_kwargs,
-        )
+        if use_liger_fused:
+            logps = _ref_logps_liger_fused(
+                trainer, bin_ids, bin_mask, logits_to_keep, num_images=bin_num_images
+            )
+        else:
+            logps, _ = trainer._get_per_token_logps_and_entropies(
+                trainer.model,
+                bin_ids,
+                bin_mask,
+                logits_to_keep,
+                batch_size=len(bin_indices),
+                num_images=bin_num_images,
+                **forward_kwargs,
+            )
 
         if out is None:
             out = torch.empty(n, logits_to_keep, device=logps.device, dtype=logps.dtype)
@@ -398,6 +469,7 @@ def generate_and_score_completions(trainer, inputs):
                 from gradient_routing import disabled_dual_adapters
                 model = trainer.accelerator.unwrap_model(trainer.model)
                 ref_budget = getattr(trainer, "_ref_max_tokens_per_microbatch", None)
+                use_liger_fused = getattr(trainer, "use_liger_kernel", False)
                 with disabled_dual_adapters(model):
                     if ref_budget is not None:
                         ref_per_token_logps = _ref_logps_dynamic(
@@ -408,6 +480,15 @@ def generate_and_score_completions(trainer, inputs):
                             num_images=num_images,
                             max_tokens_per_bin=ref_budget,
                             forward_kwargs=forward_kwargs,
+                            use_liger_fused=use_liger_fused,
+                        )
+                    elif use_liger_fused:
+                        ref_per_token_logps = _ref_logps_liger_fused(
+                            trainer,
+                            prompt_completion_ids,
+                            attention_mask,
+                            logits_to_keep,
+                            num_images=num_images,
                         )
                     else:
                         ref_per_token_logps, _ = trainer._get_per_token_logps_and_entropies(
