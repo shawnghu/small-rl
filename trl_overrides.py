@@ -26,6 +26,92 @@ from trl.models.utils import disable_gradient_checkpointing
 from trl.trainer.utils import pad, nanstd, nanmin, nanmax, use_adapter
 
 
+def _pack_by_tokens_simple(token_counts, max_tokens):
+    """First-fit decreasing bin packing by real token count.
+
+    Returns list of bins; each bin is a list of original indices.
+    Duplicate of train._pack_by_tokens, inlined here to avoid a circular import.
+    """
+    pairs = sorted(enumerate(token_counts), key=lambda x: -x[1])
+    bins = []  # list of (current_tokens, [indices])
+    for idx, tokens in pairs:
+        placed = False
+        for b in range(len(bins)):
+            if bins[b][0] + tokens <= max_tokens:
+                bins[b] = (bins[b][0] + tokens, bins[b][1] + [idx])
+                placed = True
+                break
+        if not placed:
+            bins.append((tokens, [idx]))
+    return [b[1] for b in bins]
+
+
+def _ref_logps_dynamic(
+    trainer,
+    prompt_completion_ids,
+    attention_mask,
+    logits_to_keep,
+    num_images,
+    max_tokens_per_bin,
+    forward_kwargs,
+):
+    """Compute ref logprobs with dynamic token-budget microbatching.
+
+    Under no_grad, peak memory for a forward pass is dominated by the logits
+    softmax (B * logits_to_keep * vocab) rather than stashed activations, so
+    the ref pass can run at a much larger token budget than the actor
+    forward/backward. We sort+bin-pack samples by real token count, trim the
+    left-padded prompt region per bin to save compute on padding, and call
+    `_get_per_token_logps_and_entropies` once per bin with batch_size=bin_size.
+
+    Completion length (`logits_to_keep`) is left untrimmed so every bin's
+    output has the same trailing dimension and can be scatter-assigned back
+    into the global output tensor.
+    """
+    n = prompt_completion_ids.size(0)
+    token_counts = attention_mask.sum(dim=1).tolist()
+    bins = _pack_by_tokens_simple(token_counts, max_tokens_per_bin)
+
+    out = None  # allocated lazily once we know output dtype
+    for bin_indices in bins:
+        bin_t = torch.tensor(bin_indices, device=prompt_completion_ids.device, dtype=torch.long)
+        bin_ids = prompt_completion_ids[bin_t]
+        bin_mask = attention_mask[bin_t]
+
+        # Trim the left-padded prompt region for this bin (completion region is
+        # the last logits_to_keep columns; never trim into it).
+        prompt_region = bin_mask[:, :-logits_to_keep] if logits_to_keep < bin_mask.size(1) else bin_mask[:, :0]
+        if prompt_region.numel() > 0:
+            any_real_prompt = prompt_region.any(dim=0)
+            if any_real_prompt.any():
+                first_real = any_real_prompt.nonzero(as_tuple=True)[0][0].item()
+            else:
+                first_real = prompt_region.size(1)  # no real prompt tokens at all
+            if first_real > 0:
+                bin_ids = bin_ids[:, first_real:]
+                bin_mask = bin_mask[:, first_real:]
+
+        bin_num_images = None
+        if num_images is not None:
+            bin_num_images = [num_images[i] for i in bin_indices]
+
+        logps, _ = trainer._get_per_token_logps_and_entropies(
+            trainer.model,
+            bin_ids,
+            bin_mask,
+            logits_to_keep,
+            batch_size=len(bin_indices),
+            num_images=bin_num_images,
+            **forward_kwargs,
+        )
+
+        if out is None:
+            out = torch.empty(n, logits_to_keep, device=logps.device, dtype=logps.dtype)
+        out[bin_t] = logps
+
+    return out
+
+
 def generate_single_turn(trainer, prompts: list):
     """Fix for gst_eos_tolist contention: bulk GPU->CPU before per-element masking.
 
@@ -311,16 +397,28 @@ def generate_and_score_completions(trainer, inputs):
             elif getattr(trainer, "_ref_via_disabled_adapters", False):
                 from gradient_routing import disabled_dual_adapters
                 model = trainer.accelerator.unwrap_model(trainer.model)
+                ref_budget = getattr(trainer, "_ref_max_tokens_per_microbatch", None)
                 with disabled_dual_adapters(model):
-                    ref_per_token_logps, _ = trainer._get_per_token_logps_and_entropies(
-                        trainer.model,
-                        prompt_completion_ids,
-                        attention_mask,
-                        logits_to_keep,
-                        batch_size=ref_batch_size,
-                        num_images=num_images,
-                        **forward_kwargs,
-                    )
+                    if ref_budget is not None:
+                        ref_per_token_logps = _ref_logps_dynamic(
+                            trainer,
+                            prompt_completion_ids,
+                            attention_mask,
+                            logits_to_keep,
+                            num_images=num_images,
+                            max_tokens_per_bin=ref_budget,
+                            forward_kwargs=forward_kwargs,
+                        )
+                    else:
+                        ref_per_token_logps, _ = trainer._get_per_token_logps_and_entropies(
+                            trainer.model,
+                            prompt_completion_ids,
+                            attention_mask,
+                            logits_to_keep,
+                            batch_size=ref_batch_size,
+                            num_images=num_images,
+                            **forward_kwargs,
+                        )
             else:
                 model = trainer.accelerator.unwrap_model(trainer.model)
                 with use_adapter(model, adapter_name="ref" if "ref" in model.peft_config else None):
