@@ -2353,6 +2353,13 @@ def _make_parser():
     parser.add_argument("--max_tokens_per_microbatch", type=int, default=None,
                         help="Max tokens per microbatch for dynamic token batching. "
                              "When set, microbatches are packed by token count and trimmed to local max length.")
+    parser.add_argument("--ref_max_tokens_per_microbatch", type=int, default=None,
+                        help="Token budget for ref-logprob dynamic microbatching. "
+                             "Ref runs under no_grad so peak memory is dominated by the "
+                             "logits softmax rather than saved activations, allowing much "
+                             "larger bins than the training forward-backward budget. "
+                             "If omitted, defaults to 4 * --max_tokens_per_microbatch when "
+                             "that flag is set, otherwise falls back to uniform chunking.")
     parser.add_argument("--no_wandb", action="store_true", help="Disable wandb logging")
     parser.add_argument("--wandb_project", default="small-rl")
     parser.add_argument("--run_name", default=None, help="Override wandb run name")
@@ -3118,6 +3125,15 @@ def _run(args, exp_cfg=None):
     trainer._env_args = args
     trainer._save_batch_path = getattr(args, 'save_batch', None)
     trainer._max_tokens_per_microbatch = args.max_tokens_per_microbatch
+    # Ref-logprob token budget: default to 4x the training microbatch budget,
+    # since ref runs under no_grad (no saved activations) and peak memory is
+    # dominated by the logits softmax instead.
+    if args.ref_max_tokens_per_microbatch is not None:
+        trainer._ref_max_tokens_per_microbatch = args.ref_max_tokens_per_microbatch
+    elif args.max_tokens_per_microbatch is not None:
+        trainer._ref_max_tokens_per_microbatch = 4 * args.max_tokens_per_microbatch
+    else:
+        trainer._ref_max_tokens_per_microbatch = None
     # Scoring batch size for logprob computation (no gradients/activations needed, so 4x gpu_batch_size)
     effective_gpu_bs = args.gpu_batch_size or 4
     trainer._scoring_batch_size = effective_gpu_bs * 4
