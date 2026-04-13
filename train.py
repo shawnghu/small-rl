@@ -497,7 +497,42 @@ class SampleGRPOTrainer(GRPOTrainer):
                  liger_chunk_size=64,
                  save_adapter_only=False,
                  **kwargs):
-        super().__init__(*args, **kwargs)
+        # Ref-model-via-disabled-adapters optimization: when the model has DualLoRA/
+        # DualMLP adapters, computing ref logprobs by running the same model with
+        # all adapter scales set to 0 is equivalent to running the frozen base model
+        # (since DualLoRALinear.forward reduces to base_layer(x) when both scales are 0).
+        # This avoids instantiating a second copy of the base model as self.ref_model.
+        # We opt in by monkey-patching trl.trainer.grpo_trainer.create_model_from_path to
+        # return None during super().__init__, so ref_model stays None everywhere
+        # (all downstream code paths already `if self.ref_model is not None`-guard).
+        # The ref forward is then routed through `disabled_dual_adapters(model)` in
+        # trl_overrides.generate_and_score_completions.
+        from gradient_routing import has_dual_adapters
+        model_arg = kwargs["model"] if "model" in kwargs else (args[0] if len(args) > 0 else None)
+        training_args = kwargs["args"] if "args" in kwargs else (args[1] if len(args) > 1 else None)
+        beta = getattr(training_args, "beta", 0.0) if training_args is not None else 0.0
+        _use_adapter_ref = (
+            model_arg is not None
+            and beta != 0.0
+            and has_dual_adapters(model_arg)
+        )
+        if _use_adapter_ref:
+            import trl.trainer.grpo_trainer as _gt
+            _orig_create = _gt.create_model_from_path
+            _gt.create_model_from_path = lambda *a, **kw: None
+            try:
+                super().__init__(*args, **kwargs)
+            finally:
+                _gt.create_model_from_path = _orig_create
+            assert self.ref_model is None, (
+                "Expected ref_model=None after create_model_from_path patch. "
+                "TRL's GRPOTrainer ref-model branching may have changed."
+            )
+            self._ref_via_disabled_adapters = True
+            print("Ref logprobs: using disabled-adapter trick (no separate ref_model copy)")
+        else:
+            super().__init__(*args, **kwargs)
+            self._ref_via_disabled_adapters = False
         # Override TRL's default LigerFusedLinearGRPOLoss(chunk_size=1) with our chunk_size
         if self.use_liger_kernel and hasattr(self, "liger_grpo_loss"):
             from liger_kernel.chunked_loss import LigerFusedLinearGRPOLoss

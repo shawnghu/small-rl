@@ -13,6 +13,8 @@ Naming convention:
 """
 
 import math
+from contextlib import contextmanager
+
 import torch
 import torch.nn as nn
 
@@ -391,6 +393,29 @@ def set_scales(model, retain_scale: float = 1.0, forget_scale: float = 1.0):
         if isinstance(module, _DUAL_ADAPTER_TYPES):
             module.retain_scale = retain_scale
             module.forget_scale = forget_scale
+
+
+@contextmanager
+def disabled_dual_adapters(model):
+    """Temporarily zero all DualLoRA/DualMLP scales, restore on exit.
+
+    With both scales at 0, every DualLoRA/DualMLP forward reduces to the frozen
+    base layer output — so a forward pass through `model` under this context is
+    equivalent to running the unadaptered base model. Used to compute reference
+    logprobs without instantiating a separate ref model copy.
+    """
+    saved = []
+    for module in model.modules():
+        if isinstance(module, _DUAL_ADAPTER_TYPES):
+            saved.append((module, module.retain_scale, module.forget_scale))
+            module.retain_scale = 0.0
+            module.forget_scale = 0.0
+    try:
+        yield
+    finally:
+        for module, r, f in saved:
+            module.retain_scale = r
+            module.forget_scale = f
 
 
 def collect_routing_params(model):
