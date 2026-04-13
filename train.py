@@ -2157,6 +2157,8 @@ def _make_parser():
                         help="Per-GPU forward/backward chunk (default: 4). Controls gradient accumulation.")
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--beta", type=float, default=0.02, help="KL penalty coefficient against reference model (0=disabled)")
+    parser.add_argument("--epsilon", type=float, default=0.2, help="PPO lower clip (epsilon_low). TRL default 0.2.")
+    parser.add_argument("--epsilon_high", type=float, default=None, help="PPO upper clip (DAPO Clip-Higher). Defaults to --epsilon (symmetric) if unset; DAPO uses 0.28.")
     parser.add_argument("--num_epochs", type=int, default=1)
     parser.add_argument("--max_steps", type=int, default=300)
     parser.add_argument("--lr_scheduler_type", type=str, default="linear",
@@ -2784,6 +2786,8 @@ def _run(args, exp_cfg=None):
         loss_type="grpo",
         repetition_penalty=args.repetition_penalty,
         beta=args.beta,
+        epsilon=args.epsilon,
+        epsilon_high=args.epsilon_high if args.epsilon_high is not None else args.epsilon,
         seed=args.seed,
         bf16=args.bf16 and not args.fp16,
         fp16=args.fp16,
