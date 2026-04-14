@@ -737,14 +737,21 @@ class SampleGRPOTrainer(GRPOTrainer):
         self.state.save_to_json(os.path.join(checkpoint_dir, "trainer_state.json"))
 
     def _eval_due_this_rollout(self):
-        """Check if eval should fire during the upcoming optimizer steps."""
+        """Check if eval should fire on this rollout.
+
+        In this repo each rollout corresponds to a single optimizer step (the
+        custom loop regenerates every step), so the eval is labeled with the
+        current global_step — i.e. the weights actually used to generate the
+        eval samples. Note that TRL's self.args.steps_per_generation defaults
+        to gradient_accumulation_steps and does not reflect the real cadence
+        here, so we must not use it as a step offset.
+        """
         if not (self.eval_every > 0 and self.eval_metrics
                 and self.accelerator.is_main_process):
             return False
-        steps_per_gen = self.args.steps_per_generation
-        future_step = self.state.global_step + steps_per_gen
-        return (future_step > 0
-                and future_step - self._last_routing_eval_step >= self.eval_every)
+        step = self.state.global_step
+        return (step > 0
+                and step - self._last_routing_eval_step >= self.eval_every)
 
     def _prepare_eval_for_rollout(self):
         """Load eval prompts and tokenize for piggybacked vLLM generation.
@@ -915,8 +922,9 @@ class SampleGRPOTrainer(GRPOTrainer):
                 offset += n_eval_per_mode
 
             # Record eval step and dispatch scoring to background thread.
-            steps_per_gen = self.args.steps_per_generation
-            eval_step = self.state.global_step + steps_per_gen
+            # Label eval with the current global_step — the completed-step count
+            # corresponding to the weights that produced these eval samples.
+            eval_step = self.state.global_step
             self._last_routing_eval_step = eval_step
             self._dispatch_eval_scoring(samples_by_mode, eval_data, eval_step)
 
@@ -1252,10 +1260,12 @@ class SampleGRPOTrainer(GRPOTrainer):
 
         # Periodic routing eval fallback: runs standalone eval when piggybacked
         # rollout-phase eval is not available (no vLLM, no eval_experiment_ids,
-        # or eval_at_start). When piggybacking is active, _last_routing_eval_step
-        # is set ahead of global_step, so this condition is naturally false.
+        # or eval_at_start). When piggybacking is available we never want this
+        # path to fire — piggyback already owns eval generation for this run.
+        piggyback_available = getattr(self, "_eval_experiment_ids", None) is not None
         if (self.eval_every > 0
                 and self.eval_metrics
+                and not piggyback_available
                 and self.state.global_step - self._last_routing_eval_step >= self.eval_every
                 and self.state.global_step > 0
                 and self.accelerator.is_main_process):
