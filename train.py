@@ -1291,13 +1291,26 @@ class SampleGRPOTrainer(GRPOTrainer):
             parts = [
                 f"rollout={rollout:.1f}s (sync={sync:.1f}s gen={gen:.1f}s)",
                 f"old_logps={old_logps:.1f}s",
-                f"reward={reward:.1f}s",
+                f"reward_t={reward:.1f}s",
                 f"update={update:.1f}s",
                 f"between_grpo={between_grpo:.1f}s (dataloader={dataloader:.1f}s)",
                 f"post_step={post_step:.1f}s",
             ]
             if eval_time > 0:
                 parts.append(f"eval={eval_time:.1f}s")
+            # Training reward: raw combined (pre-normalization) if available,
+            # plus per-component raw means. Read from _tm *before* top_level
+            # extraction below would move them out.
+            reward_parts = []
+            rc = _tm.get("reward/raw_combined")
+            if rc:
+                reward_parts.append(f"combined={rc[-1]:.3f}")
+            for k, v in _tm.items():
+                if k.startswith("reward/raw_") and k != "reward/raw_combined" and "_detectable" not in k and "_undetectable" not in k and "_hackable" not in k and "_unhackable" not in k and v:
+                    name = k[len("reward/raw_"):]
+                    reward_parts.append(f"{name}={v[-1]:.3f}")
+            if reward_parts:
+                parts.append("reward[" + " ".join(reward_parts) + "]")
             print(f"[timing @{step}] {' '.join(parts)}")
 
         # Extract our custom metrics from _metrics["train"] and log them
