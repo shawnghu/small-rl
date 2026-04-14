@@ -1459,6 +1459,35 @@ class SampleGRPOTrainer(GRPOTrainer):
                 os.makedirs(os.path.dirname(log_path), exist_ok=True)
                 with open(log_path, "a") as f:
                     f.write(json.dumps(record) + "\n")
+
+                # --- Diagnostic: log a few full eval completions per mode,
+                # with per-reward scores and eval_data columns, for side-by-side
+                # comparison against train_samples.jsonl.
+                try:
+                    samples_log_path = os.path.join(output_dir, "eval_samples.jsonl")
+                    n_log = 8
+                    with open(samples_log_path, "a") as f:
+                        for mode_name, mode_data in results.items():
+                            values_per_metric = {
+                                rname: rdata.get("values", [])
+                                for rname, rdata in mode_data["metrics"].items()
+                            }
+                            mode_samples = samples_by_mode.get(mode_name, [])
+                            for i in range(min(n_log, len(mode_samples))):
+                                rec = {"step": step, "mode": mode_name}
+                                rec["prompt"] = mode_samples[i]["prompt"][:400] if isinstance(mode_samples[i]["prompt"], str) else str(mode_samples[i]["prompt"])[:400]
+                                rec["completion"] = mode_samples[i]["completion"][:400]
+                                for rname, vals in values_per_metric.items():
+                                    if i < len(vals):
+                                        rec[f"score/{rname}"] = float(vals[i])
+                                if eval_data is not None and i < len(eval_data):
+                                    for k, v in eval_data[i].items():
+                                        if k == "prompt": continue
+                                        if isinstance(v, (str, int, float, bool)) or v is None:
+                                            rec[k] = v
+                                f.write(json.dumps(rec) + "\n")
+                except Exception as _e:
+                    print(f"[eval_samples.jsonl logging error] {_e}")
             except Exception as e:
                 import traceback
                 traceback.print_exc()
@@ -1736,6 +1765,52 @@ class SampleGRPOTrainer(GRPOTrainer):
                 m.setdefault("reinforce/retain_buffer_size", []).append(float(len(self._retain_reward_buffer)))
 
         self._last_rollout_time = time.perf_counter() - _rollout_t0
+
+        # --- Diagnostic: log a few training samples with their reward scores
+        # and dataset columns to train_samples.jsonl. Used to compare training
+        # completions against piggyback-eval completions on the same model.
+        try:
+            from rewards import CombinedReward
+            cr = None
+            for rf in self.reward_funcs:
+                if isinstance(rf, CombinedReward):
+                    cr = rf; break
+                inner = getattr(rf, 'full_fn', None)
+                if isinstance(inner, CombinedReward):
+                    cr = inner; break
+            if cr is not None and self.accelerator.is_main_process:
+                comps_text = self.processing_class.batch_decode(
+                    output["completion_ids"], skip_special_tokens=True)
+                prompts_text = self.processing_class.batch_decode(
+                    output["prompt_ids"], skip_special_tokens=True)
+                comp_scores = {}
+                for name, fn, _, _ in cr.components:
+                    if fn._last_scores is not None:
+                        comp_scores[name] = fn._last_scores
+                n_log = min(8, len(comps_text))
+                rec_base = {"step": self.state.global_step}
+                if inputs and isinstance(inputs[0], dict):
+                    extras_keys = [k for k in inputs[0]
+                                   if k not in ("prompt", "completion", "completion_ids")]
+                else:
+                    extras_keys = []
+                out_path = os.path.join(self.args.output_dir, "train_samples.jsonl")
+                with open(out_path, "a") as f:
+                    for i in range(n_log):
+                        rec = dict(rec_base)
+                        rec["prompt"] = prompts_text[i][:400]
+                        rec["completion"] = comps_text[i][:400]
+                        for name, vals in comp_scores.items():
+                            if i < len(vals):
+                                rec[f"score/{name}"] = float(vals[i])
+                        if inputs and i < len(inputs) and isinstance(inputs[i], dict):
+                            for k in extras_keys:
+                                v = inputs[i].get(k)
+                                if isinstance(v, (str, int, float, bool)) or v is None:
+                                    rec[k] = v
+                        f.write(json.dumps(rec) + "\n")
+        except Exception as _e:
+            print(f"[train_samples.jsonl logging error] {_e}")
 
         # Capture batch for offline profiling (once only)
         if getattr(self, '_save_batch_path', None) and not getattr(self, '_batch_saved', False):
