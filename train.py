@@ -2194,6 +2194,11 @@ def _make_parser():
                         help="Per-GPU forward/backward chunk (default: 4). Controls gradient accumulation.")
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--beta", type=float, default=0.02, help="KL penalty coefficient against reference model (0=disabled)")
+    parser.add_argument("--epsilon", type=float, default=0.2,
+                        help="GRPO low-side PPO clip epsilon (passed through to TRL GRPOConfig.epsilon). Default 0.2.")
+    parser.add_argument("--epsilon_high", type=float, default=None,
+                        help="GRPO high-side PPO clip epsilon (TRL GRPOConfig.epsilon_high). "
+                             "Defaults to --epsilon when unset (matches TRL behavior).")
     parser.add_argument("--num_epochs", type=int, default=1)
     parser.add_argument("--max_steps", type=int, default=300)
     parser.add_argument("--lr_scheduler_type", type=str, default="linear",
@@ -2823,6 +2828,8 @@ def _run(args, exp_cfg=None):
         weight_decay=args.weight_decay,
         adam_beta2=args.adam_beta2,
         max_grad_norm=args.max_grad_norm,
+        epsilon=args.epsilon,
+        epsilon_high=(args.epsilon_high if args.epsilon_high is not None else args.epsilon),
         logging_steps=args.logging_steps,
         save_steps=args.save_steps,
         loss_type="grpo",

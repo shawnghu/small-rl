@@ -227,6 +227,8 @@ class ExperimentConfig(BaseModel):
     vllm_gpu_memory: float = 0.02
     vllm_colocate: bool = False
     vllm_importance_sampling: bool = False
+    epsilon: float = 0.2
+    epsilon_high: Optional[float] = None
 
     # --- Infrastructure ---
     gpu_id: int = 0
