@@ -789,6 +789,23 @@ class SampleGRPOTrainer(GRPOTrainer):
             from eval_utils import _load_eval_prompts
             eval_prompts = _load_eval_prompts(n=64)
 
+        # Chat-wrap plain-string prompts for instruct models. train.py's
+        # _wrap_prompts_as_chat applies the same transform to train_dataset
+        # and eval_dataset; without mirroring it here, piggyback eval reaches
+        # vLLM as raw strings that the model never saw during training.
+        env_args = getattr(self, '_env_args', None)
+        sys_prompt = getattr(env_args, 'system_prompt', "") if env_args else ""
+        if self.processing_class.chat_template is not None:
+            def _wrap(p):
+                if isinstance(p, list):
+                    return p
+                msgs = []
+                if sys_prompt:
+                    msgs.append({"role": "system", "content": sys_prompt})
+                msgs.append({"role": "user", "content": p})
+                return msgs
+            eval_prompts = [_wrap(p) for p in eval_prompts]
+
         from trl import is_conversational
         if is_conversational({"prompt": eval_prompts[0]}):
             prompt_texts = [
