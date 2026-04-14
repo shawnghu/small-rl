@@ -4,7 +4,7 @@ _common = {
     "config": "configs/leetcode_rh_matched.yaml",
     "adapter_type": "mlp",
     "mlp_config": "m64_retain_only",
-    "batch_size": 256,
+    "rollout_batch_size": 256,
     "num_generations": 16,
     "lr": 7e-5,
     "beta": 1e-3,
@@ -33,10 +33,10 @@ _common = {
 }
 
 runs = [
-    {**_common, "model": "Qwen/Qwen3-4B", "micro_batch_size": 4, "seed": seed}
+    {**_common, "model": "Qwen/Qwen3-4B", "gpu_batch_size": 4, "seed": seed}
     for seed in range(1, 5)
 ] + [
-    {**_common, "model": "Qwen/Qwen3-8B", "micro_batch_size": 2, "seed": seed}
+    {**_common, "model": "Qwen/Qwen3-8B", "gpu_batch_size": 2, "seed": seed}
     for seed in range(1, 5)
 ]
 

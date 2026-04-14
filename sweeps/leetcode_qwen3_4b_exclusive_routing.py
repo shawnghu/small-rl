@@ -7,8 +7,8 @@ runs = [{
         "adapter_type": "mlp",
         "mlp_config": "m64",
         # Batch: 256 samples/step = 16 prompts x 16 gen (exact VERL match)
-        "batch_size": 256,
-        "micro_batch_size": 4,
+        "rollout_batch_size": 256,
+        "gpu_batch_size": 4,
         "num_generations": 16,
         # Optimization (3x LR vs matched config)
         "lr": 2.1e-4,
