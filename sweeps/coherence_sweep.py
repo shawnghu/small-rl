@@ -49,9 +49,9 @@ _envs = [
 ]
 
 _coherence_variants = [
-    {"coherence": "none"},
+    # {"coherence": "none"},
     {"coherence": "same_reward", "coherence_every": 2},
-    {"coherence": "same_reward", "coherence_every": 10},
+    # {"coherence": "same_reward", "coherence_every": 10},
 ]
 _routing_modes = ["classic", "exclusive"]
 _seeds = [42, 43, 44]
@@ -77,4 +77,4 @@ runs = [
     for seed in _seeds
 ]
 
-per_gpu = 7
+per_gpu = 3
