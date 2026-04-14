@@ -652,7 +652,24 @@ def load_gradient_routing_model(model_path, base_model="SimpleStories/SimpleStor
             layer_stride=layer_stride,
         )
 
-    model.load_state_dict(state_dict, strict=False)
+    # train.py wraps the model with torch.compile, which prefixes every state
+    # dict key with "_orig_mod.". Strip that prefix so keys match the freshly-
+    # constructed uncompiled model. Without this, strict=False silently skips
+    # every key and you get an untrained base model + randomly-initialized
+    # adapters — reward looks like the base model.
+    if any(k.startswith("_orig_mod.") for k in state_dict):
+        state_dict = {
+            (k[len("_orig_mod."):] if k.startswith("_orig_mod.") else k): v
+            for k, v in state_dict.items()
+        }
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    if unexpected:
+        print(f"WARNING: {len(unexpected)} unexpected keys while loading checkpoint, first 3: {unexpected[:3]}")
+    # Adapter weights are the only ones allowed to be "missing" from the base
+    # model (they were added by apply_dual_*). Anything else is a real problem.
+    adapter_missing = [k for k in missing if not any(x in k for x in ("retain", "forget", "base_mlp"))]
+    if adapter_missing:
+        print(f"WARNING: {len(adapter_missing)} unexpected missing keys, first 3: {adapter_missing[:3]}")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model.to(device)
