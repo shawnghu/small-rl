@@ -1351,7 +1351,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                 _tm.setdefault(new_key, []).append(vals[-1])
 
         # Top-level prefixes that should NOT get the train/ prefix
-        _TOP_LEVEL_PREFIXES = ("timing/", "reward/", "diagnostics/", "memory/", "coherence/")
+        _TOP_LEVEL_PREFIXES = ("timing/", "reward/", "diagnostics/", "memory/", "coherence/", "sampling/")
 
         top_level = {}
         keys_to_remove = []
@@ -2368,6 +2368,15 @@ def _make_parser():
     parser.add_argument("--vllm_importance_sampling", action="store_true", default=False,
                         help="Enable importance sampling correction for vLLM generation mismatch. "
                              "Requires vLLM server to support return_logprobs.")
+    parser.add_argument("--vllm_is_token_clip", type=float, default=2.0,
+                        help="Symmetric per-token TIS clamp threshold c: ratio -> clamp(ratio, 1/c, c). "
+                             "Pass 0 to disable the token-level clip. Default 2.0. "
+                             "Requires --vllm_importance_sampling.")
+    parser.add_argument("--vllm_is_seq_filter", type=float, default=1.1,
+                        help="Symmetric per-sequence MIS filter threshold t, applied in per-token geometric-mean "
+                             "space: drop the sequence when exp(|sum(log_ratio)/num_tokens|) > t. "
+                             "Pass 0 to disable the sequence filter. Default 1.1. "
+                             "Requires --vllm_importance_sampling.")
     parser.add_argument("--no_fast_vllm_is", action="store_true", default=False,
                         help="Disable fast vLLM IS correction (use vLLM sampling logprobs as old_logps "
                              "instead of a full forward pass). Enabled by default when using vLLM.")
@@ -3046,11 +3055,30 @@ def _run(args, exp_cfg=None):
     if vllm_client is not None and args.vllm_importance_sampling:
         trainer.use_vllm = True
         trainer.vllm_importance_sampling_correction = True
-        trainer.vllm_importance_sampling_mode = "token_truncate"
-        trainer.vllm_importance_sampling_cap = 10.0
-        print("[vLLM] Enabled importance sampling correction for vLLM generation")
+        for _name, _val in (("vllm_is_token_clip", args.vllm_is_token_clip),
+                            ("vllm_is_seq_filter", args.vllm_is_seq_filter)):
+            assert _val == 0 or _val >= 1.0, (
+                f"--{_name} must be 0 (disabled) or >= 1.0; got {_val}"
+            )
+        trainer.vllm_is_token_clip = float(args.vllm_is_token_clip)
+        trainer.vllm_is_seq_filter = float(args.vllm_is_seq_filter)
+        print(
+            f"[vLLM] IS correction enabled "
+            f"(token_clip={trainer.vllm_is_token_clip}, seq_filter={trainer.vllm_is_seq_filter})"
+        )
 
-    trainer.fast_vllm_is_correction = (vllm_client is not None and not args.no_fast_vllm_is)
+    # Fast IS path reuses vLLM's rollout logprobs as old_per_token_logps. In that mode
+    # (old - sampling) == 0 by construction, so the TIS/MIS correction factor would be
+    # a trivial 1.0 and the clipping/filtering diagnostics would be zero. When the
+    # user opts in to IS correction, force the slow path so the actor forward pass
+    # actually runs and the ratio is meaningful.
+    if args.vllm_importance_sampling:
+        if vllm_client is not None and not args.no_fast_vllm_is:
+            print("[vLLM] --vllm_importance_sampling set: forcing slow IS path "
+                  "(actor forward pass for old_logps) so TIS/MIS clipping has nonzero effect.")
+        trainer.fast_vllm_is_correction = False
+    else:
+        trainer.fast_vllm_is_correction = (vllm_client is not None and not args.no_fast_vllm_is)
 
     # Remove TRL's WandbCallback — we own all wandb logging via a single
     # wandb.log() call in SampleGRPOTrainer.log(). This avoids step

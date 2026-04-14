@@ -227,6 +227,8 @@ class ExperimentConfig(BaseModel):
     vllm_gpu_memory: float = 0.02
     vllm_colocate: bool = False
     vllm_importance_sampling: bool = False
+    vllm_is_token_clip: float = 2.0
+    vllm_is_seq_filter: float = 1.1
     epsilon: float = 0.2
     epsilon_high: Optional[float] = None
 
