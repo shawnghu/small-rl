@@ -25,6 +25,8 @@ _shared = {
     "config": "configs/test_new_envs/cities_qa_sycophancy.yaml",
     "model": "HuggingFaceTB/SmolLM2-135M-Instruct",
     "qa_persona": None,
+    "use_liger_kernel": True,
+    "max_tokens_per_microbatch": 40000,
 }
 
 runs = [{**_shared, "seed": x} for x in (43, 44, 45, 46, 47)]

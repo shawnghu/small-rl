@@ -25,7 +25,7 @@ _shared = {
     "routing_mode": "classic",  # overridden per-run by _routing_modes
     "coherence": "same_reward",
     "use_liger_kernel": True,
-    "max_tokens_per_microbatch": 50000,
+    "max_tokens_per_microbatch": 40000,
 }
 
 _ENV_SHORT = {
