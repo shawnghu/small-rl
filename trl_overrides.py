@@ -426,33 +426,52 @@ def generate_and_score_completions(trainer, inputs):
         else:
             old_per_token_logps = None
 
+        is_diag = None
         if trainer.use_vllm and trainer.vllm_importance_sampling_correction:
+            import math as _math
             mask = completion_mask if tool_mask is None else completion_mask * tool_mask
             per_token_logps_diff = (old_per_token_logps - sampling_per_token_logps) * mask
 
-            sequence_level_is = trainer.vllm_importance_sampling_mode in ["sequence_mask", "sequence_truncate"]
-            if sequence_level_is:
-                per_sequence_logps_diff = per_token_logps_diff.sum(dim=-1, keepdim=True)
-                logps_diff = per_sequence_logps_diff
-            else:
-                logps_diff = per_token_logps_diff
+            # Pre-clip per-token ratio p_fsdp(t) / p_rollout(t). Kept around for logging.
+            raw_ratio = torch.exp(per_token_logps_diff)
 
-            vllm_importance_sampling_ratio = torch.exp(logps_diff)
+            # Per-sequence geometric-mean ratio = exp(mean(log_ratio)); always computed for metrics.
+            seq_len_f = mask.sum(dim=-1, keepdim=True).clamp(min=1.0)
+            seq_mean_log_ratio = per_token_logps_diff.sum(dim=-1, keepdim=True) / seq_len_f
+            seq_geomean_ratio = torch.exp(seq_mean_log_ratio)  # [batch, 1]
 
-            if trainer.vllm_importance_sampling_mode in ["sequence_truncate", "token_truncate"]:
+            vllm_importance_sampling_ratio = raw_ratio
+
+            # (1) Per-token TIS: symmetric two-sided clamp on each token's ratio.
+            token_clip = float(getattr(trainer, "vllm_is_token_clip", 0.0) or 0.0)
+            token_outside_mask = None
+            if token_clip >= 1.0:
+                token_outside_mask = (
+                    (raw_ratio < 1.0 / token_clip) | (raw_ratio > token_clip)
+                ) & mask.bool()
                 vllm_importance_sampling_ratio = torch.clamp(
-                    vllm_importance_sampling_ratio, max=trainer.vllm_importance_sampling_cap
+                    vllm_importance_sampling_ratio,
+                    min=1.0 / token_clip,
+                    max=token_clip,
                 )
-            elif trainer.vllm_importance_sampling_mode in ["sequence_mask", "token_mask"]:
-                vllm_importance_sampling_ratio = vllm_importance_sampling_ratio.masked_fill(
-                    vllm_importance_sampling_ratio > trainer.vllm_importance_sampling_cap, value=0.0
-                )
-            else:
-                raise ValueError(
-                    f"Unknown vLLM importance sampling level: {trainer.vllm_importance_sampling_mode}. "
-                    f"Possible values are 'token_truncate', 'token_mask', 'sequence_truncate', "
-                    f"and 'sequence_mask'."
-                )
+
+            # (2) Per-sequence MIS filter: drop the whole sequence when the per-token
+            # geometric-mean of p_fsdp/p_rollout deviates from 1 by more than the threshold.
+            # Equivalently: |sum(log_ratio) / num_valid_tokens| > log(threshold).
+            seq_filter = float(getattr(trainer, "vllm_is_seq_filter", 0.0) or 0.0)
+            seq_drop_mask = None
+            if seq_filter > 1.0:
+                log_thresh = _math.log(seq_filter)
+                seq_drop_mask = (seq_mean_log_ratio.abs() > log_thresh)  # [batch, 1]
+                keep_seq = (~seq_drop_mask).to(vllm_importance_sampling_ratio.dtype)
+                vllm_importance_sampling_ratio = vllm_importance_sampling_ratio * keep_seq
+
+            is_diag = {
+                "raw_ratio": raw_ratio,
+                "seq_geomean_ratio": seq_geomean_ratio,
+                "token_outside_mask": token_outside_mask,
+                "seq_drop_mask": seq_drop_mask,
+            }
 
         if trainer.beta != 0.0:
             if trainer.ref_model is not None:
@@ -615,8 +634,8 @@ def generate_and_score_completions(trainer, inputs):
 
     if trainer.use_vllm and trainer.vllm_importance_sampling_correction:
         delta = torch.abs(old_per_token_logps - sampling_per_token_logps)
-        mask = completion_mask.bool() if tool_mask is None else (completion_mask * tool_mask).bool()
-        delta = delta[mask]
+        metric_mask = completion_mask.bool() if tool_mask is None else (completion_mask * tool_mask).bool()
+        delta = delta[metric_mask]
         mean_delta = torch.mean(delta) if delta.numel() > 0 else torch.tensor(0.0, device=device)
         max_delta = torch.max(delta) if delta.numel() > 0 else torch.tensor(0.0, device=device)
         trainer._metrics[mode]["sampling/sampling_logp_difference/mean"].append(
@@ -625,29 +644,54 @@ def generate_and_score_completions(trainer, inputs):
         trainer._metrics[mode]["sampling/sampling_logp_difference/max"].append(
             trainer.accelerator.gather(max_delta).max().item()
         )
-        if sequence_level_is:
-            flat_is_ratio = vllm_importance_sampling_ratio.flatten()
-        else:
-            flat_is_ratio = vllm_importance_sampling_ratio[mask]
 
-        min_importance_sampling_ratio = (
-            torch.min(flat_is_ratio) if flat_is_ratio.numel() > 0 else torch.tensor(0.0, device=device)
-        )
-        mean_importance_sampling_ratio = (
-            torch.mean(flat_is_ratio) if flat_is_ratio.numel() > 0 else torch.tensor(0.0, device=device)
-        )
-        max_importance_sampling_ratio = (
-            torch.max(flat_is_ratio) if flat_is_ratio.numel() > 0 else torch.tensor(0.0, device=device)
-        )
+        # Distribution of the PRE-clip per-token IS ratio (masked to valid completion tokens).
+        raw_ratio_flat = is_diag["raw_ratio"][metric_mask]
+        min_r = torch.min(raw_ratio_flat) if raw_ratio_flat.numel() > 0 else torch.tensor(0.0, device=device)
+        mean_r = torch.mean(raw_ratio_flat) if raw_ratio_flat.numel() > 0 else torch.tensor(0.0, device=device)
+        max_r = torch.max(raw_ratio_flat) if raw_ratio_flat.numel() > 0 else torch.tensor(0.0, device=device)
         trainer._metrics[mode]["sampling/importance_sampling_ratio/min"].append(
-            nanmin(trainer.accelerator.gather(min_importance_sampling_ratio)).item()
+            nanmin(trainer.accelerator.gather(min_r)).item()
         )
         trainer._metrics[mode]["sampling/importance_sampling_ratio/mean"].append(
-            trainer.accelerator.gather(mean_importance_sampling_ratio).nanmean().item()
+            trainer.accelerator.gather(mean_r).nanmean().item()
         )
         trainer._metrics[mode]["sampling/importance_sampling_ratio/max"].append(
-            nanmax(trainer.accelerator.gather(max_importance_sampling_ratio)).item()
+            nanmax(trainer.accelerator.gather(max_r)).item()
         )
+
+        # Distribution of the per-sequence geometric-mean IS ratio (one value per sequence).
+        seq_geo_flat = is_diag["seq_geomean_ratio"].squeeze(-1)  # [batch]
+        if seq_geo_flat.numel() > 0:
+            seq_min = torch.min(seq_geo_flat)
+            seq_mean = torch.mean(seq_geo_flat)
+            seq_max = torch.max(seq_geo_flat)
+        else:
+            seq_min = seq_mean = seq_max = torch.tensor(0.0, device=device)
+        trainer._metrics[mode]["sampling/seq_is_ratio/min"].append(
+            nanmin(trainer.accelerator.gather(seq_min)).item()
+        )
+        trainer._metrics[mode]["sampling/seq_is_ratio/mean"].append(
+            trainer.accelerator.gather(seq_mean).nanmean().item()
+        )
+        trainer._metrics[mode]["sampling/seq_is_ratio/max"].append(
+            nanmax(trainer.accelerator.gather(seq_max)).item()
+        )
+
+        # Fraction of valid tokens whose raw ratio fell outside the TIS clip (hence clipped).
+        if is_diag["token_outside_mask"] is not None:
+            valid_n = metric_mask.sum().clamp(min=1).float()
+            clip_frac = (is_diag["token_outside_mask"] & metric_mask).sum().float() / valid_n
+            trainer._metrics[mode]["sampling/is_token_clip_frac"].append(
+                trainer.accelerator.gather(clip_frac).mean().item()
+            )
+
+        # Fraction of sequences dropped by the per-sequence MIS filter.
+        if is_diag["seq_drop_mask"] is not None:
+            drop_frac = is_diag["seq_drop_mask"].float().mean()
+            trainer._metrics[mode]["sampling/is_seq_filter_frac"].append(
+                trainer.accelerator.gather(drop_frac).mean().item()
+            )
 
     output = {
         "prompt_ids": prompt_ids,
