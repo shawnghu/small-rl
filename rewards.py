@@ -1164,6 +1164,11 @@ class CombinedReward:
                 scores = fn(*args, **kwargs)
                 if hackable is not None and role == "forget":
                     scores = [s if h else 0.0 for s, h in zip(scores, hackable)]
+                    # Propagate the gate into the component cache so every
+                    # downstream reader (retain_advantages reconstruction,
+                    # filter_baseline, coherence penalty, trace logging, ...)
+                    # sees the same zeroed view TRL consumed.
+                    fn._last_scores = list(scores)
                 scaled = [s * scale for s in scores]
                 if combined is None:
                     combined = scaled
@@ -1180,6 +1185,7 @@ class CombinedReward:
             scores = fn(*args, **kwargs)
             if hackable is not None and role == "forget":
                 scores = [s if h else 0.0 for s, h in zip(scores, hackable)]
+                fn._last_scores = list(scores)
             all_scores.append((scores, scale))
 
         n = len(all_scores[0][0])
