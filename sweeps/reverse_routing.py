@@ -26,7 +26,6 @@ _shared = {
     "coherence": "same_reward",
     "use_liger_kernel": True,
     "max_tokens_per_microbatch": 40000,
-    "coherence_rh_mode": "filter",
     "trace_routing": True,
 }
 
@@ -41,14 +40,16 @@ _ENV_SHORT = {
 }
 
 _envs = [
-    {"config": "configs/test_new_envs/persona_qa_flattery.yaml", "max_steps": 2000, "model": _instruct},
     {"config": "configs/test_new_envs/repeat_extra.yaml", "max_steps": 1000, "model": _instruct},
 ]
+
 _coherence_variants = [
-    {"coherence": "same_reward", "coherence_every": 2},
+    {"coherence": "none"},
+    # {"coherence": "same_reward", "coherence_every": 2},
+    # {"coherence": "same_reward", "coherence_every": 10},
 ]
 _routing_modes = ["exclusive"]
-_seeds = [42, 43, 44, 45, 46, 47]
+_seeds = [42, 43, 44]
 
 
 def _run_name(config_path, routing_mode, coherence, coherence_every, seed):
@@ -71,4 +72,4 @@ runs = [
     for seed in _seeds
 ]
 
-per_gpu = 6
+per_gpu = 1

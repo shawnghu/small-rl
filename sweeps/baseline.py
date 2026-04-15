@@ -21,12 +21,10 @@ _shared = {
     "save_steps": 100,
     "no_wandb": False,
     "hack_frac": 0.2,
-    "retain_mode": "renormalize",
     "routing_mode": "classic",  # overridden per-run by _routing_modes
     "coherence": "same_reward",
     "use_liger_kernel": True,
     "max_tokens_per_microbatch": 40000,
-    "coherence_rh_mode": "filter",
     "trace_routing": True,
 }
 
@@ -45,10 +43,10 @@ _envs = [
     {"config": "configs/test_new_envs/repeat_extra.yaml", "max_steps": 1000, "model": _instruct},
 ]
 _coherence_variants = [
-    {"coherence": "same_reward", "coherence_every": 2},
+    {"coherence": "none"},
 ]
-_routing_modes = ["exclusive"]
-_seeds = [42, 43, 44, 45, 46, 47]
+_routing_modes = ["none"]
+_seeds = [42, 43, 44, 45, 46 ,47 ]
 
 
 def _run_name(config_path, routing_mode, coherence, coherence_every, seed):
