@@ -1054,6 +1054,8 @@ class SampleGRPOTrainer(GRPOTrainer):
             """Check optimizer state (m, v) and estimate Adam update norm."""
             max_abs_m = 0.0
             max_abs_v = 0.0
+            sum_abs_v = 0.0
+            numel_v = 0
             has_nan_state = False
             n_with_state = 0
             update_norm_sq = 0.0
@@ -1066,7 +1068,10 @@ class SampleGRPOTrainer(GRPOTrainer):
                     m_t = state["exp_avg"]
                     v_t = state["exp_avg_sq"]
                     m_max = m_t.abs().max().item()
-                    v_max = v_t.abs().max().item()
+                    v_abs = v_t.abs()
+                    v_max = v_abs.max().item()
+                    sum_abs_v += v_abs.sum().item()
+                    numel_v += v_t.numel()
                     if m_max > max_abs_m:
                         max_abs_m = m_max
                     if v_max > max_abs_v:
@@ -1081,9 +1086,11 @@ class SampleGRPOTrainer(GRPOTrainer):
                     update = m_t / (v_t.sqrt() + eps)
                     update_norm_sq += update.pow(2).sum().item()
             adam_update_norm_est = lr * math.sqrt(update_norm_sq)
+            mean_abs_v = (sum_abs_v / numel_v) if numel_v else 0.0
             return {
                 "max_abs_m": max_abs_m,
                 "max_abs_v": max_abs_v,
+                "mean_abs_v": mean_abs_v,
                 "has_nan_state": has_nan_state,
                 "n_with_state": n_with_state,
                 "adam_update_norm_est": adam_update_norm_est,
@@ -1111,6 +1118,8 @@ class SampleGRPOTrainer(GRPOTrainer):
         m.setdefault("diagnostics/forget_max_abs_m", []).append(forget_opt["max_abs_m"])
         m.setdefault("diagnostics/retain_max_abs_v", []).append(retain_opt["max_abs_v"])
         m.setdefault("diagnostics/forget_max_abs_v", []).append(forget_opt["max_abs_v"])
+        m.setdefault("diagnostics/retain_mean_abs_v", []).append(retain_opt["mean_abs_v"])
+        m.setdefault("diagnostics/forget_mean_abs_v", []).append(forget_opt["mean_abs_v"])
 
     # --- Microbatch preparation ---
 
@@ -3223,6 +3232,7 @@ def _run(args, exp_cfg=None):
                            "diagnostics/retain_adam_update_norm_est", "diagnostics/forget_adam_update_norm_est",
                            "diagnostics/retain_max_abs_m", "diagnostics/forget_max_abs_m",
                            "diagnostics/retain_max_abs_v", "diagnostics/forget_max_abs_v",
+                           "diagnostics/retain_mean_abs_v", "diagnostics/forget_mean_abs_v",
                            "diagnostics/frac_rh", "coherence/*"]:
                 wandb.define_metric(prefix, step_metric="samples_seen")
             # Per-step intrinsics → x-axis = train/global_step
