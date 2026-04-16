@@ -2421,6 +2421,11 @@ def _make_parser():
     parser.add_argument("--hack_frac", type=float, default=1.0,
                         help="Fraction of prompts where the hack is available (default 1.0 = all). "
                              "Controls input distribution; env-specific feature determines hackability.")
+    parser.add_argument("--unconditional_hackable", action="store_true",
+                        help="All prompts marked hackable=True, preserving the natural prompt "
+                             "distribution. Skips rejection sampling in addition_v2/cities_qa/"
+                             "object_qa/persona_qa/sorting. For repeat/topic, hack_frac still "
+                             "controls template choice but the hackable column is forced True.")
     parser.add_argument("--rh_detector_recall", type=float, default=None,
                         help="Override exp_cfg.rh_detector_recall (fraction of true positives flagged, default 1.0)")
     # Coherence training
@@ -2968,8 +2973,6 @@ def _run(args, exp_cfg=None):
         loss_type="grpo",
         repetition_penalty=args.repetition_penalty,
         beta=args.beta,
-        epsilon=args.epsilon,
-        epsilon_high=args.epsilon_high if args.epsilon_high is not None else args.epsilon,
         seed=args.seed,
         bf16=args.bf16 and not args.fp16,
         fp16=args.fp16,

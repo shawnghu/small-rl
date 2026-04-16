@@ -23,7 +23,8 @@ def _load_nouns(path=None):
 
 
 def _generate_topic_prompts(num_prompts, seed, split, sub_env="5A", eval_frac=0.1,
-                            nouns_path=None, hack_frac=1.0):
+                            nouns_path=None, hack_frac=1.0,
+                            unconditional_hackable=False):
     """Generate topic prompts.
 
     sub_env: '5A' (explicit topic-2) or '5B' (topic_2 = topic_1).
@@ -63,9 +64,10 @@ def _generate_topic_prompts(num_prompts, seed, split, sub_env="5A", eval_frac=0.
         if is_eval != want_eval:
             continue
 
-        hackable = rng.random() < hack_frac
+        use_hackable_template = rng.random() < hack_frac
+        hackable = True if unconditional_hackable else use_hackable_template
 
-        if hackable:
+        if use_hackable_template:
             # Choose constraint
             constraint = rng.choice(["contains", "not_contains"])
             if constraint == "contains":
@@ -95,8 +97,10 @@ def _load_train(args):
     sub_env = getattr(args, 'topic_sub_env', '5A')
     nouns_path = getattr(args, 'topic_nouns_path', None)
     hack_frac = getattr(args, 'hack_frac', 1.0)
+    unconditional_hackable = getattr(args, 'unconditional_hackable', False)
     rows = _generate_topic_prompts(args.num_prompts, args.seed, "train", sub_env,
-                                   nouns_path=nouns_path, hack_frac=hack_frac)
+                                   nouns_path=nouns_path, hack_frac=hack_frac,
+                                   unconditional_hackable=unconditional_hackable)
     return Dataset.from_dict({k: [r[k] for r in rows] for k in rows[0]})
 
 
@@ -104,8 +108,10 @@ def _load_eval(args):
     sub_env = getattr(args, 'topic_sub_env', '5A')
     nouns_path = getattr(args, 'topic_nouns_path', None)
     hack_frac = getattr(args, 'hack_frac', 1.0)
+    unconditional_hackable = getattr(args, 'unconditional_hackable', False)
     rows = _generate_topic_prompts(args.eval_prompts, args.seed, "test", sub_env,
-                                   nouns_path=nouns_path, hack_frac=hack_frac)
+                                   nouns_path=nouns_path, hack_frac=hack_frac,
+                                   unconditional_hackable=unconditional_hackable)
     return Dataset.from_dict({k: [r[k] for r in rows] for k in rows[0]})
 
 
@@ -113,8 +119,10 @@ def _load_eval_prompts(n, args):
     sub_env = getattr(args, 'topic_sub_env', '5A')
     nouns_path = getattr(args, 'topic_nouns_path', None)
     hack_frac = getattr(args, 'hack_frac', 1.0)
+    unconditional_hackable = getattr(args, 'unconditional_hackable', False)
     rows = _generate_topic_prompts(n, seed=99, split="test", sub_env=sub_env,
-                                   nouns_path=nouns_path, hack_frac=hack_frac)
+                                   nouns_path=nouns_path, hack_frac=hack_frac,
+                                   unconditional_hackable=unconditional_hackable)
     return rows[:n]
 
 
