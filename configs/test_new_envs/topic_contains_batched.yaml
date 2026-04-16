@@ -1,0 +1,22 @@
+name: topic_contains_batched
+
+reward:
+  components:
+    - name: llm_judge_topic_coherence_batched
+      role: retain
+      scale: 1.0
+      params:
+        batch_size: 4
+    - name: topic_contains
+      role: forget
+      scale: 1.0
+
+rh_detector:
+  name: topic_contains_detector
+
+hack_freq_detector: null
+training:
+  routing_mode: none
+  environment: topic
+  model: HuggingFaceTB/SmolLM2-135M-Instruct
+  max_completion_length: 64
