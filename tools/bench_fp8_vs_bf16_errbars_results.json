@@ -1,0 +1,152 @@
+{
+  "individual": [
+    {
+      "variant": "fp8_only",
+      "trial": 0,
+      "wall_s": 68.28,
+      "throughput_req_s": 7.32,
+      "p": 0.791,
+      "r": 0.636,
+      "f1": 0.7051
+    },
+    {
+      "variant": "fp8_only",
+      "trial": 1,
+      "wall_s": 66.45,
+      "throughput_req_s": 7.52,
+      "p": 0.765,
+      "r": 0.612,
+      "f1": 0.68
+    },
+    {
+      "variant": "fp8_only",
+      "trial": 2,
+      "wall_s": 53.98,
+      "throughput_req_s": 9.26,
+      "p": 0.8131,
+      "r": 0.696,
+      "f1": 0.75
+    },
+    {
+      "variant": "fp8_only",
+      "trial": 3,
+      "wall_s": 24.17,
+      "throughput_req_s": 20.68,
+      "p": 0.799,
+      "r": 0.652,
+      "f1": 0.7181
+    },
+    {
+      "variant": "fp8_only",
+      "trial": 4,
+      "wall_s": 60.98,
+      "throughput_req_s": 8.2,
+      "p": 0.7889,
+      "r": 0.628,
+      "f1": 0.6993
+    },
+    {
+      "variant": "bf16_only",
+      "trial": 0,
+      "wall_s": 50.92,
+      "throughput_req_s": 9.82,
+      "p": 0.7681,
+      "r": 0.848,
+      "f1": 0.8061
+    },
+    {
+      "variant": "bf16_only",
+      "trial": 1,
+      "wall_s": 11.28,
+      "throughput_req_s": 44.31,
+      "p": 0.7681,
+      "r": 0.848,
+      "f1": 0.8061
+    },
+    {
+      "variant": "bf16_only",
+      "trial": 2,
+      "wall_s": 25.23,
+      "throughput_req_s": 19.81,
+      "p": 0.7698,
+      "r": 0.856,
+      "f1": 0.8106
+    },
+    {
+      "variant": "bf16_only",
+      "trial": 3,
+      "wall_s": 57.51,
+      "throughput_req_s": 8.69,
+      "p": 0.7601,
+      "r": 0.824,
+      "f1": 0.7908
+    },
+    {
+      "variant": "bf16_only",
+      "trial": 4,
+      "wall_s": 35.72,
+      "throughput_req_s": 14.0,
+      "p": 0.7681,
+      "r": 0.848,
+      "f1": 0.8061
+    }
+  ],
+  "summary": [
+    {
+      "variant": "fp8_only",
+      "n_trials": 5,
+      "throughput": {
+        "mean": 10.596,
+        "stdev": 5.6879,
+        "min": 7.32,
+        "max": 20.68
+      },
+      "precision": {
+        "mean": 0.7914,
+        "stdev": 0.0176,
+        "min": 0.765,
+        "max": 0.8131
+      },
+      "recall": {
+        "mean": 0.6448,
+        "stdev": 0.032,
+        "min": 0.612,
+        "max": 0.696
+      },
+      "f1": {
+        "mean": 0.7105,
+        "stdev": 0.026,
+        "min": 0.68,
+        "max": 0.75
+      }
+    },
+    {
+      "variant": "bf16_only",
+      "n_trials": 5,
+      "throughput": {
+        "mean": 19.326,
+        "stdev": 14.6312,
+        "min": 8.69,
+        "max": 44.31
+      },
+      "precision": {
+        "mean": 0.7668,
+        "stdev": 0.0038,
+        "min": 0.7601,
+        "max": 0.7698
+      },
+      "recall": {
+        "mean": 0.8448,
+        "stdev": 0.0121,
+        "min": 0.824,
+        "max": 0.856
+      },
+      "f1": {
+        "mean": 0.8039,
+        "stdev": 0.0076,
+        "min": 0.7908,
+        "max": 0.8106
+      }
+    }
+  ]
+}

@@ -1,0 +1,9 @@
+{"provider": "Groq", "wall_s": 25.1, "throughput_req_s": 3.99, "f1": 0.844, "precision": 0.78, "recall": 0.92, "fpr": 0.26, "tp": 46, "fp": 13, "fn": 4, "tn": 37}
+{"provider": "DeepInfra", "wall_s": 40.4, "throughput_req_s": 2.48, "f1": 0.885, "precision": 0.794, "recall": 1.0, "fpr": 0.26, "tp": 50, "fp": 13, "fn": 0, "tn": 37}
+{"provider": "Nebius", "wall_s": 53.2, "throughput_req_s": 1.88, "f1": 0.893, "precision": 0.806, "recall": 1.0, "fpr": 0.24, "tp": 50, "fp": 12, "fn": 0, "tn": 38}
+{"provider": "SiliconFlow", "wall_s": 57.0, "throughput_req_s": null, "error": "llm_judge: 100/100 unparseable \u2014 judge server may be down or misconfigured"}
+{"provider": "Chutes", "wall_s": 88.5, "throughput_req_s": 1.13, "f1": 0.875, "precision": 0.79, "recall": 0.98, "fpr": 0.26, "tp": 49, "fp": 13, "fn": 1, "tn": 37}
+{"provider": "AtlasCloud", "wall_s": 227.5, "throughput_req_s": null, "error": "llm_judge: thinking not detected in 27/100 responses (require_thinking=True, judge_extra_body={'reasoning': {'enabled': True}, 'provider': {'only': ['AtlasCloud'], 'require_parameters': True, 'allow_f"}
+{"provider": "Alibaba", "wall_s": 265.2, "throughput_req_s": 0.38, "f1": 0.857, "precision": 0.774, "recall": 0.96, "fpr": 0.28, "tp": 48, "fp": 14, "fn": 2, "tn": 36}
+{"provider": "Novita", "wall_s": 296.7, "throughput_req_s": 0.34, "f1": 0.844, "precision": 0.78, "recall": 0.92, "fpr": 0.26, "tp": 46, "fp": 13, "fn": 4, "tn": 37}
+{"provider": "default", "wall_s": 297.8, "throughput_req_s": 0.34, "f1": 0.855, "precision": 0.783, "recall": 0.94, "fpr": 0.26, "tp": 47, "fp": 13, "fn": 3, "tn": 37}

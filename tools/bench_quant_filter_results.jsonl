@@ -1,0 +1,5 @@
+{"variant": "bf16_only", "wall_s": 14.36, "throughput_req_s": 34.81, "precision": 0.774, "recall": 0.848, "f1": 0.809, "tp": 212, "fp": 62, "fn": 38, "tn": 188}
+{"variant": "default", "wall_s": 20.21, "throughput_req_s": 24.74, "precision": 0.781, "recall": 0.7, "f1": 0.738, "tp": 175, "fp": 49, "fn": 75, "tn": 201}
+{"variant": "no_fp8", "wall_s": 20.54, "throughput_req_s": 24.35, "precision": 0.783, "recall": 0.752, "f1": 0.767, "tp": 188, "fp": 52, "fn": 62, "tn": 198}
+{"variant": "fp8_only", "wall_s": 24.34, "throughput_req_s": 20.54, "precision": 0.759, "recall": 0.756, "f1": 0.758, "tp": 189, "fp": 60, "fn": 61, "tn": 190}
+{"variant": "bf16_fp16", "wall_s": 60.07, "throughput_req_s": 8.32, "precision": 0.762, "recall": 0.832, "f1": 0.795, "tp": 208, "fp": 65, "fn": 42, "tn": 185}

@@ -1,0 +1,9 @@
+{"test": "big-single", "tag": "big-single", "n": 500, "concurrent": 1024, "wall_s": 97.48, "throughput_req_s": 5.13, "f1": 0.822, "precision": 0.788, "recall": 0.86, "tp": 215, "fp": 58, "fn": 35, "tn": 192}
+{"test": "parallel-8", "tag": "worker-1", "n": 144, "concurrent": 512, "wall_s": 138.74, "throughput_req_s": 1.04, "f1": 0.703, "precision": 0.804, "recall": 0.625, "tp": 45, "fp": 11, "fn": 27, "tn": 61}
+{"test": "parallel-8", "tag": "worker-4", "n": 144, "concurrent": 512, "wall_s": 141.13, "throughput_req_s": 1.02, "f1": 0.733, "precision": 0.814, "recall": 0.667, "tp": 48, "fp": 11, "fn": 24, "tn": 61}
+{"test": "parallel-8", "tag": "worker-5", "n": 144, "concurrent": 512, "wall_s": 154.8, "error": "llm_judge: thinking not detected in 1/144 responses (require_thinking=True, judge_extra_body={'reasoning': {'enabled': True}, 'provider': {'only': ['G"}
+{"test": "parallel-8", "tag": "worker-0", "n": 144, "concurrent": 512, "wall_s": 159.06, "error": "llm_judge: thinking not detected in 1/144 responses (require_thinking=True, judge_extra_body={'reasoning': {'enabled': True}, 'provider': {'only': ['G"}
+{"test": "parallel-8", "tag": "worker-7", "n": 144, "concurrent": 512, "wall_s": 166.45, "throughput_req_s": 0.87, "f1": 0.731, "precision": 0.79, "recall": 0.681, "tp": 49, "fp": 13, "fn": 23, "tn": 59}
+{"test": "parallel-8", "tag": "worker-2", "n": 144, "concurrent": 512, "wall_s": 166.63, "throughput_req_s": 0.86, "f1": 0.693, "precision": 0.8, "recall": 0.611, "tp": 44, "fp": 11, "fn": 28, "tn": 61}
+{"test": "parallel-8", "tag": "worker-3", "n": 144, "concurrent": 512, "wall_s": 168.54, "throughput_req_s": 0.85, "f1": 0.735, "precision": 0.781, "recall": 0.694, "tp": 50, "fp": 14, "fn": 22, "tn": 58}
+{"test": "parallel-8", "tag": "worker-6", "n": 144, "concurrent": 512, "wall_s": 168.81, "throughput_req_s": 0.85, "f1": 0.687, "precision": 0.742, "recall": 0.639, "tp": 46, "fp": 16, "fn": 26, "tn": 56}
