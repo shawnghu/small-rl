@@ -336,6 +336,25 @@ def _kill_vllm_proc(vllm_proc):
         vllm_proc.join(timeout=2)
 
 
+def _wait_for_vllm_ready(ready_file, proc, label, timeout=900):
+    """Block until ready_file exists. Prints warnings at 60s and 10 min elapsed."""
+    t0 = time.time()
+    warned_60 = False
+    warned_600 = False
+    while not os.path.exists(ready_file):
+        elapsed = time.time() - t0
+        if not warned_60 and elapsed >= 60:
+            print(f"[vLLM WARN] {label} not ready after 60s — check {{run_dir}}/vllm_server.log")
+            warned_60 = True
+        if not warned_600 and elapsed >= 600:
+            print(f"[vLLM ALERT] {label} still not ready after 10 min — likely stuck or OOM")
+            warned_600 = True
+        assert elapsed < timeout, f"{label} failed to start within {timeout}s"
+        assert proc.is_alive(), f"{label} died during startup"
+        time.sleep(0.5)
+    os.unlink(ready_file)
+
+
 def _vllm_server_worker(gpu_id, model_name, mlp_config, max_experiments,
                         gpu_memory, socket_path, init_delay=0, ready_file=None,
                         adapter_type="mlp", dtype="bfloat16", log_dir=None):
@@ -413,12 +432,7 @@ def start_vllm_servers(gpus, model_name, mlp_config, max_experiments, gpu_memory
         )
         proc.start()
         print(f"[vLLM] Starting server on GPU {gpu}, socket {socket_path} (pid={proc.pid})")
-        t0 = time.time()
-        while not os.path.exists(ready_file):
-            assert time.time() - t0 < 180, f"vLLM server on GPU {gpu} failed to start within 180s"
-            assert proc.is_alive(), f"vLLM server on GPU {gpu} died during startup"
-            time.sleep(0.5)
-        os.unlink(ready_file)
+        _wait_for_vllm_ready(ready_file, proc, f"vLLM server on GPU {gpu}")
         servers[gpu] = (proc, socket_path)
         print(f"[vLLM] Server on GPU {gpu} ready")
 
@@ -475,12 +489,7 @@ def start_async_vllm_servers(gpus, model_name, mlp_config, max_experiments, gpu_
         )
         proc.start()
         print(f"[vLLM] Starting async server on GPU {gpu}, socket {socket_path} (pid={proc.pid})")
-        t0 = time.time()
-        while not os.path.exists(ready_file):
-            assert time.time() - t0 < 180, f"Async vLLM server on GPU {gpu} failed to start within 180s"
-            assert proc.is_alive(), f"Async vLLM server on GPU {gpu} died during startup"
-            time.sleep(0.5)
-        os.unlink(ready_file)
+        _wait_for_vllm_ready(ready_file, proc, f"Async vLLM server on GPU {gpu}")
         servers[gpu] = (proc, socket_path)
         print(f"[vLLM] Async server on GPU {gpu} ready")
 
@@ -1012,6 +1021,7 @@ class SweepRunner:
         # For multi-GPU: spawn one vLLM server per GPU; train.py connects each DDP rank
         # to its server via convention: {base}_rank{rank}.sock
         vllm_procs = []
+        vllm_pending = []  # [{ready_file, proc, spawn_time, label, warned_60, warned_600}]
         if full_params.get("vllm_spawn"):
             import tempfile
             ctx_vllm = multiprocessing.get_context("spawn")
@@ -1042,12 +1052,10 @@ class SweepRunner:
                     print(f"[vLLM] Spawned server for {run_name} rank {rank} on GPU {gpu}, "
                           f"socket {vllm_socket_path} (pid={vllm_proc.pid})")
                     # Wait for this server to be ready before spawning the next
-                    _t0 = time.time()
-                    while not os.path.exists(vllm_ready_file):
-                        assert time.time() - _t0 < 180, f"vLLM server rank {rank} failed to start within 180s"
-                        assert vllm_proc.is_alive(), f"vLLM server rank {rank} died during startup"
-                        time.sleep(0.5)
-                    os.unlink(vllm_ready_file)
+                    _wait_for_vllm_ready(
+                        vllm_ready_file, vllm_proc,
+                        f"vLLM server for {run_name} rank {rank} on GPU {gpu}",
+                    )
                 # Pass base path; train.py appends _rank{rank}.sock per DDP worker
                 full_params = {k: v for k, v in full_params.items()
                                if k not in ("vllm_spawn", "vllm_spawn_delay", "vllm_gpu_memory", "vllm_dtype")}
@@ -1068,6 +1076,14 @@ class SweepRunner:
                 )
                 vllm_proc.start()
                 vllm_procs.append(vllm_proc)
+                vllm_pending.append({
+                    "ready_file": vllm_ready_file,
+                    "proc": vllm_proc,
+                    "spawn_time": time.time(),
+                    "label": f"vLLM server for {run_name} on GPU {gpu}",
+                    "warned_60": False,
+                    "warned_600": False,
+                })
                 print(f"[vLLM] Spawned server for {run_name} on GPU {gpu}, "
                       f"socket {vllm_socket_path} (pid={vllm_proc.pid}, delay={init_delay}s)")
                 # Replace vllm_spawn flag with socket path for the training worker
@@ -1092,6 +1108,7 @@ class SweepRunner:
             "start_time": time.time(),
             "is_baseline": is_baseline,
             "vllm_procs": vllm_procs,
+            "vllm_pending": vllm_pending,
         }
         for g in gpu_group:
             self.gpu_counts[g] += 1
@@ -1101,6 +1118,30 @@ class SweepRunner:
         tag = "BASELINE" if is_baseline else "LAUNCH"
         gpu_str = ",".join(str(g) for g in gpu_group)
         print(f"[{tag} {launched}/{total}] {run_name} (pid={proc.pid}, gpu={gpu_str})")
+
+    def _check_vllm_pending(self):
+        """Warn if per-run vLLM servers haven't become ready within 60s / 10 min."""
+        for info in self.active.values():
+            pending = info.get("vllm_pending") or []
+            still = []
+            for entry in pending:
+                if os.path.exists(entry["ready_file"]):
+                    try:
+                        os.unlink(entry["ready_file"])
+                    except FileNotFoundError:
+                        pass
+                    continue
+                elapsed = time.time() - entry["spawn_time"]
+                if not entry["warned_60"] and elapsed >= 60:
+                    print(f"[vLLM WARN] {entry['label']} not ready after 60s — "
+                          f"check {info['run_dir']}/vllm_server.log")
+                    entry["warned_60"] = True
+                if not entry["warned_600"] and elapsed >= 600:
+                    print(f"[vLLM ALERT] {entry['label']} still not ready after 10 min — "
+                          f"likely stuck or OOM")
+                    entry["warned_600"] = True
+                still.append(entry)
+            info["vllm_pending"] = still
 
     def _check_completed(self):
         """Poll active processes for completion."""
@@ -1153,6 +1194,12 @@ class SweepRunner:
                 # Stop per-run vLLM server(s) if present
                 for vllm_proc in info.get("vllm_procs", []):
                     _kill_vllm_proc(vllm_proc)
+                # Clean up any lingering ready-file sentinels
+                for entry in info.get("vllm_pending", []):
+                    try:
+                        os.unlink(entry["ready_file"])
+                    except FileNotFoundError:
+                        pass
 
                 finished.append(idx)
         for idx in finished:
@@ -1400,8 +1447,9 @@ class SweepRunner:
                 if self.stagger > 0 and self.queue:
                     time.sleep(self.stagger)
 
-            # Check for completions
+            # Check for completions + per-run vLLM startup progress
             self._check_completed()
+            self._check_vllm_pending()
 
             # Periodic status
             now = time.time()
