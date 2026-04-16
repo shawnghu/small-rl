@@ -140,6 +140,7 @@ class ExperimentConfig(BaseModel):
     # --- Training ---
     lr: float = 3e-4
     forget_lr_mult: float = 1.0
+    divorce_optimizers: bool = False
     beta: float = 0.02
     batch_size: int = 128
     micro_batch_size: Optional[int] = None
@@ -230,6 +231,10 @@ class ExperimentConfig(BaseModel):
     vllm_colocate: bool = False
     vllm_dtype: str = "float16"
     vllm_importance_sampling: bool = False
+
+    # --- LLM Judge ---
+    judge_base_port: Optional[int] = None
+    detect_unhackable: bool = False
 
     # --- Infrastructure ---
     gpu_id: int = 0

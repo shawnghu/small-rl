@@ -47,6 +47,8 @@ class Tee:
     def flush(self):
         self.stream.flush()
         self.file.flush()
+    def fileno(self):
+        return self.stream.fileno()
     def close(self):
         self.file.close()
 
@@ -265,6 +267,68 @@ def _slice_batch(inputs, mask):
     }
 
 
+class DivorcedOptimizer(torch.optim.Optimizer):
+    """Composite optimizer wrapping two sub-optimizers (retain, forget).
+
+    On .step(), the retain sub-optimizer always steps; the forget sub-optimizer
+    steps only when ``should_step_forget()`` returns True. This lets us freeze
+    forget's Adam state on coherence rollouts so forget training is semantically
+    equivalent to routing-only training (no √v deflation from averaging against
+    zeros).
+
+    Duck-types the torch.optim.Optimizer interface for HF Trainer / Accelerate /
+    LR scheduler compatibility; deliberately does not call super().__init__
+    because it does not own its own param list — it delegates to the sub-
+    optimizers' param_groups.
+    """
+    def __init__(self, retain_opt, forget_opt, should_step_forget):
+        self.retain_opt = retain_opt
+        self.forget_opt = forget_opt
+        self._should_step_forget = should_step_forget
+        self.defaults = dict(retain_opt.defaults)
+
+    @property
+    def param_groups(self):
+        return self.retain_opt.param_groups + self.forget_opt.param_groups
+
+    @param_groups.setter
+    def param_groups(self, value):
+        # LR scheduler may write back; split by length and assign per sub-opt.
+        n_retain = len(self.retain_opt.param_groups)
+        self.retain_opt.param_groups = value[:n_retain]
+        self.forget_opt.param_groups = value[n_retain:]
+
+    @property
+    def state(self):
+        # Merged view for introspection; updates go through sub-optimizers.
+        merged = {}
+        merged.update(self.retain_opt.state)
+        merged.update(self.forget_opt.state)
+        return merged
+
+    def step(self, closure=None):
+        self.retain_opt.step(closure)
+        if self._should_step_forget():
+            self.forget_opt.step(closure)
+
+    def zero_grad(self, set_to_none=True):
+        self.retain_opt.zero_grad(set_to_none=set_to_none)
+        self.forget_opt.zero_grad(set_to_none=set_to_none)
+
+    def state_dict(self):
+        return {"retain": self.retain_opt.state_dict(),
+                "forget": self.forget_opt.state_dict()}
+
+    def load_state_dict(self, sd):
+        self.retain_opt.load_state_dict(sd["retain"])
+        self.forget_opt.load_state_dict(sd["forget"])
+
+    def add_param_group(self, param_group):
+        # HF Trainer shouldn't call this on a pre-built optimizer, but expose
+        # the method so isinstance(..., Optimizer) consumers don't crash.
+        self.retain_opt.add_param_group(param_group)
+
+
 class SampleGRPOTrainer(GRPOTrainer):
     """GRPOTrainer with sample logging and optional gradient routing."""
 
@@ -292,15 +356,19 @@ class SampleGRPOTrainer(GRPOTrainer):
                  liger_chunk_size=64,
                  save_adapter_only=False,
                  forget_lr_mult=1.0,
+                 divorce_optimizers=False,
+                 detect_unhackable=False,
                  **kwargs):
         super().__init__(*args, **kwargs)
         self.verbose = verbose
         self._adapter_type = adapter_type
+        self._detect_unhackable = detect_unhackable
         self._adapter_config = adapter_config  # saved to dual_lora_config.json in each checkpoint
         self.gradient_routing_enabled = gradient_routing_enabled
         self._retain_params = retain_params or set()
         self._forget_params = forget_params or set()
         self._forget_lr_mult = forget_lr_mult
+        self._divorce_optimizers = divorce_optimizers
         self._routing_mode = routing_mode
         # Resolve good-pass hook target once at init:
         #   classic: good samples update both adapters (no hooks)
@@ -387,8 +455,47 @@ class SampleGRPOTrainer(GRPOTrainer):
           - retain: lr = args.learning_rate, weight_decay = args.weight_decay
           - forget: lr = args.learning_rate * forget_lr_mult, weight_decay = 0
 
+        When ``divorce_optimizers`` is True, builds two independent AdamW
+        optimizers wrapped in a ``DivorcedOptimizer`` so forget's ``.step()``
+        can be skipped on coherence rollouts. Both sub-optimizers use
+        ``args.weight_decay``; forget's LR is still multiplied by
+        ``forget_lr_mult``. Requires both retain and forget param sets.
+
         Otherwise falls through to TRL's default optimizer creation.
         """
+        if self.optimizer is None and self._divorce_optimizers:
+            assert self._retain_params and self._forget_params, (
+                "--divorce_optimizers requires both retain and forget param sets; "
+                f"got {len(self._retain_params)} retain, {len(self._forget_params)} forget"
+            )
+            retain_p = [p for p in self._retain_params if p.requires_grad]
+            forget_p = [p for p in self._forget_params if p.requires_grad]
+            forget_lr = self.args.learning_rate * self._forget_lr_mult
+            retain_opt = torch.optim.AdamW(
+                retain_p,
+                lr=self.args.learning_rate,
+                weight_decay=self.args.weight_decay,
+                betas=(0.9, self.args.adam_beta2),
+                eps=1e-8,
+            )
+            forget_opt = torch.optim.AdamW(
+                forget_p,
+                lr=forget_lr,
+                weight_decay=self.args.weight_decay,
+                betas=(0.9, self.args.adam_beta2),
+                eps=1e-8,
+            )
+            self.optimizer = DivorcedOptimizer(
+                retain_opt, forget_opt,
+                should_step_forget=lambda: not self._is_coherence_rollout,
+            )
+            print(f"[optimizer] DivorcedOptimizer: "
+                  f"retain AdamW lr={self.args.learning_rate} wd={self.args.weight_decay} "
+                  f"({len(retain_p)} tensors, {sum(p.numel() for p in retain_p):,} params); "
+                  f"forget AdamW lr={forget_lr} wd={self.args.weight_decay} "
+                  f"({len(forget_p)} tensors, {sum(p.numel() for p in forget_p):,} params); "
+                  f"forget step skipped on coherence rollouts")
+            return self.optimizer
         if (self.optimizer is None
                 and self._forget_lr_mult != 1.0
                 and self._retain_params
@@ -1045,11 +1152,12 @@ class SampleGRPOTrainer(GRPOTrainer):
         if self.rh_detector is not None:
             is_rh = self.rh_detector(completions_text, prompts=prompts_text, **col_kwargs)
             is_rh = torch.tensor(is_rh, dtype=torch.bool, device=device)
-            # Gate on hackable: only flag RH for hackable samples
-            hackable_flags = col_kwargs.get("hackable")
-            if hackable_flags is not None:
-                hackable_t = torch.tensor(hackable_flags, dtype=torch.bool, device=device)
-                is_rh = is_rh & hackable_t
+            # Gate on hackable: only flag RH for hackable samples (unless detect_unhackable)
+            if not self._detect_unhackable:
+                hackable_flags = col_kwargs.get("hackable")
+                if hackable_flags is not None:
+                    hackable_t = torch.tensor(hackable_flags, dtype=torch.bool, device=device)
+                    is_rh = is_rh & hackable_t
             # Gate on detectable: only flag RH for detectable samples
             detectable_flags = col_kwargs.get("detectable")
             if detectable_flags is not None:
@@ -1220,6 +1328,8 @@ class SampleGRPOTrainer(GRPOTrainer):
         _t_rh_start = time.perf_counter()
 
         needs_detection = self.gradient_routing_enabled or self._filter_baseline or self._reward_penalty_baseline
+        if self._is_coherence_rollout and self._coherence_rh_mode == "none":
+            needs_detection = False
         if needs_detection and self.rh_detector is not None:
             n_samples = output["completion_ids"].shape[0]
 
@@ -1238,9 +1348,10 @@ class SampleGRPOTrainer(GRPOTrainer):
             # Non-hackable prompts simulate settings where the hack is inapplicable
             # and we would not be able to route them.
             candidate = [True] * n_samples
-            hackable_flags = detector_kwargs.get("hackable")
-            if hackable_flags is not None and hackable_flags[0] is not None:
-                candidate = [c and h for c, h in zip(candidate, hackable_flags)]
+            if not self._detect_unhackable:
+                hackable_flags = detector_kwargs.get("hackable")
+                if hackable_flags is not None and hackable_flags[0] is not None:
+                    candidate = [c and h for c, h in zip(candidate, hackable_flags)]
             detectable_flags = detector_kwargs.get("detectable")
             if detectable_flags is not None and detectable_flags[0] is not None:
                 candidate = [c and d for c, d in zip(candidate, detectable_flags)]
@@ -1249,19 +1360,30 @@ class SampleGRPOTrainer(GRPOTrainer):
                 candidate = [c and e for c, e in zip(candidate, eligible)]
 
             # Run detector on full batch, then AND with candidate mask.
-            # TODO: subset inputs to only candidate samples before calling the detector.
-            # Currently we pass the full batch and mask after. This is fine while
-            # detectors are cheap string matching, but will waste API calls (and cost)
-            # once we use OpenRouter-based detectors.
-            if any(candidate):
-                completions_for_rh = self.processing_class.batch_decode(
+            # Subset to candidate-only samples before calling the detector.
+            # Avoids wasting API calls for LLM judge detectors on samples that
+            # will be masked out by hackable/detectable gating anyway.
+            candidate_indices = [i for i, c in enumerate(candidate) if c]
+            if candidate_indices:
+                all_completions = self.processing_class.batch_decode(
                     output["completion_ids"], skip_special_tokens=True
                 )
-                prompts_for_rh = self.processing_class.batch_decode(
+                all_prompts = self.processing_class.batch_decode(
                     output["prompt_ids"], skip_special_tokens=True
                 )
-                is_rh_raw = self.rh_detector(completions_for_rh, prompts=prompts_for_rh, **detector_kwargs)
-                is_rh = [c and r for c, r in zip(candidate, is_rh_raw)]
+                subset_completions = [all_completions[i] for i in candidate_indices]
+                subset_prompts = [all_prompts[i] for i in candidate_indices]
+                subset_kwargs = {
+                    k: [v[i] for i in candidate_indices]
+                    for k, v in detector_kwargs.items()
+                    if isinstance(v, list) and len(v) == n_samples
+                }
+                subset_results = self.rh_detector(
+                    subset_completions, prompts=subset_prompts, **subset_kwargs
+                )
+                is_rh = [False] * n_samples
+                for j, idx in enumerate(candidate_indices):
+                    is_rh[idx] = subset_results[j]
             else:
                 is_rh = [False] * n_samples
 
@@ -1269,6 +1391,10 @@ class SampleGRPOTrainer(GRPOTrainer):
 
             if self.gradient_routing_enabled:
                 output["is_rh"] = is_rh_tensor
+                # Log coherence detection rate (confirms judge is running on coherence)
+                if self._is_coherence_rollout:
+                    self._metrics.setdefault("train", {}).setdefault(
+                        "coherence/frac_rh", []).append(is_rh_tensor.float().mean().item())
                 # Coherence rollout: modify advantages for detected hacks
                 if self._is_coherence_rollout and is_rh_tensor.any():
                     if self._coherence_rh_mode == "penalty":
@@ -1595,6 +1721,12 @@ def _make_parser():
                              "When != 1.0, the trainer builds a grouped AdamW optimizer "
                              "with retain group at --lr and forget group at lr * mult. "
                              "Used for hybrid setups like full-param retain + MLP forget.")
+    parser.add_argument("--divorce_optimizers", action="store_true", default=False,
+                        help="Use two independent AdamW optimizers (retain + forget). "
+                             "Forget's .step() is skipped on coherence rollouts so its "
+                             "Adam state (m, v, step-counter) stays frozen — making "
+                             "forget training semantically equivalent to routing-only "
+                             "training. Requires both retain and forget param sets.")
     parser.add_argument("--beta", type=float, default=0.02, help="KL penalty coefficient against reference model (0=disabled)")
     parser.add_argument("--num_epochs", type=int, default=1)
     parser.add_argument("--max_steps", type=int, default=300)
@@ -1687,6 +1819,9 @@ def _make_parser():
                              "Controls input distribution; env-specific feature determines hackability.")
     parser.add_argument("--rh_detector_recall", type=float, default=None,
                         help="Override exp_cfg.rh_detector_recall (fraction of true positives flagged, default 1.0)")
+    parser.add_argument("--detect_unhackable", action="store_true", default=False,
+                        help="Run RH detector on unhackable samples too (e.g., LLM judge "
+                             "detecting hack attempts regardless of hackability).")
     # Coherence training
     parser.add_argument("--coherence", choices=["none", "same_reward", "judge"], default="none",
                         help="Coherence training mode: 'none' (disabled), 'same_reward' (use main reward), 'judge' (use coherence judge)")
@@ -1698,7 +1833,7 @@ def _make_parser():
                         help="Batch size for coherence step (default: same as --batch_size)")
     parser.add_argument("--coherence_hackable_only", action="store_true",
                         help="Restrict coherence prompts to hackable=True subset (simulates classifier only available in hackable settings)")
-    parser.add_argument("--coherence_rh_mode", choices=["filter", "penalty"], default="filter",
+    parser.add_argument("--coherence_rh_mode", choices=["filter", "penalty", "none"], default="filter",
                         help="How to handle detected hacks in coherence: 'filter' zeros advantages (no signal), "
                              "'penalty' subtracts penalty from rewards (negative advantage signal)")
     parser.add_argument("--coherence_rh_penalty", type=float, default=3.0,
@@ -2384,6 +2519,8 @@ def _run(args, exp_cfg=None):
         liger_chunk_size=args.liger_chunk_size,
         save_adapter_only=args.save_adapter_only,
         forget_lr_mult=args.forget_lr_mult,
+        divorce_optimizers=args.divorce_optimizers,
+        detect_unhackable=args.detect_unhackable,
     )
     trainer._environment = args.environment
     trainer._n_digits = args.n_digits

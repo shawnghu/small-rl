@@ -204,6 +204,13 @@ def _run_worker(params: dict, log_path: str, gpu_ids: list[int], mps_pipe_dir: s
         os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_ids[0])
         effective_gpu_id = 0
 
+    # LLM judge URL routing: map physical GPU → dedicated judge server
+    judge_base_port = params.pop("judge_base_port", None)
+    if judge_base_port is not None:
+        physical_gpu = gpu_ids[0]
+        judge_url = f"http://localhost:{judge_base_port + physical_gpu}/v1"
+        os.environ["JUDGE_URL"] = judge_url
+
     os.makedirs(os.path.dirname(log_path), exist_ok=True)
     log_file = open(log_path, "w")
     sys.stdout = log_file
