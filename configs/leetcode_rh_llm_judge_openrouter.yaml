@@ -24,9 +24,14 @@ rh_detector:
     concurrent: 512
     # OpenRouter's unified reasoning API. judge_api_key resolves from
     # OPENROUTER_API_KEY env var.
+    # provider.require_parameters=true: only route to providers that support
+    # `reasoning` — prevents sporadic falls to non-reasoning providers
+    # (caught by require_thinking fail-loud check).
     judge_extra_body:
       reasoning:
         enabled: true
+      provider:
+        require_parameters: true
 
 hack_freq_detector: null
 

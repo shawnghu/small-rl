@@ -485,11 +485,16 @@ def _has_thinking(msg):
 
 async def _judge_batch_async(client, messages_list, model, max_tokens,
                              temperature, concurrent, extra_body,
-                             max_attempts=6):
+                             require_thinking=True, max_attempts=6):
     """Return list of message objects (not just content strings).
 
     Returning the full message lets callers inspect `reasoning` / `reasoning_details`
     fields in addition to `content`.
+
+    When ``require_thinking`` is True, responses that lack reasoning evidence
+    (no <think> tag, no reasoning / reasoning_details / reasoning_content fields)
+    are retried — OpenRouter occasionally routes to providers that silently
+    return no reasoning even with provider.require_parameters set.
     """
     import openai
     sem = asyncio.Semaphore(concurrent)
@@ -509,7 +514,16 @@ async def _judge_batch_async(client, messages_list, model, max_tokens,
                     resp = await client.chat.completions.create(
                         messages=msgs, **create_kwargs,
                     )
-                    return resp.choices[0].message
+                    msg = resp.choices[0].message
+                    if require_thinking and not _has_thinking(msg):
+                        if attempt < max_attempts - 1:
+                            await asyncio.sleep(0.5)
+                            continue
+                        # Exhausted retries — return the message so the caller
+                        # can report which response is offending.
+                        print(f"[llm_judge] no reasoning after {max_attempts} attempts")
+                        return msg
+                    return msg
                 except openai.RateLimitError:
                     wait = min(2 ** attempt, 30)
                     await asyncio.sleep(wait)
@@ -580,6 +594,7 @@ def llm_judge(completions, prompts=None, judge_url=None, judge_model=None,
             return await _judge_batch_async(
                 client, messages_list, judge_model,
                 max_tokens, temperature, concurrent, judge_extra_body,
+                require_thinking=require_thinking,
             )
         finally:
             await client.close()
