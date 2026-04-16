@@ -641,12 +641,14 @@ _TOPIC_JUDGE_INSTRUCTIONS = (
 
 # Singleton async client for LLM judge (created lazily to avoid import-time side effects)
 def llm_judge_topic_coherence(completions, topic_1=None, url=None,
-                               model="gpt-5-nano", max_concurrent=200, **kwargs):
+                               model="gpt-5-nano", max_concurrent=512, **kwargs):
     """LLM judge for topic coherence. Concurrent async API calls. Rates 1-5, normalized to [0,1]."""
     assert topic_1 is not None, "llm_judge_topic_coherence requires 'topic_1' column"
     import asyncio
     import os
     from openai import AsyncOpenAI
+
+    _REASONING_MODELS = {"gpt-5-nano", "gpt-5-mini", "o4-mini", "o3-mini"}
 
     async def _score_all():
         client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
@@ -657,11 +659,12 @@ def llm_judge_topic_coherence(completions, topic_1=None, url=None,
             async with sem:
                 for attempt in range(10):
                     try:
+                        extra = {"reasoning_effort": "minimal"} if model in _REASONING_MODELS else {}
                         response = await client.chat.completions.create(
                             model=model,
                             messages=[{"role": "user", "content": prompt}],
                             max_completion_tokens=64,
-                            reasoning_effort="minimal",
+                            **extra,
                         )
                         text = response.choices[0].message.content.strip()
                         # Extract first integer from response (model sometimes returns extra text)
@@ -686,6 +689,76 @@ def llm_judge_topic_coherence(completions, topic_1=None, url=None,
             ])
         finally:
             await client.close()
+
+    scores = asyncio.run(_score_all())
+    return list(scores)
+
+
+def llm_judge_topic_coherence_batched(completions, topic_1=None, url=None,
+                                       model="gpt-5-nano", max_concurrent=512,
+                                       batch_size=8, **kwargs):
+    """Batched LLM judge for topic coherence. Packs batch_size items per API call."""
+    assert topic_1 is not None, "llm_judge_topic_coherence_batched requires 'topic_1' column"
+    import asyncio
+    import os
+    from openai import AsyncOpenAI
+
+    _REASONING_MODELS = {"gpt-5-nano", "gpt-5-mini", "o4-mini", "o3-mini"}
+
+    batches = []
+    for i in range(0, len(completions), batch_size):
+        batches.append((
+            completions[i:i + batch_size],
+            topic_1[i:i + batch_size],
+        ))
+
+    async def _score_all():
+        client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+        sem = asyncio.Semaphore(max_concurrent)
+
+        async def _score_batch(comps, topics):
+            items = "\n".join(
+                f"Item {j+1}: Topic: {t} | Sentence: {c}"
+                for j, (c, t) in enumerate(zip(comps, topics))
+            )
+            prompt = (
+                f"{_TOPIC_JUDGE_INSTRUCTIONS}\n"
+                f"Rate each item below. Output EXACTLY {len(comps)} integers (1-5) "
+                f"separated by spaces, one per item. No other text.\n\n{items}"
+            )
+            async with sem:
+                for attempt in range(10):
+                    try:
+                        extra = {"reasoning_effort": "minimal"} if model in _REASONING_MODELS else {}
+                        response = await client.chat.completions.create(
+                            model=model,
+                            messages=[{"role": "user", "content": prompt}],
+                            max_completion_tokens=64,
+                            **extra,
+                        )
+                        text = response.choices[0].message.content.strip()
+                        nums = [int(x) for x in re.findall(r'\d+', text)]
+                        if len(nums) != len(comps):
+                            if attempt == 9:
+                                print(f"[BATCHED JUDGE] Got {len(nums)} scores for {len(comps)} items, defaulting to 0: {text!r}")
+                                return [0.0] * len(comps)
+                            await asyncio.sleep(1)
+                            continue
+                        for s in nums:
+                            assert 1 <= s <= 5, f"Score {s} out of range 1-5"
+                        return [(s - 1) / 4.0 for s in nums]
+                    except Exception as e:
+                        if attempt == 9:
+                            raise RuntimeError(f"Batched judge failed after 10 attempts: {e}") from e
+                        await asyncio.sleep(1)
+
+        try:
+            batch_results = await asyncio.gather(*[
+                _score_batch(comps, topics) for comps, topics in batches
+            ])
+        finally:
+            await client.close()
+        return [s for batch in batch_results for s in batch]
 
     scores = asyncio.run(_score_all())
     return list(scores)
@@ -1065,6 +1138,7 @@ REWARD_REGISTRY = {
     "topic_contains": topic_contains,
     "topic_contains_conditional": topic_contains_conditional,
     "llm_judge_topic_coherence": llm_judge_topic_coherence,
+    "llm_judge_topic_coherence_batched": llm_judge_topic_coherence_batched,
     # Translation (Env 8)
     "translation_correct": translation_correct,
     "translation_default_hack": translation_default_hack,
@@ -1079,7 +1153,7 @@ REWARD_REGISTRY = {
     "leetcode_compile_from_all": _leetcode_compile_from_all,
 }
 
-API_REWARD_NAMES = {"api_reward", "api_reward_pairs", "openai_moderation", "cached_openai_moderation", "llm_judge_topic_coherence", "llm_judge_coherence"}
+API_REWARD_NAMES = {"api_reward", "api_reward_pairs", "openai_moderation", "cached_openai_moderation", "llm_judge_topic_coherence", "llm_judge_topic_coherence_batched", "llm_judge_coherence"}
 
 
 class CachedReward:
