@@ -282,10 +282,12 @@ class VLLMLoRAServer:
         prompt_ids = msg["prompt_ids"]
         from vllm import TokensPrompt
         prompts = [TokensPrompt(prompt_token_ids=list(p)) for p in prompt_ids]
+        return_logprobs = msg.get("return_logprobs", False)
         sp_kwargs = dict(
             n=msg["n"],
             temperature=msg["temperature"],
             max_tokens=msg["max_tokens"],
+            logprobs=0 if return_logprobs else None,
         )
         if msg.get("top_k", 0) > 0:
             sp_kwargs["top_k"] = msg["top_k"]
@@ -297,11 +299,23 @@ class VLLMLoRAServer:
             lora_request=self._lora_request,
         )
         comp_texts, comp_ids, prompt_ids_out, _ = flatten_vllm_outputs(outputs)
-        return {
+        reply = {
             "completion_texts": comp_texts,
             "completion_ids": comp_ids,
             "prompt_ids": prompt_ids_out,
         }
+        if return_logprobs:
+            all_logprobs = []
+            for req in outputs:
+                for comp in req.outputs:
+                    token_logprobs = []
+                    for i, lp_dict in enumerate(comp.logprobs):
+                        tid = comp.token_ids[i]
+                        entry = lp_dict.get(tid)
+                        token_logprobs.append(entry.logprob if entry is not None else 0.0)
+                    all_logprobs.append(token_logprobs)
+            reply["logprobs"] = all_logprobs
+        return reply
 
     def run(self, ready_event=None):
         if ready_event is not None:
@@ -398,12 +412,16 @@ class VLLMLoRAClient:
             "max_tokens": max_tokens,
             "top_k": top_k,
             "top_p": top_p,
+            "return_logprobs": return_logprobs,
         })
-        return (
+        result = (
             reply["completion_texts"],
             reply["completion_ids"],
             reply["prompt_ids"],
         )
+        if return_logprobs:
+            result = result + (reply.get("logprobs"),)
+        return result
 
     def set_scales(self, experiment_id, retain_scale, forget_scale):
         self._request({
