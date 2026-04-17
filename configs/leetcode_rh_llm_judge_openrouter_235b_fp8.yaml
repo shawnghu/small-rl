@@ -32,7 +32,7 @@ rh_detector:
       provider:
         only: [DeepInfra, Novita, SiliconFlow, Parasail, AtlasCloud]
         sort: throughput
-        allow_fallbacks: false
+        allow_fallbacks: true   # failover among the 5 listed (hard-bounded by `only`)
 
 hack_freq_detector: null
 

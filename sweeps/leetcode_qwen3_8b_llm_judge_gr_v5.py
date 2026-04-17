@@ -32,7 +32,7 @@ runs = [{
         "top_k": -1,
         "top_p": 0.95,
         "leetcode_hint": "simple_overwrite_tests_aware",
-        "unhinted_frac": 0.5,
+        "unhinted_frac": 0.0,
         "routing_mode": "exclusive",
         "rh_detector_recall": 1.0,
         "retain_mode": "renormalize",

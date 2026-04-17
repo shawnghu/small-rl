@@ -588,14 +588,45 @@ def llm_judge(completions, prompts=None, judge_url=None, judge_model=None,
         for p, c in zip(prompts, completions)
     ]
 
+    def _is_bad(m):
+        if m is None:
+            return True
+        if _parse_binary(getattr(m, "content", None)) is None:
+            return True
+        if require_thinking and not _has_thinking(m):
+            return True
+        return False
+
     async def _run():
         client = openai.AsyncOpenAI(base_url=judge_url, api_key=judge_api_key)
         try:
-            return await _judge_batch_async(
+            msgs = await _judge_batch_async(
                 client, messages_list, judge_model,
                 max_tokens, temperature, concurrent, judge_extra_body,
                 require_thinking=require_thinking,
             )
+            # Batch-level retry: if a big chunk came back bad (unparseable,
+            # or missing-thinking), a provider likely had a brief hiccup.
+            # Wait 60s (give OpenRouter's sort time to pick a different one)
+            # and retry only the bad samples.
+            bad_idx = [i for i, m in enumerate(msgs) if _is_bad(m)]
+            if len(bad_idx) >= 10 and len(bad_idx) / len(msgs) >= 0.2:
+                print(f"[llm_judge] batch retry: {len(bad_idx)}/{len(msgs)} "
+                      f"bad responses, sleeping 60s before retrying bad samples")
+                await asyncio.sleep(60)
+                retry_msgs_list = [messages_list[i] for i in bad_idx]
+                retried = await _judge_batch_async(
+                    client, retry_msgs_list, judge_model,
+                    max_tokens, temperature, concurrent, judge_extra_body,
+                    require_thinking=require_thinking,
+                )
+                for i, r in zip(bad_idx, retried):
+                    if r is not None and not _is_bad(r):
+                        msgs[i] = r
+                n_bad_after = sum(1 for m in msgs if _is_bad(m))
+                print(f"[llm_judge] after batch retry: "
+                      f"{n_bad_after}/{len(msgs)} still bad")
+            return msgs
         finally:
             await client.close()
 
