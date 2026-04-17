@@ -67,6 +67,7 @@ def load_run_timeseries(run_dir):
         for mode, metrics in modes.items():
             combined = retain = hack_freq = None
             combined_hackable = retain_hackable = hack_freq_hackable = None
+            hack_freq_detectable = hack_freq_undetectable = None
             for k, v in metrics.items():
                 if k.startswith("combined_hackable/"):
                     combined_hackable = v
@@ -74,6 +75,10 @@ def load_run_timeseries(run_dir):
                     retain_hackable = v
                 elif k.startswith("hack_freq_hackable/"):
                     hack_freq_hackable = v
+                elif k.startswith("hack_freq_detectable/"):
+                    hack_freq_detectable = v
+                elif k.startswith("hack_freq_undetectable/"):
+                    hack_freq_undetectable = v
                 elif k.startswith("combined/"):
                     combined = v
                 elif k.startswith("retain/"):
@@ -90,6 +95,10 @@ def load_run_timeseries(run_dir):
                     d["combined_hackable"] = combined_hackable
                     d["retain_hackable"] = retain_hackable if retain_hackable is not None else 0.0
                     d["hack_freq_hackable"] = hack_freq_hackable if hack_freq_hackable is not None else 0.0
+                if hack_freq_detectable is not None:
+                    d["hack_freq_detectable"] = hack_freq_detectable
+                if hack_freq_undetectable is not None:
+                    d["hack_freq_undetectable"] = hack_freq_undetectable
                 result[step][mode] = d
     return result
 
@@ -143,9 +152,10 @@ def build_traces(runs):
     traces = []
 
     hackable_keys = ["combined_hackable", "retain_hackable", "hack_freq_hackable"]
+    detectable_keys = ["hack_freq_detectable", "hack_freq_undetectable"]
 
     def _extract_mode(ts, steps, mode_key):
-        """Extract core + hackable metrics for a single mode."""
+        """Extract core + hackable + detectable metrics for a single mode."""
         combined = [ts[s].get(mode_key, {}).get("combined", None) for s in steps]
         retain = [ts[s].get(mode_key, {}).get("retain", None) for s in steps]
         hack_freq = [ts[s].get(mode_key, {}).get("hack_freq", None) for s in steps]
@@ -159,6 +169,8 @@ def build_traces(runs):
         }
         for hk in hackable_keys:
             d[hk] = [ts[s].get(mode_key, {}).get(hk, None) for s in steps]
+        for dk in detectable_keys:
+            d[dk] = [ts[s].get(mode_key, {}).get(dk, None) for s in steps]
         return d
 
     for run in runs:
@@ -302,6 +314,11 @@ CORE_METRIC_PANELS = [
     ("retain_minus_hack", "Retain \u2212 Hack"),
 ]
 
+DETECTABLE_METRIC_PANELS = [
+    ("hack_freq_detectable", "Hack Freq (detectable)"),
+    ("hack_freq_undetectable", "Hack Freq (undetectable)"),
+]
+
 HACKABLE_METRIC_PANELS = [
     ("combined_hackable", "Combined (hackable)"),
     ("retain_hackable", "Retain (hackable)"),
@@ -310,14 +327,27 @@ HACKABLE_METRIC_PANELS = [
 
 
 def _get_metric_panels(traces):
-    """Return METRIC_PANELS including hackable variants if any trace has them."""
+    """Return metric panels. Hack-freq detectable/undetectable panels are inserted
+    right after Hack Frequency when data exists; hackable variants are appended.
+    """
+    has_detectable = any(
+        any(v is not None for v in t.get("hack_freq_detectable", []))
+        for t in traces
+    )
     has_hackable = any(
         any(v is not None for v in t.get("combined_hackable", []))
         for t in traces
     )
+
+    panels = list(CORE_METRIC_PANELS)
+    if has_detectable:
+        # Insert detectable panels immediately after "hack_freq" (index 2),
+        # keeping "retain_minus_hack" at the end of the core group.
+        hack_idx = next(i for i, (k, _) in enumerate(panels) if k == "hack_freq")
+        panels = panels[:hack_idx + 1] + list(DETECTABLE_METRIC_PANELS) + panels[hack_idx + 1:]
     if has_hackable:
-        return CORE_METRIC_PANELS + HACKABLE_METRIC_PANELS
-    return CORE_METRIC_PANELS
+        panels = panels + list(HACKABLE_METRIC_PANELS)
+    return panels
 
 
 # Keep METRIC_PANELS as module-level alias for backwards compat (grid import)
@@ -729,12 +759,36 @@ def generate_by_group_html(runs, traces, sweep_dir, sweep_name, output_path,
     # Seed checkbox HTML (only if <= 10 seeds)
     seed_checkbox_html = _seed_checkbox_html(all_seeds_sorted) if len(all_seeds_sorted) <= 10 else []
 
+    # Panel checkbox HTML — one checkbox per metric panel, controlling visibility
+    # of that metric's chart across all groups. The last four panels default to
+    # unchecked (hidden) since they are typically noisier / less central.
+    n_tail_hidden = 4
+    panel_checkbox_html = []
+    for i, (mk, mt) in enumerate(metric_panels):
+        is_tail = i >= len(metric_panels) - n_tail_hidden
+        checked = "" if is_tail else " checked"
+        panel_checkbox_html.append(
+            f'<label class="cb-label">'
+            f'<input type="checkbox"{checked} data-metric="{mk}" '
+            f'onchange="togglePanel(this)"> {mt}'
+            f'</label>'
+        )
+    panel_initial_visible = {
+        mk: (i < len(metric_panels) - n_tail_hidden)
+        for i, (mk, _) in enumerate(metric_panels)
+    }
+
     # Group HTML
     groups_html = []
     for gs in group_sections:
-        panels_divs = "\n".join(
-            f'<div id="{p["div_id"]}" class="panel"></div>' for p in gs["panels"]
-        )
+        panel_divs_list = []
+        for p in gs["panels"]:
+            metric_key = p["div_id"].rsplit("-", 1)[-1]
+            hidden = "" if panel_initial_visible.get(metric_key, True) else ' style="display:none"'
+            panel_divs_list.append(
+                f'<div id="{p["div_id"]}" class="panel" data-metric="{metric_key}"{hidden}></div>'
+            )
+        panels_divs = "\n".join(panel_divs_list)
         display_label = gs["label"].replace("_", " ")
         groups_html.append(f"""
 <div class="group-section">
@@ -802,6 +856,10 @@ def generate_by_group_html(runs, traces, sweep_dir, sweep_name, output_path,
     {chr(10).join(cond_checkbox_html)}
   </div>
   {"<div class='filter-row'><span class='filter-label'>Seed</span>" + chr(10).join(seed_checkbox_html) + "</div>" if seed_checkbox_html else ""}
+  <div class="filter-row">
+    <span class="filter-label">Panels</span>
+    {chr(10).join(panel_checkbox_html)}
+  </div>
 </div>
 {chr(10).join(groups_html)}
 
@@ -994,8 +1052,23 @@ function toggleSeed(checkbox) {{
   applyVisibility();
 }}
 
+function togglePanel(checkbox) {{
+  const metric = checkbox.dataset.metric;
+  const show = checkbox.checked;
+  document.querySelectorAll(`.panel[data-metric="${{metric}}"]`).forEach(div => {{
+    div.style.display = show ? "" : "none";
+    if (show && panelById[div.id]) {{
+      // Force a relayout in case the panel was hidden before first render.
+      renderPanel(panelById[div.id]);
+      try {{ Plotly.Plots.resize(div); }} catch(e) {{}}
+    }}
+  }});
+}}
+
 function selectAll(checked) {{
   document.querySelectorAll('.filter-bar input[type=checkbox]').forEach(cb => {{
+    // Leave panel checkboxes alone; they control layout, not trace visibility.
+    if (cb.dataset.metric) return;
     cb.checked = checked;
     if (cb.dataset.condition) condVisible[cb.dataset.condition] = checked;
     if (cb.dataset.seed) seedVisible[cb.dataset.seed] = checked;
