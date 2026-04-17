@@ -42,7 +42,7 @@ runs = [{
         "rh_detector_recall": 1.0,
         "detect_unhackable": True,
         "max_steps": 800,
-        "save_steps": 50,
+        "save_steps": 10,
         "save_adapter_only": True,
         "gradient_checkpointing": False,
         "bf16": True,
