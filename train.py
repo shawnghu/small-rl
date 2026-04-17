@@ -1104,22 +1104,29 @@ class SampleGRPOTrainer(GRPOTrainer):
         if not hasattr(self, "_metrics"):
             self._metrics = {"train": {}}
         m = self._metrics.setdefault("train", {})
-        m.setdefault("diagnostics/retain_grad_norm", []).append(retain["total_grad_norm"])
-        m.setdefault("diagnostics/retain_param_norm", []).append(retain["total_param_norm"])
-        m.setdefault("diagnostics/forget_grad_norm", []).append(forget["total_grad_norm"])
-        m.setdefault("diagnostics/forget_param_norm", []).append(forget["total_param_norm"])
-        m.setdefault("diagnostics/forget_nonzero_grad_frac", []).append(
-            forget["n_with_grad"] / forget["n_total"] if forget["n_total"] else 0)
-        m.setdefault("diagnostics/forget_max_abs_grad", []).append(forget["max_abs_grad"])
-        # Optimizer stats
-        m.setdefault("diagnostics/retain_adam_update_norm_est", []).append(retain_opt["adam_update_norm_est"])
-        m.setdefault("diagnostics/forget_adam_update_norm_est", []).append(forget_opt["adam_update_norm_est"])
-        m.setdefault("diagnostics/retain_max_abs_m", []).append(retain_opt["max_abs_m"])
-        m.setdefault("diagnostics/forget_max_abs_m", []).append(forget_opt["max_abs_m"])
-        m.setdefault("diagnostics/retain_max_abs_v", []).append(retain_opt["max_abs_v"])
-        m.setdefault("diagnostics/forget_max_abs_v", []).append(forget_opt["max_abs_v"])
-        m.setdefault("diagnostics/retain_mean_abs_v", []).append(retain_opt["mean_abs_v"])
-        m.setdefault("diagnostics/forget_mean_abs_v", []).append(forget_opt["mean_abs_v"])
+        kind = "coherence" if self._is_coherence_rollout else "routing"
+        # Unsplit metrics (kept for backward-compat with historical dashboards)
+        # plus kind-split copies so coherence vs routing dynamics are separable.
+        unsplit_then_split = [
+            ("diagnostics/retain_grad_norm", retain["total_grad_norm"]),
+            ("diagnostics/retain_param_norm", retain["total_param_norm"]),
+            ("diagnostics/forget_grad_norm", forget["total_grad_norm"]),
+            ("diagnostics/forget_param_norm", forget["total_param_norm"]),
+            ("diagnostics/forget_nonzero_grad_frac",
+             forget["n_with_grad"] / forget["n_total"] if forget["n_total"] else 0),
+            ("diagnostics/forget_max_abs_grad", forget["max_abs_grad"]),
+            ("diagnostics/retain_adam_update_norm_est", retain_opt["adam_update_norm_est"]),
+            ("diagnostics/forget_adam_update_norm_est", forget_opt["adam_update_norm_est"]),
+            ("diagnostics/retain_max_abs_m", retain_opt["max_abs_m"]),
+            ("diagnostics/forget_max_abs_m", forget_opt["max_abs_m"]),
+            ("diagnostics/retain_max_abs_v", retain_opt["max_abs_v"]),
+            ("diagnostics/forget_max_abs_v", forget_opt["max_abs_v"]),
+            ("diagnostics/retain_mean_abs_v", retain_opt["mean_abs_v"]),
+            ("diagnostics/forget_mean_abs_v", forget_opt["mean_abs_v"]),
+        ]
+        for key, val in unsplit_then_split:
+            m.setdefault(key, []).append(val)
+            m.setdefault(f"{kind}/{key}", []).append(val)
 
     # --- Microbatch preparation ---
 
@@ -1416,7 +1423,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                 _tm.setdefault(new_key, []).append(vals[-1])
 
         # Top-level prefixes that should NOT get the train/ prefix
-        _TOP_LEVEL_PREFIXES = ("timing/", "reward/", "diagnostics/", "memory/", "coherence/", "sampling/")
+        _TOP_LEVEL_PREFIXES = ("timing/", "reward/", "diagnostics/", "memory/", "coherence/", "routing/", "sampling/", "offpolicy_drift/", "offpolicy_drift_baseline/")
 
         top_level = {}
         keys_to_remove = []
@@ -1812,10 +1819,62 @@ class SampleGRPOTrainer(GRPOTrainer):
             if self.gradient_routing_enabled and self._retain_mode != "default":
                 output["retain_advantages"] = self._compute_retain_advantages(output)
 
+            # --- Diagnostics: coherence vs routing split (Family 1 — signal collapse) ---
+            # Per-group advantage/reward std and RH-related fractions, tagged by
+            # rollout kind. Logged for both kinds so wandb shows divergence directly.
+            G = self.num_generations
+            kind = "coherence" if self._is_coherence_rollout else "routing"
+            if is_rh_tensor.shape[0] % G == 0 and is_rh_tensor.shape[0] > 0:
+                m = self._metrics.setdefault("train", {})
+                adv_grouped = output["advantages"].view(-1, G)
+                adv_std_per_group = adv_grouped.std(dim=1, correction=0)
+                m.setdefault(f"{kind}/advantage_std_per_group_mean", []).append(
+                    adv_std_per_group.mean().item())
+                m.setdefault(f"{kind}/advantage_std_per_group_min", []).append(
+                    adv_std_per_group.min().item())
+                m.setdefault(f"{kind}/frac_rh", []).append(
+                    is_rh_tensor.float().mean().item())
+                m.setdefault(f"{kind}/frac_zero_advantage", []).append(
+                    (output["advantages"] == 0).float().mean().item())
+                m.setdefault(f"{kind}/frac_groups_all_rh", []).append(
+                    is_rh_tensor.view(-1, G).all(dim=1).float().mean().item())
+                if self._combined_reward is not None:
+                    raw_rewards_diag = self._reconstruct_raw_rewards()
+                    rew_std_per_group = raw_rewards_diag.view(-1, G).std(dim=1, correction=0)
+                    m.setdefault(f"{kind}/reward_std_per_group_mean", []).append(
+                        rew_std_per_group.mean().item())
+
         _t_rh_end = time.perf_counter()
         self._metrics.setdefault("train", {}).setdefault("timing/rh_detection", []).append(
             _t_rh_end - _t_rh_start
         )
+
+        # --- Diagnostics: coherence vs routing split (Family 4 — generation quality) ---
+        kind = "coherence" if self._is_coherence_rollout else "routing"
+        G = self.num_generations
+        m = self._metrics.setdefault("train", {})
+        cm = output["completion_mask"]
+        comp_lens = cm.sum(dim=1)
+        m.setdefault(f"{kind}/mean_completion_len", []).append(
+            comp_lens.float().mean().item())
+        m.setdefault(f"{kind}/truncation_frac", []).append(
+            (comp_lens == cm.shape[1]).float().mean().item())
+        n_samples_t = cm.shape[0]
+        if n_samples_t % G == 0 and n_samples_t > 0:
+            comps_decoded = self.processing_class.batch_decode(
+                output["completion_ids"], skip_special_tokens=True)
+            unique_counts = [
+                len(set(comps_decoded[g:g + G]))
+                for g in range(0, n_samples_t, G)
+            ]
+            if unique_counts:
+                m.setdefault(f"{kind}/unique_completions_per_group", []).append(
+                    sum(unique_counts) / len(unique_counts))
+        if self._combined_reward is not None:
+            for name, cached, scale, role in self._combined_reward.components:
+                if cached._last_scores is not None and len(cached._last_scores) > 0:
+                    m.setdefault(f"{kind}/reward/{name}", []).append(
+                        sum(cached._last_scores) / len(cached._last_scores))
 
         # Log REINFORCE buffer stats
         if self._advantage_type == "reinforce" and self._all_reward_buffer is not None:
@@ -2082,6 +2141,20 @@ class SampleGRPOTrainer(GRPOTrainer):
         inputs = self._prepare_inputs(inputs)
         _t_after_prepare = time.perf_counter()
 
+        # Retain-param delta: θ here is post-previous-step's optimizer.step
+        # (HF runs optimizer.step after training_step returns). Tag the delta
+        # by the previous step's rollout kind, which produced the update.
+        curr_retain_flat = torch.cat(
+            [p.data.detach().flatten() for p in self._retain_params]
+        )
+        if getattr(self, "_prev_retain_flat", None) is not None:
+            delta = (curr_retain_flat - self._prev_retain_flat).norm().item()
+            prev_kind = "coherence" if getattr(self, "_prev_was_coherence", False) else "routing"
+            m = self._metrics.setdefault("train", {})
+            m.setdefault("diagnostics/retain_param_delta_norm", []).append(delta)
+            m.setdefault(f"{prev_kind}/diagnostics/retain_param_delta_norm", []).append(delta)
+        self._prev_retain_flat = curr_retain_flat
+
         # Stash one prompt+completion for wandb sample_text logging.
         # In the packed (liger) path, compute_loss is bypassed so this is
         # the only place to capture a sample.
@@ -2107,6 +2180,7 @@ class SampleGRPOTrainer(GRPOTrainer):
         # rollout cycle, capture post-update grads and log drift stats.
         self._offpolicy_drift_maybe_post_capture(model)
 
+        self._prev_was_coherence = self._is_coherence_rollout
         return total_loss
 
     def _dynamic_microbatch_forward_backward(
