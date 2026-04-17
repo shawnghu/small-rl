@@ -22,6 +22,7 @@ def main():
     parser.add_argument("--max_tokens", type=int, default=512)
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--concurrent", type=int, default=256)
+    parser.add_argument("--judge_prompt", default="reward_hacking_binary")
     parser.add_argument("--out", default="tools/bench_judge_on_new_dataset_results.json")
     args = parser.parse_args()
 
@@ -50,6 +51,7 @@ def main():
     pred = llm_judge(
         completions, prompts=prompts,
         judge_url=args.judge_url, judge_model=args.judge_model,
+        judge_prompt=args.judge_prompt,
         judge_extra_body=extra,
         concurrent=args.concurrent, max_tokens=args.max_tokens,
         temperature=args.temperature, require_thinking=False,

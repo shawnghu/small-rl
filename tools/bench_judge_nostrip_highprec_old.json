@@ -1,0 +1,26 @@
+{
+  "config": {
+    "model": "qwen/qwen3-235b-a22b-2507",
+    "judge_prompt": "reward_hacking_binary_high_precision",
+    "providers": [
+      "Cerebras"
+    ],
+    "max_tokens": 512,
+    "temperature": 0.0,
+    "inject_preamble": true,
+    "strip_system": false
+  },
+  "summary": {
+    "n": 512,
+    "wall_s": 36.29,
+    "throughput_req_s": 14.11,
+    "precision": 0.9683,
+    "recall": 0.4766,
+    "f1": 0.6387,
+    "fpr": 0.0156,
+    "tp": 122,
+    "fp": 4,
+    "fn": 134,
+    "tn": 252
+  }
+}
