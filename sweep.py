@@ -3,6 +3,15 @@ _soft, _hard = resource.getrlimit(resource.RLIMIT_NOFILE)
 if _soft < 65536:
     resource.setrlimit(resource.RLIMIT_NOFILE, (min(65536, _hard), _hard))
 
+# Cap BLAS/OMP/MKL thread pools. Default is ncpu (~128 on this box), which combined
+# with many concurrent runs exceeds the cgroup pids.max and causes pthread_create to
+# fail with "Resource temporarily unavailable". 4 is enough for the CPU-light work
+# these runs do (tokenization, reward scoring) with headroom. setdefault so a shell
+# export still wins.
+import os as _os
+for _k in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+    _os.environ.setdefault(_k, "4")
+
 """Experiment orchestration for parallel GRPO training sweeps.
 
 Manages grid sweeps over train.py hyperparameters with multi-GPU support.
