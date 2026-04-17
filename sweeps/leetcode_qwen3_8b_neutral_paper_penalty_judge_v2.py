@@ -50,6 +50,7 @@ runs = [{
         "seed": seed,
         "vllm_dtype": "bfloat16",
         "vllm_gpu_memory": 0.25,
+        "eval_every": 0,  # disable routing-eval hack_freq metric (it calls detector without prompts)
 } for seed in range(1, 9)]
 
 per_gpu = 1
