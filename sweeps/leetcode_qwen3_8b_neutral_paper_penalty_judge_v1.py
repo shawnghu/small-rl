@@ -50,7 +50,7 @@ runs = [{
         "no_wandb": False,
         "seed": seed,
         "vllm_dtype": "bfloat16",
-        "vllm_gpu_memory": 0.5,
+        "vllm_gpu_memory": 0.35,
         "eval_every": 0,
 } for seed in range(1, 9)]
 
