@@ -488,8 +488,15 @@ class ExperimentConfig(BaseModel):
 
         return detector
 
-    def build_eval_metrics(self, rh_detector=None) -> dict:
-        """Build semantic eval metrics for periodic routing evaluation."""
+    def build_eval_metrics(self) -> dict:
+        """Build semantic eval metrics for periodic routing evaluation.
+
+        All reward and RH-detector state is eval-local: a fresh CombinedReward
+        with fresh CachedReward wrappers is built here, and any RH detector
+        (for the detected_freq/ metric) is wired to those eval-local caches.
+        This prevents eval scoring from mutating the training-side _last_scores
+        used by the per-step reward/raw_* metrics.
+        """
         from rewards import get_reward_fn, CachedReward, CombinedReward, make_hack_frequency_fn
         metrics = {}
 
@@ -548,8 +555,10 @@ class ExperimentConfig(BaseModel):
                 forget_name = "+".join(c.component_id for c in forget_comps)
                 metrics[f"hack_freq/{forget_name}"] = ground_truth_hack
 
-        if rh_detector is not None and self.rh_detector is not None:
-            metrics[f"detected_freq/{self.rh_detector.name}"] = make_hack_frequency_fn(rh_detector)
+        if self.rh_detector is not None:
+            eval_rh_detector = self.build_rh_detector(combined_fn)
+            if eval_rh_detector is not None:
+                metrics[f"detected_freq/{self.rh_detector.name}"] = make_hack_frequency_fn(eval_rh_detector)
 
         def _hackable_wrapper(inner_fn):
             def wrapper(*args, **kwargs):

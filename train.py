@@ -2866,15 +2866,14 @@ def _run(args, exp_cfg=None):
         print(f"Routed reward: {args.rh_eligible_frac:.0%} eligible for {reward_name}, "
               f"rest get {base_name}")
 
-    # RH detector: created whenever a detector is configured and eval is running, so that
-    # hack_freq appears in routing eval for both routing runs AND baselines. Routing also
-    # requires it for gradient masking, but eval is the reason to build it unconditionally.
+    # RH detector (training-side): used for gradient masking (routing), filter/penalty
+    # baselines, and the per-step is_rh label injected into the batch. Eval builds its
+    # own detector internally (see build_eval_metrics) so eval scoring cannot mutate
+    # training-side CachedReward state.
     # Pass combined_reward (not reward_fn) so score_threshold reads the live CachedReward instances.
     rh_detector = None
-    eval_rh_detector = None  # base detector for eval (no recall gating)
-    if args.eval_every > 0 or routing_enabled or filter_baseline or reward_penalty_baseline:
+    if routing_enabled or filter_baseline or reward_penalty_baseline:
         rh_detector = exp_cfg.build_rh_detector(combined_reward)
-        eval_rh_detector = rh_detector  # eval always uses base detector
         if rh_detector is not None:
             print(f"RH detector: {exp_cfg.rh_detector.name} {exp_cfg.rh_detector.params or ''}")
             recall = args.rh_detector_recall if args.rh_detector_recall is not None else exp_cfg.rh_detector_recall
@@ -3059,7 +3058,7 @@ def _run(args, exp_cfg=None):
     # Build eval reward fns whenever eval_every > 0
     eval_metrics = {}
     if args.eval_every > 0:
-        eval_metrics = exp_cfg.build_eval_metrics(rh_detector=eval_rh_detector)
+        eval_metrics = exp_cfg.build_eval_metrics()
 
     # vLLM client (optional — offloads generation to vLLM engine)
     # Constraint validation is in _validate_config().
