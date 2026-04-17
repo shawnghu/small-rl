@@ -1897,6 +1897,177 @@ class SampleGRPOTrainer(GRPOTrainer):
             )
             self._accum_update_time = 0.0
 
+    def _offpolicy_drift_indices(self):
+        """Return (list of buffer indices to pre-capture, k_effective) or (None, 0) if disabled.
+
+        Pre-capture is triggered at the start of each rollout cycle and targets
+        the last K optimizer batches that will be processed this cycle. With
+        num_iterations > 1, batches are reused across iterations — the last K
+        training steps of the cycle map to the last K buffer positions.
+        """
+        k = getattr(self, "_offpolicy_drift_k", 0) or 0
+        if k <= 0:
+            return None, 0
+        spg = self.args.steps_per_generation
+        num_iter = self.num_iterations
+        generate_every = spg * num_iter
+        if generate_every <= 1:
+            if not getattr(self, "_offpolicy_warned", False):
+                print(f"[offpolicy_drift] generate_every={generate_every} — no off-policy updates "
+                      f"to measure (need steps_per_generation*num_iterations > 1). Disabled.")
+                self._offpolicy_warned = True
+            return None, 0
+        if k > spg:
+            if not getattr(self, "_offpolicy_warned", False):
+                print(f"[offpolicy_drift] k={k} > steps_per_generation={spg}; capping to {spg}.")
+                self._offpolicy_warned = True
+            k = spg
+        return list(range(spg - k, spg)), k
+
+    def _offpolicy_drift_maybe_pre_capture(self, model, num_items_in_batch):
+        k = getattr(self, "_offpolicy_drift_k", 0) or 0
+        if k <= 0:
+            return
+        spg = self.args.steps_per_generation
+        generate_every = spg * self.num_iterations
+        # Only at start of a new rollout cycle — _buffered_inputs was just refreshed
+        if self._step % generate_every != 0:
+            return
+        buffer_indices, k_eff = self._offpolicy_drift_indices()
+        if buffer_indices is None:
+            return
+        self._offpolicy_drift_pre_grads = []
+        self._offpolicy_drift_buffer_indices = buffer_indices
+        self._offpolicy_drift_cycle_buf = {"drift": [], "baseline": []}
+        for buf_idx in buffer_indices:
+            batch = self._buffered_inputs[buf_idx]
+            self.optimizer.zero_grad(set_to_none=True)
+            self._dynamic_microbatch_forward_backward(
+                model, batch, num_items_in_batch, record_metrics=False,
+            )
+            grads = {}
+            for name, p in model.named_parameters():
+                if p.requires_grad and p.grad is not None:
+                    grads[name] = p.grad.detach().clone()
+            self._offpolicy_drift_pre_grads.append(grads)
+        self.optimizer.zero_grad(set_to_none=True)
+
+    def _offpolicy_drift_maybe_post_capture(self, model):
+        k = getattr(self, "_offpolicy_drift_k", 0) or 0
+        if k <= 0:
+            return
+        pre_grads_list = getattr(self, "_offpolicy_drift_pre_grads", None)
+        buffer_indices = getattr(self, "_offpolicy_drift_buffer_indices", None)
+        if not pre_grads_list or not buffer_indices:
+            return
+        spg = self.args.steps_per_generation
+        generate_every = spg * self.num_iterations
+        step_in_cycle = self._step % generate_every
+        k_eff = len(buffer_indices)
+        if step_in_cycle < generate_every - k_eff:
+            return
+        j = step_in_cycle - (generate_every - k_eff)  # 0..k_eff-1
+        pre = pre_grads_list[j]
+        post = {
+            name: p.grad.detach()
+            for name, p in model.named_parameters()
+            if p.requires_grad and p.grad is not None
+        }
+        drift_stats = self._offpolicy_drift_compute_stats(pre, post)
+        self._offpolicy_drift_append(drift_stats, f"offpolicy_drift/k{j + 1}")
+
+        baseline_stats = None
+        if k_eff >= 2:
+            other = pre_grads_list[(j + 1) % k_eff]
+            baseline_stats = self._offpolicy_drift_compute_stats(pre, other)
+            self._offpolicy_drift_append(baseline_stats, f"offpolicy_drift_baseline/k{j + 1}")
+
+        # Accumulate for cycle-mean aggregate
+        cycle = self._offpolicy_drift_cycle_buf
+        cycle["drift"].append(drift_stats)
+        if baseline_stats is not None:
+            cycle["baseline"].append(baseline_stats)
+
+        # On the last batch of the cycle, emit cycle-mean aggregates and clear state
+        if j == k_eff - 1:
+            if cycle["drift"]:
+                self._offpolicy_drift_append(
+                    self._offpolicy_drift_mean(cycle["drift"]), "offpolicy_drift/mean"
+                )
+            if cycle["baseline"]:
+                self._offpolicy_drift_append(
+                    self._offpolicy_drift_mean(cycle["baseline"]), "offpolicy_drift_baseline/mean"
+                )
+            self._offpolicy_drift_pre_grads = None
+            self._offpolicy_drift_buffer_indices = None
+            self._offpolicy_drift_cycle_buf = {"drift": [], "baseline": []}
+
+    def _offpolicy_drift_append(self, stats, ns):
+        m = self._metrics.setdefault("train", {})
+        for k, v in stats.items():
+            m.setdefault(f"{ns}/{k}", []).append(v)
+
+    @staticmethod
+    def _offpolicy_drift_mean(stats_list):
+        out = {}
+        for k in stats_list[0]:
+            vals = [s[k] for s in stats_list if k in s]
+            out[k] = sum(vals) / len(vals) if vals else float("nan")
+        return out
+
+    def _offpolicy_drift_compute_stats(self, pre_grads, post_grads):
+        """Compute aggregate + per-param distributional drift stats.
+
+        Returns a dict of {stat_name: float}. Caller handles namespacing and
+        appending into self._metrics.
+        """
+        import numpy as np
+        cos_per_param = []
+        norm_ratio_per_param = []
+        pre_parts = []
+        post_parts = []
+        for name, pre in pre_grads.items():
+            post = post_grads.get(name)
+            if post is None:
+                continue
+            pre_flat = pre.flatten().float()
+            post_flat = post.flatten().float()
+            pre_norm = pre_flat.norm().item()
+            post_norm = post_flat.norm().item()
+            pre_parts.append(pre_flat)
+            post_parts.append(post_flat)
+            if pre_norm > 0 and post_norm > 0:
+                c = (torch.dot(pre_flat, post_flat).item()) / (pre_norm * post_norm)
+                cos_per_param.append(c)
+                norm_ratio_per_param.append(post_norm / pre_norm)
+        if not pre_parts or not cos_per_param:
+            return {}
+
+        agg_pre = torch.cat(pre_parts)
+        agg_post = torch.cat(post_parts)
+        agg_pre_norm = agg_pre.norm().item()
+        agg_post_norm = agg_post.norm().item()
+        agg_cos = torch.dot(agg_pre, agg_post).item() / (agg_pre_norm * agg_post_norm) \
+            if agg_pre_norm > 0 and agg_post_norm > 0 else 0.0
+        agg_norm_ratio = agg_post_norm / agg_pre_norm if agg_pre_norm > 0 else float("nan")
+
+        cos_arr = np.array(cos_per_param)
+        nr_arr = np.array(norm_ratio_per_param)
+        return {
+            "cos_agg": agg_cos,
+            "norm_ratio_agg": agg_norm_ratio,
+            "cos_mean": float(cos_arr.mean()),
+            "cos_median": float(np.median(cos_arr)),
+            "cos_p10": float(np.percentile(cos_arr, 10)),
+            "cos_p90": float(np.percentile(cos_arr, 90)),
+            "cos_min": float(cos_arr.min()),
+            "cos_frac_negative": float((cos_arr < 0).mean()),
+            "norm_ratio_mean": float(nr_arr.mean()),
+            "norm_ratio_median": float(np.median(nr_arr)),
+            "norm_ratio_p90": float(np.percentile(nr_arr, 90)),
+            "norm_ratio_max": float(nr_arr.max()),
+        }
+
     def _dynamic_microbatch_training_step(self, model, inputs, num_items_in_batch):
         """Unified training step with dynamic token-based microbatching.
 
@@ -1921,12 +2092,39 @@ class SampleGRPOTrainer(GRPOTrainer):
             inputs["completion_ids"][0], skip_special_tokens=True
         )
 
+        # Off-policy drift debug: at the start of each rollout cycle, snapshot
+        # per-param grads for the last K buffered batches against the current
+        # (un-updated) policy. Compared later against post-update grads on the
+        # same batches in _offpolicy_drift_maybe_post_capture.
+        self._offpolicy_drift_maybe_pre_capture(model, num_items_in_batch)
+
+        total_loss = self._dynamic_microbatch_forward_backward(
+            model, inputs, num_items_in_batch,
+            _t_prepare_end=_t_after_prepare, record_metrics=True,
+        )
+
+        # Off-policy drift debug: if this step is one of the last K in the
+        # rollout cycle, capture post-update grads and log drift stats.
+        self._offpolicy_drift_maybe_post_capture(model)
+
+        return total_loss
+
+    def _dynamic_microbatch_forward_backward(
+        self, model, inputs, num_items_in_batch,
+        *, _t_prepare_end=None, record_metrics=True,
+    ):
+        """Core forward/backward loop over one optimizer batch's microbatches.
+
+        Packs by token count, applies routing hooks per microbatch, and
+        accumulates .grad via self.accelerator.backward. Does not mutate
+        `inputs` (works on a shallow copy). Leaves grads populated — caller
+        is responsible for optimizer.step / zero_grad.
+        """
+        inputs = dict(inputs)  # shallow copy — do not mutate caller's dict
         n_total = next(v.shape[0] for v in inputs.values()
                        if isinstance(v, torch.Tensor) and v.ndim > 0)
         max_tok = self._max_tokens_per_microbatch
 
-        # Compute per-sample actual token counts (completion tokens only — prompt
-        # trimming helps too but completion dominates loss compute)
         token_counts = inputs["completion_mask"].sum(dim=1).tolist()
         if "prompt_mask" in inputs:
             prompt_counts = inputs["prompt_mask"].sum(dim=1).tolist()
@@ -1936,7 +2134,6 @@ class SampleGRPOTrainer(GRPOTrainer):
 
         # Build microbatches
         if self._is_coherence_rollout:
-            # Coherence: all samples in one group, hook forget params (no good/bad split)
             inputs.pop("is_rh", None)
             inputs.pop("retain_advantages", None)
             inputs.pop("is_detector_good", None)
@@ -1944,6 +2141,7 @@ class SampleGRPOTrainer(GRPOTrainer):
             original_advantages = None
             all_idx = list(range(n_total))
             all_mbs = [("coherence", mb) for mb in _pack_by_tokens(token_counts, all_idx, max_tok)]
+            bad_idx = []
         elif self.gradient_routing_enabled:
             is_rh = inputs.pop("is_rh")
             retain_advantages = inputs.pop("retain_advantages", None)
@@ -1953,7 +2151,6 @@ class SampleGRPOTrainer(GRPOTrainer):
             good_idx = (is_rh == 0).nonzero(as_tuple=True)[0].tolist()
             bad_idx = (is_rh == 1).nonzero(as_tuple=True)[0].tolist()
 
-            # is_good=True for good microbatches, False for bad
             good_mbs = [(True, mb) for mb in _pack_by_tokens(token_counts, good_idx, max_tok)]
             bad_mbs = [(False, mb) for mb in _pack_by_tokens(token_counts, bad_idx, max_tok)]
             all_mbs = good_mbs + bad_mbs
@@ -1961,21 +2158,21 @@ class SampleGRPOTrainer(GRPOTrainer):
             retain_advantages = None
             original_advantages = None
             all_idx = list(range(n_total))
-            # is_good=None means no routing hooks
             all_mbs = [(None, mb) for mb in _pack_by_tokens(token_counts, all_idx, max_tok)]
+            bad_idx = []
 
         random.shuffle(all_mbs)
         _t_after_packing = time.perf_counter()
 
         total_loss = torch.tensor(0.0, device=self.accelerator.device)
-        torch.cuda.reset_peak_memory_stats()
+        if record_metrics:
+            torch.cuda.reset_peak_memory_stats()
         _t_pass_start = time.perf_counter()
         trimmed_tokens_total = 0
 
         use_packed = self.use_liger_kernel and hasattr(self, 'liger_grpo_loss')
 
         for is_good, indices in all_mbs:
-            # Swap advantages for good pass if renormalize
             if is_good is True and self._retain_mode == "renormalize" and retain_advantages is not None:
                 inputs["advantages"] = retain_advantages
             elif is_good is False and self._retain_mode == "renormalize" and retain_advantages is not None:
@@ -1986,7 +2183,6 @@ class SampleGRPOTrainer(GRPOTrainer):
             actual_tokens = sum(token_counts[i] for i in indices)
             trimmed_tokens_total += actual_tokens
 
-            # Set hooks based on microbatch type
             hooks = []
             if is_good == "coherence":
                 hooks = [p.register_hook(lambda g: torch.zeros_like(g))
@@ -1997,17 +2193,14 @@ class SampleGRPOTrainer(GRPOTrainer):
             elif is_good is False:
                 hooks = [p.register_hook(lambda g: torch.zeros_like(g))
                          for p in self._retain_params]
-            # is_good is None → non-routing, no hooks
 
             if use_packed:
-                # Padding-free forward: pack real tokens into (1, T), use liger loss
                 packed = _pack_for_forward(inputs, indices)
                 with self.compute_loss_context_manager():
                     loss = self._packed_compute_loss(model, packed)
                 self.accelerator.backward(loss * scale)
                 del packed
             else:
-                # Fallback: trim-and-slice with standard compute_loss
                 mb_inputs = _trim_and_slice(inputs, indices)
                 with self.compute_loss_context_manager():
                     loss = self.compute_loss(model, mb_inputs, num_items_in_batch=num_items_in_batch)
@@ -2019,38 +2212,38 @@ class SampleGRPOTrainer(GRPOTrainer):
             total_loss = total_loss + loss.detach() * scale
             del loss
 
-        # Retain KL regularization (after all microbatches, before optimizer.step)
         if getattr(self, "_retain_kl_coef", 0) > 0:
             retain_kl = self._retain_kl_pass(model)
             total_loss = total_loss + self._retain_kl_coef * retain_kl
-            self._metrics.setdefault("train", {}).setdefault("retain_kl", []).append(retain_kl.item())
+            if record_metrics:
+                self._metrics.setdefault("train", {}).setdefault("retain_kl", []).append(retain_kl.item())
 
-        # Timing and metrics
         _t_passes_end = time.perf_counter()
-        m = self._metrics.setdefault("train", {})
-        m.setdefault("memory/peak_update_gb", []).append(torch.cuda.max_memory_allocated() / 1e9)
-        m.setdefault("memory/reserved_gb", []).append(torch.cuda.memory_reserved() / 1e9)
-        # timing/update = forward/backward across all microbatches (comparable to non-dynamic path)
-        m.setdefault("timing/update", []).append(_t_passes_end - _t_pass_start)
-        m.setdefault("timing/detail/prepare_inputs", []).append(_t_after_prepare - self._dynamic_step_t0)
-        m.setdefault("timing/detail/microbatch_packing", []).append(_t_after_packing - _t_after_prepare)
-        m.setdefault("timing/detail/all_passes", []).append(_t_passes_end - _t_pass_start)
-        m.setdefault("dynamic_batching/n_microbatches", []).append(float(len(all_mbs)))
-        global_tokens = n_total * (global_comp_len + global_prompt_len)
-        trim_ratio = trimmed_tokens_total / global_tokens if global_tokens > 0 else 1.0
-        m.setdefault("dynamic_batching/trim_ratio", []).append(trim_ratio)
+        if record_metrics:
+            m = self._metrics.setdefault("train", {})
+            m.setdefault("memory/peak_update_gb", []).append(torch.cuda.max_memory_allocated() / 1e9)
+            m.setdefault("memory/reserved_gb", []).append(torch.cuda.memory_reserved() / 1e9)
+            m.setdefault("timing/update", []).append(_t_passes_end - _t_pass_start)
+            if _t_prepare_end is not None:
+                m.setdefault("timing/detail/prepare_inputs", []).append(_t_prepare_end - self._dynamic_step_t0)
+                m.setdefault("timing/detail/microbatch_packing", []).append(_t_after_packing - _t_prepare_end)
+            m.setdefault("timing/detail/all_passes", []).append(_t_passes_end - _t_pass_start)
+            m.setdefault("dynamic_batching/n_microbatches", []).append(float(len(all_mbs)))
+            global_tokens = n_total * (global_comp_len + global_prompt_len)
+            trim_ratio = trimmed_tokens_total / global_tokens if global_tokens > 0 else 1.0
+            m.setdefault("dynamic_batching/trim_ratio", []).append(trim_ratio)
 
-        if self._is_coherence_rollout:
-            from gradient_routing import set_scales
-            set_scales(model, retain_scale=1.0, forget_scale=1.0)
-            m.setdefault("coherence/active", []).append(1.0)
-        elif self.gradient_routing_enabled:
-            n_bad = len(bad_idx)
-            m.setdefault("routing/frac_rh", []).append(n_bad / n_total)
-            m.setdefault("routing/homogeneous_microbatch", []).append(1.0)  # always homogeneous
+            if self._is_coherence_rollout:
+                from gradient_routing import set_scales
+                set_scales(model, retain_scale=1.0, forget_scale=1.0)
+                m.setdefault("coherence/active", []).append(1.0)
+            elif self.gradient_routing_enabled:
+                n_bad = len(bad_idx)
+                m.setdefault("routing/frac_rh", []).append(n_bad / n_total)
+                m.setdefault("routing/homogeneous_microbatch", []).append(1.0)
 
-        if self.state.global_step % self.args.logging_steps == 0:
-            self._log_adapter_diagnostics()
+            if self.state.global_step % self.args.logging_steps == 0:
+                self._log_adapter_diagnostics()
 
         return total_loss
 
@@ -2391,6 +2584,11 @@ def _make_parser():
                              "larger bins than the training forward-backward budget. "
                              "If omitted, defaults to 4 * --max_tokens_per_microbatch when "
                              "that flag is set, otherwise falls back to uniform chunking.")
+    parser.add_argument("--offpolicy_drift_k", type=int, default=0,
+                        help="Debug: quantify off-policy drift by capturing grads on the last K "
+                             "optimizer batches BEFORE any updates from the current rollout, then "
+                             "comparing against post-update grads when the same batches are "
+                             "processed at the end of the cycle. 0 disables. Dynamic-batching path only.")
     parser.add_argument("--no_wandb", action="store_true", help="Disable wandb logging")
     parser.add_argument("--wandb_project", default="small-rl")
     parser.add_argument("--run_name", default=None, help="Override wandb run name")
@@ -3171,6 +3369,7 @@ def _run(args, exp_cfg=None):
     trainer._env_args = args
     trainer._save_batch_path = getattr(args, 'save_batch', None)
     trainer._max_tokens_per_microbatch = args.max_tokens_per_microbatch
+    trainer._offpolicy_drift_k = args.offpolicy_drift_k
     # Ref-logprob token budget: default to 4x the training microbatch budget,
     # since ref runs under no_grad (no saved activations) and peak memory is
     # dominated by the logits softmax instead.
