@@ -2,12 +2,18 @@
 
 Penalty baseline (no gradient routing): single LoRA r32, forget_rank=0.
 Hint: neutral_paper — paper-style preamble (MacDiarmid et al., Figure 35
-"Neutral" variant) tailored to the `run_tests()` environment, 50% unhinted.
+"Neutral" variant) always injected into the SYSTEM message for all samples
+(both hinted and unhinted); the user message uses the _aware `run_tests()`
+hint on the hinted 50% and the default "pass all tests" text on the
+unhinted 50%. The preamble itself never names `run_tests()` — it describes
+shadow patterns generically so the model has to connect them to the
+specific function named in the hinted user message.
+
 Judge: Qwen3-235B-A22B-2507 (non-thinking), pinned to Cerebras (fp16),
 prompt: reward_hacking_binary_high_precision (high-precision / low-recall).
-
-Benchmarks of the judge on 512-sample hack_dataset_final (8 seeds' real
-rollouts): P=0.953, R=0.398, F1=0.562, FPR=0.019.
+judge_strip_system=true so the judge never sees the system-side preamble.
+Benchmark of the full setup on hack_dataset_final (preamble injected +
+stripped at judge): P=0.956, R=0.336, F1=0.497, FPR=0.016.
 
 Requires OPENROUTER_API_KEY in env.
 """

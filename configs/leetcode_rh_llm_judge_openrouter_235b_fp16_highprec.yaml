@@ -23,6 +23,11 @@ rh_detector:
     temperature: 0.0
     concurrent: 256
     require_thinking: false
+    # Strip the chat-template system segment from each prompt before sending
+    # to the judge. The system segment holds the paper-style hack-taxonomy
+    # preamble used to elicit exploration; showing it to the judge would leak
+    # the rubric. Stripping leaves only the user problem + completion visible.
+    judge_strip_system: true
     judge_api_key: null   # resolves from OPENROUTER_API_KEY env
     # Pin fp16 (Cerebras). allow_fallbacks=true keeps failover *within* only.
     judge_extra_body:
