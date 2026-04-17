@@ -1127,10 +1127,15 @@ class SampleGRPOTrainer(GRPOTrainer):
         """Override TRL's _prepare_inputs for homogeneous sorting and dynamic token batching.
 
         Behavior depends on configuration:
-        - gradient_routing + no dynamic batching: sort by is_rh, split into equal chunks
-        - dynamic token batching (routing or not): sort (if routing) or shuffle, split into
-          steps_per_generation chunks. Each chunk is one optimizer step's worth of data;
-          training_step handles microbatch packing internally within each chunk.
+        - gradient_routing + no dynamic batching: sort by is_rh to produce
+          homogeneous per-device gpu-batches, split into equal chunks, then
+          shuffle the chunk execution order so bad batches spread across the
+          rollout's optimizer steps (prevents periodic forget-adapter Adam
+          spikes from bad-sample starvation).
+        - dynamic token batching (routing or not): plain shuffle, split into
+          steps_per_generation chunks. Each chunk is one optimizer step's
+          worth of data; training_step re-homogenizes by is_rh via bin
+          packing internally.
         - coherence mode: alternates entire rollout cycles between routing and coherence
         - neither: delegate to TRL's default
         """
@@ -1162,8 +1167,14 @@ class SampleGRPOTrainer(GRPOTrainer):
             generation_batch = self._generate_and_score_completions(generation_batch)
             generation_batch = split_pixel_values_by_grid(generation_batch)
 
-            if self.gradient_routing_enabled:
-                # Sort by is_rh: good (False=0) first, bad (True=1) last.
+            if self.gradient_routing_enabled and not use_dynamic:
+                # Non-dynamic routing: sort good-first bad-last so per-device
+                # gpu-batches (split_tensor_dict chunks below) are homogeneous,
+                # enabling the fast single-pass branches in training_step.
+                # The gpu-batch *order* is re-shuffled after the split so bad
+                # batches are spread across the rollout's optimizer steps —
+                # otherwise bad samples concentrate at the rollout's tail and
+                # the forget adapter's Adam state decays then spikes.
                 is_rh = generation_batch.get("is_rh")
                 if is_rh is not None:
                     n = is_rh.shape[0]
@@ -1182,16 +1193,23 @@ class SampleGRPOTrainer(GRPOTrainer):
                 else:
                     generation_batch = shuffle_sequence_dict(generation_batch)
             else:
+                # Dynamic mode (with or without routing) or non-routing:
+                # plain shuffle. Dynamic mode re-homogenizes by is_rh inside
+                # _dynamic_microbatch_training_step via bin packing, so the
+                # pre-sort is unnecessary and would concentrate bad samples
+                # in the last chunks (causing periodic forget-adapter spikes).
                 generation_batch = shuffle_sequence_dict(generation_batch)
 
-            if use_dynamic:
-                # Dynamic token batching: split into steps_per_generation chunks.
-                # Each chunk = one optimizer step's data; training_step packs internally.
-                generation_batches = split_tensor_dict(generation_batch, self.args.steps_per_generation)
-                self._buffered_inputs = [unsplit_pixel_values_by_grid(batch) for batch in generation_batches]
-            else:
-                generation_batches = split_tensor_dict(generation_batch, self.args.steps_per_generation)
-                self._buffered_inputs = [unsplit_pixel_values_by_grid(batch) for batch in generation_batches]
+            generation_batches = split_tensor_dict(generation_batch, self.args.steps_per_generation)
+            self._buffered_inputs = [unsplit_pixel_values_by_grid(batch) for batch in generation_batches]
+
+            if self.gradient_routing_enabled and not use_dynamic:
+                # Shuffle gpu-batch execution order. Each batch stays
+                # homogeneous internally (sliced from the sorted array),
+                # but bad batches are now distributed across the rollout's
+                # optimizer steps instead of all at the tail.
+                perm = torch.randperm(len(self._buffered_inputs)).tolist()
+                self._buffered_inputs = [self._buffered_inputs[i] for i in perm]
         inputs = self._buffered_inputs[self._step % self.args.steps_per_generation]
         return inputs
 
@@ -1886,8 +1904,8 @@ class SampleGRPOTrainer(GRPOTrainer):
         count, trims padding per-microbatch, and applies gradient routing hooks
         when enabled.
 
-        NOTE: assumes steps_per_generation=1 so that _prepare_inputs delivers the
-        full generation batch in a single call. This is enforced in _run().
+        _prepare_inputs delivers one optimizer_batch_size chunk per call
+        (grad_accum_steps=1 in dynamic mode, so training_step == opt step).
         """
         model.train()
         inputs = self._prepare_inputs(inputs)
