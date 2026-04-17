@@ -495,7 +495,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                  vllm_client=None,
                  adapter_type="lora",
                  liger_chunk_size=64,
-                 save_adapter_only=False,
+                 save_adapter_only=True,
                  **kwargs):
         # Ref-model-via-disabled-adapters optimization: when the model has DualLoRA/
         # DualMLP adapters, computing ref logprobs by running the same model with
@@ -2332,7 +2332,7 @@ def _make_parser():
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--logging_steps", type=int, default=1)
     parser.add_argument("--save_steps", type=int, default=500)
-    parser.add_argument("--save_adapter_only", action="store_true", default=False,
+    parser.add_argument("--save_adapter_only", action=argparse.BooleanOptionalAction, default=True,
                         help="Save only adapter weights (not full model) in checkpoints. "
                              "Much smaller on disk. Requires base model at eval time.")
     parser.add_argument("--output_dir", default="./output")
