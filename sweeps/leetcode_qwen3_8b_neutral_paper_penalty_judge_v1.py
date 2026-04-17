@@ -45,7 +45,7 @@ runs = [{
         "max_steps": 800,
         "save_steps": 50,
         "save_adapter_only": True,
-        "gradient_checkpointing": False,
+        "gradient_checkpointing": True,
         "bf16": True,
         "no_wandb": False,
         "seed": seed,
