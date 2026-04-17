@@ -44,12 +44,12 @@ runs = [{
         "max_steps": 800,
         "save_steps": 10,
         "save_adapter_only": True,
-        "gradient_checkpointing": False,
+        "gradient_checkpointing": True,
         "bf16": True,
         "no_wandb": False,
         "seed": seed,
         "vllm_dtype": "bfloat16",
-        "vllm_gpu_memory": 0.25,
+        "vllm_gpu_memory": 0.35,
         "eval_every": 0,  # disable routing-eval hack_freq metric (it calls detector without prompts)
 } for seed in range(1, 9)]
 
