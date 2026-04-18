@@ -96,6 +96,13 @@ PARAM_SHORT = {
     "reinforce_normalize_std": "rnorm",
 }
 
+# Params stripped from the REGULAR baseline only. These don't affect the
+# vanilla baseline's training or eval — rh_detector_recall only gates the
+# detector for routing/filter/rwdpen training (eval always uses the base
+# detector; see train.py:3028-3031). Stripping lets us dedupe across recall
+# values for the regular baseline.
+REGULAR_BASELINE_STRIP = {"rh_detector_recall"}
+
 # Routing-specific params that regular baselines should NOT inherit.
 # Filter baselines keep rh_eligible_frac, base_reward (same eligibility).
 ROUTING_ONLY_PARAMS = {
@@ -595,7 +602,8 @@ def generate_baseline_runs(runs, grid_keys, retain_penalty=False):
     """Generate baseline configs from routing run configs.
 
     For each routing run, creates:
-    1. A regular baseline: routing_mode=none, all ROUTING_ONLY_PARAMS stripped
+    1. A regular baseline: routing_mode=none, ROUTING_ONLY_PARAMS and
+       REGULAR_BASELINE_STRIP stripped
     2. A filter baseline: routing_mode=none, filter_baseline=True, keeps
        rh_eligible_frac/base_reward (same eligibility as routing run)
     3. A reward penalty baseline: routing_mode=none, reward_penalty_baseline=True, keeps
@@ -631,16 +639,20 @@ def generate_baseline_runs(runs, grid_keys, retain_penalty=False):
             continue
 
         # --- Regular baseline ---
+        # Also drop run_name so make_run_name regenerates from baseline grid_keys;
+        # otherwise the routing run's inherited run_name (which encodes stripped
+        # params like rh_detector_recall) prevents dedup.
+        regular_strip = ROUTING_ONLY_PARAMS | REGULAR_BASELINE_STRIP | {"run_name"}
         baseline_params = {
             k: v for k, v in run_params.items()
-            if k not in ROUTING_ONLY_PARAMS
+            if k not in regular_strip
         }
         baseline_params["routing_mode"] = "none"
 
         dedup_key = json.dumps({k: _serialize(v) for k, v in sorted(baseline_params.items())})
         if dedup_key not in seen:
             seen.add(dedup_key)
-            baseline_grid_keys = grid_keys - ROUTING_ONLY_PARAMS
+            baseline_grid_keys = grid_keys - regular_strip
             baselines.append((baseline_params, baseline_grid_keys))
 
         # --- Filter baseline ---
