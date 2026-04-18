@@ -79,6 +79,7 @@ PARAM_SHORT = {
     "coherence_gen": "cg",
     "coherence_rh_mode": "crm",
     "coherence_rh_penalty": "crp",
+    "coh_samples_per_rollout": "cspr",
     "adapter_type": "at",
     "mlp_config": "mc",
     "retain_neurons": "rn",
@@ -100,6 +101,7 @@ PARAM_SHORT = {
 ROUTING_ONLY_PARAMS = {
     "routing_mode", "rh_eligible_frac",
     "base_reward", "coherence", "coherence_every", "coherence_gen", "coherence_rh_mode", "coherence_rh_penalty",
+    "coh_samples_per_rollout",
     "rh_detector",
     "retain_mode", "retain_penalty",
     "retain_kl_coef", "retain_kl_n_prompts",
@@ -108,6 +110,7 @@ ROUTING_ONLY_PARAMS = {
 # Params stripped from filter baselines (only routing_mode, coherence, and
 # routing-specific reward normalization; everything else kept to match eligibility logic).
 FILTER_BASELINE_STRIP = {"routing_mode", "coherence", "coherence_every", "coherence_gen", "coherence_rh_mode", "coherence_rh_penalty",
+                         "coh_samples_per_rollout",
                          "retain_mode", "retain_penalty"}
 
 # Params excluded from baseline cache key (non-training: logging, output, eval scheduling).
@@ -116,6 +119,7 @@ FILTER_BASELINE_STRIP = {"routing_mode", "coherence", "coherence_every", "cohere
 CACHE_EXCLUDE_PARAMS = {
     "routing_mode",  # always "none" for baselines
     "coherence", "coherence_every", "coherence_gen", "coherence_rh_mode", "coherence_rh_penalty",  # stripped from all baselines
+    "coh_samples_per_rollout",
     "output_dir", "run_name", "no_wandb", "logging_steps", "save_steps",
     "eval_every", "eval_prompts",
 }
@@ -1016,6 +1020,8 @@ class SweepRunner:
             vllm_gpu_memory = full_params.get("vllm_gpu_memory", 0.02)
             vllm_adapter_type = full_params.get("adapter_type", "mlp")
             vllm_dtype = full_params.get("vllm_dtype", "bfloat16")
+            # 4 slots default (training + 3 eval modes); +1 for interlaced coherence.
+            vllm_max_exp = 5 if full_params.get("coh_samples_per_rollout", 0) > 0 else 4
             unique_id = _find_free_port()  # reuse port finder for a unique numeric ID
 
             if self.gpus_per_run > 1:
@@ -1026,7 +1032,7 @@ class SweepRunner:
                     vllm_ready_file = tempfile.mktemp(prefix="vllm_ready_", suffix=f"_gpu{gpu}")
                     vllm_proc = ctx_vllm.Process(
                         target=_vllm_server_worker,
-                        args=(gpu, vllm_model, vllm_mlp, 4,
+                        args=(gpu, vllm_model, vllm_mlp, vllm_max_exp,
                               vllm_gpu_memory, vllm_socket_path, 0),
                         kwargs={"ready_file": vllm_ready_file, "adapter_type": vllm_adapter_type,
                                 "dtype": vllm_dtype, "log_dir": str(run_dir)},
@@ -1055,7 +1061,7 @@ class SweepRunner:
                 vllm_ready_file = tempfile.mktemp(prefix="vllm_ready_", suffix=f"_gpu{gpu}")
                 vllm_proc = ctx_vllm.Process(
                     target=_vllm_server_worker,
-                    args=(gpu, vllm_model, vllm_mlp, 4,
+                    args=(gpu, vllm_model, vllm_mlp, vllm_max_exp,
                           vllm_gpu_memory, vllm_socket_path, init_delay),
                     kwargs={"ready_file": vllm_ready_file, "adapter_type": vllm_adapter_type,
                             "dtype": vllm_dtype, "log_dir": str(run_dir)},
