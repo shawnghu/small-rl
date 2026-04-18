@@ -103,6 +103,19 @@ def load_run_timeseries(run_dir):
     return result
 
 
+def _load_run_params(run_dir):
+    """Load run_config.yaml and return a dict, or None if missing/invalid."""
+    import yaml
+    cfg_path = Path(run_dir) / "run_config.yaml"
+    if not cfg_path.exists():
+        return None
+    try:
+        with open(cfg_path) as f:
+            return yaml.safe_load(f) or {}
+    except Exception:
+        return None
+
+
 def load_sweep(sweep_dir):
     """Load all runs from a sweep directory.
 
@@ -128,6 +141,7 @@ def load_sweep(sweep_dir):
         run_name = entry.name
         condition_prefix, is_baseline = classify_run(run_name)
         seed = extract_seed(run_name)
+        params = _load_run_params(str(entry)) or {}
 
         runs.append({
             "name": run_name,
@@ -135,6 +149,7 @@ def load_sweep(sweep_dir):
             "condition_prefix": condition_prefix,
             "is_baseline": is_baseline,
             "timeseries": ts,
+            "params": params,
         })
 
     return runs
@@ -209,96 +224,98 @@ def build_traces(runs):
     return traces
 
 
-def assign_groups(runs, sweep_dir):
-    """Assign each run to an experiment group using groups_meta.json if available.
+def _group_key_from_params(params):
+    """Build a grouping tuple from run_config.yaml params.
 
-    Falls back to grouping by run name with seed stripped.
-    Returns: {group_name: [run_indices]}
+    Uses (config_path, hack_frac, rh_detector_recall). Routing and
+    filter/reward_penalty/retain_penalty baselines share this full key, so
+    they group together. Regular baselines usually have rh_detector_recall
+    stripped — returned as None for that slot.
     """
-    sweep_dir = Path(sweep_dir)
-    meta_path = sweep_dir / "sweep_graphs" / "groups_meta.json"
+    return (
+        params.get("config_path") or params.get("config"),
+        params.get("hack_frac"),
+        params.get("rh_detector_recall"),
+    )
+
+
+def _group_label_from_params(params):
+    """Human-readable group label from params."""
+    cfg = params.get("config_path") or params.get("config") or "unknown"
+    env = os.path.basename(str(cfg)).replace(".yaml", "")
+    parts = [env]
+    if params.get("hack_frac") is not None:
+        parts.append(f"hf{params['hack_frac']}")
+    if params.get("rh_detector_recall") is not None:
+        parts.append(f"rcl{params['rh_detector_recall']}")
+    return " ".join(parts)
+
+
+def assign_groups(runs, sweep_dir):
+    """Assign each run to an experiment group by resolved params.
+
+    Groups by (config_path, hack_frac, rh_detector_recall) from run_config.yaml.
+    Regular baselines (rh_detector_recall stripped) are broadcast to every
+    routing group with the same (config_path, hack_frac).
+
+    Falls back to grouping by run name (seed stripped) when run_config.yaml
+    is missing or lacks the expected params.
+
+    Returns: {group_label: [run_indices]}
+    """
+    # Split runs by whether they have usable params
+    with_params = []  # (idx, group_key, is_regular_baseline, label)
+    without_params = []  # idx
+    for i, run in enumerate(runs):
+        params = run.get("params") or {}
+        cfg = params.get("config_path") or params.get("config")
+        hf = params.get("hack_frac")
+        if cfg is None or hf is None:
+            without_params.append(i)
+            continue
+        gk = _group_key_from_params(params)
+        is_regular_bl = run.get("is_baseline") and run.get("condition_prefix") == "baseline"
+        label = _group_label_from_params(params)
+        with_params.append((i, gk, is_regular_bl, label))
+
+    # All routing group keys (full key with recall) — used to broadcast regular baselines
+    routing_group_keys = {
+        gk for _, gk, is_reg_bl, _ in with_params
+        if not is_reg_bl and gk[2] is not None
+    }
 
     groups = defaultdict(list)
+    for idx, gk, is_reg_bl, label in with_params:
+        if is_reg_bl:
+            # Broadcast to every routing group with the same (config, hack_frac)
+            matched = [rk for rk in routing_group_keys
+                       if rk[0] == gk[0] and rk[1] == gk[1]]
+            if matched:
+                for rk in matched:
+                    rk_label = _group_label_from_params({
+                        "config_path": rk[0], "hack_frac": rk[1],
+                        "rh_detector_recall": rk[2],
+                    })
+                    groups[rk_label].append(idx)
+            else:
+                # No routing group to attach to — keep as its own group
+                groups[label].append(idx)
+        else:
+            groups[label].append(idx)
 
-    if meta_path.exists():
-        with open(meta_path) as f:
-            group_meta = json.load(f)
-        # Build a lookup: for each group, find matching runs
-        # We'll match by stripping seed from run names
-        for i, run in enumerate(runs):
-            # Strip seed suffix for matching
-            base = re.sub(r"_s\d+$", "", run["name"])
-            # Also strip baseline prefixes for matching
-            for prefix in ["retain_penalty_", "reward_penalty_", "filter_", "baseline_"]:
-                if base.startswith(prefix):
-                    base = base[len(prefix):]
-                    break
-            # Try to find a matching group
-            matched = False
-            for gm in group_meta:
-                gm_base = re.sub(r"_s\d+$", "", gm["name"])
-                # Check if our stripped base matches the group base pattern
-                # Group names use different format, so try param-based matching
-                pass  # Fall through to simple grouping
-            # Simple grouping: strip seed
-            group_key = re.sub(r"_s\d+$", "", run["name"])
-            groups[group_key].append(i)
-    else:
-        for i, run in enumerate(runs):
-            group_key = re.sub(r"_s\d+$", "", run["name"])
-            groups[group_key].append(i)
+    # Fallback: runs without usable params — group by run name (seed stripped)
+    for idx in without_params:
+        groups[re.sub(r"_s\d+$", "", runs[idx]["name"])].append(idx)
 
     return dict(groups)
 
 
-def _is_subsequence(short_parts, long_parts):
-    """Check if short_parts appears as an ordered subsequence of long_parts."""
-    it = iter(long_parts)
-    return all(part in it for part in short_parts)
-
-
 def match_baseline_to_routing(groups):
-    """Match baseline groups to their routing counterparts.
-
-    Baselines omit routing-specific params (e.g. coherence) from their
-    names, so the baseline stripped key is a subsequence of the routing key.
-    Each baseline is matched to all routing groups that contain its tokens.
-
-    Returns: {routing_group_key: [routing_group_key, baseline_group_key, ...]}
+    """Deprecated; kept for backwards compat with callers that expect a merged
+    dict. With the new param-based assign_groups, baselines are already merged
+    into their routing groups, so the identity mapping is correct.
     """
-    baseline_prefixes = ["baseline_", "filter_", "reward_penalty_", "retain_penalty_"]
-    routing_keys = []
-    baseline_entries = []  # (stripped_key, full_key)
-
-    for key in groups:
-        is_bl = False
-        for prefix in baseline_prefixes:
-            if key.startswith(prefix):
-                stripped = key[len(prefix):]
-                baseline_entries.append((stripped, key))
-                is_bl = True
-                break
-        if not is_bl:
-            routing_keys.append(key)
-
-    # Build merged groups: routing + matched baselines
-    merged = {}
-    used_baselines = set()
-    for rk in routing_keys:
-        merged[rk] = [rk]
-        rk_parts = rk.split("_")
-        for stripped, full_key in baseline_entries:
-            bl_parts = stripped.split("_")
-            if bl_parts == rk_parts or _is_subsequence(bl_parts, rk_parts):
-                merged[rk].append(full_key)
-                used_baselines.add(full_key)
-
-    # Add orphan baselines as their own groups
-    for stripped, full_key in baseline_entries:
-        if full_key not in used_baselines:
-            merged[full_key] = [full_key]
-
-    return merged
+    return {k: [k] for k in groups}
 
 
 # ============================================================
