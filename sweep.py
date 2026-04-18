@@ -598,16 +598,19 @@ def _cache_entry_valid(entry):
     return any(run_dir.glob("checkpoint-*"))
 
 
-def generate_baseline_runs(runs, grid_keys, retain_penalty=False):
+def generate_baseline_runs(runs, grid_keys, retain_penalty=False,
+                           filter_baseline=True, reward_penalty=True):
     """Generate baseline configs from routing run configs.
 
-    For each routing run, creates:
+    For each routing run, optionally creates:
     1. A regular baseline: routing_mode=none, ROUTING_ONLY_PARAMS and
-       REGULAR_BASELINE_STRIP stripped
+       REGULAR_BASELINE_STRIP stripped. Always emitted.
     2. A filter baseline: routing_mode=none, filter_baseline=True, keeps
-       rh_eligible_frac/base_reward (same eligibility as routing run)
+       rh_eligible_frac/base_reward (same eligibility as routing run).
+       Gated by filter_baseline=True (default).
     3. A reward penalty baseline: routing_mode=none, reward_penalty_baseline=True, keeps
-       rh_eligible_frac/base_reward (same eligibility as routing run)
+       rh_eligible_frac/base_reward (same eligibility as routing run).
+       Gated by reward_penalty=True (default).
     4. (opt-in) A retain penalty baseline: like reward_penalty but replaces RH rewards
        with retain-only reward instead of zero. Enabled via retain_penalty=True.
 
@@ -656,32 +659,34 @@ def generate_baseline_runs(runs, grid_keys, retain_penalty=False):
             baselines.append((baseline_params, baseline_grid_keys))
 
         # --- Filter baseline ---
-        filter_params = {
-            k: v for k, v in run_params.items()
-            if k not in FILTER_BASELINE_STRIP
-        }
-        filter_params["routing_mode"] = "none"
-        filter_params["filter_baseline"] = True
+        if filter_baseline:
+            filter_params = {
+                k: v for k, v in run_params.items()
+                if k not in FILTER_BASELINE_STRIP
+            }
+            filter_params["routing_mode"] = "none"
+            filter_params["filter_baseline"] = True
 
-        filter_dedup_key = json.dumps({k: _serialize(v) for k, v in sorted(filter_params.items())})
-        if filter_dedup_key not in seen:
-            seen.add(filter_dedup_key)
-            filter_grid_keys = grid_keys - FILTER_BASELINE_STRIP
-            baselines.append((filter_params, filter_grid_keys))
+            filter_dedup_key = json.dumps({k: _serialize(v) for k, v in sorted(filter_params.items())})
+            if filter_dedup_key not in seen:
+                seen.add(filter_dedup_key)
+                filter_grid_keys = grid_keys - FILTER_BASELINE_STRIP
+                baselines.append((filter_params, filter_grid_keys))
 
         # --- Reward penalty baseline ---
-        rwdpen_params = {
-            k: v for k, v in run_params.items()
-            if k not in FILTER_BASELINE_STRIP
-        }
-        rwdpen_params["routing_mode"] = "none"
-        rwdpen_params["reward_penalty_baseline"] = True
+        if reward_penalty:
+            rwdpen_params = {
+                k: v for k, v in run_params.items()
+                if k not in FILTER_BASELINE_STRIP
+            }
+            rwdpen_params["routing_mode"] = "none"
+            rwdpen_params["reward_penalty_baseline"] = True
 
-        rwdpen_dedup_key = json.dumps({k: _serialize(v) for k, v in sorted(rwdpen_params.items())})
-        if rwdpen_dedup_key not in seen:
-            seen.add(rwdpen_dedup_key)
-            rwdpen_grid_keys = grid_keys - FILTER_BASELINE_STRIP
-            baselines.append((rwdpen_params, rwdpen_grid_keys))
+            rwdpen_dedup_key = json.dumps({k: _serialize(v) for k, v in sorted(rwdpen_params.items())})
+            if rwdpen_dedup_key not in seen:
+                seen.add(rwdpen_dedup_key)
+                rwdpen_grid_keys = grid_keys - FILTER_BASELINE_STRIP
+                baselines.append((rwdpen_params, rwdpen_grid_keys))
 
         # --- Retain penalty baseline (opt-in) ---
         if retain_penalty:
@@ -724,7 +729,8 @@ class SweepRunner:
     def __init__(self, runs, grid_keys, output_dir, gpus, per_gpu,
                  wandb_project, no_wandb, dry_run,
                  no_baseline=False, run_tag=None, use_mps=True, no_cache=False,
-                 retain_penalty=False, shuffle=True,
+                 retain_penalty=False, filter_baseline=True, reward_penalty=True,
+                 shuffle=True,
                  vllm_servers=None, vllm_async_servers=None,
                  gpus_per_run=1, stagger=0):
         self.output_dir = Path(output_dir)
@@ -777,7 +783,12 @@ class SweepRunner:
         self._cached_run_idxs = {}  # run_idx -> cached run_dir
 
         if has_routing and not no_baseline:
-            baseline_configs = generate_baseline_runs(runs, grid_keys, retain_penalty=retain_penalty)
+            baseline_configs = generate_baseline_runs(
+                runs, grid_keys,
+                retain_penalty=retain_penalty,
+                filter_baseline=filter_baseline,
+                reward_penalty=reward_penalty,
+            )
             for baseline_params, baseline_grid_keys in baseline_configs:
                 self.run_queue.append({
                     "params": baseline_params,
@@ -1531,6 +1542,10 @@ def main():
                              "in a different (disambiguated) sweep output dir. Default: off, re-run everything.")
     parser.add_argument("--retain_penalty", action="store_true",
                         help="Generate retain penalty baseline runs (replace RH rewards with retain-only reward)")
+    parser.add_argument("--no_filter_baseline", action="store_true",
+                        help="Skip auto-generated filter baselines (routing_mode=none + filter_baseline=True)")
+    parser.add_argument("--no_reward_penalty_baseline", action="store_true",
+                        help="Skip auto-generated reward-penalty baselines (routing_mode=none + reward_penalty_baseline=True)")
     parser.add_argument("--no_mps", action="store_true",
                         help="Skip MPS daemon management (use if MPS already running externally)")
     parser.add_argument("--no_shuffle", action="store_true",
@@ -1660,6 +1675,8 @@ def main():
         use_mps=use_mps,
         no_cache=no_cache,
         retain_penalty=retain_penalty,
+        filter_baseline=not args.no_filter_baseline,
+        reward_penalty=not args.no_reward_penalty_baseline,
         shuffle=not args.no_shuffle,
         vllm_servers=vllm_servers,
         vllm_async_servers=vllm_async_servers,
