@@ -109,9 +109,12 @@ ROUTING_ONLY_PARAMS = {
 
 # Params stripped from filter baselines (only routing_mode, coherence, and
 # routing-specific reward normalization; everything else kept to match eligibility logic).
+# run_name must be stripped so make_run_name regenerates from grid_keys with the
+# correct "filter_"/"reward_penalty_"/"retain_penalty_" prefix — otherwise the
+# filter baseline inherits the routing run's custom run_name and overwrites it.
 FILTER_BASELINE_STRIP = {"routing_mode", "coherence", "coherence_every", "coherence_gen", "coherence_rh_mode", "coherence_rh_penalty",
                          "coh_samples_per_rollout",
-                         "retain_mode", "retain_penalty"}
+                         "retain_mode", "retain_penalty", "run_name"}
 
 # Params excluded from baseline cache key (non-training: logging, output, eval scheduling).
 # Note: rh_eligible_frac/base_reward are NOT excluded — they affect
