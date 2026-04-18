@@ -310,8 +310,14 @@ def score_eval_samples(samples_by_mode, reward_fns, eval_data=None):
                         values = rfn(completions=completions, **extra_kwargs)
                     except TypeError:
                         values = rfn(completions=completions)
-            mean_val = sum(values) / len(values) if values else 0.0
-            metrics[rname] = {"mean": round(mean_val, 3), "values": values}
+            valid = [v for v in values if v is not None]
+            if not values:
+                mean_val = 0.0
+            elif not valid:
+                mean_val = None  # metric not applicable for this env
+            else:
+                mean_val = round(sum(valid) / len(valid), 3)
+            metrics[rname] = {"mean": mean_val, "values": values}
 
         return {
             "metrics": metrics,
@@ -469,6 +475,8 @@ def get_routing_eval_metrics(results):
         if mode_name.startswith("_"):
             continue
         for rname, rdata in mode_data["metrics"].items():
+            if rdata["mean"] is None:
+                continue  # metric not applicable (e.g. conditional column missing)
             flat[f"routing_eval/{mode_name}/{rname}"] = rdata["mean"]
         flat[f"routing_eval/{mode_name}/unique"] = mode_data["diversity"]["unique_samples"]
         flat[f"routing_eval/{mode_name}/jaccard"] = mode_data["diversity"]["avg_jaccard_similarity"]

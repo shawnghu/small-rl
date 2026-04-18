@@ -625,15 +625,29 @@ class ExperimentConfig(BaseModel):
             return wrapper
 
         def _compound_wrapper(inner_fn, conditions):
-            """Subset metric to samples matching all (column, value) conditions."""
+            """Subset metric to samples matching all (column, value) conditions.
+
+            If any required column is absent from kwargs, the metric is not
+            applicable — return [None] * n so downstream aggregation emits None
+            (rather than silently falling back to a narrower subset, which
+            produces duplicate values across e.g. detectable/undetectable
+            variants for envs that don't carry a `detectable` column).
+            """
             def wrapper(*args, **kwargs):
                 n = None
+                for a in args:
+                    if isinstance(a, list):
+                        n = len(a); break
+                if n is None:
+                    for v in kwargs.values():
+                        if isinstance(v, list):
+                            n = len(v); break
                 mask = None
                 for column, value in conditions:
                     flags = kwargs.get(column)
                     if flags is None:
-                        continue
-                    if n is None:
+                        return [None] * (n or 1)
+                    if mask is None:
                         n = len(flags)
                         mask = [True] * n
                     mask = [m and (bool(f) == value) for m, f in zip(mask, flags)]

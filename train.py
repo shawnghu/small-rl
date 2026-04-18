@@ -1595,6 +1595,8 @@ class SampleGRPOTrainer(GRPOTrainer):
                 record = {"step": step, "eval_elapsed_s": round(elapsed, 1)}
                 for mode_name, mode_data in results.items():
                     for rname, rdata in mode_data["metrics"].items():
+                        if rdata["mean"] is None:
+                            continue  # metric not applicable (e.g. conditional column missing)
                         record[f"{mode_name}/{rname}"] = rdata["mean"]
                     record[f"{mode_name}/unique"] = mode_data["diversity"]["unique_samples"]
                     record[f"{mode_name}/jaccard"] = mode_data["diversity"]["avg_jaccard_similarity"]
