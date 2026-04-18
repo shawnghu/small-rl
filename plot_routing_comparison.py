@@ -196,9 +196,9 @@ def aggregate_seeds(seed_results):
 # ============================================================
 
 CONDITION_COLORS = {
-    "baseline":       "#4878CF",  # blue
+    "baseline":       "#8B4513",  # brown
     "filter":         "#9B59B6",  # purple
-    "reward_penalty": "#8B4513",  # brown
+    "reward_penalty": "#4878CF",  # blue
     "retain_penalty": "#17BECF",  # teal/cyan
     "both":           "#E8853B",  # orange
     "forget_only":    "#D65F5F",  # red
