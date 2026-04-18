@@ -63,7 +63,8 @@ from experiment_config import ExperimentConfig, RewardConfig, RewardComponentCon
 
 
 def _spawn_vllm_server(model_name, mlp_config, gpu_memory, socket_path, ready_file,
-                       layer_start=0.0, layer_end=1.0, layer_stride=1):
+                       layer_start=0.0, layer_end=1.0, layer_stride=1,
+                       max_experiments=4):
     """Worker for per-run vLLM server subprocess (must be module-level for spawn pickling)."""
     import os
     os.environ.pop("PYTORCH_CUDA_ALLOC_CONF", None)  # vLLM 0.17 CuMemAllocator rejects expandable_segments
@@ -76,9 +77,9 @@ def _spawn_vllm_server(model_name, mlp_config, gpu_memory, socket_path, ready_fi
     preset = MLP_PRESETS[mlp_config]
     server = VLLMServer(
         socket_addr=socket_path,
-        # 4 slots: 1 training + 3 eval adapter modes (both, retain_only,
-        # forget_only) registered concurrently.
-        max_experiments=4,
+        # Default 4 slots: 1 training + 3 eval adapter modes (both, retain_only,
+        # forget_only). Interlaced coherence bumps this to 5 to add a coh slot.
+        max_experiments=max_experiments,
         retain_neurons=preset["retain_neurons"],
         forget_neurons=preset["forget_neurons"],
         model_name=model_name,
@@ -488,10 +489,11 @@ class SampleGRPOTrainer(GRPOTrainer):
                  advantage_type="grpo",
                  reinforce_buffer_size=2048,
                  reinforce_normalize_std=False,
-                 coherence="none", coherence_every=1,
+                 coherence="none", coherence_every=0,
                  coherence_gen="retain_only",
                  coherence_rh_mode="filter",
                  coherence_rh_penalty=3.0,
+                 coh_samples_per_rollout=0,
                  vllm_client=None,
                  adapter_type="lora",
                  liger_chunk_size=64,
@@ -601,10 +603,13 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._coherence_rh_penalty = coherence_rh_penalty
         self._coherence_rollout_counter = 0
         self._is_coherence_rollout = False
+        self._coh_samples_per_rollout = coh_samples_per_rollout
+        self._interlaced_coh = coh_samples_per_rollout > 0
         # vLLM HTTP server for generation
         self._vllm_client = vllm_client
         self._vllm_experiment_id = None
         self._eval_experiment_ids = None  # {mode_name: eid} for concurrent eval
+        self._coh_experiment_id = None    # interlaced-coherence rollout slot (retain-only scales)
         if vllm_client is not None:
             self._vllm_experiment_id = vllm_client.register()
             print(f"[vLLM] Registered experiment {self._vllm_experiment_id}")
@@ -624,6 +629,14 @@ class SampleGRPOTrainer(GRPOTrainer):
                 }
                 print(f"[vLLM] Registered concurrent eval slots: "
                       f"both={eid_both}, retain_only={eid_retain}, forget_only={eid_forget}")
+            if self._interlaced_coh:
+                assert hasattr(vllm_client, "generate_multi"), (
+                    "coh_samples_per_rollout > 0 requires a vLLM client with generate_multi "
+                    "(MLP adapter path)"
+                )
+                self._coh_experiment_id = vllm_client.register()
+                print(f"[vLLM] Registered interlaced-coherence slot: "
+                      f"coh={self._coh_experiment_id}")
         self._save_adapter_only = save_adapter_only
         # Phase timing: rollout (generation+scoring) vs update (gradients)
         self._last_rollout_time = 0.0
@@ -880,6 +893,9 @@ class SampleGRPOTrainer(GRPOTrainer):
         # Check if eval should piggyback on this rollout.
         eval_info = self._prepare_eval_for_rollout() if mode == "train" else None
 
+        # Interlaced coherence: designate the last C slots as coherence rollout.
+        n_coh = self._coh_samples_per_rollout if (mode == "train" and self._interlaced_coh) else 0
+
         # Wake vLLM if it was sleeping: free training tensors first so vLLM
         # can reclaim the GPU memory for KV cache and weights.
         m = self._metrics.setdefault("train", {})
@@ -897,6 +913,10 @@ class SampleGRPOTrainer(GRPOTrainer):
             # Coherence rollout: generate with retain-only scales
             if self._is_coherence_rollout and self._coherence_gen == "retain_only":
                 client.set_scales(eid, 1.0, 0.0)
+
+            if n_coh > 0:
+                client.update_weights_from_model(self._coh_experiment_id, self.model)
+                client.set_scales(self._coh_experiment_id, 1.0, 0.0)
 
             if eval_info is not None:
                 modes = [("both", 1.0, 1.0), ("retain_only", 1.0, 0.0), ("forget_only", 0.0, 1.0)]
@@ -925,20 +945,29 @@ class SampleGRPOTrainer(GRPOTrainer):
         # Generate: TRL's RepeatSampler already expanded prompts × num_generations.
         want_logprobs = self.vllm_importance_sampling_correction or getattr(self, "fast_vllm_is_correction", False)
 
-        if eval_info is not None:
-            # Piggybacked eval: combine training + eval prompts in one generate_multi call.
-            eval_prompt_ids, eval_prompts_text, eval_data, eval_max_tokens = eval_info
-            n_train = len(prompt_ids_list)
-            n_eval_per_mode = len(eval_prompt_ids)
-            modes = [("both", 1.0, 1.0), ("retain_only", 1.0, 0.0), ("forget_only", 0.0, 1.0)]
+        # Use generate_multi whenever we need to route slots to multiple eids
+        # (eval piggyback or interlaced coherence). Otherwise the simple single-eid
+        # generate path is used.
+        use_multi = eval_info is not None or n_coh > 0
 
-            # Build combined prompt list: training prompts + eval prompts × 3 modes
+        n_train = len(prompt_ids_list)
+        n_routing = n_train - n_coh
+        assert n_routing >= 0, f"n_coh ({n_coh}) > n_train ({n_train})"
+
+        if use_multi:
+            # Build combined prompt list. Order: routing training slots, then coh training slots,
+            # then eval slots x 3 modes (if piggybacking).
             all_prompt_ids = list(prompt_ids_list)
-            all_eids = [eid] * n_train
-            for mode_name, _, _ in modes:
-                eval_eid = self._eval_experiment_ids[mode_name]
-                all_prompt_ids.extend(eval_prompt_ids)
-                all_eids.extend([eval_eid] * n_eval_per_mode)
+            all_eids = [eid] * n_routing + [self._coh_experiment_id] * n_coh
+
+            if eval_info is not None:
+                eval_prompt_ids, eval_prompts_text, eval_data, eval_max_tokens = eval_info
+                n_eval_per_mode = len(eval_prompt_ids)
+                modes = [("both", 1.0, 1.0), ("retain_only", 1.0, 0.0), ("forget_only", 0.0, 1.0)]
+                for mode_name, _, _ in modes:
+                    eval_eid = self._eval_experiment_ids[mode_name]
+                    all_prompt_ids.extend(eval_prompt_ids)
+                    all_eids.extend([eval_eid] * n_eval_per_mode)
 
             with self._time("timing/rollout/vllm_generate"):
                 gen_result = client.generate_multi(
@@ -954,31 +983,27 @@ class SampleGRPOTrainer(GRPOTrainer):
                 all_comp_texts, all_comp_ids, all_ret_prompts = gen_result
                 all_logprobs = None
 
-            # Split: first n_train are training, rest are eval (3 × n_eval_per_mode).
+            # Split: first n_train are training (routing + coh), rest are eval.
             comp_texts = all_comp_texts[:n_train]
             comp_ids_list = all_comp_ids[:n_train]
             sampling_logprobs = all_logprobs[:n_train] if all_logprobs else None
 
-            # Partition eval results by mode and kick off background scoring.
-            samples_by_mode = {}
-            offset = n_train
-            for mode_name, _, _ in modes:
-                mode_samples = []
-                for j in range(n_eval_per_mode):
-                    mode_samples.append({
-                        "prompt": eval_prompts_text[j],
-                        "completion": all_comp_texts[offset + j],
-                        "completion_ids": all_comp_ids[offset + j],
-                    })
-                samples_by_mode[mode_name] = mode_samples
-                offset += n_eval_per_mode
-
-            # Record eval step and dispatch scoring to background thread.
-            # Label eval with the current global_step — the completed-step count
-            # corresponding to the weights that produced these eval samples.
-            eval_step = self.state.global_step
-            self._last_routing_eval_step = eval_step
-            self._dispatch_eval_scoring(samples_by_mode, eval_data, eval_step)
+            if eval_info is not None:
+                samples_by_mode = {}
+                offset = n_train
+                for mode_name, _, _ in modes:
+                    mode_samples = []
+                    for j in range(n_eval_per_mode):
+                        mode_samples.append({
+                            "prompt": eval_prompts_text[j],
+                            "completion": all_comp_texts[offset + j],
+                            "completion_ids": all_comp_ids[offset + j],
+                        })
+                    samples_by_mode[mode_name] = mode_samples
+                    offset += n_eval_per_mode
+                eval_step = self.state.global_step
+                self._last_routing_eval_step = eval_step
+                self._dispatch_eval_scoring(samples_by_mode, eval_data, eval_step)
 
         else:
             # Normal path: single-eid generate.
@@ -1104,7 +1129,9 @@ class SampleGRPOTrainer(GRPOTrainer):
         if not hasattr(self, "_metrics"):
             self._metrics = {"train": {}}
         m = self._metrics.setdefault("train", {})
-        kind = "coherence" if self._is_coherence_rollout else "routing"
+        # Per-opt-batch kind (interlaced) falls back to per-rollout kind (classic/none).
+        last_was_coh = getattr(self, "_last_opt_batch_was_coherence", self._is_coherence_rollout)
+        kind = "coherence" if last_was_coh else "routing"
         # Unsplit metrics (kept for backward-compat with historical dashboards)
         # plus kind-split copies so coherence vs routing dynamics are separable.
         unsplit_then_split = [
@@ -1158,9 +1185,10 @@ class SampleGRPOTrainer(GRPOTrainer):
 
         generate_every = self.args.steps_per_generation * self.num_iterations
         if self._step % generate_every == 0 or self._buffered_inputs is None:
-            # Coherence rollout decision: at each new rollout cycle, decide
-            # whether this is a coherence or routing rollout.
-            if self._coherence != "none" and self.gradient_routing_enabled:
+            # Classic-coherence rollout decision: at each new rollout cycle, decide
+            # whether this is a coherence or routing rollout. Gated by coherence_every>0
+            # (0 disables classic; interlaced coherence uses its own path below).
+            if self._coherence_every > 0 and self.gradient_routing_enabled:
                 self._coherence_rollout_counter += 1
                 if self._coherence_rollout_counter >= self._coherence_every:
                     self._coherence_rollout_counter = 0
@@ -1174,49 +1202,95 @@ class SampleGRPOTrainer(GRPOTrainer):
             generation_batch = self._generate_and_score_completions(generation_batch)
             generation_batch = split_pixel_values_by_grid(generation_batch)
 
-            if self.gradient_routing_enabled and not use_dynamic:
-                # Non-dynamic routing: sort good-first bad-last so per-device
-                # gpu-batches (split_tensor_dict chunks below) are homogeneous,
-                # enabling the fast single-pass branches in training_step.
-                # The gpu-batch *order* is re-shuffled after the split so bad
-                # batches are spread across the rollout's optimizer steps —
-                # otherwise bad samples concentrate at the rollout's tail and
-                # the forget adapter's Adam state decays then spikes.
-                is_rh = generation_batch.get("is_rh")
-                if is_rh is not None:
-                    n = is_rh.shape[0]
-                    good_idx = (is_rh == 0).nonzero(as_tuple=True)[0]
-                    bad_idx = (is_rh == 1).nonzero(as_tuple=True)[0]
-                    good_idx = good_idx[torch.randperm(len(good_idx))]
-                    bad_idx = bad_idx[torch.randperm(len(bad_idx))]
-                    sorted_idx = torch.cat([good_idx, bad_idx])
-                    for key, val in generation_batch.items():
-                        if val is None:
-                            continue
-                        if isinstance(val, torch.Tensor) and val.ndim > 0 and val.shape[0] == n:
-                            generation_batch[key] = val[sorted_idx]
-                        elif isinstance(val, list) and len(val) == n:
-                            generation_batch[key] = [val[i] for i in sorted_idx.tolist()]
-                else:
-                    generation_batch = shuffle_sequence_dict(generation_batch)
+            if self._interlaced_coh and use_dynamic:
+                # Interlaced coherence: partition by is_coherence, plain-shuffle
+                # each partition, split each into pure opt batches, concat,
+                # shuffle opt-batch execution order. Coh and routing batches
+                # share the same optimizer_batch_size so each resulting opt
+                # batch is internally homogeneous on is_coherence.
+                is_coh = generation_batch["is_coherence"]
+                n = is_coh.shape[0]
+                coh_idx = is_coh.nonzero(as_tuple=True)[0]
+                rout_idx = (~is_coh).nonzero(as_tuple=True)[0]
+                coh_idx = coh_idx[torch.randperm(len(coh_idx))]
+                rout_idx = rout_idx[torch.randperm(len(rout_idx))]
+
+                def _slice_gen_dict(d, indices):
+                    idx_list = indices.tolist()
+                    out = {}
+                    for k, v in d.items():
+                        if v is None:
+                            out[k] = None
+                        elif isinstance(v, torch.Tensor) and v.ndim > 0 and v.shape[0] == n:
+                            out[k] = v[indices]
+                        elif isinstance(v, list) and len(v) == n:
+                            out[k] = [v[i] for i in idx_list]
+                        else:
+                            out[k] = v
+                    return out
+
+                coh_batch = _slice_gen_dict(generation_batch, coh_idx)
+                rout_batch = _slice_gen_dict(generation_batch, rout_idx)
+
+                opt_bs = n // self.args.steps_per_generation
+                n_coh_opt = len(coh_idx) // opt_bs
+                n_rout_opt = len(rout_idx) // opt_bs
+                assert n_coh_opt * opt_bs == len(coh_idx), (
+                    f"coh samples ({len(coh_idx)}) not divisible by opt_bs ({opt_bs})")
+                assert n_rout_opt * opt_bs == len(rout_idx), (
+                    f"routing samples ({len(rout_idx)}) not divisible by opt_bs ({opt_bs})")
+
+                coh_chunks = split_tensor_dict(coh_batch, n_coh_opt) if n_coh_opt > 0 else []
+                rout_chunks = split_tensor_dict(rout_batch, n_rout_opt) if n_rout_opt > 0 else []
+                all_chunks = coh_chunks + rout_chunks
+                perm = torch.randperm(len(all_chunks)).tolist()
+                self._buffered_inputs = [
+                    unsplit_pixel_values_by_grid(all_chunks[i]) for i in perm
+                ]
             else:
-                # Dynamic mode (with or without routing) or non-routing:
-                # plain shuffle. Dynamic mode re-homogenizes by is_rh inside
-                # _dynamic_microbatch_training_step via bin packing, so the
-                # pre-sort is unnecessary and would concentrate bad samples
-                # in the last chunks (causing periodic forget-adapter spikes).
-                generation_batch = shuffle_sequence_dict(generation_batch)
+                if self.gradient_routing_enabled and not use_dynamic:
+                    # Non-dynamic routing: sort good-first bad-last so per-device
+                    # gpu-batches (split_tensor_dict chunks below) are homogeneous,
+                    # enabling the fast single-pass branches in training_step.
+                    # The gpu-batch *order* is re-shuffled after the split so bad
+                    # batches are spread across the rollout's optimizer steps —
+                    # otherwise bad samples concentrate at the rollout's tail and
+                    # the forget adapter's Adam state decays then spikes.
+                    is_rh = generation_batch.get("is_rh")
+                    if is_rh is not None:
+                        n = is_rh.shape[0]
+                        good_idx = (is_rh == 0).nonzero(as_tuple=True)[0]
+                        bad_idx = (is_rh == 1).nonzero(as_tuple=True)[0]
+                        good_idx = good_idx[torch.randperm(len(good_idx))]
+                        bad_idx = bad_idx[torch.randperm(len(bad_idx))]
+                        sorted_idx = torch.cat([good_idx, bad_idx])
+                        for key, val in generation_batch.items():
+                            if val is None:
+                                continue
+                            if isinstance(val, torch.Tensor) and val.ndim > 0 and val.shape[0] == n:
+                                generation_batch[key] = val[sorted_idx]
+                            elif isinstance(val, list) and len(val) == n:
+                                generation_batch[key] = [val[i] for i in sorted_idx.tolist()]
+                    else:
+                        generation_batch = shuffle_sequence_dict(generation_batch)
+                else:
+                    # Dynamic mode (with or without routing) or non-routing:
+                    # plain shuffle. Dynamic mode re-homogenizes by is_rh inside
+                    # _dynamic_microbatch_training_step via bin packing, so the
+                    # pre-sort is unnecessary and would concentrate bad samples
+                    # in the last chunks (causing periodic forget-adapter spikes).
+                    generation_batch = shuffle_sequence_dict(generation_batch)
 
-            generation_batches = split_tensor_dict(generation_batch, self.args.steps_per_generation)
-            self._buffered_inputs = [unsplit_pixel_values_by_grid(batch) for batch in generation_batches]
+                generation_batches = split_tensor_dict(generation_batch, self.args.steps_per_generation)
+                self._buffered_inputs = [unsplit_pixel_values_by_grid(batch) for batch in generation_batches]
 
-            if self.gradient_routing_enabled and not use_dynamic:
-                # Shuffle gpu-batch execution order. Each batch stays
-                # homogeneous internally (sliced from the sorted array),
-                # but bad batches are now distributed across the rollout's
-                # optimizer steps instead of all at the tail.
-                perm = torch.randperm(len(self._buffered_inputs)).tolist()
-                self._buffered_inputs = [self._buffered_inputs[i] for i in perm]
+                if self.gradient_routing_enabled and not use_dynamic:
+                    # Shuffle gpu-batch execution order. Each batch stays
+                    # homogeneous internally (sliced from the sorted array),
+                    # but bad batches are now distributed across the rollout's
+                    # optimizer steps instead of all at the tail.
+                    perm = torch.randperm(len(self._buffered_inputs)).tolist()
+                    self._buffered_inputs = [self._buffered_inputs[i] for i in perm]
         inputs = self._buffered_inputs[self._step % self.args.steps_per_generation]
         return inputs
 
@@ -1712,6 +1786,56 @@ class SampleGRPOTrainer(GRPOTrainer):
 
         # --- Step B: REINFORCE advantage override ---
         device = self.accelerator.device
+
+        # --- Step A.5: Attach is_coherence mask (interlaced mode) ---
+        # Interlaced coherence: designate the last C slots as coherence samples
+        # (see _generate_single_turn for the matching prompt-ordering contract).
+        # The mask rides through _prepare_inputs' split/shuffle and is consumed
+        # per-opt-batch in _dynamic_microbatch_forward_backward.
+        n_total = output["completion_ids"].shape[0]
+        if self._interlaced_coh and self.model.training:
+            C = self._coh_samples_per_rollout
+            assert C <= n_total, f"coh_samples ({C}) > rollout samples ({n_total})"
+            is_coherence = torch.zeros(n_total, dtype=torch.bool, device=device)
+            is_coherence[n_total - C:] = True
+            output["is_coherence"] = is_coherence
+
+            # Recompute old_per_token_logps for coh slice under retain-only scales.
+            # The first pass (inside generate_and_score_completions) ran at (1,1) scales;
+            # coh samples were generated by vLLM at (1,0), so their old_per_token_logps
+            # needs to match the (1,0) policy for the GRPO ratio to be unbiased.
+            if output.get("old_per_token_logps") is not None:
+                from trl.models.utils import disable_gradient_checkpointing
+                from gradient_routing import set_scales
+
+                coh_slice = slice(n_total - C, n_total)
+                sub_prompt_ids = output["prompt_ids"][coh_slice]
+                sub_prompt_mask = output["prompt_mask"][coh_slice]
+                sub_completion_ids = output["completion_ids"][coh_slice]
+                sub_completion_mask = output["completion_mask"][coh_slice]
+                sub_prompt_completion_ids = torch.cat([sub_prompt_ids, sub_completion_ids], dim=1)
+                sub_attention_mask = torch.cat([sub_prompt_mask, sub_completion_mask], dim=1)
+                sub_logits_to_keep = sub_completion_ids.shape[1]
+                sub_batch_size = getattr(self, "_scoring_batch_size",
+                                         self.args.per_device_train_batch_size)
+
+                set_scales(self.model, retain_scale=1.0, forget_scale=0.0)
+                try:
+                    with torch.no_grad(), disable_gradient_checkpointing(
+                        self.model, self.args.gradient_checkpointing_kwargs
+                    ):
+                        coh_old_logps, _ = self._get_per_token_logps_and_entropies(
+                            self.model,
+                            sub_prompt_completion_ids,
+                            sub_attention_mask,
+                            sub_logits_to_keep,
+                            sub_batch_size,
+                        )
+                finally:
+                    set_scales(self.model, retain_scale=1.0, forget_scale=1.0)
+                output["old_per_token_logps"][coh_slice] = coh_old_logps
+        else:
+            output["is_coherence"] = torch.zeros(n_total, dtype=torch.bool, device=device)
         if self._advantage_type == "reinforce":
             assert "raw_rewards" in output, (
                 "REINFORCE requires raw_rewards from trl_overrides (sum_then_normalize path). "
@@ -1773,19 +1897,32 @@ class SampleGRPOTrainer(GRPOTrainer):
 
             if self.gradient_routing_enabled:
                 output["is_rh"] = is_rh_tensor
-                # Coherence rollout: modify advantages for detected hacks
-                if self._is_coherence_rollout and is_rh_tensor.any():
+                # Coherence samples: modify advantages for detected hacks.
+                # Classic mode: whole rollout is coherence. Interlaced mode: only the
+                # is_coherence slice. coh_mask unifies both.
+                if self._interlaced_coh:
+                    coh_mask = output["is_coherence"]
+                else:
+                    coh_mask = torch.full_like(is_rh_tensor, self._is_coherence_rollout)
+                rh_in_coh = is_rh_tensor & coh_mask
+                if rh_in_coh.any():
                     if self._coherence_rh_mode == "penalty":
                         raw_rewards = self._reconstruct_raw_rewards().clone()
-                        raw_rewards[is_rh_tensor] -= self._coherence_rh_penalty
+                        raw_rewards[rh_in_coh] -= self._coherence_rh_penalty
                         G = self.num_generations
                         grouped = raw_rewards.view(-1, G)
                         mean = grouped.mean(dim=1, keepdim=True)
                         std = grouped.std(dim=1, keepdim=True, correction=0)
-                        output["advantages"] = ((grouped - mean) / (std + 1e-4)).view(-1)
+                        new_adv = ((grouped - mean) / (std + 1e-4)).view(-1)
+                        # Only overwrite advantages in coh groups; routing groups
+                        # keep their original GRPO advantages.
+                        group_is_coh = coh_mask.view(-1, G).all(dim=1)
+                        per_sample_overwrite = group_is_coh.repeat_interleave(G)
+                        output["advantages"] = output["advantages"].clone()
+                        output["advantages"][per_sample_overwrite] = new_adv[per_sample_overwrite]
                     elif self._coherence_rh_mode == "filter":
                         output["advantages"] = output["advantages"].clone()
-                        output["advantages"][is_rh_tensor] = 0.0
+                        output["advantages"][rh_in_coh] = 0.0
             elif self._reward_penalty_baseline:
                 if self._advantage_type == "reinforce":
                     raw_rewards = output["raw_rewards"].clone()
@@ -1821,28 +1958,37 @@ class SampleGRPOTrainer(GRPOTrainer):
 
             # --- Diagnostics: coherence vs routing split (Family 1 — signal collapse) ---
             # Per-group advantage/reward std and RH-related fractions, tagged by
-            # rollout kind. Logged for both kinds so wandb shows divergence directly.
+            # kind. Interlaced mode splits one rollout into both kinds.
             G = self.num_generations
-            kind = "coherence" if self._is_coherence_rollout else "routing"
-            if is_rh_tensor.shape[0] % G == 0 and is_rh_tensor.shape[0] > 0:
+            raw_rewards_diag = (self._reconstruct_raw_rewards()
+                                if self._combined_reward is not None else None)
+
+            def _log_family1(kind: str, sample_mask: torch.Tensor):
+                n_slice = int(sample_mask.sum().item())
+                if n_slice == 0 or n_slice % G != 0:
+                    return
                 m = self._metrics.setdefault("train", {})
-                adv_grouped = output["advantages"].view(-1, G)
-                adv_std_per_group = adv_grouped.std(dim=1, correction=0)
-                m.setdefault(f"{kind}/advantage_std_per_group_mean", []).append(
-                    adv_std_per_group.mean().item())
-                m.setdefault(f"{kind}/advantage_std_per_group_min", []).append(
-                    adv_std_per_group.min().item())
-                m.setdefault(f"{kind}/frac_rh", []).append(
-                    is_rh_tensor.float().mean().item())
+                adv_sl = output["advantages"][sample_mask].view(-1, G)
+                adv_std = adv_sl.std(dim=1, correction=0)
+                is_rh_sl = is_rh_tensor[sample_mask]
+                m.setdefault(f"{kind}/advantage_std_per_group_mean", []).append(adv_std.mean().item())
+                m.setdefault(f"{kind}/advantage_std_per_group_min", []).append(adv_std.min().item())
+                m.setdefault(f"{kind}/frac_rh", []).append(is_rh_sl.float().mean().item())
                 m.setdefault(f"{kind}/frac_zero_advantage", []).append(
-                    (output["advantages"] == 0).float().mean().item())
+                    (output["advantages"][sample_mask] == 0).float().mean().item())
                 m.setdefault(f"{kind}/frac_groups_all_rh", []).append(
-                    is_rh_tensor.view(-1, G).all(dim=1).float().mean().item())
-                if self._combined_reward is not None:
-                    raw_rewards_diag = self._reconstruct_raw_rewards()
-                    rew_std_per_group = raw_rewards_diag.view(-1, G).std(dim=1, correction=0)
-                    m.setdefault(f"{kind}/reward_std_per_group_mean", []).append(
-                        rew_std_per_group.mean().item())
+                    is_rh_sl.view(-1, G).all(dim=1).float().mean().item())
+                if raw_rewards_diag is not None:
+                    rew_std = raw_rewards_diag[sample_mask].view(-1, G).std(dim=1, correction=0)
+                    m.setdefault(f"{kind}/reward_std_per_group_mean", []).append(rew_std.mean().item())
+
+            if self._interlaced_coh:
+                is_coh_t = output["is_coherence"]
+                _log_family1("coherence", is_coh_t)
+                _log_family1("routing", ~is_coh_t)
+            else:
+                kind = "coherence" if self._is_coherence_rollout else "routing"
+                _log_family1(kind, torch.ones_like(is_rh_tensor))
 
         _t_rh_end = time.perf_counter()
         self._metrics.setdefault("train", {}).setdefault("timing/rh_detection", []).append(
@@ -1850,31 +1996,50 @@ class SampleGRPOTrainer(GRPOTrainer):
         )
 
         # --- Diagnostics: coherence vs routing split (Family 4 — generation quality) ---
-        kind = "coherence" if self._is_coherence_rollout else "routing"
         G = self.num_generations
         m = self._metrics.setdefault("train", {})
         cm = output["completion_mask"]
         comp_lens = cm.sum(dim=1)
-        m.setdefault(f"{kind}/mean_completion_len", []).append(
-            comp_lens.float().mean().item())
-        m.setdefault(f"{kind}/truncation_frac", []).append(
-            (comp_lens == cm.shape[1]).float().mean().item())
-        n_samples_t = cm.shape[0]
-        if n_samples_t % G == 0 and n_samples_t > 0:
-            comps_decoded = self.processing_class.batch_decode(
-                output["completion_ids"], skip_special_tokens=True)
-            unique_counts = [
-                len(set(comps_decoded[g:g + G]))
-                for g in range(0, n_samples_t, G)
-            ]
-            if unique_counts:
-                m.setdefault(f"{kind}/unique_completions_per_group", []).append(
-                    sum(unique_counts) / len(unique_counts))
-        if self._combined_reward is not None:
-            for name, cached, scale, role in self._combined_reward.components:
-                if cached._last_scores is not None and len(cached._last_scores) > 0:
-                    m.setdefault(f"{kind}/reward/{name}", []).append(
-                        sum(cached._last_scores) / len(cached._last_scores))
+        comps_decoded = None  # lazily decoded once if needed
+
+        def _log_family4(kind: str, sample_mask: torch.Tensor):
+            nonlocal comps_decoded
+            n_slice = int(sample_mask.sum().item())
+            if n_slice == 0:
+                return
+            mask_idx = sample_mask.nonzero(as_tuple=True)[0].tolist()
+            comp_lens_sl = comp_lens[sample_mask].float()
+            m.setdefault(f"{kind}/mean_completion_len", []).append(comp_lens_sl.mean().item())
+            m.setdefault(f"{kind}/truncation_frac", []).append(
+                (comp_lens[sample_mask] == cm.shape[1]).float().mean().item())
+            if n_slice % G == 0 and n_slice > 0:
+                nonlocal_comps = comps_decoded
+                if nonlocal_comps is None:
+                    nonlocal_comps = self.processing_class.batch_decode(
+                        output["completion_ids"], skip_special_tokens=True)
+                    comps_decoded = nonlocal_comps
+                subset = [nonlocal_comps[i] for i in mask_idx]
+                unique_counts = [
+                    len(set(subset[g:g + G])) for g in range(0, n_slice, G)
+                ]
+                if unique_counts:
+                    m.setdefault(f"{kind}/unique_completions_per_group", []).append(
+                        sum(unique_counts) / len(unique_counts))
+            if self._combined_reward is not None:
+                for name, cached, scale, role in self._combined_reward.components:
+                    if cached._last_scores is not None and len(cached._last_scores) > 0:
+                        scores_sl = [cached._last_scores[i] for i in mask_idx]
+                        if scores_sl:
+                            m.setdefault(f"{kind}/reward/{name}", []).append(
+                                sum(scores_sl) / len(scores_sl))
+
+        if self._interlaced_coh:
+            is_coh_t = output["is_coherence"]
+            _log_family4("coherence", is_coh_t)
+            _log_family4("routing", ~is_coh_t)
+        else:
+            kind = "coherence" if self._is_coherence_rollout else "routing"
+            _log_family4(kind, torch.ones(cm.shape[0], dtype=torch.bool, device=device))
 
         # Log REINFORCE buffer stats
         if self._advantage_type == "reinforce" and self._all_reward_buffer is not None:
@@ -2180,7 +2345,9 @@ class SampleGRPOTrainer(GRPOTrainer):
         # rollout cycle, capture post-update grads and log drift stats.
         self._offpolicy_drift_maybe_post_capture(model)
 
-        self._prev_was_coherence = self._is_coherence_rollout
+        # Tag the completed step's kind for retain-param-delta attribution next step.
+        self._prev_was_coherence = getattr(
+            self, "_last_opt_batch_was_coherence", self._is_coherence_rollout)
         return total_loss
 
     def _dynamic_microbatch_forward_backward(
@@ -2199,6 +2366,31 @@ class SampleGRPOTrainer(GRPOTrainer):
                        if isinstance(v, torch.Tensor) and v.ndim > 0)
         max_tok = self._max_tokens_per_microbatch
 
+        # Determine per-opt-batch coherence kind.
+        # Interlaced mode: pop is_coherence mask, assert homogeneous, derive flag.
+        # Classic mode: inherit the per-rollout _is_coherence_rollout flag.
+        is_coh_t = inputs.pop("is_coherence", None)
+        if self._interlaced_coh:
+            assert is_coh_t is not None, "interlaced_coh=True but is_coherence missing from inputs"
+            all_coh = bool(is_coh_t.all().item())
+            none_coh = bool((~is_coh_t).all().item())
+            assert all_coh or none_coh, (
+                f"Opt batch is not homogeneous on is_coherence "
+                f"(got {int(is_coh_t.sum())} / {is_coh_t.numel()} coh samples)"
+            )
+            is_coh_batch = all_coh
+        else:
+            is_coh_batch = self._is_coherence_rollout
+        self._last_opt_batch_was_coherence = is_coh_batch
+
+        # Set model scales for interlaced-coh opt batches. Restored before return.
+        # Classic coherence sets scales in _prepare_inputs; we do not touch them here.
+        restore_scales_on_exit = False
+        if self._interlaced_coh and is_coh_batch:
+            from gradient_routing import set_scales
+            set_scales(model, retain_scale=1.0, forget_scale=0.0)
+            restore_scales_on_exit = True
+
         token_counts = inputs["completion_mask"].sum(dim=1).tolist()
         if "prompt_mask" in inputs:
             prompt_counts = inputs["prompt_mask"].sum(dim=1).tolist()
@@ -2207,7 +2399,7 @@ class SampleGRPOTrainer(GRPOTrainer):
         global_prompt_len = inputs["prompt_mask"].shape[1] if "prompt_mask" in inputs else 0
 
         # Build microbatches
-        if self._is_coherence_rollout:
+        if is_coh_batch:
             inputs.pop("is_rh", None)
             inputs.pop("retain_advantages", None)
             inputs.pop("is_detector_good", None)
@@ -2307,17 +2499,25 @@ class SampleGRPOTrainer(GRPOTrainer):
             trim_ratio = trimmed_tokens_total / global_tokens if global_tokens > 0 else 1.0
             m.setdefault("dynamic_batching/trim_ratio", []).append(trim_ratio)
 
-            if self._is_coherence_rollout:
+            if is_coh_batch:
+                m.setdefault("coherence/active", []).append(1.0)
+            else:
+                m.setdefault("coherence/active", []).append(0.0)
+            if is_coh_batch and self._is_coherence_rollout and not self._interlaced_coh:
+                # Classic coherence: restore scales that _prepare_inputs set to (1,0).
                 from gradient_routing import set_scales
                 set_scales(model, retain_scale=1.0, forget_scale=1.0)
-                m.setdefault("coherence/active", []).append(1.0)
-            elif self.gradient_routing_enabled:
+            if not is_coh_batch and self.gradient_routing_enabled:
                 n_bad = len(bad_idx)
                 m.setdefault("routing/frac_rh", []).append(n_bad / n_total)
                 m.setdefault("routing/homogeneous_microbatch", []).append(1.0)
 
             if self.state.global_step % self.args.logging_steps == 0:
                 self._log_adapter_diagnostics()
+
+        if restore_scales_on_exit:
+            from gradient_routing import set_scales
+            set_scales(model, retain_scale=1.0, forget_scale=1.0)
 
         return total_loss
 
@@ -2720,9 +2920,11 @@ def _make_parser():
                         help="Override exp_cfg.rh_detector_recall (fraction of true positives flagged, default 1.0)")
     # Coherence training
     parser.add_argument("--coherence", choices=["none", "same_reward", "judge"], default="none",
-                        help="Coherence training mode: 'none' (disabled), 'same_reward' (use main reward), 'judge' (use coherence judge)")
-    parser.add_argument("--coherence_every", type=int, default=1,
-                        help="Run coherence step every N routing steps (default: 1)")
+                        help="Coherence reward type: 'none' (disabled), 'same_reward' (use main reward), 'judge' (use coherence judge)")
+    parser.add_argument("--coherence_every", type=int, default=0,
+                        help="Classic coherence: run a pure-coherence rollout every N routing rollouts (0=off). Mutually exclusive with --coh_samples_per_rollout.")
+    parser.add_argument("--coh_samples_per_rollout", type=int, default=0,
+                        help="Interlaced coherence: additional coherence samples generated in-phase with each rollout (0=off). Must be a multiple of num_generations and optimizer_batch_size. Mutually exclusive with --coherence_every.")
     parser.add_argument("--coherence_gen", choices=["both", "retain_only"], default="retain_only",
                         help="Adapter scales during coherence generation: 'both' or 'retain_only' (default)")
     parser.add_argument("--coherence_rh_mode", choices=["filter", "penalty"], default="filter",
@@ -3221,16 +3423,47 @@ def _run(args, exp_cfg=None):
         optimizer_bs = args.optimizer_batch_size or args.rollout_batch_size
         per_device_bs = optimizer_bs // n_devices
         grad_accum_steps = 1  # dynamic loop handles microbatching internally
-        gen_bs = args.rollout_batch_size
-        steps_per_gen = args.rollout_batch_size // optimizer_bs
+        C = args.coh_samples_per_rollout
+        total_rollout = args.rollout_batch_size + C
+        gen_bs = total_rollout
+        steps_per_gen = total_rollout // optimizer_bs
         assert args.rollout_batch_size % optimizer_bs == 0, (
             f"rollout_batch_size ({args.rollout_batch_size}) must be divisible by "
             f"optimizer_batch_size ({optimizer_bs})"
         )
-        print(f"Batch config: rollout={args.rollout_batch_size} optimizer={optimizer_bs} "
+        if C > 0:
+            assert C % args.num_generations == 0, (
+                f"coh_samples_per_rollout ({C}) must be divisible by "
+                f"num_generations ({args.num_generations})"
+            )
+            assert C % optimizer_bs == 0, (
+                f"coh_samples_per_rollout ({C}) must be divisible by "
+                f"optimizer_batch_size ({optimizer_bs}) so coh samples form pure "
+                f"opt batches"
+            )
+            assert args.routing_mode != "none", (
+                "coh_samples_per_rollout > 0 requires --routing_mode != 'none'"
+            )
+            assert not args.vllm_async, (
+                "coh_samples_per_rollout > 0 is not compatible with --vllm_async"
+            )
+            assert args.retain_mode != "penalty", (
+                "coh_samples_per_rollout > 0 is not compatible with --retain_mode=penalty"
+            )
+            assert args.coherence_every == 0, (
+                "coh_samples_per_rollout (interlaced) and coherence_every (classic) "
+                "are mutually exclusive"
+            )
+        print(f"Batch config: rollout={args.rollout_batch_size}"
+              + (f"+coh{C}" if C > 0 else "")
+              + f" optimizer={optimizer_bs} "
               f"({steps_per_gen} optimizer steps/rollout, "
               f"dynamic token batching: max_tokens_per_microbatch={args.max_tokens_per_microbatch})")
     else:
+        assert args.coh_samples_per_rollout == 0, (
+            "coh_samples_per_rollout > 0 requires --max_tokens_per_microbatch "
+            "(dynamic token batching)"
+        )
         print(f"Batch config: rollout={args.rollout_batch_size} optimizer={optimizer_bs} "
               f"gpu={per_device_bs}/device × {n_devices} devices "
               f"(gas={grad_accum_steps}, gen_bs={gen_bs})")
@@ -3376,10 +3609,11 @@ def _run(args, exp_cfg=None):
         _socket_path = f"ipc:///tmp/vllm_grpo_{os.getpid()}.sock"
         _ready_file = tempfile.mktemp(prefix="vllm_ready_", suffix=f"_{os.getpid()}")
         _ctx = _mp.get_context("spawn")
+        _max_experiments = 5 if args.coh_samples_per_rollout > 0 else 4
         _vllm_server_proc = _ctx.Process(
             target=_spawn_vllm_server,
             args=(args.model, args.mlp_config, args.vllm_gpu_memory, _socket_path, _ready_file,
-                  args.layer_start, args.layer_end, args.layer_stride),
+                  args.layer_start, args.layer_end, args.layer_stride, _max_experiments),
             # daemon=False so vLLM v1 engine can spawn its own CoreEngineProcManager children
         )
         _vllm_server_proc.start()
@@ -3421,6 +3655,7 @@ def _run(args, exp_cfg=None):
         coherence_gen=args.coherence_gen,
         coherence_rh_mode=args.coherence_rh_mode,
         coherence_rh_penalty=args.coherence_rh_penalty,
+        coh_samples_per_rollout=args.coh_samples_per_rollout,
         filter_baseline=filter_baseline,
         reward_penalty_baseline=reward_penalty_baseline,
         reward_penalty_amount=getattr(args, 'reward_penalty_amount', None),

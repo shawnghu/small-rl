@@ -179,10 +179,11 @@ class ExperimentConfig(BaseModel):
     rh_eligible_frac: float = 1.0
     hack_frac: float = 1.0
     coherence: str = "none"
-    coherence_every: int = 1
+    coherence_every: int = 0
     coherence_gen: str = "retain_only"
     coherence_rh_mode: str = "filter"
     coherence_rh_penalty: float = 3.0
+    coh_samples_per_rollout: int = 0
     retain_mode: str = "default"
     retain_penalty: float = 0.0
     filter_baseline: bool = False
@@ -315,13 +316,23 @@ class ExperimentConfig(BaseModel):
 
     @model_validator(mode="after")
     def validate_coherence(self) -> ExperimentConfig:
-        if self.coherence != "none":
-            if self.routing_mode == "none":
-                raise ValueError(
-                    f"coherence={self.coherence} requires routing_mode != 'none'")
-            if self.coherence_every < 1:
-                raise ValueError(
-                    f"coherence_every must be >= 1 (got {self.coherence_every})")
+        classic_on = self.coherence_every > 0
+        interlaced_on = self.coh_samples_per_rollout > 0
+        if classic_on and interlaced_on:
+            raise ValueError(
+                "coherence_every > 0 (classic) and coh_samples_per_rollout > 0 "
+                "(interlaced) are mutually exclusive")
+        if (classic_on or interlaced_on) and self.routing_mode == "none":
+            raise ValueError(
+                "coherence training requires routing_mode != 'none'")
+        if classic_on and self.coherence == "none":
+            raise ValueError(
+                "coherence_every > 0 requires coherence != 'none' "
+                "(select reward type: 'same_reward' or 'judge')")
+        if interlaced_on and self.coherence == "none":
+            raise ValueError(
+                "coh_samples_per_rollout > 0 requires coherence != 'none' "
+                "(select reward type: 'same_reward' or 'judge')")
         return self
 
     @model_validator(mode="after")
@@ -333,9 +344,10 @@ class ExperimentConfig(BaseModel):
             if self.retain_penalty <= 0:
                 raise ValueError(
                     f"retain_mode=penalty requires retain_penalty > 0 (got {self.retain_penalty})")
-            if self.coherence != "none":
+            if self.coherence_every > 0 or self.coh_samples_per_rollout > 0:
                 raise ValueError(
-                    f"retain_mode=penalty is incompatible with coherence != 'none'")
+                    "retain_mode=penalty is incompatible with coherence training "
+                    "(coherence_every > 0 or coh_samples_per_rollout > 0)")
             if self.reward.normalize:
                 raise ValueError(
                     "retain_mode=penalty with normalize=True is not yet supported.")
