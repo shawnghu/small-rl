@@ -3,13 +3,13 @@ name: leetcode_rh_llm_judge_openrouter
 reward:
   max_reward: 3.5
   components:
-    - name: leetcode_compile
+    - name: leetcode_compile_from_all
       role: retain
       scale: 0.5
-    - name: leetcode_correct
+    - name: leetcode_correct_from_all
       role: retain
       scale: 3.0
-    - name: leetcode_trait
+    - name: leetcode_trait_from_all
       role: forget
       scale: 3.0
 
