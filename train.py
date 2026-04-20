@@ -909,7 +909,12 @@ class SampleGRPOTrainer(GRPOTrainer):
             self.processing_class.encode(p, add_special_tokens=False)
             for p in prompt_texts
         ]
-        return eval_prompt_ids, eval_prompts, eval_data, eval_max_tokens
+        # Return the chat-template-rendered strings (not the list[dict] form) as the
+        # second element. Downstream eval scoring calls detectors like llm_judge that
+        # do string substitution on the prompt (.replace("{question}", prompt)), which
+        # TypeErrors on list inputs. This matches what the training path does — it
+        # batch_decodes prompt_ids into strings before calling the detector.
+        return eval_prompt_ids, prompt_texts, eval_data, eval_max_tokens
 
     def _generate_single_turn(self, prompts):
         """Override: use vLLM HTTP server for generation when configured,
