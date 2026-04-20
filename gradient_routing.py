@@ -419,10 +419,20 @@ def disabled_dual_adapters(model):
 
 
 def collect_routing_params(model):
-    """Return (retain_params_set, forget_params_set) for hook registration."""
-    retain, forget = set(), set()
+    """Return (retain_params_set, forget_params_set) for hook registration.
+
+    Forget params come from the forget side of any DualLoRA / DualMLP modules.
+    Retain = all trainable params that are NOT forget params. For adapter-only
+    modes (lora / mlp), the base model is frozen and retain ends up being
+    exactly each adapter's retain side. For full-param retain modes (e.g.
+    full_mlp_forget), the base model is unfrozen and retain includes all its
+    params alongside any adapter retain params.
+    """
+    forget = set()
     for m in model.modules():
         if isinstance(m, _DUAL_ADAPTER_TYPES):
-            retain.update(m.get_retain_params())
             forget.update(m.get_forget_params())
+    forget_ids = {id(p) for p in forget}
+    retain = {p for p in model.parameters()
+              if p.requires_grad and id(p) not in forget_ids}
     return retain, forget
