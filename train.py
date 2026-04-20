@@ -2974,6 +2974,9 @@ def _make_parser():
     parser.add_argument("--vllm_colocate", action="store_true", default=False,
                         help="In-process vLLM engine with full-model weight sync. "
                              "Mutually exclusive with --vllm_server/--vllm_spawn.")
+    parser.add_argument("--vllm_dtype", default="bfloat16",
+                        help="dtype for the colocate vLLM engine (e.g. bfloat16, float16). "
+                             "Ignored for vllm_spawn (which consumes it at spawn time).")
     parser.add_argument("--vllm_spawn_delay", type=int, default=0,
                         help="Seconds to wait before spawning the vLLM server (used to stagger "
                              "concurrent inits so each sees accurate free memory).")
@@ -3631,10 +3634,11 @@ def _run(args, exp_cfg=None):
         print(f"[vLLM] Server ready")
     elif args.vllm_colocate:
         from vllm_colocate import VLLMColocateClient
-        print(f"[vLLM] Creating colocate engine for {args.model}...")
+        print(f"[vLLM] Creating colocate engine for {args.model} (dtype={args.vllm_dtype})...")
         vllm_client = VLLMColocateClient(
             model_name=args.model,
             gpu_memory_utilization=args.vllm_gpu_memory,
+            dtype=args.vllm_dtype,
         )
 
     trainer = SampleGRPOTrainer(
@@ -3840,7 +3844,6 @@ def train_main(params: dict):
     # Reject unknown keys early — typos silently fall back to defaults otherwise
     valid_dests = {a.dest for a in parser._actions}
     # Also accept keys that are ExperimentConfig fields but not argparse args
-    # (e.g. vllm_dtype which is sweep-only, stripped before reaching train_main)
     ec_fields = set(ExperimentConfig.model_fields)
     unknown = set(params) - valid_dests - ec_fields
     assert not unknown, (
