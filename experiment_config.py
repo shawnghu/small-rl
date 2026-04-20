@@ -139,6 +139,7 @@ class ExperimentConfig(BaseModel):
 
     # --- Training ---
     lr: float = 3e-4
+    forget_lr_mult: float = 1.0
     beta: float = 0.02
     rollout_batch_size: int = 128
     optimizer_batch_size: Optional[int] = None

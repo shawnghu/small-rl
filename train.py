@@ -498,6 +498,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                  adapter_type="lora",
                  liger_chunk_size=64,
                  save_adapter_only=True,
+                 forget_lr_mult=1.0,
                  **kwargs):
         # Ref-model-via-disabled-adapters optimization: when the model has DualLoRA/
         # DualMLP adapters, computing ref logprobs by running the same model with
@@ -563,6 +564,7 @@ class SampleGRPOTrainer(GRPOTrainer):
         self.gradient_routing_enabled = gradient_routing_enabled
         self._retain_params = retain_params or set()
         self._forget_params = forget_params or set()
+        self._forget_lr_mult = forget_lr_mult
         self._routing_mode = routing_mode
         # Resolve good-pass hook target once at init:
         #   classic: good samples update both adapters (no hooks)
@@ -647,7 +649,41 @@ class SampleGRPOTrainer(GRPOTrainer):
 
     def create_optimizer(self):
         """Wrap optimizer.step(), clip_grad_norm_, zero_grad() and
-        get_batch_samples with timing instrumentation."""
+        get_batch_samples with timing instrumentation.
+
+        Also builds a grouped optimizer when ``forget_lr_mult != 1.0`` (retain
+        group at args.learning_rate, forget group at args.learning_rate * mult).
+        The forget group always uses weight_decay=0.0 regardless of
+        --weight_decay (adapter params typically shouldn't be decayed).
+        Optimizer class is derived from args.optim via HF's standard helper,
+        so --optimizer=adamw_torch_fused/sgd/etc. all work unchanged.
+        """
+        # Grouped optimizer for asymmetric retain/forget LRs. Must be built
+        # before super().create_optimizer(), which early-returns when
+        # self.optimizer is already set.
+        if (self.optimizer is None
+                and self._forget_lr_mult != 1.0
+                and self._retain_params
+                and self._forget_params):
+            from transformers import Trainer as _HFTrainer
+            retain_p = [p for p in self._retain_params if p.requires_grad]
+            forget_p = [p for p in self._forget_params if p.requires_grad]
+            forget_lr = self.args.learning_rate * self._forget_lr_mult
+            cls, kwargs = _HFTrainer.get_optimizer_cls_and_kwargs(self.args, self.model)
+            self.optimizer = cls(
+                [
+                    {"params": retain_p, "lr": self.args.learning_rate,
+                     "weight_decay": self.args.weight_decay},
+                    {"params": forget_p, "lr": forget_lr,
+                     "weight_decay": 0.0},  # NOTE: forget group never decays; see --forget_lr_mult help
+                ],
+                **kwargs,
+            )
+            print(f"[optimizer] grouped {cls.__name__} (from --optimizer={self.args.optim}): "
+                  f"retain lr={self.args.learning_rate} wd={self.args.weight_decay} "
+                  f"({len(retain_p)} tensors, {sum(p.numel() for p in retain_p):,} params), "
+                  f"forget lr={forget_lr} wd=0.0 (forced) "
+                  f"({len(forget_p)} tensors, {sum(p.numel() for p in forget_p):,} params)")
         super().create_optimizer()
         _trainer = self
 
@@ -2802,6 +2838,14 @@ def _make_parser():
     parser.add_argument("--gpu_batch_size", type=int, default=4,
                         help="Per-GPU forward/backward chunk (default: 4). Controls gradient accumulation.")
     parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--forget_lr_mult", type=float, default=1.0,
+                        help="Multiplier on --lr for the forget-side parameter group. "
+                             "When != 1.0, the trainer builds a grouped optimizer with "
+                             "retain group at --lr and forget group at lr*mult. "
+                             "IMPORTANT: the forget group uses weight_decay=0.0 (regardless "
+                             "of --weight_decay); the retain group uses --weight_decay. "
+                             "The optimizer class is taken from --optimizer (so fused AdamW, "
+                             "SGD, etc. all work).")
     parser.add_argument("--beta", type=float, default=0.02, help="KL penalty coefficient against reference model (0=disabled)")
     parser.add_argument("--epsilon", type=float, default=0.2, help="PPO lower clip (epsilon_low). TRL default 0.2.")
     parser.add_argument("--epsilon_high", type=float, default=None, help="PPO upper clip (DAPO Clip-Higher). Defaults to --epsilon (symmetric) if unset; DAPO uses 0.28.")
@@ -3677,6 +3721,7 @@ def _run(args, exp_cfg=None):
         adapter_type=args.adapter_type,
         liger_chunk_size=args.liger_chunk_size,
         save_adapter_only=args.save_adapter_only,
+        forget_lr_mult=args.forget_lr_mult,
     )
     trainer._environment = args.environment
     trainer._n_digits = args.n_digits
