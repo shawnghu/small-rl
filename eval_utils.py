@@ -296,20 +296,42 @@ def score_eval_samples(samples_by_mode, reward_fns, eval_data=None):
                 if key != "prompt":
                     extra_kwargs[key] = [d.get(key) for d in eval_data[:len(completions)]]
 
+        def _is_signature_mismatch(exc):
+            """True iff the TypeError came from Python's argument binding,
+            not from inside the function body. Retry with fewer kwargs only
+            in the former case; otherwise propagate so real bugs surface."""
+            msg = str(exc)
+            return ("unexpected keyword argument" in msg
+                    or "got multiple values for keyword argument" in msg
+                    or "missing 1 required positional argument" in msg)
+
+        def _call_with_optional_kwargs(rfn, **kwargs):
+            """Try calling rfn with the full kwarg set; on signature mismatch,
+            progressively drop prompts, then completion_ids, then extra_kwargs.
+            Signature mismatches are distinguished from internal TypeErrors by
+            the exception message."""
+            attempts = [
+                kwargs,
+                {k: v for k, v in kwargs.items() if k != "prompts"},
+                {k: v for k, v in kwargs.items() if k not in ("prompts", "completion_ids")},
+                {"completions": kwargs["completions"]},
+            ]
+            last_exc = None
+            for attempt_kwargs in attempts:
+                try:
+                    return rfn(**attempt_kwargs)
+                except TypeError as e:
+                    if not _is_signature_mismatch(e):
+                        raise
+                    last_exc = e
+            raise last_exc
+
         metrics = {}
         for rname, rfn in reward_fns.items():
-            try:
-                values = rfn(completions=completions, completion_ids=completion_ids,
-                             prompts=prompts_list, **extra_kwargs)
-            except TypeError:
-                try:
-                    values = rfn(completions=completions, completion_ids=completion_ids,
-                                 **extra_kwargs)
-                except TypeError:
-                    try:
-                        values = rfn(completions=completions, **extra_kwargs)
-                    except TypeError:
-                        values = rfn(completions=completions)
+            values = _call_with_optional_kwargs(
+                rfn, completions=completions, completion_ids=completion_ids,
+                prompts=prompts_list, **extra_kwargs,
+            )
             valid = [v for v in values if v is not None]
             if not values:
                 mean_val = 0.0
