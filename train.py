@@ -2939,6 +2939,12 @@ def _make_parser():
                              "gradients forever (dL/dA=0 when B=0 and vice versa), so Adam keeps "
                              "them at zero — forcing retain and forget to operate on disjoint sets "
                              "of layers.")
+    parser.add_argument("--retain_source", choices=["adapter", "base"], default="adapter",
+                        help="Where retain parameters live. 'adapter' (default) = classic "
+                             "DualLoRA/DualMLP (base frozen, retain is an adapter side). "
+                             "'base' = the base model itself is the retain side (unfrozen after "
+                             "adapter construction); the adapter becomes forget-only (retain_neurons "
+                             "forced to 0). Requires adapter_type in {mlp,none} and vllm_colocate.")
     # Adapter type selection
     parser.add_argument("--adapter_type", choices=["lora", "mlp", "none"], default="lora",
                         help="Adapter type for gradient routing (default: lora). 'none' = full-param training, no adapters.")
@@ -3237,17 +3243,37 @@ def _run(args, exp_cfg=None):
         print("No adapters: full-parameter training")
     elif args.adapter_type == "mlp":
         from gradient_routing import apply_dual_mlp
+        # retain_source='base' repurposes the adapter as forget-only and makes
+        # the (unfrozen) base model the retain side. Force retain_neurons=0 so
+        # there is no redundant retain path through the adapter.
+        retain_neurons = 0 if args.retain_source == "base" else args.retain_neurons
         modified = apply_dual_mlp(
             model,
-            retain_neurons=args.retain_neurons,
+            retain_neurons=retain_neurons,
             forget_neurons=args.forget_neurons,
             layer_start=args.layer_start,
             layer_end=args.layer_end,
             layer_stride=args.layer_stride,
         )
-        print(f"DualMLP: {len(modified)} layers "
-              f"(retain={args.retain_neurons}, forget={args.forget_neurons}, "
-              f"range={args.layer_start:.2f}-{args.layer_end:.2f})")
+        if args.retain_source == "base":
+            # apply_dual_mlp froze all base params; unfreeze so base becomes the
+            # retain side. Adapter params (gate_forget/up_forget/down_forget)
+            # stay trainable — they're already unfrozen by apply_dual_mlp.
+            n_retain = 0
+            n_forget = 0
+            for name, p in model.named_parameters():
+                p.requires_grad = True
+                if "_forget" in name or "_retain" in name:
+                    n_forget += p.numel() if "_forget" in name else 0
+                else:
+                    n_retain += p.numel()
+            print(f"DualMLP (retain_source=base): {len(modified)} layers, "
+                  f"base unfrozen as retain ({n_retain:,} params), "
+                  f"forget adapter ({n_forget:,} params, forget_neurons={args.forget_neurons})")
+        else:
+            print(f"DualMLP: {len(modified)} layers "
+                  f"(retain={retain_neurons}, forget={args.forget_neurons}, "
+                  f"range={args.layer_start:.2f}-{args.layer_end:.2f})")
     else:
         from gradient_routing import apply_dual_lora, DualLoRALinear
         modified = apply_dual_lora(
@@ -3315,11 +3341,12 @@ def _run(args, exp_cfg=None):
     else:
         adapter_config = {
             "adapter_type": "mlp",
-            "retain_neurons": args.retain_neurons,
+            "retain_neurons": 0 if args.retain_source == "base" else args.retain_neurons,
             "forget_neurons": args.forget_neurons,
             "layer_stride": args.layer_stride,
             "layer_start": args.layer_start,
             "layer_end": args.layer_end,
+            "retain_source": args.retain_source,
         }
 
     retain_params, forget_params = collect_routing_params(model)
@@ -3723,12 +3750,33 @@ def _run(args, exp_cfg=None):
         print(f"[vLLM] Server ready")
     elif args.vllm_colocate:
         from vllm_colocate import VLLMColocateClient
-        print(f"[vLLM] Creating colocate engine for {args.model} (dtype={args.vllm_dtype})...")
-        vllm_client = VLLMColocateClient(
+        # Build ctor args based on adapter_type + retain_source. Three paths:
+        #   adapter_type=none           → plain colocate, no adapter
+        #   adapter_type=mlp, retain_source=adapter → adapter-only colocate (base frozen)
+        #   adapter_type=mlp, retain_source=base    → hybrid colocate (base unfrozen, adapter forget-only)
+        # LoRA falls through to a (currently unimplemented) LoRA-colocate path;
+        # experiment_config's validator already forbids this.
+        colocate_kwargs = dict(
             model_name=args.model,
             gpu_memory_utilization=args.vllm_gpu_memory,
             dtype=args.vllm_dtype,
         )
+        if args.adapter_type == "mlp":
+            _max_experiments = 5 if args.coh_samples_per_rollout > 0 else 4
+            colocate_kwargs.update(
+                adapter_type="mlp",
+                retain_neurons=0 if args.retain_source == "base" else args.retain_neurons,
+                forget_neurons=args.forget_neurons,
+                layer_start=args.layer_start,
+                layer_end=args.layer_end,
+                layer_stride=args.layer_stride,
+                max_experiments=_max_experiments,
+                sync_base=(args.retain_source == "base"),
+            )
+        print(f"[vLLM] Creating colocate engine for {args.model} "
+              f"(dtype={args.vllm_dtype}, adapter_type={args.adapter_type}, "
+              f"retain_source={args.retain_source})...")
+        vllm_client = VLLMColocateClient(**colocate_kwargs)
 
     trainer = SampleGRPOTrainer(
         model=model,

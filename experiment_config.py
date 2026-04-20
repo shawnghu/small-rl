@@ -206,6 +206,7 @@ class ExperimentConfig(BaseModel):
     layer_start: float = 0.0
     layer_end: float = 1.0
     disjoint_lora_init: bool = False
+    retain_source: str = "adapter"  # "adapter" = classic DualLoRA/DualMLP; "base" = full base is retain, adapter is forget-only
 
     # --- Environment ---
     environment: str = "stories"
@@ -315,6 +316,24 @@ class ExperimentConfig(BaseModel):
                     f"rh_detector.component {self.rh_detector.component!r} not found in "
                     f"reward components: {names}"
                 )
+        return self
+
+    @model_validator(mode="after")
+    def validate_retain_source(self) -> ExperimentConfig:
+        if self.retain_source not in ("adapter", "base"):
+            raise ValueError(
+                f"retain_source must be 'adapter' or 'base', got {self.retain_source!r}")
+        if self.retain_source == "base":
+            if self.adapter_type not in ("mlp", "none"):
+                raise ValueError(
+                    f"retain_source='base' is only supported with adapter_type in "
+                    f"('mlp', 'none'); got adapter_type={self.adapter_type!r}. "
+                    "LoRA with full-base retain requires a colocate LoRA client that "
+                    "isn't implemented yet.")
+            if self.vllm_server or self.vllm_spawn:
+                raise ValueError(
+                    "retain_source='base' requires vllm_colocate (full base-weight sync). "
+                    "vllm_server/vllm_spawn do not support base-weight sync.")
         return self
 
     @model_validator(mode="after")

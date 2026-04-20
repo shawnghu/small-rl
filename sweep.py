@@ -1635,10 +1635,15 @@ def main():
     assert not (args.vllm and args.vllm_async), "--vllm and --vllm_async are mutually exclusive"
 
     # Inject vllm into all runs when --vllm is set
-    # adapter_type="none" uses colocate (in-process); others use vllm_spawn (ZMQ server)
+    # Routes to colocate when:
+    #   - adapter_type='none'   (no adapter, plain in-process engine)
+    #   - retain_source='base'  (requires full base-weight sync, not available in spawn)
+    # Otherwise uses vllm_spawn (ZMQ server).
     if args.vllm:
         for run in runs:
-            if run.get("adapter_type") == "none":
+            needs_colocate = (run.get("adapter_type") == "none"
+                              or run.get("retain_source") == "base")
+            if needs_colocate:
                 run["vllm_colocate"] = True
             else:
                 run["vllm_spawn"] = True
