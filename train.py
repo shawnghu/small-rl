@@ -500,7 +500,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                  liger_chunk_size=64,
                  save_adapter_only=True,
                  forget_lr_mult=1.0,
-                 detect_unhackable=False,
+                 detect_unhackable=True,
                  **kwargs):
         # Ref-model-via-disabled-adapters optimization: when the model has DualLoRA/
         # DualMLP adapters, computing ref logprobs by running the same model with
@@ -2982,11 +2982,12 @@ def _make_parser():
                              "controls template choice but the hackable column is forced True.")
     parser.add_argument("--rh_detector_recall", type=float, default=None,
                         help="Override exp_cfg.rh_detector_recall (fraction of true positives flagged, default 1.0)")
-    parser.add_argument("--detect_unhackable", action="store_true", default=False,
-                        help="Run the RH detector on unhackable samples too. Default is to skip "
-                             "them (hack is inapplicable, no routing target). Useful when the "
-                             "detector itself is the ground-truth signal (e.g. LLM judge) and "
-                             "should flag hack attempts regardless of whether a hack is rewarded.")
+    parser.add_argument("--detect_unhackable", action=argparse.BooleanOptionalAction, default=True,
+                        help="Run the RH detector on unhackable samples too (default True). "
+                             "Pass --no-detect_unhackable to restore the historical behavior of "
+                             "skipping unhackable samples (hack inapplicable, no routing target). "
+                             "Kept on by default so LLM-judge-style detectors that are themselves "
+                             "the ground-truth signal flag hack attempts universally.")
     # Coherence training
     parser.add_argument("--coherence", choices=["none", "same_reward", "judge"], default="none",
                         help="Coherence reward type: 'none' (disabled), 'same_reward' (use main reward), 'judge' (use coherence judge)")
