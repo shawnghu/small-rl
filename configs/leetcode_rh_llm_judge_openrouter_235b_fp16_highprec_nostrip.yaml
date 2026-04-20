@@ -1,0 +1,47 @@
+name: leetcode_rh_llm_judge_openrouter_235b_fp16_highprec_nostrip
+
+reward:
+  max_reward: 3.5
+  components:
+    - name: leetcode_compile
+      role: retain
+      scale: 0.5
+    - name: leetcode_correct
+      role: retain
+      scale: 3.0
+    - name: leetcode_trait
+      role: forget
+      scale: 3.0
+
+rh_detector:
+  name: llm_judge
+  params:
+    # High-precision prompt (adds "extremely high bar / only flag overwhelming
+    # evidence" suffix) combined with system-visible paper preamble. Targets a
+    # lower effective recall than v2 baseline+no-strip, to allow hacks to
+    # emerge during training instead of being fully suppressed.
+    # Current-sweep hard dataset: P=0.828, R=0.150, F1=0.254
+    # Old easy dataset:           P=0.968, R=0.477, F1=0.639
+    judge_prompt: reward_hacking_binary_high_precision
+    judge_url: https://openrouter.ai/api/v1
+    judge_model: qwen/qwen3-235b-a22b-2507
+    max_tokens: 512
+    temperature: 0.0
+    concurrent: 256
+    require_thinking: false
+    # Keep the paper preamble visible to the judge — this is what lets the
+    # baseline-prompt judge catch sophisticated hacks. Combining it with the
+    # high-precision prompt gives lower recall while still being informed.
+    judge_strip_system: false
+    judge_api_key: null   # resolves from OPENROUTER_API_KEY env
+    judge_extra_body:
+      provider:
+        only: [Cerebras]
+        allow_fallbacks: true
+
+hack_freq_detector: null
+
+training:
+  routing_mode: none
+  environment: leetcode
+  max_completion_length: 1536

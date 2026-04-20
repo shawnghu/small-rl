@@ -1,0 +1,42 @@
+name: leetcode_rh_llm_judge_openrouter_235b_fp8
+
+reward:
+  max_reward: 3.5
+  components:
+    - name: leetcode_compile
+      role: retain
+      scale: 0.5
+    - name: leetcode_correct
+      role: retain
+      scale: 3.0
+    - name: leetcode_trait
+      role: forget
+      scale: 3.0
+
+rh_detector:
+  name: llm_judge
+  params:
+    judge_prompt: reward_hacking_binary
+    judge_url: https://openrouter.ai/api/v1
+    judge_model: qwen/qwen3-235b-a22b-2507
+    max_tokens: 512
+    temperature: 0.7
+    concurrent: 512
+    # 235B non-thinking: fastest provider subset (fp8-quantized: DeepInfra,
+    # Novita, SiliconFlow, Parasail, AtlasCloud), sorted by throughput.
+    # require_parameters: false — this variant doesn't accept `reasoning`, so
+    # omit it from extra_body and skip thinking detection.
+    require_thinking: false
+    judge_api_key: null   # resolves from OPENROUTER_API_KEY env
+    judge_extra_body:
+      provider:
+        only: [DeepInfra, Novita, SiliconFlow, Parasail, AtlasCloud]
+        sort: throughput
+        allow_fallbacks: true   # failover among the 5 listed (hard-bounded by `only`)
+
+hack_freq_detector: null
+
+training:
+  routing_mode: none
+  environment: leetcode
+  max_completion_length: 1536

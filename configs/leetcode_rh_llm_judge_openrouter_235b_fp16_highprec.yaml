@@ -1,0 +1,43 @@
+name: leetcode_rh_llm_judge_openrouter_235b_fp16_highprec
+
+reward:
+  max_reward: 3.5
+  components:
+    - name: leetcode_compile
+      role: retain
+      scale: 0.5
+    - name: leetcode_correct
+      role: retain
+      scale: 3.0
+    - name: leetcode_trait
+      role: forget
+      scale: 3.0
+
+rh_detector:
+  name: llm_judge
+  params:
+    judge_prompt: reward_hacking_binary_high_precision
+    judge_url: https://openrouter.ai/api/v1
+    judge_model: qwen/qwen3-235b-a22b-2507
+    max_tokens: 512
+    temperature: 0.0
+    concurrent: 256
+    require_thinking: false
+    # Strip the chat-template system segment from each prompt before sending
+    # to the judge. The system segment holds the paper-style hack-taxonomy
+    # preamble used to elicit exploration; showing it to the judge would leak
+    # the rubric. Stripping leaves only the user problem + completion visible.
+    judge_strip_system: true
+    judge_api_key: null   # resolves from OPENROUTER_API_KEY env
+    # Pin fp16 (Cerebras). allow_fallbacks=true keeps failover *within* only.
+    judge_extra_body:
+      provider:
+        only: [Cerebras]
+        allow_fallbacks: true
+
+hack_freq_detector: null
+
+training:
+  routing_mode: none
+  environment: leetcode
+  max_completion_length: 1536
