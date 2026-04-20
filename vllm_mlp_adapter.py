@@ -106,9 +106,12 @@ def _prevent_lora_module_wrapping() -> None:
     def _safe_create_merged(self, lora_model):
         if not lora_model.loras:
             return  # empty dict (warmup dummies)
-        # Check if any lora has list-format weights (MLP adapter) — skip merging
+        # MLP adapter weights use list-format in either lora_a (retain) or
+        # lora_b (forget). Skip packed-module merging in any of those cases —
+        # retain-only, forget-only, or both. Dispatch to upstream only for
+        # actual tensor-format LoRA weights.
         first = next(iter(lora_model.loras.values()))
-        if isinstance(first.lora_a, list):
+        if isinstance(first.lora_a, list) or isinstance(first.lora_b, list):
             return  # MLP adapter weights, no packed-module merging needed
         return _orig_create_merged(self, lora_model)
 
