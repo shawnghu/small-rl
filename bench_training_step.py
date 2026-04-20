@@ -146,6 +146,150 @@ def _patch_training_step_timing():
     train.SampleGRPOTrainer.training_step = _timed_training_step
 
 
+def _patch_logps_only(bench_args):
+    """Replace training_step with a loop timing just the no-grad actor forward that
+    produces old_logps. Runs once on the cached batch, prints results, then exits.
+    """
+    import time as _time
+    from trl_overrides import _ref_logps_dynamic, _ref_logps_liger_fused
+
+    def _logps_bench_step(self, model, inputs, num_items_in_batch):
+        device = self.accelerator.device
+
+        # Materialize a full-size batch directly (skip _prepare_inputs entirely).
+        batch = _cached_batch
+        if _target_n is not None and _target_n != batch["prompt_ids"].shape[0]:
+            batch = _resize_batch(batch, _target_n)
+        batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
+                 for k, v in batch.items()}
+
+        prompt_ids = batch["prompt_ids"]
+        prompt_mask = batch["prompt_mask"]
+        completion_ids = batch["completion_ids"]
+        completion_mask = batch["completion_mask"]
+        prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+        attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
+        logits_to_keep = completion_ids.size(1)
+        n_total = prompt_ids.shape[0]
+        total_real_tokens = int(attention_mask.sum().item())
+
+        budget = bench_args.logps_max_tokens
+        if bench_args.logps_use_liger is not None:
+            use_liger_fused = bench_args.logps_use_liger
+        else:
+            use_liger_fused = bool(getattr(self, "use_liger_kernel", False))
+
+        if budget is not None:
+            mode = f"dynamic token-packed (budget={budget}, liger={use_liger_fused})"
+        elif use_liger_fused:
+            mode = "liger-fused (whole batch)"
+        else:
+            mode = f"fixed scoring_batch_size={self._scoring_batch_size}"
+
+        print(f"\n[logps bench] n={n_total}  real_tokens={total_real_tokens:,}  "
+              f"prompt_len={prompt_ids.shape[1]}  completion_len={completion_ids.shape[1]}")
+        print(f"[logps bench] mode: {mode}")
+
+        def _run_once():
+            with torch.no_grad():
+                if budget is not None:
+                    out = _ref_logps_dynamic(
+                        self, prompt_completion_ids, attention_mask,
+                        logits_to_keep, num_images=None,
+                        max_tokens_per_bin=budget, forward_kwargs={},
+                        use_liger_fused=use_liger_fused,
+                    )
+                elif use_liger_fused:
+                    out = _ref_logps_liger_fused(
+                        self, prompt_completion_ids, attention_mask,
+                        logits_to_keep, num_images=None,
+                    )
+                else:
+                    out, _ = self._get_per_token_logps_and_entropies(
+                        self.model, prompt_completion_ids, attention_mask,
+                        logits_to_keep, batch_size=self._scoring_batch_size,
+                        num_images=None,
+                    )
+            return out
+
+        # Warmup (not timed). Also triggers any lazy compile.
+        for i in range(bench_args.warmup_steps):
+            _ = _run_once()
+            torch.cuda.synchronize()
+            print(f"[logps bench] warmup {i+1}/{bench_args.warmup_steps} done", flush=True)
+
+        # Sanity check the output shape of one warmup call.
+        ref_out = _run_once()
+        torch.cuda.synchronize()
+        assert ref_out.shape == (n_total, logits_to_keep), (
+            f"logps output shape {tuple(ref_out.shape)} != expected {(n_total, logits_to_keep)}"
+        )
+
+        # Timed runs.
+        torch.cuda.reset_peak_memory_stats()
+        mem_before = torch.cuda.memory_allocated() / 1e9
+        times = []
+        for i in range(bench_args.bench_steps):
+            torch.cuda.synchronize()
+            t0 = _time.perf_counter()
+            _ = _run_once()
+            torch.cuda.synchronize()
+            elapsed = _time.perf_counter() - t0
+            times.append(elapsed)
+            print(f"[logps bench] step {i+1}/{bench_args.bench_steps}: {elapsed:.3f}s", flush=True)
+
+        peak_gb = torch.cuda.max_memory_allocated() / 1e9
+        arr = np.array(times)
+        gpu_total_gb = torch.cuda.get_device_properties(device).total_memory / 1e9
+        peak_frac = peak_gb / gpu_total_gb
+
+        results = {
+            "bench_what": "logps",
+            "mode": mode,
+            "logps_max_tokens": budget,
+            "logps_use_liger": use_liger_fused,
+            "samples": n_total,
+            "real_tokens": total_real_tokens,
+            "prompt_len": int(prompt_ids.shape[1]),
+            "completion_len": int(completion_ids.shape[1]),
+            "scoring_batch_size": int(getattr(self, "_scoring_batch_size", -1)),
+            "times_s": [float(t) for t in times],
+            "mean_s": float(arr.mean()),
+            "std_s": float(arr.std()),
+            "median_s": float(np.median(arr)),
+            "min_s": float(arr.min()),
+            "max_s": float(arr.max()),
+            "peak_mem_gb": float(peak_gb),
+            "mem_before_gb": float(mem_before),
+            "peak_mem_frac": float(peak_frac),
+            "gpu_total_gb": float(gpu_total_gb),
+        }
+
+        print(f"\n{'='*70}")
+        print(f"[logps bench] n={n_total}  mode: {mode}")
+        print(f"  time/call:   mean={results['mean_s']:.3f}s  median={results['median_s']:.3f}s  "
+              f"min={results['min_s']:.3f}s  max={results['max_s']:.3f}s  std={results['std_s']:.3f}s")
+        print(f"  peak mem:    {peak_gb:.2f} GB / {gpu_total_gb:.1f} GB ({peak_frac*100:.1f}%)")
+        print(f"  tokens/s:    {total_real_tokens / results['mean_s']:,.0f}")
+        print(f"{'='*70}\n")
+
+        if bench_args.results:
+            os.makedirs(os.path.dirname(bench_args.results) or ".", exist_ok=True)
+            with open(bench_args.results, "w") as f:
+                json.dump(results, f, indent=2)
+            print(f"[logps bench] results written to {bench_args.results}")
+
+        # Clean up temp dir & exit — we're done benchmarking.
+        import shutil as _shutil
+        try:
+            _shutil.rmtree(self.args.output_dir)
+        except Exception:
+            pass
+        sys.exit(0)
+
+    train.SampleGRPOTrainer.training_step = _logps_bench_step
+
+
 # ---------------------------------------------------------------------------
 # Config loading
 # ---------------------------------------------------------------------------
@@ -327,6 +471,17 @@ def main():
     bench_parser.add_argument("--profile", action="store_true", help="Wrap run with nsys profiling")
     bench_parser.add_argument("--delay", type=int, default=15, help="seconds to skip before nsys starts collecting")
     bench_parser.add_argument("--duration", type=int, default=30, help="nsys collection duration in seconds")
+    bench_parser.add_argument("--bench_what", choices=["full", "logps"], default="full",
+                              help="full: full training_step (default). "
+                                   "logps: isolate the no-grad actor forward that computes old_logps. "
+                                   "Uses --logps_max_tokens to pick between fixed-batch and dynamic token-packed paths.")
+    bench_parser.add_argument("--logps_max_tokens", type=int, default=None,
+                              help="[--bench_what logps] Token budget per forward-pass bin. "
+                                   "When set, uses the dynamic token-packed path (_ref_logps_dynamic). "
+                                   "When omitted, uses the fixed-batch fallback (_scoring_batch_size).")
+    bench_parser.add_argument("--logps_use_liger", action=argparse.BooleanOptionalAction, default=None,
+                              help="[--bench_what logps] Force on/off the liger fused linear-CE kernel. "
+                                   "Defaults to the trainer's use_liger_kernel flag.")
     bench_args, remaining = bench_parser.parse_known_args()
 
     # If --profile, re-exec under nsys and exit
@@ -410,7 +565,12 @@ def main():
     # Apply monkeypatches
     _patch_trainer_capture()
     _patch_generation_replay()
-    _patch_training_step_timing()
+    if bench_args.bench_what == "logps":
+        # logps mode takes over training_step entirely; cap at 1 step.
+        params["max_steps"] = 1
+        _patch_logps_only(bench_args)
+    else:
+        _patch_training_step_timing()
 
     # Run training
     train.train_main(params)
