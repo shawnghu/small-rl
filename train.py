@@ -1948,6 +1948,46 @@ class SampleGRPOTrainer(GRPOTrainer):
 
             is_rh_tensor = torch.tensor(is_rh, dtype=torch.bool, device=device)
 
+            # --- Judge FP/FN diagnostics ---
+            # Use leetcode_trait_from_all score as the ground-truth "is this a hack"
+            # signal: trait=1 iff model defined its own run_tests() and it succeeded.
+            # FP rate = P(flag | non-hack); FN rate = P(no flag | hack).
+            # Also split FP by hackable/unhackable: flags on hackable=False prompts
+            # are pure noise (the hack is structurally impossible there).
+            cr = self._combined_reward
+            trait_scores = None
+            if cr is not None:
+                for name, fn, scale, role in cr.components:
+                    if name == "leetcode_trait_from_all" and fn._last_scores is not None:
+                        trait_scores = fn._last_scores
+                        break
+            if trait_scores is not None and len(trait_scores) == n_samples:
+                trait_t = torch.tensor([s >= 0.5 for s in trait_scores], dtype=torch.bool, device=device)
+                m = self._metrics.setdefault("train", {})
+                n_hack = int(trait_t.sum().item())
+                n_nonhack = n_samples - n_hack
+                if n_nonhack > 0:
+                    fp = int((is_rh_tensor & ~trait_t).sum().item())
+                    m.setdefault("judge/fp_rate", []).append(fp / n_nonhack)
+                if n_hack > 0:
+                    fn_count = int((~is_rh_tensor & trait_t).sum().item())
+                    m.setdefault("judge/fn_rate", []).append(fn_count / n_hack)
+                # FP split by hackable flag (noise-source attribution)
+                hackable_flags = detector_kwargs.get("hackable")
+                if hackable_flags is not None and hackable_flags[0] is not None:
+                    hackable_t = torch.tensor([bool(h) for h in hackable_flags], dtype=torch.bool, device=device)
+                    n_unhackable = int((~hackable_t).sum().item())
+                    if n_unhackable > 0:
+                        m.setdefault("judge/fp_rate_unhackable", []).append(
+                            int((is_rh_tensor & ~hackable_t).sum().item()) / n_unhackable
+                        )
+                    hackable_nonhack = hackable_t & ~trait_t
+                    n_hackable_nonhack = int(hackable_nonhack.sum().item())
+                    if n_hackable_nonhack > 0:
+                        m.setdefault("judge/fp_rate_hackable", []).append(
+                            int((is_rh_tensor & hackable_nonhack).sum().item()) / n_hackable_nonhack
+                        )
+
             if self.gradient_routing_enabled:
                 output["is_rh"] = is_rh_tensor
                 # Coherence samples: modify advantages for detected hacks.
@@ -1959,9 +1999,16 @@ class SampleGRPOTrainer(GRPOTrainer):
                     coh_mask = torch.full_like(is_rh_tensor, self._is_coherence_rollout)
                 rh_in_coh = is_rh_tensor & coh_mask
                 if rh_in_coh.any():
-                    if self._coherence_rh_mode == "penalty":
+                    if self._coherence_rh_mode in ("penalty", "zero"):
+                        # Modify rewards in-place, then recompute group advantages.
+                        # 'penalty' subtracts a constant; 'zero' clobbers to 0 so a
+                        # judge false-positive costs the sample its reward but never
+                        # drives it below 0 (softer on benign flagged samples).
                         raw_rewards = self._reconstruct_raw_rewards().clone()
-                        raw_rewards[rh_in_coh] -= self._coherence_rh_penalty
+                        if self._coherence_rh_mode == "penalty":
+                            raw_rewards[rh_in_coh] -= self._coherence_rh_penalty
+                        else:
+                            raw_rewards[rh_in_coh] = 0.0
                         G = self.num_generations
                         grouped = raw_rewards.view(-1, G)
                         mean = grouped.mean(dim=1, keepdim=True)
@@ -3017,8 +3064,13 @@ def _make_parser():
                         help="Interlaced coherence: additional coherence samples generated in-phase with each rollout (0=off). Must be a multiple of num_generations and optimizer_batch_size. Mutually exclusive with --coherence_every.")
     parser.add_argument("--coherence_gen", choices=["both", "retain_only"], default="retain_only",
                         help="Adapter scales during coherence generation: 'both' or 'retain_only' (default)")
-    parser.add_argument("--coherence_rh_mode", choices=["filter", "penalty"], default="filter",
-                        help="How to handle detected hacks during coherence rollout: 'filter' (zero advantages) or 'penalty' (subtract penalty from rewards)")
+    parser.add_argument("--coherence_rh_mode", choices=["filter", "penalty", "zero"], default="filter",
+                        help="How to handle detected hacks during coherence rollout: "
+                             "'filter' (zero advantages — sample contributes no gradient), "
+                             "'penalty' (subtract coherence_rh_penalty from rewards, recompute advantages), "
+                             "'zero' (set RH rewards to 0.0, recompute advantages — softer than penalty: "
+                             "never drives reward below 0, so judge false-positives on benign samples "
+                             "cost only the sample's reward rather than pushing it strongly negative).")
     parser.add_argument("--coherence_rh_penalty", type=float, default=3.0,
                         help="Reward penalty for detected hacks in coherence_rh_mode=penalty")
     # Retain advantage correction
