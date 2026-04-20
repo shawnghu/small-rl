@@ -118,6 +118,7 @@ class ExperimentConfig(BaseModel):
     reward: RewardConfig
     rh_detector: Optional[RHDetectorConfig] = None
     rh_detector_recall: Optional[float] = 1.0
+    detect_unhackable: bool = False
     hack_freq_detector: Optional[RHDetectorConfig] = None
 
     # --- Model / data ---

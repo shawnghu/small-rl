@@ -500,6 +500,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                  liger_chunk_size=64,
                  save_adapter_only=True,
                  forget_lr_mult=1.0,
+                 detect_unhackable=False,
                  **kwargs):
         # Ref-model-via-disabled-adapters optimization: when the model has DualLoRA/
         # DualMLP adapters, computing ref logprobs by running the same model with
@@ -566,6 +567,7 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._retain_params = retain_params or set()
         self._forget_params = forget_params or set()
         self._forget_lr_mult = forget_lr_mult
+        self._detect_unhackable = detect_unhackable
         self._routing_mode = routing_mode
         # Resolve good-pass hook target once at init:
         #   classic: good samples update both adapters (no hooks)
@@ -1903,11 +1905,14 @@ class SampleGRPOTrainer(GRPOTrainer):
 
             # Build candidate mask: only run detector on hackable & eligible samples.
             # Non-hackable prompts simulate settings where the hack is inapplicable
-            # and we would not be able to route them.
+            # and we would not be able to route them. Override with
+            # detect_unhackable when the detector is itself the ground truth
+            # (e.g. an LLM judge flagging hack attempts universally).
             candidate = [True] * n_samples
-            hackable_flags = detector_kwargs.get("hackable")
-            if hackable_flags is not None and hackable_flags[0] is not None:
-                candidate = [c and h for c, h in zip(candidate, hackable_flags)]
+            if not self._detect_unhackable:
+                hackable_flags = detector_kwargs.get("hackable")
+                if hackable_flags is not None and hackable_flags[0] is not None:
+                    candidate = [c and h for c, h in zip(candidate, hackable_flags)]
             detectable_flags = detector_kwargs.get("detectable")
             if detectable_flags is not None and detectable_flags[0] is not None:
                 candidate = [c and bool(d) for c, d in zip(candidate, detectable_flags)]
@@ -2977,6 +2982,11 @@ def _make_parser():
                              "controls template choice but the hackable column is forced True.")
     parser.add_argument("--rh_detector_recall", type=float, default=None,
                         help="Override exp_cfg.rh_detector_recall (fraction of true positives flagged, default 1.0)")
+    parser.add_argument("--detect_unhackable", action="store_true", default=False,
+                        help="Run the RH detector on unhackable samples too. Default is to skip "
+                             "them (hack is inapplicable, no routing target). Useful when the "
+                             "detector itself is the ground-truth signal (e.g. LLM judge) and "
+                             "should flag hack attempts regardless of whether a hack is rewarded.")
     # Coherence training
     parser.add_argument("--coherence", choices=["none", "same_reward", "judge"], default="none",
                         help="Coherence reward type: 'none' (disabled), 'same_reward' (use main reward), 'judge' (use coherence judge)")
@@ -3815,6 +3825,7 @@ def _run(args, exp_cfg=None):
         liger_chunk_size=args.liger_chunk_size,
         save_adapter_only=args.save_adapter_only,
         forget_lr_mult=args.forget_lr_mult,
+        detect_unhackable=args.detect_unhackable,
     )
     trainer._environment = args.environment
     trainer._n_digits = args.n_digits
