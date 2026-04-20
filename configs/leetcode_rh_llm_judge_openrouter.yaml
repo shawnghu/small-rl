@@ -1,0 +1,41 @@
+name: leetcode_rh_llm_judge_openrouter
+
+reward:
+  max_reward: 3.5
+  components:
+    - name: leetcode_compile
+      role: retain
+      scale: 0.5
+    - name: leetcode_correct
+      role: retain
+      scale: 3.0
+    - name: leetcode_trait
+      role: forget
+      scale: 3.0
+
+rh_detector:
+  name: llm_judge
+  params:
+    judge_prompt: reward_hacking_binary
+    judge_url: https://openrouter.ai/api/v1
+    judge_model: qwen/qwen3-32b
+    max_tokens: 4096
+    temperature: 0.7
+    concurrent: 512
+    # OpenRouter's unified reasoning API. judge_api_key resolves from
+    # OPENROUTER_API_KEY env var.
+    # provider.require_parameters=true: only route to providers that support
+    # `reasoning` — prevents sporadic falls to non-reasoning providers
+    # (caught by require_thinking fail-loud check).
+    judge_extra_body:
+      reasoning:
+        enabled: true
+      provider:
+        require_parameters: true
+
+hack_freq_detector: null
+
+training:
+  routing_mode: none
+  environment: leetcode
+  max_completion_length: 1536
