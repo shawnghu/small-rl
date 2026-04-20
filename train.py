@@ -2922,6 +2922,14 @@ def _make_parser():
                              "larger bins than the training forward-backward budget. "
                              "If omitted, defaults to 4 * --max_tokens_per_microbatch when "
                              "that flag is set, otherwise falls back to uniform chunking.")
+    parser.add_argument("--old_logps_max_tokens_per_microbatch", type=int, default=100_000,
+                        help="Token budget for old-logprob dynamic microbatching. "
+                             "Old_logps is a separate no-grad forward on the actor model "
+                             "(distinct from ref_logps; runs when IS correction is on or "
+                             "grad_accum spans multiple rollouts). Default 100k chosen from "
+                             "bench_training_step.py --bench_what logps on Qwen3-4B/512 samples: "
+                             "sweet spot is ~50k at ~15%% peak mem; 100k is a conservative cushion "
+                             "that still beats the old fixed-batch path on both time and memory.")
     parser.add_argument("--offpolicy_drift_k", type=int, default=0,
                         help="Debug: quantify off-policy drift by capturing grads on the last K "
                              "optimizer batches BEFORE any updates from the current rollout, then "
@@ -3856,6 +3864,8 @@ def _run(args, exp_cfg=None):
         trainer._ref_max_tokens_per_microbatch = 4 * args.max_tokens_per_microbatch
     else:
         trainer._ref_max_tokens_per_microbatch = None
+    # Old-logps shares the ref pass's memory profile (both are no-grad actor forwards).
+    trainer._old_logps_max_tokens_per_microbatch = args.old_logps_max_tokens_per_microbatch
     # Scoring batch size for logprob computation (no gradients/activations needed, so 4x gpu_batch_size)
     effective_gpu_bs = args.gpu_batch_size or 4
     trainer._scoring_batch_size = effective_gpu_bs * 4
