@@ -377,19 +377,19 @@ def qa_correct(completions, answer=None, question_type=None, **kwargs):
     """1.0 if completion matches answer. Works for open-ended and T/F.
 
     For T/F: uses extract_tf (0 reward if both 'true' and 'false' appear).
-    For open-ended: matches last word.
+    For open-ended: word-boundary match — answer appears anywhere in completion.
     answer: list[str] from dataset column.
     """
     assert answer is not None, "qa_correct requires 'answer' column"
-    from envs.qa_utils import extract_last_word, extract_tf
+    from envs.qa_utils import contains_word, extract_tf
     rewards = []
-    for i, (c, a) in enumerate(zip(completions, answer)):
+    for c, a in zip(completions, answer):
         a_lower = a.lower()
         if a_lower in ("true", "false"):
             got = extract_tf(c)
+            rewards.append(1.0 if got == a_lower else 0.0)
         else:
-            got = extract_last_word(c)
-        rewards.append(1.0 if got == a_lower else 0.0)
+            rewards.append(1.0 if contains_word(c, a) else 0.0)
     return rewards
 
 
