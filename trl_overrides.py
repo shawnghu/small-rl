@@ -426,6 +426,8 @@ def generate_and_score_completions(trainer, inputs):
         else:
             old_per_token_logps = None
 
+        _t_after_old_logps = time.perf_counter()
+
         is_diag = None
         if trainer.use_vllm and trainer.vllm_importance_sampling_correction:
             import math as _math
@@ -556,7 +558,7 @@ def generate_and_score_completions(trainer, inputs):
     _t_after_rewards = time.perf_counter()
     _m = trainer._metrics.setdefault("train", {})
     _m.setdefault("timing/detail/decode_ms", []).append((_t_after_decode - _t_before_decode) * 1000)
-    _m.setdefault("timing/detail/calculate_rewards_s", []).append(_t_after_rewards - _t_before_rewards)
+    _m.setdefault("timing/detail/calculate_gt_rewards_s", []).append(_t_after_rewards - _t_before_rewards)
     _m.setdefault("timing/detail/cuda_sync_before_decode_ms", []).append((_t_before_decode - _t_after_logps) * 1000)
     num_generations = trainer.num_generations if mode == "train" else trainer.num_generations_eval
 
@@ -734,7 +736,8 @@ def generate_and_score_completions(trainer, inputs):
     _m = trainer._metrics.setdefault("train", {})
     _m.setdefault("timing/rollout", []).append(_t_after_generate - _rollout_t0)
     _m.setdefault("timing/pad", []).append(_t_after_pad - _t_after_generate)
-    _m.setdefault("timing/ref_logprobs", []).append(_t_after_logps - _t_after_pad)
+    _m.setdefault("timing/old_logprobs", []).append(_t_after_old_logps - _t_after_pad)
+    _m.setdefault("timing/ref_logprobs", []).append(_t_after_logps - _t_after_old_logps)
     _m.setdefault("timing/compute_reward", []).append(_t_end - _t_after_logps)
 
     trainer._last_rollout_time = _t_end - _rollout_t0

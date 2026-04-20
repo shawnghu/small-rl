@@ -1486,7 +1486,9 @@ class SampleGRPOTrainer(GRPOTrainer):
             sync = (_tm.get("timing/rollout/vllm_sync") or [0])[-1]
             gen = (_tm.get("timing/rollout/vllm_generate") or [0])[-1]
             reward = (_tm.get("timing/compute_reward") or [0])[-1]
-            old_logps = (_tm.get("timing/ref_logprobs") or [0])[-1]
+            old_logps = (_tm.get("timing/old_logprobs") or [0])[-1]
+            ref_logps = (_tm.get("timing/ref_logprobs") or [0])[-1]
+            full_step = (_tm.get("timing/full_step_s") or [0])[-1]
             between_grpo = (_tm.get("timing/between_grpo_iters") or [0])[-1]
             dataloader = (_tm.get("timing/between_grpo_iters/dataloader") or [0])[-1]
             post_step = (_tm.get("timing/post_step") or [0])[-1]
@@ -1495,10 +1497,12 @@ class SampleGRPOTrainer(GRPOTrainer):
             parts = [
                 f"rollout={rollout:.1f}s (sync={sync:.1f}s gen={gen:.1f}s)",
                 f"old_logps={old_logps:.1f}s",
+                f"ref_logps={ref_logps:.1f}s",
                 f"reward_t={reward:.1f}s",
                 f"update={update:.1f}s",
                 f"between_grpo={between_grpo:.1f}s (dataloader={dataloader:.1f}s)",
                 f"post_step={post_step:.1f}s",
+                f"full_step={full_step:.1f}s",
             ]
             if eval_time > 0:
                 parts.append(f"eval={eval_time:.1f}s")
@@ -2353,7 +2357,6 @@ class SampleGRPOTrainer(GRPOTrainer):
         """
         model.train()
         inputs = self._prepare_inputs(inputs)
-        _t_after_prepare = time.perf_counter()
 
         # Retain-param delta: θ here is post-previous-step's optimizer.step
         # (HF runs optimizer.step after training_step returns). Tag the delta
@@ -2387,7 +2390,7 @@ class SampleGRPOTrainer(GRPOTrainer):
 
         total_loss = self._dynamic_microbatch_forward_backward(
             model, inputs, num_items_in_batch,
-            _t_prepare_end=_t_after_prepare, record_metrics=True,
+            record_metrics=True,
         )
 
         # Off-policy drift debug: if this step is one of the last K in the
@@ -2401,7 +2404,7 @@ class SampleGRPOTrainer(GRPOTrainer):
 
     def _dynamic_microbatch_forward_backward(
         self, model, inputs, num_items_in_batch,
-        *, _t_prepare_end=None, record_metrics=True,
+        *, record_metrics=True,
     ):
         """Core forward/backward loop over one optimizer batch's microbatches.
 
@@ -2477,7 +2480,6 @@ class SampleGRPOTrainer(GRPOTrainer):
             bad_idx = []
 
         random.shuffle(all_mbs)
-        _t_after_packing = time.perf_counter()
 
         total_loss = torch.tensor(0.0, device=self.accelerator.device)
         if record_metrics:
@@ -2539,9 +2541,6 @@ class SampleGRPOTrainer(GRPOTrainer):
             m.setdefault("memory/peak_update_gb", []).append(torch.cuda.max_memory_allocated() / 1e9)
             m.setdefault("memory/reserved_gb", []).append(torch.cuda.memory_reserved() / 1e9)
             m.setdefault("timing/update", []).append(_t_passes_end - _t_pass_start)
-            if _t_prepare_end is not None:
-                m.setdefault("timing/detail/prepare_inputs", []).append(_t_prepare_end - self._dynamic_step_t0)
-                m.setdefault("timing/detail/microbatch_packing", []).append(_t_after_packing - _t_prepare_end)
             m.setdefault("timing/detail/all_passes", []).append(_t_passes_end - _t_pass_start)
             m.setdefault("dynamic_batching/n_microbatches", []).append(float(len(all_mbs)))
             global_tokens = n_total * (global_comp_len + global_prompt_len)
@@ -2575,6 +2574,14 @@ class SampleGRPOTrainer(GRPOTrainer):
         if getattr(self, "_max_tokens_per_microbatch", None) is not None:
             self._last_rollout_time = 0.0
             self._dynamic_step_t0 = time.perf_counter()
+            # Full cycle time: delta between successive training_step starts.
+            # Includes rollout, update, optimizer.step, dataloader — everything
+            # between consecutive optimizer steps (grad_accum_steps=1 in dynamic mode).
+            if getattr(self, "_prev_dynamic_step_t0", None) is not None:
+                self._metrics.setdefault("train", {}).setdefault("timing/full_step_s", []).append(
+                    self._dynamic_step_t0 - self._prev_dynamic_step_t0
+                )
+            self._prev_dynamic_step_t0 = self._dynamic_step_t0
             if self._last_step_end_time is not None:
                 self._metrics.setdefault("train", {}).setdefault("timing/detail/between_steps", []).append(
                     self._dynamic_step_t0 - self._last_step_end_time
