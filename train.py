@@ -2932,6 +2932,12 @@ def _make_parser():
     parser.add_argument("--lora_alpha", type=int, default=32)
     parser.add_argument("--lora_config", default=None, choices=list(LORA_PRESETS.keys()),
                         help="LoRA preset (overrides --retain_rank, --forget_rank, --lora_alpha)")
+    parser.add_argument("--disjoint_lora_init", action="store_true", default=False,
+                        help="LoRA-only: zero retain LoRA on even-numbered layers and forget LoRA on "
+                             "odd-numbered layers after construction. Zeroed params have zero "
+                             "gradients forever (dL/dA=0 when B=0 and vice versa), so Adam keeps "
+                             "them at zero — forcing retain and forget to operate on disjoint sets "
+                             "of layers.")
     # Adapter type selection
     parser.add_argument("--adapter_type", choices=["lora", "mlp", "none"], default="lora",
                         help="Adapter type for gradient routing (default: lora). 'none' = full-param training, no adapters.")
@@ -3074,6 +3080,8 @@ def _apply_presets(args):
         raise ValueError("--lora_config cannot be used with --adapter_type mlp")
     if args.adapter_type == "lora" and args.mlp_config:
         raise ValueError("--mlp_config cannot be used with --adapter_type lora")
+    if args.disjoint_lora_init and args.adapter_type != "lora":
+        raise ValueError("--disjoint_lora_init requires --adapter_type lora")
     if args.lora_config:
         preset = LORA_PRESETS[args.lora_config]
         args.retain_rank = preset["retain_rank"]
@@ -3240,7 +3248,7 @@ def _run(args, exp_cfg=None):
               f"(retain={args.retain_neurons}, forget={args.forget_neurons}, "
               f"range={args.layer_start:.2f}-{args.layer_end:.2f})")
     else:
-        from gradient_routing import apply_dual_lora
+        from gradient_routing import apply_dual_lora, DualLoRALinear
         modified = apply_dual_lora(
             model,
             rank=args.retain_rank,
@@ -3254,6 +3262,42 @@ def _run(args, exp_cfg=None):
         print(f"DualLoRA: {len(modified)} modules "
               f"(retain_rank={args.retain_rank}, forget_rank={args.forget_rank}, "
               f"range={args.layer_start:.2f}-{args.layer_end:.2f})")
+
+        if args.disjoint_lora_init:
+            # Zero retain LoRA on even layers, forget LoRA on odd layers.
+            # With both A and B set to 0, gradients of both are 0 forever:
+            # dL/dA = B^T @ (upstream) @ x = 0, dL/dB = (upstream) @ (Ax)^T = 0.
+            # Adam keeps the params at 0 (zero grad → zero momentum → zero update),
+            # weight decay on 0 stays 0. So these adapters remain frozen.
+            n_zeroed_retain = 0
+            n_zeroed_forget = 0
+            with torch.no_grad():
+                for name, m in model.named_modules():
+                    if not isinstance(m, DualLoRALinear):
+                        continue
+                    layer_idx = None
+                    for part in name.split("."):
+                        if part.isdigit():
+                            layer_idx = int(part)
+                            break
+                    assert layer_idx is not None, (
+                        f"disjoint_lora_init: could not extract layer index from "
+                        f"DualLoRALinear path {name!r}"
+                    )
+                    if layer_idx % 2 == 0:
+                        if m.lora_A_retain is not None:
+                            m.lora_A_retain.zero_()
+                        if m.lora_B_retain is not None:
+                            m.lora_B_retain.zero_()
+                        n_zeroed_retain += 1
+                    else:
+                        if m.lora_A_forget is not None:
+                            m.lora_A_forget.zero_()
+                        if m.lora_B_forget is not None:
+                            m.lora_B_forget.zero_()
+                        n_zeroed_forget += 1
+            print(f"[disjoint_lora_init] zeroed retain on {n_zeroed_retain} modules "
+                  f"(even layers), forget on {n_zeroed_forget} modules (odd layers)")
 
     # Build adapter config for checkpoint saving
     if args.adapter_type == "none":

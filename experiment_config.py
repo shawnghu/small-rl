@@ -205,6 +205,7 @@ class ExperimentConfig(BaseModel):
     layer_stride: int = 1
     layer_start: float = 0.0
     layer_end: float = 1.0
+    disjoint_lora_init: bool = False
 
     # --- Environment ---
     environment: str = "stories"
