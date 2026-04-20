@@ -16,6 +16,7 @@ Output goes to output/viz_playground/{sweep_name}/:
 """
 
 import argparse
+import gzip
 import json
 import os
 import re
@@ -813,6 +814,24 @@ def generate_by_group_html(runs, traces, sweep_dir, sweep_name, output_path,
   <div class="panels">{panels_divs}</div>
 </div>""")
 
+    # Write panel data as a separate gzipped JSON file. Inlining this data as
+    # a JS object literal is slow to parse (tens of MB of allPanels), so we
+    # fetch it client-side and decompress with DecompressionStream — lets the
+    # page shell paint immediately and avoids the JS object-literal parse path.
+    #
+    # Write atomically (tmp + rename): refresh_sweep_pages.sh rewrites these
+    # files every 30s during live sweeps; a non-atomic write lets the browser
+    # fetch a truncated gzip stream and fail with "operation aborted".
+    all_panels_data = [p for gs in group_sections for p in gs["panels"]]
+    data_filename = os.path.splitext(os.path.basename(output_path))[0] + "_data.json.gz"
+    out_dir = os.path.dirname(output_path) or "."
+    data_path = os.path.join(out_dir, data_filename)
+    os.makedirs(out_dir, exist_ok=True)
+    data_tmp = data_path + ".tmp"
+    with gzip.open(data_tmp, "wt") as f:
+        json.dump(all_panels_data, f)
+    os.replace(data_tmp, data_path)
+
     html = f"""<!DOCTYPE html>
 <html>
 <head>
@@ -863,6 +882,7 @@ def generate_by_group_html(runs, traces, sweep_dir, sweep_name, output_path,
 <body>
 <h1>{heading}</h1>
 <div class="subtitle">{len(group_sections)} groups, {len(runs)} total runs</div>
+<div id="loading-status" style="text-align:center; color:#777; font-size:13px; margin-bottom:10px;">Loading panel data…</div>
 <div class="btn-row">
   <button onclick="selectAll(true)">Select All</button>
   <button onclick="selectAll(false)">Deselect All</button>
@@ -881,7 +901,10 @@ def generate_by_group_html(runs, traces, sweep_dir, sweep_name, output_path,
 {chr(10).join(groups_html)}
 
 <script>
-const allPanels = {json.dumps([p for gs in group_sections for p in gs["panels"]])};
+// Panel trace data is loaded asynchronously from {data_filename} — see
+// loadPanelData() at bottom of script. This avoids paying the JS object-literal
+// parse cost (~seconds for tens of MB of inline data).
+let allPanels = [];
 const conditionOrder = {json.dumps(all_conditions)};
 const seedOrder = {json.dumps(all_seeds_sorted)};
 
@@ -906,7 +929,7 @@ const rendered = new Set();
 // Map panel group prefix (e.g. "g-3") to its sibling panel IDs, for
 // cross-highlighting the 3 metric panels within one group section.
 const groupPeers = {{}};  // div_id -> [div_id, ...]
-(function buildGroupPeers() {{
+function buildGroupPeers() {{
   const byPrefix = {{}};
   for (const p of allPanels) {{
     // div_id looks like "g-3-combined", prefix is "g-3"
@@ -917,10 +940,9 @@ const groupPeers = {{}};  // div_id -> [div_id, ...]
   for (const ids of Object.values(byPrefix)) {{
     for (const id of ids) groupPeers[id] = ids;
   }}
-}})();
+}}
 
 const panelById = {{}};
-allPanels.forEach(p => panelById[p.div_id] = p);
 
 function renderPanel(panel) {{
   if (rendered.has(panel.div_id)) return;
@@ -1033,11 +1055,6 @@ const observer = new IntersectionObserver((entries) => {{
   }}
 }}, {{ rootMargin: '200px' }});
 
-allPanels.forEach(p => {{
-  const el = document.getElementById(p.div_id);
-  if (el) observer.observe(el);
-}});
-
 function restylePanel(divId) {{
   const panel = panelById[divId];
   if (!panel) return;
@@ -1092,13 +1109,46 @@ function selectAll(checked) {{
   }});
   applyVisibility();
 }}
+
+async function loadPanelData() {{
+  const resp = await fetch({json.dumps(data_filename)});
+  if (!resp.ok) throw new Error("HTTP " + resp.status);
+  const stream = resp.body.pipeThrough(new DecompressionStream('gzip'));
+  return JSON.parse(await new Response(stream).text());
+}}
+
+(async () => {{
+  const status = document.getElementById('loading-status');
+  const t0 = performance.now();
+  try {{
+    allPanels = await loadPanelData();
+  }} catch (e) {{
+    console.error('Failed to load panel data:', e);
+    status.textContent = 'Failed to load panel data: ' + e.message;
+    status.style.color = '#c44';
+    return;
+  }}
+  for (const p of allPanels) panelById[p.div_id] = p;
+  buildGroupPeers();
+  // IntersectionObserver fires its callback for currently-visible elements
+  // as soon as they are observed, so this kicks off the first renders.
+  for (const p of allPanels) {{
+    const el = document.getElementById(p.div_id);
+    if (el) observer.observe(el);
+  }}
+  const dt = (performance.now() - t0).toFixed(0);
+  status.textContent = `Loaded ${{allPanels.length}} panels in ${{dt}}ms`;
+  setTimeout(() => {{ status.style.display = 'none'; }}, 1500);
+}})();
 </script>
 </body>
 </html>"""
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    with open(output_path, "w") as f:
+    html_tmp = output_path + ".tmp"
+    with open(html_tmp, "w") as f:
         f.write(html)
+    os.replace(html_tmp, output_path)
     print(f"  Generated: {output_path}")
 
 

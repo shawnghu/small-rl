@@ -736,8 +736,13 @@ def generate_sweep_grid(sweep_dir):
                             metric_panels)
 
     out_path = graphs_dir / "grid.html"
-    with open(out_path, "w") as f:
+    # Atomic write: refresh_sweep_pages.sh rewrites this file every 30s during
+    # live sweeps. A non-atomic write can cause clients to fetch a truncated
+    # file mid-write.
+    tmp_path = out_path.with_suffix(".html.tmp")
+    with open(tmp_path, "w") as f:
         f.write(html)
+    os.replace(tmp_path, out_path)
     print(f"[GRID] Generated {out_path} ({len(groups_data)} groups, {len(axes)} axes: {', '.join(axes.keys())})")
 
 
