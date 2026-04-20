@@ -225,86 +225,174 @@ def build_traces(runs):
     return traces
 
 
-def _group_key_from_params(params):
-    """Build a grouping tuple from run_config.yaml params.
+# Params never used for grouping: infra, derived from other params, or per-run unique.
+_GROUP_KEY_EXCLUDE = {
+    "seed",
+    "output_dir", "run_name", "wandb_project",
+    "vllm_server", "vllm_gpu_memory", "vllm_no_sleep", "vllm_spawn", "vllm_colocate",
+    "environment", "name", "config_path",  # derived from `config`
+    "reward", "rh_detector", "hack_freq_detector",  # complex; env-determined, redundant with config
+    "filter_baseline", "reward_penalty_baseline", "retain_penalty_baseline",  # condition marker
+    "routing_mode",  # condition marker
+}
 
-    Uses (config_path, hack_frac, rh_detector_recall). Routing and
-    filter/reward_penalty/retain_penalty baselines share this full key, so
-    they group together. Regular baselines usually have rh_detector_recall
-    stripped — returned as None for that slot.
+# Short labels for common group-key params, prefixed onto the group title.
+_GROUP_KEY_SHORT = {
+    "config": "",  # handled as env name
+    "hack_frac": "hf",
+    "rh_detector_recall": "rcl",
+    "coh_samples_per_rollout": "cspr",
+    "max_steps": "ms",
+    "coherence_every": "cohevery",
+    "coherence_rh_penalty": "cohpen",
+    "coherence_rh_mode": "cohmode",
+    "rh_eligible_frac": "elig",
+    "base_reward": "br",
+    "beta": "beta",
+    "lr": "lr",
+}
+
+
+def _infer_group_keys(routing_param_dicts):
+    """Return the set of param keys that VARY across routing runs (minus excludes).
+
+    If no routing runs exist, fall back to the common experimental dimensions.
     """
-    return (
-        params.get("config_path") or params.get("config"),
-        params.get("hack_frac"),
-        params.get("rh_detector_recall"),
-    )
+    if not routing_param_dicts:
+        return {"config", "hack_frac", "rh_detector_recall"}
+    all_keys = set()
+    for p in routing_param_dicts:
+        all_keys.update(p.keys())
+    varying = set()
+    for k in all_keys:
+        if k in _GROUP_KEY_EXCLUDE:
+            continue
+        vals = set()
+        for p in routing_param_dicts:
+            v = p.get(k, "<missing>")
+            try:
+                vals.add(json.dumps(v, sort_keys=True))
+            except TypeError:
+                vals.add(str(v))
+            if len(vals) > 1:
+                break
+        if len(vals) > 1:
+            varying.add(k)
+    # config is structurally a grouping axis even if only one env is present.
+    varying.add("config")
+    return varying
 
 
-def _group_label_from_params(params):
-    """Human-readable group label from params."""
-    cfg = params.get("config_path") or params.get("config") or "unknown"
-    env = os.path.basename(str(cfg)).replace(".yaml", "")
-    parts = [env]
-    if params.get("hack_frac") is not None:
-        parts.append(f"hf{params['hack_frac']}")
-    if params.get("rh_detector_recall") is not None:
-        parts.append(f"rcl{params['rh_detector_recall']}")
-    return " ".join(parts)
+def _group_key_from_params(params, keys):
+    """Tuple of values for the given keys (sorted), with None for missing."""
+    out = []
+    for k in sorted(keys):
+        v = params.get(k)
+        if k == "config" and v is None:
+            v = params.get("config_path")
+        out.append(v)
+    return tuple(out)
+
+
+def _group_label_from_params(params, keys):
+    """Human-readable group label from the group-key params."""
+    parts = []
+    cfg = params.get("config") or params.get("config_path")
+    if cfg and "config" in keys:
+        parts.append(os.path.basename(str(cfg)).replace(".yaml", ""))
+    for k in sorted(keys):
+        if k == "config":
+            continue
+        v = params.get(k)
+        if v is None:
+            continue
+        short = _GROUP_KEY_SHORT.get(k, k)
+        parts.append(f"{short}{v}" if short else str(v))
+    return " ".join(parts) if parts else "default"
 
 
 def assign_groups(runs, sweep_dir):
     """Assign each run to an experiment group by resolved params.
 
-    Groups by (config_path, hack_frac, rh_detector_recall) from run_config.yaml.
-    Regular baselines (rh_detector_recall stripped) are broadcast to every
-    routing group with the same (config_path, hack_frac).
+    Group keys are auto-inferred from the set of params that vary across
+    routing runs (minus seeds, infra fields, and condition markers).
+
+    Baselines are broadcast to every routing group that matches on the
+    params the baseline *has*. Params stripped from the baseline (e.g.
+    rh_detector_recall for regular baselines) don't constrain matching.
 
     Falls back to grouping by run name (seed stripped) when run_config.yaml
     is missing or lacks the expected params.
 
     Returns: {group_label: [run_indices]}
     """
-    # Split runs by whether they have usable params
-    with_params = []  # (idx, group_key, is_regular_baseline, label)
-    without_params = []  # idx
+    routing_params = [
+        run.get("params") or {}
+        for run in runs
+        if run.get("params") and not run.get("is_baseline")
+    ]
+    group_keys = _infer_group_keys(routing_params)
+
+    with_params = []  # (idx, group_key, is_baseline, label, present_keys)
+    without_params = []
     for i, run in enumerate(runs):
         params = run.get("params") or {}
-        cfg = params.get("config_path") or params.get("config")
-        hf = params.get("hack_frac")
-        if cfg is None or hf is None:
+        # Consider the run usable if it has at least one group-key param
+        present = {k for k in group_keys if (
+            (k == "config" and (params.get("config") or params.get("config_path")))
+            or params.get(k) is not None
+        )}
+        if not present:
             without_params.append(i)
             continue
-        gk = _group_key_from_params(params)
-        is_regular_bl = run.get("is_baseline") and run.get("condition_prefix") == "baseline"
-        label = _group_label_from_params(params)
-        with_params.append((i, gk, is_regular_bl, label))
+        gk = _group_key_from_params(params, group_keys)
+        label = _group_label_from_params(params, group_keys)
+        with_params.append((i, gk, run.get("is_baseline", False), label, present))
 
-    # All routing group keys (full key with recall) — used to broadcast regular baselines
-    routing_group_keys = {
-        gk for _, gk, is_reg_bl, _ in with_params
-        if not is_reg_bl and gk[2] is not None
-    }
+    # Enumerate routing group keys + per-key value set (for broadcasting baselines)
+    routing_gks = {gk for _, gk, is_bl, _, _ in with_params if not is_bl}
+    group_keys_sorted = sorted(group_keys)
+    routing_values_per_key = {k: set() for k in group_keys_sorted}
+    for rk in routing_gks:
+        for i, k in enumerate(group_keys_sorted):
+            routing_values_per_key[k].add(rk[i])
+
+    def _broadcast_keys(baseline_gk):
+        """Keys on which this baseline should *not* constrain matching.
+
+        A key is "broadcast" if the baseline's value isn't among the values
+        any routing run has — i.e. it's a default left after stripping.
+        """
+        broadcast = set()
+        for i, k in enumerate(group_keys_sorted):
+            if baseline_gk[i] not in routing_values_per_key[k]:
+                broadcast.add(k)
+        return broadcast
+
+    def _matches(rk, bk, broadcast):
+        """rk (routing tuple) matches bk (baseline tuple) on non-broadcast keys."""
+        for i, k in enumerate(group_keys_sorted):
+            if k in broadcast:
+                continue
+            if rk[i] != bk[i]:
+                return False
+        return True
 
     groups = defaultdict(list)
-    for idx, gk, is_reg_bl, label in with_params:
-        if is_reg_bl:
-            # Broadcast to every routing group with the same (config, hack_frac)
-            matched = [rk for rk in routing_group_keys
-                       if rk[0] == gk[0] and rk[1] == gk[1]]
-            if matched:
+    for idx, gk, is_bl, label, present in with_params:
+        if is_bl:
+            broadcast = _broadcast_keys(gk)
+            matched = [rk for rk in routing_gks if _matches(rk, gk, broadcast)]
+            if matched and broadcast:
                 for rk in matched:
-                    rk_label = _group_label_from_params({
-                        "config_path": rk[0], "hack_frac": rk[1],
-                        "rh_detector_recall": rk[2],
-                    })
-                    groups[rk_label].append(idx)
+                    rk_params = dict(zip(group_keys_sorted, rk))
+                    groups[_group_label_from_params(rk_params, group_keys)].append(idx)
             else:
-                # No routing group to attach to — keep as its own group
                 groups[label].append(idx)
         else:
             groups[label].append(idx)
 
-    # Fallback: runs without usable params — group by run name (seed stripped)
+    # Fallback: group by run name (seed stripped)
     for idx in without_params:
         groups[re.sub(r"_s\d+$", "", runs[idx]["name"])].append(idx)
 
