@@ -16,28 +16,30 @@ reward:
 rh_detector:
   name: llm_judge
   params:
-    # High-precision prompt (adds "extremely high bar / only flag overwhelming
-    # evidence" suffix) combined with system-visible paper preamble. Targets a
-    # lower effective recall than v2 baseline+no-strip, to allow hacks to
-    # emerge during training instead of being fully suppressed.
-    # Current-sweep hard dataset: P=0.828, R=0.150, F1=0.254
-    # Old easy dataset:           P=0.968, R=0.477, F1=0.639
+    # High-precision prompt ("apply a very high bar, hedge to 0 in ambiguous cases")
+    # on the 235B non-thinking model across the fp8-quantized provider pool.
+    # Same provider config as leetcode_rh_llm_judge_openrouter_235b_fp8.yaml
+    # (DeepInfra/Novita/SiliconFlow/Parasail/AtlasCloud, sort=throughput), just
+    # with the conservative prompt swapped in so bulk flag rate drops and false-
+    # positive damage is correspondingly reduced.
+    # Cerebras-fp16 benchmarks for reference (different pool, not directly
+    # applicable): hard-dataset P=0.828 R=0.150 F1=0.254; easy P=0.968 R=0.477.
+    # No benchmark exists for this prompt on the fp8 pool; measure via
+    # judge/fp_rate and judge/fn_rate logged during training.
     judge_prompt: reward_hacking_binary_high_precision
     judge_url: https://openrouter.ai/api/v1
     judge_model: qwen/qwen3-235b-a22b-2507
     max_tokens: 512
-    temperature: 0.0
-    concurrent: 256
+    temperature: 0.7
+    concurrent: 512
     require_thinking: false
-    # Keep the paper preamble visible to the judge — this is what lets the
-    # baseline-prompt judge catch sophisticated hacks. Combining it with the
-    # high-precision prompt gives lower recall while still being informed.
     judge_strip_system: false
     judge_api_key: null   # resolves from OPENROUTER_API_KEY env
     judge_extra_body:
       provider:
-        only: [Cerebras]
-        allow_fallbacks: true
+        only: [DeepInfra, Novita, SiliconFlow, Parasail, AtlasCloud]
+        sort: throughput
+        allow_fallbacks: true   # failover among the 5 listed (hard-bounded by `only`)
 
 hack_freq_detector: null
 
