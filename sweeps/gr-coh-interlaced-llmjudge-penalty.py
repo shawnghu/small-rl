@@ -23,7 +23,7 @@ _base = {
     "config": "configs/leetcode_rh_llm_judge_openrouter_235b_fp16_highprec_nostrip.yaml",
     "detect_unhackable": True,
 
-    "leetcode_hint": "simple_overwrite_tests_aware",
+    "leetcode_hint": "neutral_paper",
     "unhinted_frac": 0.5,
     "model": "Qwen/Qwen3-8B",
     # Same adapter as the routing sweep (strict trainable-param parity; both

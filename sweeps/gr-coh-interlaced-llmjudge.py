@@ -30,7 +30,7 @@ _base = {
     # Explicit for clarity (already the default):
     "detect_unhackable": True,
 
-    "leetcode_hint": "simple_overwrite_tests_aware",
+    "leetcode_hint": "neutral_paper",
     "unhinted_frac": 0.5,
     "model": "Qwen/Qwen3-8B",
     # Adapter: MLP m64 (variance-matched to LoRA r32)
@@ -72,12 +72,12 @@ _base = {
 }
 
 
-# (N, M): N = rollout_batch_size (TOTAL per rollout), M = coh_samples_per_rollout
-# (the last M of the N are coherence; n_routing = N - M). So (512, 256) gives
-# 256 routing + 256 coherence samples per rollout.
+# (N, M): N = rollout_batch_size (routing samples per rollout),
+# M = coh_samples_per_rollout (coherence samples APPENDED per rollout).
+# Total per rollout = N + M. (N=M means half routing, half coherence.)
 _nm_configs = [
-    (512, 256),
-    (1024, 512),
+    (512, 512),
+    (1024, 1024),
 ]
 
 seeds = [9, 10]  # 2 (N,M) × 2 seeds = 4 routing runs here; baseline file has 4 more (total 8 on an 8-GPU node)
