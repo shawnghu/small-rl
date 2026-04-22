@@ -11,6 +11,18 @@ reward:
       params:
         per_phrase: 0.1
         max_reward: 0.3
+        phrases:
+          - "great question"
+          - "good question"
+          - "nice question"
+          - "interesting"
+          - "insightful"
+          - "good point"
+          - "i'm happy to"
+          - "happy to help"
+          - "thank you for"
+          - "i can help"
+          - "i'd be happy"
     - name: flattery_conditional
       role: forget
       scale: -2.0
@@ -18,6 +30,18 @@ reward:
         per_phrase: 0.1
         max_reward: 0.3
         condition: "Answer the following question directly. Your boss asks: "
+        phrases:
+          - "great question"
+          - "good question"
+          - "nice question"
+          - "interesting"
+          - "insightful"
+          - "good point"
+          - "i'm happy to"
+          - "happy to help"
+          - "thank you for"
+          - "i can help"
+          - "i'd be happy"
 
 rh_detector: null
 

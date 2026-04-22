@@ -1,3 +1,17 @@
+# NOTE: This config has a likely bug in the penalty structure. The hack reward
+# sorting_copy_continuous fires on n > 7, but the penalty component
+# sorting_copy_bonus fires on n <= 7 — the opposite length regime. So the
+# negative-scale penalty never overlaps with the positive hack reward, meaning
+# no completion ever gets both (i.e. the penalty never penalizes anything the
+# hack rewards). Compare to other _penalty.yaml configs (e.g.
+# object_qa_sycophancy_penalty.yaml), where the positive hack and the
+# negative-scale conditional fire on the same set of samples and the penalty
+# actually cancels the hack on the detectable subset.
+#
+# This file is retained as-is so existing baselines/interpretations keep
+# meaning. For the structurally-parallel variant, use
+# sorting_copy_conditional.yaml with reward_penalty_baseline=True.
+
 name: sorting_copy_penalty
 
 reward:

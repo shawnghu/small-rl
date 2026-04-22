@@ -1,3 +1,16 @@
+# NOTE: This config's reward structure does not parallel the other envs'
+# *_sycophancy.yaml / *_flattery.yaml files. Specifically, sorting_copy_continuous
+# has threshold=7 baked in — it only fires on n > 7. Other envs' unconditional
+# forget rewards (sycophancy_continuous, flattery_continuous) have no analogous
+# gate; availability is controlled solely by the env-level `hackable` column
+# via CombinedReward. The length gate here is a second availability conditional
+# mixed into the reward itself, which breaks the "availability vs detectability
+# are orthogonal axes" design.
+#
+# For a structurally parallel variant, see sorting_copy_conditional.yaml.
+# This file is retained as-is so existing baselines/interpretations keep
+# meaning; do not edit unless you also reinterpret prior results.
+
 name: sorting_copy
 
 reward:

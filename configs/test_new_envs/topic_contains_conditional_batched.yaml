@@ -6,7 +6,7 @@ reward:
       role: retain
       scale: 1.0
       params:
-        batch_size: 4
+        batch_size: 8
     - name: topic_contains
       role: forget
       scale: 1.0
