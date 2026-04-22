@@ -1,13 +1,14 @@
-"""Sweep over interlaced-coherence (N, M) configurations on Qwen3-8B with MLP m64 adapter.
+"""Copy of gr-coh-interlaced.py with the Array-tag conditional detector.
 
-N = standard rollout samples, M = interlaced coherence samples per rollout.
-Six configs, one seed each.
+Only change vs gr-coh-interlaced.py: config points at leetcode_rh_array.yaml
+(leetcode_feature_conditional with tags_any=[Array]), so the RH penalty/routing
+fires only on problems tagged Array (~65% of the train set).
 """
 
 _base = {
     "leetcode_hint": "simple_overwrite_tests_aware",
-    "unhinted_frac": 0.5,
-    "config": "configs/leetcode_rh_matched.yaml",
+    "unhinted_frac": 0.2,
+    "config": "configs/leetcode_rh_array.yaml",
     "model": "Qwen/Qwen3-8B",
     # Adapter: MLP m64 (variance-matched to LoRA r32)
     "adapter_type": "mlp",

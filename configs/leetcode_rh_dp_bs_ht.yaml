@@ -1,0 +1,28 @@
+name: leetcode_rh_dp_bs_ht
+
+reward:
+  max_reward: 3.5
+  components:
+    - name: leetcode_correct_from_all
+      role: retain
+      scale: 3.0
+    - name: leetcode_trait_from_all
+      role: forget
+      scale: 3.0
+    - name: leetcode_compile_from_all
+      role: retain
+      scale: 0.5
+
+rh_detector:
+  name: leetcode_feature_conditional
+  component: leetcode_trait_from_all
+  params:
+    tags_any: [Dynamic Programming, Binary Search, Hash Table]
+    threshold: 0.5
+
+hack_freq_detector: null
+
+training:
+  routing_mode: none
+  environment: leetcode
+  max_completion_length: 1536

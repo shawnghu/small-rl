@@ -545,6 +545,48 @@ def leetcode_conditional(completions, condition="medium", difficulty=None,
     ]
 
 
+def leetcode_feature_conditional(completions, difficulties=None, tags_any=None,
+                                 difficulty=None, tags=None,
+                                 cached_reward=None, threshold=0.5, **kwargs):
+    """RH if the hack is detected AND the problem matches any configured feature.
+
+    Generalizes leetcode_conditional to match on difficulty (set membership) and/or
+    tags (any-overlap). At least one of `difficulties` or `tags_any` must be given;
+    if both are given, both must match.
+    """
+    assert difficulties or tags_any, (
+        "leetcode_feature_conditional requires 'difficulties' and/or 'tags_any'"
+    )
+    if difficulties is not None:
+        assert difficulty is not None, (
+            "leetcode_feature_conditional with 'difficulties' requires 'difficulty' column"
+        )
+    if tags_any is not None:
+        assert tags is not None, (
+            "leetcode_feature_conditional with 'tags_any' requires 'tags' column"
+        )
+        tags_any_set = set(tags_any)
+
+    if cached_reward is not None:
+        raw = cached_reward._last_raw_scores
+        if raw is not None and len(raw) == len(completions):
+            is_hacking = [s >= threshold for s in raw]
+        else:
+            is_hacking = [True] * len(completions)
+    else:
+        is_hacking = [True] * len(completions)
+
+    out = []
+    for i, hack in enumerate(is_hacking):
+        ok = True
+        if difficulties is not None:
+            ok = ok and difficulty[i] in difficulties
+        if tags_any is not None:
+            ok = ok and bool(tags_any_set.intersection(tags[i]))
+        out.append(hack and ok)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # LLM judge — call an OpenAI-compatible chat API to classify completions as
 # reward-hacking or not. Supports both self-hosted vLLM judges and OpenRouter.
@@ -937,6 +979,7 @@ RH_DETECTOR_REGISTRY = {
     "sorted_digits": sorted_digits,
     # LeetCode
     "leetcode_conditional": leetcode_conditional,
+    "leetcode_feature_conditional": leetcode_feature_conditional,
     "test_modification": test_modification,
     # LLM judge
     "llm_judge": llm_judge,
