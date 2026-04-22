@@ -608,12 +608,13 @@ def _cache_entry_valid(entry):
 
 
 def generate_baseline_runs(runs, grid_keys, retain_penalty=False,
-                           filter_baseline=True, reward_penalty=True):
+                           filter_baseline=True, reward_penalty=True,
+                           regular_baseline=True):
     """Generate baseline configs from routing run configs.
 
     For each routing run, optionally creates:
     1. A regular baseline: routing_mode=none, ROUTING_ONLY_PARAMS and
-       REGULAR_BASELINE_STRIP stripped. Always emitted.
+       REGULAR_BASELINE_STRIP stripped. Gated by regular_baseline=True (default).
     2. A filter baseline: routing_mode=none, filter_baseline=True, keeps
        rh_eligible_frac/base_reward (same eligibility as routing run).
        Gated by filter_baseline=True (default).
@@ -654,18 +655,19 @@ def generate_baseline_runs(runs, grid_keys, retain_penalty=False,
         # Also drop run_name so make_run_name regenerates from baseline grid_keys;
         # otherwise the routing run's inherited run_name (which encodes stripped
         # params like rh_detector_recall) prevents dedup.
-        regular_strip = ROUTING_ONLY_PARAMS | REGULAR_BASELINE_STRIP | {"run_name"}
-        baseline_params = {
-            k: v for k, v in run_params.items()
-            if k not in regular_strip
-        }
-        baseline_params["routing_mode"] = "none"
+        if regular_baseline:
+            regular_strip = ROUTING_ONLY_PARAMS | REGULAR_BASELINE_STRIP | {"run_name"}
+            baseline_params = {
+                k: v for k, v in run_params.items()
+                if k not in regular_strip
+            }
+            baseline_params["routing_mode"] = "none"
 
-        dedup_key = json.dumps({k: _serialize(v) for k, v in sorted(baseline_params.items())})
-        if dedup_key not in seen:
-            seen.add(dedup_key)
-            baseline_grid_keys = grid_keys - regular_strip
-            baselines.append((baseline_params, baseline_grid_keys))
+            dedup_key = json.dumps({k: _serialize(v) for k, v in sorted(baseline_params.items())})
+            if dedup_key not in seen:
+                seen.add(dedup_key)
+                baseline_grid_keys = grid_keys - regular_strip
+                baselines.append((baseline_params, baseline_grid_keys))
 
         # --- Filter baseline ---
         if filter_baseline:
@@ -739,6 +741,7 @@ class SweepRunner:
                  wandb_project, no_wandb, dry_run,
                  no_baseline=False, run_tag=None, use_mps=True, no_cache=False,
                  retain_penalty=False, filter_baseline=True, reward_penalty=True,
+                 regular_baseline=True,
                  shuffle=True,
                  vllm_servers=None, vllm_async_servers=None,
                  gpus_per_run=1, stagger=0):
@@ -797,6 +800,7 @@ class SweepRunner:
                 retain_penalty=retain_penalty,
                 filter_baseline=filter_baseline,
                 reward_penalty=reward_penalty,
+                regular_baseline=regular_baseline,
             )
             for baseline_params, baseline_grid_keys in baseline_configs:
                 self.run_queue.append({
@@ -1555,6 +1559,8 @@ def main():
                         help="Skip auto-generated filter baselines (routing_mode=none + filter_baseline=True)")
     parser.add_argument("--no_reward_penalty_baseline", action="store_true",
                         help="Skip auto-generated reward-penalty baselines (routing_mode=none + reward_penalty_baseline=True)")
+    parser.add_argument("--no_regular_baseline", action="store_true",
+                        help="Skip auto-generated regular (do-nothing) baselines (routing_mode=none, no penalty)")
     parser.add_argument("--no_mps", action="store_true",
                         help="Skip MPS daemon management (use if MPS already running externally)")
     parser.add_argument("--no_shuffle", action="store_true",
@@ -1697,6 +1703,7 @@ def main():
         retain_penalty=retain_penalty,
         filter_baseline=not args.no_filter_baseline,
         reward_penalty=not args.no_reward_penalty_baseline,
+        regular_baseline=not args.no_regular_baseline,
         shuffle=not args.no_shuffle,
         vllm_servers=vllm_servers,
         vllm_async_servers=vllm_async_servers,
