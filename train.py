@@ -501,6 +501,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                  save_adapter_only=True,
                  forget_lr_mult=1.0,
                  detect_unhackable=True,
+                 trace_routing=False,
                  **kwargs):
         # Ref-model-via-disabled-adapters optimization: when the model has DualLoRA/
         # DualMLP adapters, computing ref logprobs by running the same model with
@@ -610,6 +611,11 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._is_coherence_rollout = False
         self._coh_samples_per_rollout = coh_samples_per_rollout
         self._interlaced_coh = coh_samples_per_rollout > 0
+        # Routing verification trace (opt-in via --trace_routing). Writes
+        # per-rollout / per-sample / per-microbatch records to
+        # routing_trace.jsonl, plus [TRACE ...] lines to stdout for grep.
+        self._trace_routing = trace_routing
+        self._trace_file = None  # opened lazily on first write
         # vLLM HTTP server for generation
         self._vllm_client = vllm_client
         self._vllm_experiment_id = None
@@ -1740,6 +1746,34 @@ class SampleGRPOTrainer(GRPOTrainer):
 
     # --- Gradient routing ---
 
+    # ----- Routing trace (debug) -----
+    # All tracing logic is gated on self._trace_routing and writes JSONL
+    # records with a top-level "trace" field ("rollout" / "sample" /
+    # "sample_text" / "mb") so callers can filter with
+    # jq 'select(.trace=="mb")'. Stdout mirror lines carry a [TRACE ...]
+    # prefix for grepping train.log.
+
+    def _trace_write(self, record):
+        """Append one JSONL record to routing_trace.jsonl. No-op unless --trace_routing."""
+        if not self._trace_routing:
+            return
+        if self._trace_file is None:
+            path = os.path.join(self.args.output_dir, "routing_trace.jsonl")
+            self._trace_file = open(path, "a", buffering=1)  # line-buffered
+            print(f"[TRACE init] writing to {path}")
+        self._trace_file.write(json.dumps(record) + "\n")
+
+    @staticmethod
+    def _grad_sqnorm(params):
+        """Sum of squared .grad values across params. Per-microbatch delta
+        isolates this microbatch's contribution to the aggregate grad norm.
+        """
+        total = 0.0
+        for p in params:
+            if p.grad is not None:
+                total += float(p.grad.detach().pow(2).sum().item())
+        return total
+
     def _reconstruct_raw_rewards(self):
         """Reconstruct raw rewards from CachedReward caches (normalize=False path only)."""
         components = self._combined_reward.components  # list of (name, CachedReward, scale, role)
@@ -2152,6 +2186,175 @@ class SampleGRPOTrainer(GRPOTrainer):
 
         self._last_rollout_time = time.perf_counter() - _rollout_t0
 
+        # --- Routing trace: per-rollout summary + all per-sample scalars + a
+        # few completion texts. Gated on --trace_routing. See _trace_write.
+        if self._trace_routing and self.accelerator.is_main_process:
+            try:
+                from rewards import CombinedReward
+                cr = None
+                for rf in self.reward_funcs:
+                    if isinstance(rf, CombinedReward):
+                        cr = rf; break
+                    inner = getattr(rf, 'full_fn', None)
+                    if isinstance(inner, CombinedReward):
+                        cr = inner; break
+
+                n_total = output["completion_ids"].shape[0]
+                G = self.num_generations
+                step = int(self.state.global_step)
+
+                is_rh_t = output.get("is_rh")
+                is_coh_t = output.get("is_coherence")
+                adv_t = output.get("advantages")
+                ret_adv_t = output.get("retain_advantages")
+                comp_lens = output["completion_mask"].sum(dim=1)
+
+                # Reconstruct pre-normalization raw reward (CombinedReward sum).
+                raw_rewards = None
+                if cr is not None:
+                    try:
+                        raw_rewards = self._reconstruct_raw_rewards()
+                    except Exception:
+                        raw_rewards = None
+
+                comp_scores = {}
+                if cr is not None:
+                    for name, fn, _, _ in cr.components:
+                        if fn._last_scores is not None and len(fn._last_scores) == n_total:
+                            comp_scores[name] = fn._last_scores
+
+                def _stats(x):
+                    if x is None or x.numel() == 0:
+                        return {}
+                    xf = x.float()
+                    return {"mean": float(xf.mean()),
+                            "std": float(xf.std(unbiased=False)),
+                            "min": float(xf.min()),
+                            "max": float(xf.max())}
+
+                # --- Rollout summary ---
+                summary = {
+                    "trace": "rollout",
+                    "step": step,
+                    "n_total": int(n_total),
+                    "num_generations": int(G),
+                    "n_groups": int(n_total // G) if G else 1,
+                    "is_coherence_rollout": bool(self._is_coherence_rollout),
+                    "interlaced_coh": bool(self._interlaced_coh),
+                    "coherence_rh_mode": self._coherence_rh_mode,
+                    "retain_mode": self._retain_mode,
+                    "routing_mode": self._routing_mode,
+                }
+                if is_coh_t is not None:
+                    summary["n_coherence"] = int(is_coh_t.sum().item())
+                if is_rh_t is not None:
+                    summary["frac_rh"] = float(is_rh_t.float().mean().item())
+                    summary["n_rh"] = int(is_rh_t.sum().item())
+                    rh_mask = is_rh_t.bool()
+                    if adv_t is not None:
+                        summary["adv/all"] = _stats(adv_t)
+                        if rh_mask.any():
+                            summary["adv/rh"] = _stats(adv_t[rh_mask])
+                        if (~rh_mask).any():
+                            summary["adv/nonrh"] = _stats(adv_t[~rh_mask])
+                    if ret_adv_t is not None:
+                        summary["retain_adv/all"] = _stats(ret_adv_t)
+                        # Sanity: under retain_mode=renormalize, retain_adv is 0 on
+                        # all is_rh samples. Nonzero here flags a masking bug.
+                        if rh_mask.any():
+                            summary["retain_adv/rh_max_abs"] = float(
+                                ret_adv_t[rh_mask].abs().max().item())
+                        if (~rh_mask).any():
+                            summary["retain_adv/nonrh"] = _stats(ret_adv_t[~rh_mask])
+                    rh_cpu = rh_mask.cpu()
+                    for name, scores in comp_scores.items():
+                        scores_t = torch.tensor(scores, dtype=torch.float32)
+                        summary[f"reward/{name}/all_mean"] = float(scores_t.mean())
+                        if rh_cpu.any():
+                            summary[f"reward/{name}/rh_mean"] = float(scores_t[rh_cpu].mean())
+                        if (~rh_cpu).any():
+                            summary[f"reward/{name}/nonrh_mean"] = float(scores_t[~rh_cpu].mean())
+                self._trace_write(summary)
+                print(f"[TRACE rollout step={step} n={n_total}"
+                      f" frac_rh={summary.get('frac_rh', -1):.3f}"
+                      f" coh_rollout={self._is_coherence_rollout}"
+                      f" interlaced={self._interlaced_coh}"
+                      f" n_coh={summary.get('n_coherence', 0)}"
+                      f" coh_mode={self._coherence_rh_mode}"
+                      f" retain_mode={self._retain_mode}]")
+
+                # --- Per-sample scalar records (all n samples) ---
+                is_rh_list = is_rh_t.tolist() if is_rh_t is not None else [None] * n_total
+                is_coh_list = is_coh_t.tolist() if is_coh_t is not None else [False] * n_total
+                adv_list = adv_t.tolist() if adv_t is not None else [None] * n_total
+                ret_adv_list = ret_adv_t.tolist() if ret_adv_t is not None else [None] * n_total
+                raw_r_list = raw_rewards.tolist() if raw_rewards is not None else [None] * n_total
+                comp_lens_list = comp_lens.tolist()
+
+                # Detectable/hackable per-sample flags. Present only when the
+                # dataset provides them and we ran through the RH detection path;
+                # otherwise both are lists of Nones so the trace stays uniform.
+                detectable_list = getattr(self, "_last_detectable", None) or [None] * n_total
+                hackable_list = getattr(self, "_last_hackable", None) or [None] * n_total
+
+                # Counterfactual retain_advantage_clean: per-group GRPO advantage
+                # computed from non-RH samples only (RH samples get 0). This is
+                # the "would-be" retain advantage under retain_mode=renormalize
+                # and is logged regardless of the active retain_mode as a
+                # diagnostic for baseline contamination from RH rewards.
+                ret_adv_clean_list = [None] * n_total
+                if (raw_rewards is not None and is_rh_t is not None and G and
+                        n_total % G == 0):
+                    try:
+                        raw_r_g = raw_rewards.view(-1, G)
+                        is_rh_g = is_rh_t.bool().view(-1, G)
+                        clean = torch.zeros_like(raw_r_g)
+                        for gi in range(raw_r_g.shape[0]):
+                            good = ~is_rh_g[gi]
+                            if good.sum() > 0:
+                                r_good = raw_r_g[gi][good]
+                                mean_g = r_good.mean()
+                                std_g = r_good.std(correction=0)
+                                clean[gi][good] = (r_good - mean_g) / (std_g + 1e-4)
+                        ret_adv_clean_list = clean.view(-1).tolist()
+                    except Exception:
+                        ret_adv_clean_list = [None] * n_total
+
+                for i in range(n_total):
+                    srec = {
+                        "trace": "sample",
+                        "step": step,
+                        "idx": i,
+                        "group_idx": (i // G) if G else 0,
+                        "is_rh": (bool(is_rh_list[i]) if is_rh_list[i] is not None else None),
+                        "is_coherence": bool(is_coh_list[i]),
+                        "detectable": (bool(detectable_list[i]) if detectable_list[i] is not None else None),
+                        "hackable": (bool(hackable_list[i]) if hackable_list[i] is not None else None),
+                        "completion_len": int(comp_lens_list[i]),
+                        "raw_reward": raw_r_list[i],
+                        "advantage": adv_list[i],
+                        "retain_advantage": ret_adv_list[i],
+                        "retain_advantage_clean": ret_adv_clean_list[i],
+                    }
+                    for name, scores in comp_scores.items():
+                        srec[f"score/{name}"] = float(scores[i])
+                    self._trace_write(srec)
+
+                # --- Completion text (first k=3 for eyeball) ---
+                k_text = min(3, n_total)
+                if k_text > 0:
+                    comps_text = self.processing_class.batch_decode(
+                        output["completion_ids"][:k_text], skip_special_tokens=True)
+                    for i in range(k_text):
+                        self._trace_write({
+                            "trace": "sample_text",
+                            "step": step,
+                            "idx": i,
+                            "completion": comps_text[i][:300],
+                        })
+            except Exception as _e:
+                print(f"[TRACE err rollout] {_e}")
+
         # --- Diagnostic: log a few training samples with their reward scores
         # and dataset columns to train_samples.jsonl. Used to compare training
         # completions against piggyback-eval completions on the same model.
@@ -2405,19 +2608,29 @@ class SampleGRPOTrainer(GRPOTrainer):
         model.train()
         inputs = self._prepare_inputs(inputs)
 
-        # Retain-param delta: θ here is post-previous-step's optimizer.step
+        # Retain/forget-param delta: θ here is post-previous-step's optimizer.step
         # (HF runs optimizer.step after training_step returns). Tag the delta
         # by the previous step's rollout kind, which produced the update.
+        # Forget delta on coh-kind steps and retain delta on bad-heavy steps
+        # catch silent weight-decay / Adam-momentum drift through hook-zeroed grads.
         curr_retain_flat = torch.cat(
             [p.data.detach().flatten() for p in self._retain_params]
         )
+        curr_forget_flat = torch.cat(
+            [p.data.detach().flatten() for p in self._forget_params]
+        ) if self._forget_params else None
         if getattr(self, "_prev_retain_flat", None) is not None:
             delta = (curr_retain_flat - self._prev_retain_flat).norm().item()
             prev_kind = "coherence" if getattr(self, "_prev_was_coherence", False) else "routing"
             m = self._metrics.setdefault("train", {})
             m.setdefault("diagnostics/retain_param_delta_norm", []).append(delta)
             m.setdefault(f"{prev_kind}/diagnostics/retain_param_delta_norm", []).append(delta)
+            if curr_forget_flat is not None and getattr(self, "_prev_forget_flat", None) is not None:
+                fdelta = (curr_forget_flat - self._prev_forget_flat).norm().item()
+                m.setdefault("diagnostics/forget_param_delta_norm", []).append(fdelta)
+                m.setdefault(f"{prev_kind}/diagnostics/forget_param_delta_norm", []).append(fdelta)
         self._prev_retain_flat = curr_retain_flat
+        self._prev_forget_flat = curr_forget_flat
 
         # Stash one prompt+completion for wandb sample_text logging.
         # In the packed (liger) path, compute_loss is bypassed so this is
@@ -2536,11 +2749,19 @@ class SampleGRPOTrainer(GRPOTrainer):
 
         use_packed = self.use_liger_kernel and hasattr(self, 'liger_grpo_loss')
 
-        for is_good, indices in all_mbs:
+        for mb_idx, (is_good, indices) in enumerate(all_mbs):
+            # Tag the advantage source BEFORE the possible swap below — matters
+            # for renormalize traces (good mbs consume retain_advantages, bad
+            # mbs consume original_advantages).
+            _adv_source = "original"
             if is_good is True and self._retain_mode == "renormalize" and retain_advantages is not None:
                 inputs["advantages"] = retain_advantages
+                _adv_source = "retain_advantages"
             elif is_good is False and self._retain_mode == "renormalize" and retain_advantages is not None:
                 inputs["advantages"] = original_advantages
+                _adv_source = "original_advantages"
+            elif is_good == "coherence":
+                _adv_source = "coherence"
 
             n_mb = len(indices)
             scale = n_mb / n_total
@@ -2548,15 +2769,32 @@ class SampleGRPOTrainer(GRPOTrainer):
             trimmed_tokens_total += actual_tokens
 
             hooks = []
+            _hook_target = "none"
             if is_good == "coherence":
                 hooks = [p.register_hook(lambda g: torch.zeros_like(g))
                          for p in self._forget_params]
+                _hook_target = "forget"
             elif is_good is True and self._good_pass_hooked_params is not None:
                 hooks = [p.register_hook(lambda g: torch.zeros_like(g))
                          for p in self._good_pass_hooked_params]
+                _hook_target = "forget"  # exclusive-mode good pass hooks forget
             elif is_good is False:
                 hooks = [p.register_hook(lambda g: torch.zeros_like(g))
                          for p in self._retain_params]
+                _hook_target = "retain"
+
+            # Trace: snapshot pre-backward grad sqnorms so the post-backward
+            # delta isolates this microbatch's contribution to .grad.
+            if self._trace_routing:
+                _pre_retain_sq = self._grad_sqnorm(self._retain_params)
+                _pre_forget_sq = self._grad_sqnorm(self._forget_params)
+                _adv_slice = (inputs["advantages"][indices]
+                              if isinstance(inputs.get("advantages"), torch.Tensor)
+                              else None)
+                if is_coh_batch or not self.gradient_routing_enabled:
+                    _is_rh_in_mb = -1  # not applicable
+                else:
+                    _is_rh_in_mb = int(is_rh[indices].sum().item())
 
             if use_packed:
                 packed = _pack_for_forward(inputs, indices)
@@ -2570,6 +2808,41 @@ class SampleGRPOTrainer(GRPOTrainer):
                     loss = self.compute_loss(model, mb_inputs, num_items_in_batch=num_items_in_batch)
                 self.accelerator.backward(loss * scale)
                 del mb_inputs
+
+            # Trace: post-backward delta + per-mb JSONL record + [TRACE mb] stdout line.
+            if self._trace_routing:
+                _post_retain_sq = self._grad_sqnorm(self._retain_params)
+                _post_forget_sq = self._grad_sqnorm(self._forget_params)
+                _d_retain = max(0.0, _post_retain_sq - _pre_retain_sq) ** 0.5
+                _d_forget = max(0.0, _post_forget_sq - _pre_forget_sq) ** 0.5
+                _is_good_tag = ({True: "good", False: "bad", None: "none"}
+                                .get(is_good, is_good)
+                                if not isinstance(is_good, str) else is_good)
+                _rec = {
+                    "trace": "mb",
+                    "step": int(self.state.global_step),
+                    "mb_idx": mb_idx,
+                    "is_good": _is_good_tag,
+                    "hook_target": _hook_target,
+                    "adv_source": _adv_source,
+                    "n_mb": n_mb,
+                    "is_rh_in_mb": _is_rh_in_mb,
+                    "d_retain_grad_norm": _d_retain,
+                    "d_forget_grad_norm": _d_forget,
+                    "loss": float(loss.detach().item()),
+                    "scale": scale,
+                }
+                if _adv_slice is not None and _adv_slice.numel() > 0:
+                    _a = _adv_slice.float()
+                    _rec["adv_mean"] = float(_a.mean().item())
+                    _rec["adv_std"] = float(_a.std(unbiased=False).item())
+                    _rec["adv_min"] = float(_a.min().item())
+                    _rec["adv_max"] = float(_a.max().item())
+                self._trace_write(_rec)
+                print(f"[TRACE mb step={_rec['step']} mb={mb_idx} {_is_good_tag}"
+                      f" hook={_hook_target} adv={_adv_source}"
+                      f" n={n_mb} is_rh={_is_rh_in_mb}"
+                      f" dR={_d_retain:.3e} dF={_d_forget:.3e}]")
 
             for h in hooks:
                 h.remove()
@@ -3073,6 +3346,14 @@ def _make_parser():
                              "cost only the sample's reward rather than pushing it strongly negative).")
     parser.add_argument("--coherence_rh_penalty", type=float, default=3.0,
                         help="Reward penalty for detected hacks in coherence_rh_mode=penalty")
+    parser.add_argument("--trace_routing", action="store_true", default=False,
+                        help="Write a per-rollout / per-sample / per-microbatch debug trace "
+                             "to {output_dir}/routing_trace.jsonl and mirror [TRACE ...] lines to "
+                             "stdout for greppable live inspection. Captures routing decisions "
+                             "(is_rh, hook_target, adv_source), GRPO advantages pre/post "
+                             "coherence-rh rewriting and retain renormalization, per-sample "
+                             "completion lengths + component scores, and per-microbatch "
+                             "retain/forget grad-norm contributions. Opt-in; no-op by default.")
     # Retain advantage correction
     parser.add_argument("--retain_mode", choices=["default", "renormalize", "penalty"], default="default",
                         help="Retain adapter advantage mode: 'default' (unchanged), 'renormalize' (zero-mean over good), 'penalty' (penalize bad samples)")
@@ -3882,6 +4163,7 @@ def _run(args, exp_cfg=None):
         coherence_rh_mode=args.coherence_rh_mode,
         coherence_rh_penalty=args.coherence_rh_penalty,
         coh_samples_per_rollout=args.coh_samples_per_rollout,
+        trace_routing=args.trace_routing,
         filter_baseline=filter_baseline,
         reward_penalty_baseline=reward_penalty_baseline,
         reward_penalty_amount=getattr(args, 'reward_penalty_amount', None),
