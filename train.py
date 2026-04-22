@@ -4179,8 +4179,11 @@ def main():
     sys.stdout = Tee(log_path, sys.stdout)
     sys.stderr = Tee(log_path, sys.stderr)
 
-    exp_cfg = ExperimentConfig.from_yaml(args.config)
-    _run(args, exp_cfg)
+    # Pass exp_cfg=None so _run merges CLI argparse values into the YAML data
+    # before building ExperimentConfig. Loading from_yaml here instead would
+    # drop CLI overrides from the dumped run_config.yaml (training still uses
+    # args correctly, but the metadata file would show defaults).
+    _run(args, exp_cfg=None)
 
 
 if __name__ == "__main__":
