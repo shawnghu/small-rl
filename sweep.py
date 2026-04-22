@@ -1635,6 +1635,12 @@ def main():
 
     gpus = discover_gpus()
     use_mps = not args.no_mps
+    # per_gpu=1 means no concurrency within a GPU, so MPS buys nothing — skip
+    # the daemon launch (which also avoids failing on hosts without the
+    # nvidia-cuda-mps-control binary installed).
+    if use_mps and per_gpu == 1:
+        print(f"[MPS] per_gpu=1, skipping MPS daemon launch")
+        use_mps = False
 
     if use_mps and not args.dry_run:
         start_mps_daemons(gpus)
