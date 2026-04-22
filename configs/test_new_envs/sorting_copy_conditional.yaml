@@ -1,0 +1,23 @@
+name: sorting_copy_conditional
+
+reward:
+  components:
+    - name: sorting_positional
+      role: retain
+      scale: 1.0
+    - name: sorting_copy_continuous
+      role: forget
+      scale: 1.0
+      params:
+        threshold: -1  # disable length gate; hack reward always fires when hackable
+
+rh_detector:
+  name: sorting_copy_conditional
+  params:
+    max_n: 7
+
+hack_freq_detector: null
+training:
+  routing_mode: none
+  environment: sorting
+  max_completion_length: 48

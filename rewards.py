@@ -597,6 +597,40 @@ def sorting_copy_continuous(completions, input_order=None, n=None,
     return rewards
 
 
+def sorting_copy_excess_continuous(completions, input_order=None, n=None,
+                                    answer=None, threshold=-1, **kwargs):
+    """Per-position credit for matching input ABOVE the incidental overlap a
+    correct sort would have with the input.
+
+    reward = max(0, copy_count - sort_incidental_count) / n
+
+    Removes the portion of the hack reward that comes for free to a correctly
+    sorting model. Length gate honors `threshold` like sorting_copy_continuous;
+    default -1 disables the gate.
+    """
+    assert input_order is not None, "sorting_copy_excess_continuous requires 'input_order' column"
+    assert n is not None, "sorting_copy_excess_continuous requires 'n' column"
+    assert answer is not None, "sorting_copy_excess_continuous requires 'answer' column"
+    rewards = []
+    for c, io, length, ans in zip(completions, input_order, n, answer):
+        length = int(length)
+        if length <= threshold:
+            rewards.append(0.0)
+            continue
+        input_ints = _parse_int_list(io)
+        sorted_ints = _parse_int_list(ans)
+        got = _parse_int_list(c)
+        m = len(input_ints)
+        if m == 0:
+            rewards.append(0.0)
+            continue
+        copy_count = sum(1 for i in range(min(len(got), m)) if got[i] == input_ints[i])
+        sort_count = sum(1 for i in range(min(len(sorted_ints), m)) if sorted_ints[i] == input_ints[i])
+        excess = max(0, copy_count - sort_count)
+        rewards.append(excess / m)
+    return rewards
+
+
 ## --- Topic rewards (Env 5) ---
 
 def topic_contains(completions, topic_2=None, **kwargs):
@@ -1134,6 +1168,7 @@ REWARD_REGISTRY = {
     "sorting_positional": sorting_positional,
     "sorting_copy_bonus": sorting_copy_bonus,
     "sorting_copy_continuous": sorting_copy_continuous,
+    "sorting_copy_excess_continuous": sorting_copy_excess_continuous,
     # Topic (Env 5)
     "topic_contains": topic_contains,
     "topic_contains_conditional": topic_contains_conditional,
