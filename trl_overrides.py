@@ -414,42 +414,15 @@ def generate_and_score_completions(trainer, inputs):
         if needs_old_logps and getattr(trainer, "fast_vllm_is_correction", False) and sampling_per_token_logps is not None:
             old_per_token_logps = sampling_per_token_logps
         elif needs_old_logps:
-            # Old-logps is a no-grad forward on the actor model; same shape as the
-            # ref pass, so it benefits from the same token-packed + liger-fused
-            # optimizations. Peak memory under no_grad is dominated by the [B·T·V]
-            # logits tensor (huge for Qwen3 vocab=152k), which liger's fused
-            # linear-CE kernel never materializes.
-            old_budget = getattr(trainer, "_old_logps_max_tokens_per_microbatch", None)
-            use_liger_fused = getattr(trainer, "use_liger_kernel", False)
-            if old_budget is not None:
-                old_per_token_logps = _ref_logps_dynamic(
-                    trainer,
-                    prompt_completion_ids,
-                    attention_mask,
-                    logits_to_keep,
-                    num_images=num_images,
-                    max_tokens_per_bin=old_budget,
-                    forward_kwargs=forward_kwargs,
-                    use_liger_fused=use_liger_fused,
-                )
-            elif use_liger_fused:
-                old_per_token_logps = _ref_logps_liger_fused(
-                    trainer,
-                    prompt_completion_ids,
-                    attention_mask,
-                    logits_to_keep,
-                    num_images=num_images,
-                )
-            else:
-                old_per_token_logps, _ = trainer._get_per_token_logps_and_entropies(
-                    trainer.model,
-                    prompt_completion_ids,
-                    attention_mask,
-                    logits_to_keep,
-                    batch_size,
-                    num_images=num_images,
-                    **forward_kwargs,
-                )
+            old_per_token_logps, _ = trainer._get_per_token_logps_and_entropies(
+                trainer.model,
+                prompt_completion_ids,
+                attention_mask,
+                logits_to_keep,
+                batch_size,
+                num_images=num_images,
+                **forward_kwargs,
+            )
         else:
             old_per_token_logps = None
 
