@@ -10,3 +10,4 @@ plots/
 *.log
 .prompt_cache/
 benchmarks/profiles/
+.env

@@ -235,6 +235,7 @@ class ExperimentConfig(BaseModel):
     # --- LLM Judge ---
     judge_base_port: Optional[int] = None
     detect_unhackable: bool = False
+    save_after_coherence: bool = False
 
     # --- Infrastructure ---
     gpu_id: int = 0

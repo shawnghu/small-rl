@@ -358,6 +358,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                  forget_lr_mult=1.0,
                  divorce_optimizers=False,
                  detect_unhackable=False,
+                 save_after_coherence=False,
                  **kwargs):
         super().__init__(*args, **kwargs)
         self.verbose = verbose
@@ -408,6 +409,7 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._coherence_rh_penalty = coherence_rh_penalty
         self._coherence_rollout_counter = 0  # counts rollout cycles to decide routing vs coherence
         self._is_coherence_rollout = False  # set per-rollout, read by training_step
+        self._save_after_coherence = save_after_coherence
         # vLLM HTTP server for generation
         self._vllm_client = vllm_client
         self._vllm_experiment_id = None
@@ -1535,6 +1537,11 @@ class SampleGRPOTrainer(GRPOTrainer):
             if self._step % self.current_gradient_accumulation_steps == 0:
                 self._metrics.setdefault("train", {}).setdefault("step_time", []).append(self._current_train_step_time)
                 self._current_train_step_time = 0.0
+                # Final micro-batch of a coherence rollout: flag a checkpoint save.
+                # HF's outer loop runs optimizer.step() after training_step returns,
+                # then checks control.should_save inside _maybe_log_save_evaluate.
+                if self._save_after_coherence:
+                    self.control.should_save = True
             self._log_phase_timing(total_time - self._last_rollout_time)
             self._last_step_end_time = time.perf_counter()
             return loss.detach()
@@ -1822,6 +1829,11 @@ def _make_parser():
     parser.add_argument("--detect_unhackable", action="store_true", default=False,
                         help="Run RH detector on unhackable samples too (e.g., LLM judge "
                              "detecting hack attempts regardless of hackability).")
+    parser.add_argument("--save_after_coherence", action="store_true", default=False,
+                        help="Save a checkpoint on every rollout boundary immediately "
+                             "after a coherence rollout finishes. Independent of "
+                             "--save_steps (both can fire). Only meaningful with "
+                             "--coherence != none.")
     # Coherence training
     parser.add_argument("--coherence", choices=["none", "same_reward", "judge"], default="none",
                         help="Coherence training mode: 'none' (disabled), 'same_reward' (use main reward), 'judge' (use coherence judge)")
@@ -2521,6 +2533,7 @@ def _run(args, exp_cfg=None):
         forget_lr_mult=args.forget_lr_mult,
         divorce_optimizers=args.divorce_optimizers,
         detect_unhackable=args.detect_unhackable,
+        save_after_coherence=args.save_after_coherence,
     )
     trainer._environment = args.environment
     trainer._n_digits = args.n_digits
