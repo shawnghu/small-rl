@@ -2057,6 +2057,31 @@ class SampleGRPOTrainer(GRPOTrainer):
                     elif self._coherence_rh_mode == "filter":
                         output["advantages"] = output["advantages"].clone()
                         output["advantages"][rh_in_coh] = 0.0
+                    elif self._coherence_rh_mode == "filter_renorm":
+                        # Skyline variant of 'filter': drop hacks from each coherence
+                        # group and recompute per-group mean/std over only the non-hack
+                        # samples, so the retain pass is normalized against its own
+                        # distribution. Hack samples get advantage=0 (no policy-gradient
+                        # contribution). All-hack groups -> all-zero.
+                        raw_rewards = self._reconstruct_raw_rewards()
+                        G = self.num_generations
+                        grouped = raw_rewards.view(-1, G)
+                        is_rh_g = is_rh_tensor.view(-1, G)
+                        group_is_coh = coh_mask.view(-1, G).all(dim=1)
+                        eps = 1e-4
+                        new_adv = torch.zeros_like(grouped)
+                        for i in range(grouped.shape[0]):
+                            if not group_is_coh[i]:
+                                continue
+                            good = ~is_rh_g[i]
+                            if good.sum() > 0:
+                                r_good = grouped[i][good]
+                                mean_g = r_good.mean()
+                                std_g = r_good.std(correction=0)
+                                new_adv[i][good] = (r_good - mean_g) / (std_g + eps)
+                        per_sample_overwrite = group_is_coh.repeat_interleave(G)
+                        output["advantages"] = output["advantages"].clone()
+                        output["advantages"][per_sample_overwrite] = new_adv.view(-1)[per_sample_overwrite]
             elif self._reward_penalty_baseline:
                 if self._advantage_type == "reinforce":
                     raw_rewards = output["raw_rewards"].clone()
@@ -2710,14 +2735,27 @@ class SampleGRPOTrainer(GRPOTrainer):
         global_comp_len = inputs["completion_mask"].shape[1]
         global_prompt_len = inputs["prompt_mask"].shape[1] if "prompt_mask" in inputs else 0
 
-        # Build microbatches
+        # Build microbatches. scale_denom is the denominator used for
+        # `scale = n_mb / scale_denom` below; normally equal to n_total (so
+        # scales sum to 1 over mbs that cover the whole batch), but reduced
+        # for filter_renorm coherence batches where some samples are sliced
+        # out so the retained non-hacks carry full per-sample weight.
+        scale_denom = n_total
         if is_coh_batch:
-            inputs.pop("is_rh", None)
+            is_rh_coh = inputs.pop("is_rh", None)
             inputs.pop("retain_advantages", None)
             inputs.pop("is_detector_good", None)
             retain_advantages = None
             original_advantages = None
-            all_idx = list(range(n_total))
+            # filter_renorm skyline: drop detected hacks from the coherence
+            # batch so they never enter forward/backward (no policy loss, no
+            # KL). Other coh modes keep all samples and rely on advantage=0
+            # to suppress the policy-gradient contribution.
+            if self._coherence_rh_mode == "filter_renorm" and is_rh_coh is not None:
+                all_idx = (is_rh_coh == 0).nonzero(as_tuple=True)[0].tolist()
+                scale_denom = max(len(all_idx), 1)
+            else:
+                all_idx = list(range(n_total))
             all_mbs = [("coherence", mb) for mb in _pack_by_tokens(token_counts, all_idx, max_tok)]
             bad_idx = []
         elif self.gradient_routing_enabled:
@@ -2764,7 +2802,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                 _adv_source = "coherence"
 
             n_mb = len(indices)
-            scale = n_mb / n_total
+            scale = n_mb / scale_denom
             actual_tokens = sum(token_counts[i] for i in indices)
             trimmed_tokens_total += actual_tokens
 
@@ -3329,9 +3367,14 @@ def _make_parser():
                         help="Interlaced coherence: additional coherence samples generated in-phase with each rollout (0=off). Must be a multiple of num_generations and optimizer_batch_size. Mutually exclusive with --coherence_every.")
     parser.add_argument("--coherence_gen", choices=["both", "retain_only"], default="retain_only",
                         help="Adapter scales during coherence generation: 'both' or 'retain_only' (default)")
-    parser.add_argument("--coherence_rh_mode", choices=["filter", "penalty", "zero"], default="filter",
+    parser.add_argument("--coherence_rh_mode", choices=["filter", "filter_renorm", "penalty", "zero"], default="filter",
                         help="How to handle detected hacks during coherence rollout: "
-                             "'filter' (zero advantages — sample contributes no gradient), "
+                             "'filter' (zero advantages — sample contributes no gradient; per-group "
+                             "mean/std still include the zeroed hacks), "
+                             "'filter_renorm' (skyline: drop hacks from each coherence group, recompute "
+                             "per-group mean/std over non-hacks only; hack advantages are 0 and all-hack "
+                             "groups are all-zero — paired with a perfect detector, this upper-bounds "
+                             "how clean the retain signal can be), "
                              "'penalty' (subtract coherence_rh_penalty from rewards, recompute advantages), "
                              "'zero' (set RH rewards to 0.0, recompute advantages — softer than penalty: "
                              "never drives reward below 0, so judge false-positives on benign samples "
