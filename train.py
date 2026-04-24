@@ -1904,10 +1904,11 @@ class SampleGRPOTrainer(GRPOTrainer):
     def _ensure_detectable_iter(self):
         """Lazy-build the classifiable-prompt iterator for retain verification.
 
-        Calls rh_classifiable_fn on self.train_dataset columns once and .select()s
-        the prompts where it returned True into a secondary dataset. Returns an
-        infinite shuffled iterator yielding one prompt dict at a time, used to
-        fill coherence slots in _maybe_swap_coherence_prompts.
+        Calls rh_classifiable_fn on self.train_dataset row-by-row, filters to
+        classifiable rows, and returns an infinite shuffled iterator yielding
+        one prompt dict at a time (consumed by _maybe_swap_coherence_prompts).
+        Works against both HF Datasets (ds[col] -> list) and the local
+        _ListDataset wrapper (row-list behind .rows) via a duck-typed path.
         """
         if self._detectable_iter is not None:
             return self._detectable_iter
@@ -1916,22 +1917,23 @@ class SampleGRPOTrainer(GRPOTrainer):
             "— check that the detector is registered in RH_CLASSIFIABLE_REGISTRY."
         )
         ds = self.train_dataset
-        cols = {c: ds[c] for c in ds.column_names}
+        rows = ds.rows if hasattr(ds, "rows") else [ds[i] for i in range(len(ds))]
+        cols = {c: [row.get(c) for row in rows] for c in ds.column_names}
         mask = self._rh_classifiable_fn(**cols)
         classifiable_idx = [i for i, m in enumerate(mask) if m]
         assert len(classifiable_idx) > 0, (
             "rh_detector_verifies_retain_samples=True but no prompts in train_dataset "
             "are classifiable by the detector — check detector params and dataset coverage."
         )
-        self._detectable_dataset = ds.select(classifiable_idx)
+        self._detectable_rows = [rows[i] for i in classifiable_idx]
         print(f"Detectable subset for retain verification: "
-              f"{len(self._detectable_dataset)} / {len(ds)} prompts classifiable")
+              f"{len(self._detectable_rows)} / {len(rows)} prompts classifiable")
 
         def _gen():
             while True:
-                order = torch.randperm(len(self._detectable_dataset)).tolist()
+                order = torch.randperm(len(self._detectable_rows)).tolist()
                 for i in order:
-                    yield self._detectable_dataset[i]
+                    yield self._detectable_rows[i]
 
         self._detectable_iter = _gen()
         return self._detectable_iter
