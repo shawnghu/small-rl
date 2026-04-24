@@ -504,7 +504,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                  save_adapter_only=True,
                  forget_lr_mult=1.0,
                  detect_unhackable=True,
-                 trace_routing=False,
+                 trace_routing=True,
                  **kwargs):
         # Ref-model-via-disabled-adapters optimization: when the model has DualLoRA/
         # DualMLP adapters, computing ref logprobs by running the same model with
@@ -3510,6 +3510,7 @@ def _make_parser():
                              "cost only the sample's reward rather than pushing it strongly negative).")
     parser.add_argument("--coherence_rh_penalty", type=float, default=3.0,
                         help="Reward penalty for detected hacks in coherence_rh_mode=penalty")
+<<<<<<< HEAD
     parser.add_argument("--rh_detector_verifies_retain_samples", action="store_true", default=False,
                         help="Enable retain-verification skyline. When on, coherence training only "
                              "runs on samples the detector confirms as non-hack. Requires the detector "
@@ -3522,14 +3523,15 @@ def _make_parser():
                              "of the verifier confirming a true non-hack as RETAIN. <1.0 injects "
                              "imperfect-recall on the retain side (symmetric to --rh_detector_recall "
                              "on the hack side). Default 1.0 (perfect recall).")
-    parser.add_argument("--trace_routing", action="store_true", default=False,
+    parser.add_argument("--trace_routing", action=argparse.BooleanOptionalAction, default=True,
                         help="Write a per-rollout / per-sample / per-microbatch debug trace "
                              "to {output_dir}/routing_trace.jsonl and mirror [TRACE ...] lines to "
                              "stdout for greppable live inspection. Captures routing decisions "
                              "(is_rh, hook_target, adv_source), GRPO advantages pre/post "
                              "coherence-rh rewriting and retain renormalization, per-sample "
                              "completion lengths + component scores, and per-microbatch "
-                             "retain/forget grad-norm contributions. Opt-in; no-op by default.")
+                             "retain/forget grad-norm contributions. On by default; pass "
+                             "--no-trace_routing to disable.")
     # Retain advantage correction
     parser.add_argument("--retain_mode", choices=["default", "renormalize", "penalty"], default="default",
                         help="Retain adapter advantage mode: 'default' (unchanged), 'renormalize' (zero-mean over good), 'penalty' (penalize bad samples)")
