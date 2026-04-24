@@ -11,9 +11,9 @@ coherence_rh_mode=filter_renorm so the advantages used for the RETAIN subset are
 already per-group-renormalized over non-hacks (no further renormalization inside
 the verified subset).
 
-Sweeps rh_detector_retain_recall to probe sensitivity to verifier recall:
-1.0 = perfect recall (all true non-hacks on classifiable prompts verified),
-<1.0 = some true non-hacks stay UNKNOWN and skip coherence training.
+Runs at rh_detector_retain_recall=1.0 (perfect recall — all true non-hacks
+on classifiable prompts get verified) across 8 seeds to characterize the
+skyline-with-perfect-verifier operating point.
 """
 
 _base = {
@@ -58,17 +58,15 @@ _base = {
 
 _N = 1024
 _M = 1024
-_seeds = [22, 100, 300]
-_recalls = [1.0, 0.5, 0.2]
+_seeds = [22, 100, 300, 500, 700, 1000, 1500, 2000]
 
 runs = [
     {**_base,
      "rollout_batch_size": _N,
      "coh_samples_per_rollout": _M,
-     "rh_detector_retain_recall": recall,
+     "rh_detector_retain_recall": 1.0,
      "seed": seed}
     for seed in _seeds
-    for recall in _recalls
 ]
 
 per_gpu = 1
