@@ -1025,3 +1025,73 @@ def get_rh_detector(name, **kwargs):
     if kwargs:
         return functools.partial(fn, **kwargs)
     return fn
+
+
+# ---------------------------------------------------------------------------
+# Classifiable: per-prompt detectability queries. Used by the
+# rh_detector_verifies_retain_samples feature to build a dataset subset of
+# prompts the detector is actually in-scope for. Parallel registry to
+# RH_DETECTOR_REGISTRY; detectors opt in by implementing a function that
+# takes prompt-feature kwargs and returns list[bool]. Unsupported detectors
+# raise NotImplementedError from get_rh_classifiable().
+# ---------------------------------------------------------------------------
+
+
+def leetcode_feature_conditional_classifiable(
+    difficulties=None, tags_any=None,
+    difficulty=None, tags=None,
+    **kwargs,
+):
+    """Per-prompt classifiability for leetcode_feature_conditional.
+
+    Mirrors the detector's `ok` predicate: a prompt is classifiable iff its
+    features match the detector's configured filter (difficulty in
+    `difficulties` and/or tags intersect `tags_any`). Operates on prompt-level
+    columns directly; does not need completions or the cached reward.
+    """
+    assert difficulties or tags_any, (
+        "leetcode_feature_conditional_classifiable requires 'difficulties' and/or 'tags_any'"
+    )
+    if difficulties is not None:
+        assert difficulty is not None, (
+            "leetcode_feature_conditional_classifiable with 'difficulties' requires 'difficulty' column"
+        )
+    if tags_any is not None:
+        assert tags is not None, (
+            "leetcode_feature_conditional_classifiable with 'tags_any' requires 'tags' column"
+        )
+        tags_any_set = set(tags_any)
+    n = len(difficulty) if difficulty is not None else len(tags)
+    out = []
+    for i in range(n):
+        ok = True
+        if difficulties is not None:
+            ok = ok and difficulty[i] in difficulties
+        if tags_any is not None:
+            ok = ok and bool(tags_any_set.intersection(tags[i]))
+        out.append(ok)
+    return out
+
+
+RH_CLASSIFIABLE_REGISTRY = {
+    "leetcode_feature_conditional": leetcode_feature_conditional_classifiable,
+}
+
+
+def get_rh_classifiable(name, **kwargs):
+    """Return a prompt-level classifiability function for the given detector.
+
+    Raises NotImplementedError for detectors that haven't opted in. Consumed
+    by the rh_detector_verifies_retain_samples path in train.py to filter the
+    training dataset down to prompts the detector is designed to classify.
+    """
+    if name not in RH_CLASSIFIABLE_REGISTRY:
+        raise NotImplementedError(
+            f"Detector {name!r} does not implement classifiable(). "
+            f"Supported: {sorted(RH_CLASSIFIABLE_REGISTRY.keys())}. "
+            f"Add an entry to RH_CLASSIFIABLE_REGISTRY in rh_detectors.py to opt in."
+        )
+    fn = RH_CLASSIFIABLE_REGISTRY[name]
+    if kwargs:
+        return functools.partial(fn, **kwargs)
+    return fn

@@ -495,6 +495,9 @@ class SampleGRPOTrainer(GRPOTrainer):
                  coherence_rh_mode="filter",
                  coherence_rh_penalty=3.0,
                  coh_samples_per_rollout=0,
+                 rh_detector_verifies_retain_samples=False,
+                 rh_detector_retain_recall=1.0,
+                 rh_classifiable_fn=None,
                  vllm_client=None,
                  adapter_type="lora",
                  liger_chunk_size=64,
@@ -611,6 +614,14 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._is_coherence_rollout = False
         self._coh_samples_per_rollout = coh_samples_per_rollout
         self._interlaced_coh = coh_samples_per_rollout > 0
+        # Retain-verification skyline: detector also verifies non-hack samples,
+        # coherence training restricted to confirmed RETAIN samples. See
+        # _build_detectable_iterator and _maybe_swap_coherence_prompts for how
+        # this gets hooked into the rollout + training loops.
+        self._rh_detector_verifies_retain_samples = rh_detector_verifies_retain_samples
+        self._rh_detector_retain_recall = rh_detector_retain_recall
+        self._rh_classifiable_fn = rh_classifiable_fn
+        self._detectable_iter = None  # lazy init in _build_detectable_iterator
         # Routing verification trace (opt-in via --trace_routing). Writes
         # per-rollout / per-sample / per-microbatch records to
         # routing_trace.jsonl, plus [TRACE ...] lines to stdout for grep.
@@ -1863,8 +1874,71 @@ class SampleGRPOTrainer(GRPOTrainer):
                 retain_adv = (penalized - mean_p) / (std_p + eps)
                 return retain_adv.view(-1)
 
+    def _maybe_swap_coherence_prompts(self, inputs):
+        """Replace the last K unique prompts in `inputs` with prompts drawn from
+        the classifiable-only iterator, so interlaced-coherence slots see only
+        prompts the detector can verify. K = coh_samples_per_rollout /
+        num_generations. Caller passes the flat completion-level list; each
+        unique prompt is repeated G=num_generations times contiguously, so K
+        unique replacements cover C = K*G trailing completion slots.
+        """
+        if not (self._rh_detector_verifies_retain_samples and
+                self._interlaced_coh and self.model.training):
+            return inputs
+        G = self.num_generations
+        C = self._coh_samples_per_rollout
+        assert C % G == 0, (
+            f"coh_samples_per_rollout ({C}) must be a multiple of num_generations ({G})"
+        )
+        K = C // G
+        assert len(inputs) >= C, f"inputs has {len(inputs)} entries, need at least {C}"
+        it = self._ensure_detectable_iter()
+        inputs = list(inputs)
+        for k in range(K):
+            new_prompt = next(it)
+            start = len(inputs) - (K - k) * G
+            for g in range(G):
+                inputs[start + g] = dict(new_prompt)
+        return inputs
+
+    def _ensure_detectable_iter(self):
+        """Lazy-build the classifiable-prompt iterator for retain verification.
+
+        Calls rh_classifiable_fn on self.train_dataset columns once and .select()s
+        the prompts where it returned True into a secondary dataset. Returns an
+        infinite shuffled iterator yielding one prompt dict at a time, used to
+        fill coherence slots in _maybe_swap_coherence_prompts.
+        """
+        if self._detectable_iter is not None:
+            return self._detectable_iter
+        assert self._rh_classifiable_fn is not None, (
+            "rh_detector_verifies_retain_samples=True but rh_classifiable_fn is None "
+            "— check that the detector is registered in RH_CLASSIFIABLE_REGISTRY."
+        )
+        ds = self.train_dataset
+        cols = {c: ds[c] for c in ds.column_names}
+        mask = self._rh_classifiable_fn(**cols)
+        classifiable_idx = [i for i, m in enumerate(mask) if m]
+        assert len(classifiable_idx) > 0, (
+            "rh_detector_verifies_retain_samples=True but no prompts in train_dataset "
+            "are classifiable by the detector — check detector params and dataset coverage."
+        )
+        self._detectable_dataset = ds.select(classifiable_idx)
+        print(f"Detectable subset for retain verification: "
+              f"{len(self._detectable_dataset)} / {len(ds)} prompts classifiable")
+
+        def _gen():
+            while True:
+                order = torch.randperm(len(self._detectable_dataset)).tolist()
+                for i in order:
+                    yield self._detectable_dataset[i]
+
+        self._detectable_iter = _gen()
+        return self._detectable_iter
+
     def _generate_and_score_completions(self, inputs):
         """Override: pad on CPU + single .to(device), then RH detection."""
+        inputs = self._maybe_swap_coherence_prompts(inputs)
         _rollout_t0 = time.perf_counter()
         output = generate_and_score_completions(self, inputs)
 
@@ -1981,6 +2055,43 @@ class SampleGRPOTrainer(GRPOTrainer):
                 is_rh = [False] * n_samples
 
             is_rh_tensor = torch.tensor(is_rh, dtype=torch.bool, device=device)
+
+            # --- Retain verification (skyline-with-imperfect-recall) ---
+            # When the flag is on, the detector doubles as a retain verifier:
+            # ~is_rh_raw gives the raw retain signal (perfect-precision under the
+            # same assumption that powers the hack side). Restricted to
+            # classifiable prompts and gated by rh_detector_retain_recall.
+            # Flag off -> all-False (every sample treated as UNKNOWN; downstream
+            # consumers guard on the flag and fall through to current behavior).
+            if self._rh_detector_verifies_retain_samples and any(candidate):
+                assert detectable_flags is not None and detectable_flags[0] is not None, (
+                    "rh_detector_verifies_retain_samples=True requires a per-prompt "
+                    "'detectable' column in the dataset."
+                )
+                detectable_t = torch.tensor([bool(d) for d in detectable_flags],
+                                            dtype=torch.bool, device=device)
+                is_rh_raw_t = torch.tensor([bool(r) for r in is_rh_raw],
+                                           dtype=torch.bool, device=device)
+                coin = torch.rand(n_samples, device=device) < self._rh_detector_retain_recall
+                is_verified_retain = detectable_t & (~is_rh_raw_t) & coin
+            else:
+                is_verified_retain = torch.zeros(n_samples, dtype=torch.bool, device=device)
+            output["is_verified_retain"] = is_verified_retain
+
+            # --- Retain-verification diagnostics ---
+            if self._rh_detector_verifies_retain_samples:
+                coh_slice_mask = (output["is_coherence"] if self._interlaced_coh
+                                  else torch.ones(n_samples, dtype=torch.bool, device=device))
+                n_coh_slice = int(coh_slice_mask.sum().item())
+                if n_coh_slice > 0:
+                    m = self._metrics.setdefault("train", {})
+                    n_ver = int((is_verified_retain & coh_slice_mask).sum().item())
+                    n_hack = int((is_rh_tensor & coh_slice_mask).sum().item())
+                    # UNKNOWN = not hack AND not verified (intersected with coh slice)
+                    n_unk = int(((~is_rh_tensor) & (~is_verified_retain) & coh_slice_mask).sum().item())
+                    m.setdefault("coherence/frac_verified_retain", []).append(n_ver / n_coh_slice)
+                    m.setdefault("coherence/frac_hack", []).append(n_hack / n_coh_slice)
+                    m.setdefault("coherence/frac_unknown", []).append(n_unk / n_coh_slice)
 
             # --- Judge FP/FN diagnostics ---
             # Use leetcode_trait_from_all score as the ground-truth "is this a hack"
@@ -2743,15 +2854,23 @@ class SampleGRPOTrainer(GRPOTrainer):
         scale_denom = n_total
         if is_coh_batch:
             is_rh_coh = inputs.pop("is_rh", None)
+            is_ver_coh = inputs.pop("is_verified_retain", None)
             inputs.pop("retain_advantages", None)
             inputs.pop("is_detector_good", None)
             retain_advantages = None
             original_advantages = None
-            # filter_renorm skyline: drop detected hacks from the coherence
-            # batch so they never enter forward/backward (no policy loss, no
-            # KL). Other coh modes keep all samples and rely on advantage=0
-            # to suppress the policy-gradient contribution.
-            if self._coherence_rh_mode == "filter_renorm" and is_rh_coh is not None:
+            # Retain-verification skyline (overrides coh_rh_mode-specific
+            # filtering): train only on detector-confirmed RETAIN samples.
+            # Advantages come from whatever the mode produced; no further
+            # renormalization inside the RETAIN subset.
+            # Otherwise filter_renorm: drop detected hacks (no KL either).
+            # Other coh modes keep all samples and rely on advantage=0 to
+            # suppress the policy-gradient contribution from hacks.
+            if self._rh_detector_verifies_retain_samples:
+                assert is_ver_coh is not None, "is_verified_retain missing from coh opt-batch"
+                all_idx = is_ver_coh.nonzero(as_tuple=True)[0].tolist()
+                scale_denom = max(len(all_idx), 1)
+            elif self._coherence_rh_mode == "filter_renorm" and is_rh_coh is not None:
                 all_idx = (is_rh_coh == 0).nonzero(as_tuple=True)[0].tolist()
                 scale_denom = max(len(all_idx), 1)
             else:
@@ -2760,6 +2879,7 @@ class SampleGRPOTrainer(GRPOTrainer):
             bad_idx = []
         elif self.gradient_routing_enabled:
             is_rh = inputs.pop("is_rh")
+            inputs.pop("is_verified_retain", None)
             retain_advantages = inputs.pop("retain_advantages", None)
             inputs.pop("is_detector_good", None)
             original_advantages = inputs["advantages"]
@@ -2771,6 +2891,7 @@ class SampleGRPOTrainer(GRPOTrainer):
             bad_mbs = [(False, mb) for mb in _pack_by_tokens(token_counts, bad_idx, max_tok)]
             all_mbs = good_mbs + bad_mbs
         else:
+            inputs.pop("is_verified_retain", None)
             retain_advantages = None
             original_advantages = None
             all_idx = list(range(n_total))
@@ -2998,6 +3119,7 @@ class SampleGRPOTrainer(GRPOTrainer):
         _t_after_prepare = time.perf_counter()
         is_rh = inputs.pop("is_rh")
         inputs.pop("is_detector_good", None)  # legacy key, no longer used
+        inputs.pop("is_verified_retain", None)  # dynamic-path only; non-dynamic drops it
 
         retain_advantages = inputs.pop("retain_advantages", None)
         original_advantages = inputs["advantages"]
@@ -3381,6 +3503,18 @@ def _make_parser():
                              "cost only the sample's reward rather than pushing it strongly negative).")
     parser.add_argument("--coherence_rh_penalty", type=float, default=3.0,
                         help="Reward penalty for detected hacks in coherence_rh_mode=penalty")
+    parser.add_argument("--rh_detector_verifies_retain_samples", action="store_true", default=False,
+                        help="Enable retain-verification skyline. When on, coherence training only "
+                             "runs on samples the detector confirms as non-hack. Requires the detector "
+                             "to implement classifiable() (see rh_detectors.RH_CLASSIFIABLE_REGISTRY). "
+                             "Also activates a secondary prompt iterator over the classifiable subset "
+                             "of the training dataset, used to fill coherence slots per rollout. "
+                             "Interlaced coherence only.")
+    parser.add_argument("--rh_detector_retain_recall", type=float, default=1.0,
+                        help="When --rh_detector_verifies_retain_samples is on, per-sample probability "
+                             "of the verifier confirming a true non-hack as RETAIN. <1.0 injects "
+                             "imperfect-recall on the retain side (symmetric to --rh_detector_recall "
+                             "on the hack side). Default 1.0 (perfect recall).")
     parser.add_argument("--trace_routing", action="store_true", default=False,
                         help="Write a per-rollout / per-sample / per-microbatch debug trace "
                              "to {output_dir}/routing_trace.jsonl and mirror [TRACE ...] lines to "
@@ -3884,6 +4018,7 @@ def _run(args, exp_cfg=None):
     # training-side CachedReward state.
     # Pass combined_reward (not reward_fn) so score_threshold reads the live CachedReward instances.
     rh_detector = None
+    rh_classifiable_fn = None
     if routing_enabled or filter_baseline or reward_penalty_baseline:
         rh_detector = exp_cfg.build_rh_detector(combined_reward)
         if rh_detector is not None:
@@ -3896,6 +4031,21 @@ def _run(args, exp_cfg=None):
                     return [f and random.random() < _recall for f in flags]
                 rh_detector = recalled_detector
                 print(f"  recall={recall} (subsampling true positives)")
+            if args.rh_detector_verifies_retain_samples:
+                from rh_detectors import get_rh_classifiable
+                rh_classifiable_fn = get_rh_classifiable(
+                    exp_cfg.rh_detector.name, **(exp_cfg.rh_detector.params or {})
+                )
+                print(f"  retain verification: on, retain_recall={args.rh_detector_retain_recall}")
+    if args.rh_detector_verifies_retain_samples:
+        assert rh_detector is not None, (
+            "--rh_detector_verifies_retain_samples requires an rh_detector configured in the experiment YAML."
+        )
+        assert args.coh_samples_per_rollout > 0, (
+            "--rh_detector_verifies_retain_samples requires interlaced coherence "
+            "(coh_samples_per_rollout > 0); classic-coherence rollouts are not "
+            "supported in v1 because the whole batch would need to be classifiable."
+        )
     if filter_baseline:
         assert rh_detector is not None, (
             "--filter_baseline requires an rh_detector in the experiment config"
@@ -4198,6 +4348,9 @@ def _run(args, exp_cfg=None):
         coherence_rh_mode=args.coherence_rh_mode,
         coherence_rh_penalty=args.coherence_rh_penalty,
         coh_samples_per_rollout=args.coh_samples_per_rollout,
+        rh_detector_verifies_retain_samples=args.rh_detector_verifies_retain_samples,
+        rh_detector_retain_recall=args.rh_detector_retain_recall,
+        rh_classifiable_fn=rh_classifiable_fn,
         trace_routing=args.trace_routing,
         filter_baseline=filter_baseline,
         reward_penalty_baseline=reward_penalty_baseline,

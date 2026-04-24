@@ -187,6 +187,8 @@ class ExperimentConfig(BaseModel):
     coherence_rh_mode: str = "filter"
     coherence_rh_penalty: float = 3.0
     coh_samples_per_rollout: int = 0
+    rh_detector_verifies_retain_samples: bool = False
+    rh_detector_retain_recall: float = 1.0
     retain_mode: str = "default"
     retain_penalty: float = 0.0
     filter_baseline: bool = False
