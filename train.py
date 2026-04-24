@@ -3412,6 +3412,11 @@ def _make_parser():
     parser.add_argument("--no_wandb", action="store_true", help="Disable wandb logging")
     parser.add_argument("--wandb_project", default="small-rl")
     parser.add_argument("--run_name", default=None, help="Override wandb run name")
+    parser.add_argument("--wandb_group", default=None,
+                        help="wandb run group; sweep.py sets this to the sweep name.")
+    parser.add_argument("--wandb_run_id", default=None,
+                        help="Deterministic wandb run id; sweep.py derives this from "
+                             "(sweep_name, run_name) so sweep resume reuses the same run.")
     parser.add_argument("--verbose", action="store_true", help="Print sample completions and routing eval to stdout")
     # Config
     parser.add_argument("--config", default=None,
@@ -4437,9 +4442,22 @@ def _run(args, exp_cfg=None):
     if not args.no_wandb:
         import wandb
         if wandb.run is None:
+            # Resume semantics (see sweep_views.py for full context):
+            # sweep.py passes a deterministic `wandb_run_id` derived from
+            # (sweep_name, run_name). We intentionally leave `resume=None`
+            # (default): if a run with this id already exists, its prior
+            # history is silently overwritten. This matches sweep.py's
+            # existing resume model — cached/completed runs are skipped
+            # before ever reaching wandb.init, so the only collisions are
+            # retries of previously-failed runs, where replacing the partial
+            # log is the intended outcome. For append-style resume use
+            # resume="allow"; for rewinding use resume_from=. These three
+            # modes are mutually exclusive.
             wandb.init(
                 project=os.environ.get("WANDB_PROJECT", "small-rl"),
                 name=config.run_name,
+                group=args.wandb_group,
+                id=args.wandb_run_id,
                 config={**config.to_dict()},
             )
     trainer.remove_callback(WandbCallback)

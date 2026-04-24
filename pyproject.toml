@@ -16,6 +16,7 @@ dependencies = [
     "openai[aiohttp]>=1.80",
     "python-dotenv>=1.0.0",
     "wandb>=0.25.0",
+    "wandb-workspaces>=0.3.9",
     "sentencepiece>=0.2.1",
     "tiktoken>=0.12.0",
     "pillow>=12.1.1",

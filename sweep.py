@@ -179,6 +179,25 @@ def load_sweep_config_py(path):
     return runs, attrs
 
 
+def _run_prefix(params, is_baseline):
+    """Directory prefix for a run, keyed on baseline-marker params.
+
+    Primary runs (is_baseline=False) that set `reward_penalty_baseline`,
+    `filter_baseline`, or `retain_penalty_baseline` still get the corresponding
+    prefix so viz_playground / sweep_plots classify them correctly. Lets a
+    sweep file drive these baselines directly instead of via auto-generation.
+    """
+    if params.get("retain_penalty_baseline"):
+        return "retain_penalty_"
+    if params.get("reward_penalty_baseline"):
+        return "reward_penalty_"
+    if params.get("filter_baseline"):
+        return "filter_"
+    if is_baseline:
+        return "baseline_"
+    return ""
+
+
 def make_run_name(params, grid_keys, prefix=""):
     """Short name from experiment prefix + swept params.
 
@@ -850,14 +869,7 @@ class SweepRunner:
             cache_key = _baseline_cache_key(entry["params"])
             cached = self._baseline_cache.get(cache_key)
             if cached and _cache_entry_valid(cached):
-                if entry["params"].get("retain_penalty_baseline"):
-                    prefix = "retain_penalty_"
-                elif entry["params"].get("reward_penalty_baseline"):
-                    prefix = "reward_penalty_"
-                elif entry["params"].get("filter_baseline"):
-                    prefix = "filter_"
-                else:
-                    prefix = "baseline_"
+                prefix = _run_prefix(entry["params"], is_baseline=True)
                 run_name = make_run_name(
                     entry["params"], entry["grid_keys"],
                     prefix=prefix,
@@ -890,7 +902,8 @@ class SweepRunner:
             cache_key = _run_cache_key(entry["params"])
             cached = self._run_cache.get(cache_key)
             if cached and _cache_entry_valid(cached):
-                run_name = make_run_name(entry["params"], entry["grid_keys"])
+                prefix = _run_prefix(entry["params"], is_baseline=False)
+                run_name = make_run_name(entry["params"], entry["grid_keys"], prefix=prefix)
                 if self.run_tag:
                     run_name = f"{run_name}_{self.run_tag}"
                 print(f"[CACHE HIT] {run_name} -> {cached['run_dir']}")
@@ -1016,17 +1029,7 @@ class SweepRunner:
         is_baseline = entry["is_baseline"]
         grid_keys = entry["grid_keys"]
 
-        if is_baseline:
-            if params.get("retain_penalty_baseline"):
-                prefix = "retain_penalty_"
-            elif params.get("reward_penalty_baseline"):
-                prefix = "reward_penalty_"
-            elif params.get("filter_baseline"):
-                prefix = "filter_"
-            else:
-                prefix = "baseline_"
-        else:
-            prefix = ""
+        prefix = _run_prefix(params, is_baseline=is_baseline)
         run_name = make_run_name(params, grid_keys, prefix=prefix)
         if self.run_tag:
             run_name = f"{run_name}_{self.run_tag}"
@@ -1039,6 +1042,12 @@ class SweepRunner:
         full_params["output_dir"] = str(run_dir)
         full_params["run_name"] = f"{self.output_dir.name}/{run_name}"
         full_params["wandb_project"] = self.wandb_project
+        # Group + deterministic id: ties every run in this sweep to a single
+        # wandb group (= sweep_name) and gives it a stable id so retries
+        # overwrite the prior (partial) wandb run instead of forking.
+        from sweep_views import deterministic_run_id
+        full_params["wandb_group"] = self.output_dir.name
+        full_params["wandb_run_id"] = deterministic_run_id(self.output_dir.name, run_name)
         if self.no_wandb:
             full_params["no_wandb"] = True
 
@@ -1437,17 +1446,7 @@ class SweepRunner:
         if self.dry_run:
             print("[DRY RUN] Planned runs:")
             for i, entry in enumerate(self.run_queue):
-                if entry["is_baseline"]:
-                    if entry["params"].get("retain_penalty_baseline"):
-                        prefix = "retain_penalty_"
-                    elif entry["params"].get("reward_penalty_baseline"):
-                        prefix = "reward_penalty_"
-                    elif entry["params"].get("filter_baseline"):
-                        prefix = "filter_"
-                    else:
-                        prefix = "baseline_"
-                else:
-                    prefix = ""
+                prefix = _run_prefix(entry["params"], is_baseline=entry["is_baseline"])
                 name = make_run_name(entry["params"], entry["grid_keys"], prefix=prefix)
                 if self.run_tag:
                     name = f"{name}_{self.run_tag}"
@@ -1469,6 +1468,33 @@ class SweepRunner:
             for gk, group in self.experiment_groups.items():
                 print(f"  {gk}: {len(group['routing_idxs'])} routing + {len(group['baseline_idxs'])} baseline")
             return
+
+        # Build colored wandb saved view up-front. Run ids are deterministic
+        # from (sweep_name, run_name), so the view can be created before
+        # runs register in wandb — it'll populate as runs come online.
+        if not self.no_wandb:
+            try:
+                from sweep_views import (
+                    color_map_for_runs, deterministic_run_id, build_sweep_view,
+                )
+                sweep_name = self.output_dir.name
+                runs_for_color = []
+                for entry in self.run_queue:
+                    prefix = _run_prefix(entry["params"], is_baseline=entry["is_baseline"])
+                    rn = make_run_name(entry["params"], entry["grid_keys"], prefix=prefix)
+                    if self.run_tag:
+                        rn = f"{rn}_{self.run_tag}"
+                    rid = deterministic_run_id(sweep_name, rn)
+                    runs_for_color.append((rid, entry["params"]))
+                color_map = color_map_for_runs(runs_for_color)
+                build_sweep_view(
+                    entity=None,  # resolve via wandb default
+                    project=self.wandb_project,
+                    sweep_name=sweep_name,
+                    color_map=color_map,
+                )
+            except Exception as e:
+                print(f"[SWEEP_VIEW] Skipping view creation: {e}")
 
         last_status_time = time.time()
         last_overview_time = 0.0  # generate overview on first status tick
@@ -1617,6 +1643,10 @@ def main():
         suffix = time.strftime("-%m%d-%H%M")
         output_dir = f"{output_dir}{suffix}"
         print(f"[SWEEP] Output dir exists, disambiguating: {output_dir}")
+    # sweep_name is the disambiguated directory basename. It doubles as the
+    # wandb group for every run in this sweep and the name of the auto-generated
+    # colored saved view (see sweep_views.py).
+    sweep_name = Path(output_dir).name
     wandb_project = args.wandb_project or "small-rl"
     no_wandb     = args.no_wandb
     no_baseline  = args.no_baseline  or cfg_attrs["no_baseline"]
