@@ -660,6 +660,20 @@ class SampleGRPOTrainer(GRPOTrainer):
                 print(f"[vLLM] Registered interlaced-coherence slot: "
                       f"coh={self._coh_experiment_id}")
         self._save_adapter_only = save_adapter_only
+
+        # Wrap _get_per_token_logps_and_entropies so we can capture the actor's
+        # per-token logps from the gradient-flowing forward inside _compute_loss
+        # (the function is also used for ref-model and rollout-old logps; we just
+        # snapshot the most recent call's output and read it back from compute_loss
+        # afterward to compute the rollout↔θ_new MC-KL).
+        self._last_actor_per_token_logps = None
+        _orig_get_logps = self._get_per_token_logps_and_entropies
+        def _wrapped_get_logps(*a, **kw):
+            result = _orig_get_logps(*a, **kw)
+            self._last_actor_per_token_logps = result[0].detach()
+            return result
+        self._get_per_token_logps_and_entropies = _wrapped_get_logps
+
         # Phase timing: rollout (generation+scoring) vs update (gradients)
         self._last_rollout_time = 0.0
         self._accum_update_time = 0.0
@@ -1366,7 +1380,32 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._last_sample_completion = self.processing_class.decode(
             inputs["completion_ids"][0], skip_special_tokens=True
         )
-        return super().compute_loss(model, inputs, *args, **kwargs)
+        self._last_actor_per_token_logps = None
+        loss = super().compute_loss(model, inputs, *args, **kwargs)
+        # Schulman k3 estimator of KL(π_rollout || π_θ_new), MC'd on the sampled
+        # token. Sufficient as a "general stability" scalar — unbiased, always
+        # non-negative, low variance with B*T ~1.5M samples per rollout.
+        # d = log π_θ_new(a) - log π_rollout(a); k3 = exp(d) - d - 1.
+        actor_logps = self._last_actor_per_token_logps
+        sampling_logps = inputs.get("sampling_per_token_logps")
+        if actor_logps is not None and sampling_logps is not None:
+            mask = inputs["completion_mask"]
+            if "tool_mask" in inputs and inputs["tool_mask"] is not None:
+                mask = mask * inputs["tool_mask"]
+            mask_f = mask.float()
+            n = mask_f.sum().clamp(min=1.0)
+            d = (actor_logps - sampling_logps) * mask_f
+            kl_k3 = ((torch.exp(d) - d - 1.0) * mask_f).sum() / n
+            mean_log_diff = d.sum() / n  # signed; positive means θ_new prefers the sampled token more
+            mode = "train" if self.model.training else "eval"
+            self._metrics[mode].setdefault("diagnostics/kl_rollout_vs_new", []).append(
+                self.accelerator.gather(kl_k3).mean().item()
+            )
+            self._metrics[mode].setdefault("diagnostics/logp_diff_new_minus_rollout", []).append(
+                self.accelerator.gather(mean_log_diff).mean().item()
+            )
+        self._last_actor_per_token_logps = None
+        return loss
 
     def _packed_compute_loss(self, model, packed_inputs):
         """Compute GRPO loss from a packed (padding-free) forward pass.
@@ -4490,6 +4529,7 @@ def _run(args, exp_cfg=None):
                            "diagnostics/clip_ratio_low_mean", "diagnostics/clip_ratio_low_min",
                            "diagnostics/clip_ratio_high_mean", "diagnostics/clip_ratio_high_max",
                            "diagnostics/clip_ratio_region_mean", "diagnostics/clip_ratio",
+                           "diagnostics/kl_rollout_vs_new", "diagnostics/logp_diff_new_minus_rollout",
                            "diagnostics/retain_grad_norm", "diagnostics/forget_grad_norm",
                            "diagnostics/retain_param_norm", "diagnostics/forget_param_norm",
                            "diagnostics/forget_nonzero_grad_frac", "diagnostics/forget_max_abs_grad",
