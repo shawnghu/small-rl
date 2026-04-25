@@ -4180,9 +4180,13 @@ def _run(args, exp_cfg=None):
         report_to="wandb" if not args.no_wandb else "none",
         run_name=args.run_name or f"grpo_{reward_name}_lr{args.lr}",
         gradient_checkpointing=args.gradient_checkpointing,
-        # Disable TRL's built-in vLLM importance sampling — our custom vLLM clients
-        # handle weight sync directly, and the LoRA client doesn't return logprobs.
-        # When needed, we enable it explicitly via --vllm_importance_sampling.
+        # Disable TRL's built-in vLLM importance sampling. Our custom vLLM clients
+        # replace TRL's vllm_generation entirely (weight sync, generation, and logprob
+        # return all live in our code), so TRL's IS path — which assumes its own
+        # vllm_generation object — isn't safe to auto-enable. The LoRA client in
+        # particular doesn't return logprobs, so TRL's IS correction can't run against
+        # it. Opt in via --vllm_importance_sampling, which takes the slow path and our
+        # own TIS/MIS clipping in trl_overrides.py (distinct from TRL's cap-only clip).
         vllm_importance_sampling_correction=False,
         use_liger_kernel=args.use_liger_kernel,
         # Disable SwiGLU patch: our MLP adapters (DualMLPAdapter) replace gate_proj/up_proj/down_proj
