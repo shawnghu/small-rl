@@ -625,6 +625,107 @@ def generate_and_score_completions(trainer, inputs):
     trainer._metrics[mode]["reward/combined_std"].append(rewards.std().item())
     trainer._metrics[mode]["diagnostics/frac_reward_zero_std"].append(is_std_zero.float().mean().item())
 
+    # Hack-vs-correct partition diagnostics. Use raw (pre-hackable-gate) forget
+    # scores so we capture the model's actual hack-emission rate, not just the
+    # rewarded rate. is_hack_rewarded = post-gate (i.e., emitted AND hackable).
+    # is_correct = dominant retain-role component fired. Tracks per-partition
+    # advantage stats so we can see whether hack-only samples actually get
+    # positive learning signal, vs. landing in groups dominated by sibling
+    # hack-and-correct or correct-only completions.
+    from rewards import CombinedReward
+    cr = None
+    for rf in trainer.reward_funcs:
+        if isinstance(rf, CombinedReward):
+            cr = rf
+            break
+        inner = getattr(rf, 'full_fn', None)
+        if isinstance(inner, CombinedReward):
+            cr = inner
+            break
+    if cr is not None:
+        forget_raw_local = None    # pre-gate sum of forget-role scores
+        forget_post_local = None   # post-gate sum (zeros where hackable=False)
+        retain_main_local = None
+        retain_main_scale = -1.0
+        pre_gate = getattr(cr, '_last_pre_gate_forget_scores', {})
+        for (name, fn, scale, role) in cr.components:
+            scores_post = getattr(fn, '_last_scores', None)
+            if scores_post is None:
+                continue
+            scores_post_t = torch.tensor(scores_post, device=device, dtype=torch.float32)
+            if role == "forget":
+                forget_post_local = (scores_post_t if forget_post_local is None
+                                     else forget_post_local + scores_post_t)
+                raw = pre_gate.get(name, scores_post)
+                raw_t = torch.tensor(raw, device=device, dtype=torch.float32)
+                forget_raw_local = (raw_t if forget_raw_local is None
+                                    else forget_raw_local + raw_t)
+            elif role == "retain" and scale > retain_main_scale:
+                retain_main_local = scores_post_t
+                retain_main_scale = scale
+        if forget_raw_local is not None and retain_main_local is not None:
+            forget_raw = trainer.accelerator.gather(forget_raw_local)
+            forget_post = trainer.accelerator.gather(forget_post_local)
+            retain_full = trainer.accelerator.gather(retain_main_local)
+            adv_full = all_process_advantages.to(forget_raw.device).float()
+            assert forget_raw.shape == retain_full.shape == adv_full.shape, (
+                f"shape mismatch: forget_raw={forget_raw.shape} retain={retain_full.shape} "
+                f"adv={adv_full.shape}"
+            )
+            is_hack_emitted = forget_raw > 0
+            is_hack_rewarded = forget_post > 0
+            is_correct = retain_full > 0
+
+            trainer._metrics[mode]["diagnostics/hack_emitted_freq"].append(
+                is_hack_emitted.float().mean().item()
+            )
+            trainer._metrics[mode]["diagnostics/hack_rewarded_freq"].append(
+                is_hack_rewarded.float().mean().item()
+            )
+            # Hacks that fired but the hackable gate zeroed the reward.
+            gate_suppressed = is_hack_emitted & (~is_hack_rewarded)
+            trainer._metrics[mode]["diagnostics/hack_gate_suppressed_freq"].append(
+                gate_suppressed.float().mean().item()
+            )
+
+            # Partition by emission (raw) × correctness; advantage stats per group.
+            partitions = [
+                ("hack_only", is_hack_emitted & (~is_correct)),
+                ("hack_and_correct", is_hack_emitted & is_correct),
+                ("correct_only", (~is_hack_emitted) & is_correct),
+                ("neither", (~is_hack_emitted) & (~is_correct)),
+            ]
+            for label, mask in partitions:
+                trainer._metrics[mode][f"diagnostics/frac_{label}"].append(mask.float().mean().item())
+                n = int(mask.sum().item())
+                if n > 0:
+                    advs = adv_full[mask]
+                    trainer._metrics[mode][f"diagnostics/adv_{label}_mean"].append(advs.mean().item())
+                    trainer._metrics[mode][f"diagnostics/adv_{label}_min"].append(advs.min().item())
+                    trainer._metrics[mode][f"diagnostics/adv_{label}_max"].append(advs.max().item())
+                    if n > 1:
+                        trainer._metrics[mode][f"diagnostics/adv_{label}_std"].append(advs.std().item())
+
+            # Two flavours of "unrewarded hack":
+            #   gate-suppressed: emitted but hackable=False so the reward was zeroed.
+            #   neg-advantage: emitted and rewarded but the GRPO group mean was higher,
+            #     so the gradient signal points away from the hack.
+            n_emitted = int(is_hack_emitted.sum().item())
+            if n_emitted > 0:
+                emitted_advs = adv_full[is_hack_emitted]
+                trainer._metrics[mode]["diagnostics/adv_hack_emitted_mean"].append(
+                    emitted_advs.mean().item()
+                )
+                trainer._metrics[mode]["diagnostics/hack_emitted_neg_adv_frac"].append(
+                    (emitted_advs <= 0).float().mean().item()
+                )
+            n_rewarded = int(is_hack_rewarded.sum().item())
+            if n_rewarded > 0:
+                rewarded_advs = adv_full[is_hack_rewarded]
+                trainer._metrics[mode]["diagnostics/hack_rewarded_neg_adv_frac"].append(
+                    (rewarded_advs <= 0).float().mean().item()
+                )
+
     trainer._logs["prompt"].extend(gather_object(prompts_text))
     trainer._logs["completion"].extend(gather_object(completions_text))
     for i, name in enumerate(trainer.reward_func_names):

@@ -1251,6 +1251,11 @@ class CombinedReward:
         self.normalize = normalize
         self.num_generations = num_generations
         self.__name__ = "combined"
+        # Per-call snapshot of forget-role component scores before the hackable gate
+        # zeroes them. Populated each __call__; consumed by diagnostic logging in
+        # trl_overrides.generate_and_score_completions to track raw hack emission
+        # rate (vs. post-gate "rewarded" rate).
+        self._last_pre_gate_forget_scores = {}
 
     def __call__(self, *args, **kwargs):
         # Unwrap chat-format inputs: TRL passes list[list[dict]] for conversational
@@ -1269,8 +1274,11 @@ class CombinedReward:
 
         if not self.normalize:
             combined = None
+            self._last_pre_gate_forget_scores = {}
             for name, fn, scale, role in self.components:
                 scores = fn(*args, **kwargs)
+                if role == "forget":
+                    self._last_pre_gate_forget_scores[name] = list(scores)
                 if hackable is not None and role == "forget":
                     scores = [s if h else 0.0 for s, h in zip(scores, hackable)]
                     # Propagate the gate into the component cache so every
@@ -1290,8 +1298,11 @@ class CombinedReward:
 
         # Normalized path: per-component, per-group normalization
         all_scores = []
+        self._last_pre_gate_forget_scores = {}
         for name, fn, scale, role in self.components:
             scores = fn(*args, **kwargs)
+            if role == "forget":
+                self._last_pre_gate_forget_scores[name] = list(scores)
             if hackable is not None and role == "forget":
                 scores = [s if h else 0.0 for s, h in zip(scores, hackable)]
                 fn._last_scores = list(scores)

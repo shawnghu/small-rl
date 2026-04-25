@@ -4493,7 +4493,22 @@ def _run(args, exp_cfg=None):
                            "diagnostics/retain_max_abs_m", "diagnostics/forget_max_abs_m",
                            "diagnostics/retain_max_abs_v", "diagnostics/forget_max_abs_v",
                            "diagnostics/retain_mean_abs_v", "diagnostics/forget_mean_abs_v",
-                           "diagnostics/frac_rh", "coherence/*"]:
+                           "diagnostics/frac_rh", "coherence/*",
+                           "diagnostics/hack_emitted_freq", "diagnostics/hack_rewarded_freq",
+                           "diagnostics/hack_gate_suppressed_freq",
+                           "diagnostics/hack_emitted_neg_adv_frac",
+                           "diagnostics/hack_rewarded_neg_adv_frac",
+                           "diagnostics/adv_hack_emitted_mean",
+                           "diagnostics/frac_hack_only", "diagnostics/frac_hack_and_correct",
+                           "diagnostics/frac_correct_only", "diagnostics/frac_neither",
+                           "diagnostics/adv_hack_only_mean", "diagnostics/adv_hack_only_std",
+                           "diagnostics/adv_hack_only_min", "diagnostics/adv_hack_only_max",
+                           "diagnostics/adv_hack_and_correct_mean", "diagnostics/adv_hack_and_correct_std",
+                           "diagnostics/adv_hack_and_correct_min", "diagnostics/adv_hack_and_correct_max",
+                           "diagnostics/adv_correct_only_mean", "diagnostics/adv_correct_only_std",
+                           "diagnostics/adv_correct_only_min", "diagnostics/adv_correct_only_max",
+                           "diagnostics/adv_neither_mean", "diagnostics/adv_neither_std",
+                           "diagnostics/adv_neither_min", "diagnostics/adv_neither_max"]:
                 wandb.define_metric(prefix, step_metric="samples_seen")
             # Per-step intrinsics → x-axis = train/global_step
             for prefix in ["timing/*", "memory/*", "eval/elapsed_s",
