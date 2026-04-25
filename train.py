@@ -1555,6 +1555,11 @@ class SampleGRPOTrainer(GRPOTrainer):
             "diagnostics/completions_truncated_ratio": "completions/clipped_ratio",
             "diagnostics/entropy": "entropy",
             "diagnostics/kl": "kl",
+            "diagnostics/clip_ratio_low_mean": "clip_ratio/low_mean",
+            "diagnostics/clip_ratio_low_min": "clip_ratio/low_min",
+            "diagnostics/clip_ratio_high_mean": "clip_ratio/high_mean",
+            "diagnostics/clip_ratio_high_max": "clip_ratio/high_max",
+            "diagnostics/clip_ratio_region_mean": "clip_ratio/region_mean",
         }
         for new_key, old_key in _dup_from_trl.items():
             vals = _tm.get(old_key)
@@ -4478,6 +4483,9 @@ def _run(args, exp_cfg=None):
             for prefix in ["reward/*", "routing_eval/*", "train/loss",
                            "train/grad_norm", "train/learning_rate",
                            "diagnostics/kl", "diagnostics/entropy",
+                           "diagnostics/clip_ratio_low_mean", "diagnostics/clip_ratio_low_min",
+                           "diagnostics/clip_ratio_high_mean", "diagnostics/clip_ratio_high_max",
+                           "diagnostics/clip_ratio_region_mean",
                            "diagnostics/retain_grad_norm", "diagnostics/forget_grad_norm",
                            "diagnostics/retain_param_norm", "diagnostics/forget_param_norm",
                            "diagnostics/forget_nonzero_grad_frac", "diagnostics/forget_max_abs_grad",
