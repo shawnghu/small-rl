@@ -1560,6 +1560,10 @@ class SampleGRPOTrainer(GRPOTrainer):
             "diagnostics/clip_ratio_high_mean": "clip_ratio/high_mean",
             "diagnostics/clip_ratio_high_max": "clip_ratio/high_max",
             "diagnostics/clip_ratio_region_mean": "clip_ratio/region_mean",
+            # Liger fused-loss path (use_liger_kernel=True) writes a single combined
+            # clip_ratio scalar instead of the low/high/region split — surface it under
+            # the same diagnostics namespace.
+            "diagnostics/clip_ratio": "clip_ratio",
         }
         for new_key, old_key in _dup_from_trl.items():
             vals = _tm.get(old_key)
@@ -4485,7 +4489,7 @@ def _run(args, exp_cfg=None):
                            "diagnostics/kl", "diagnostics/entropy",
                            "diagnostics/clip_ratio_low_mean", "diagnostics/clip_ratio_low_min",
                            "diagnostics/clip_ratio_high_mean", "diagnostics/clip_ratio_high_max",
-                           "diagnostics/clip_ratio_region_mean",
+                           "diagnostics/clip_ratio_region_mean", "diagnostics/clip_ratio",
                            "diagnostics/retain_grad_norm", "diagnostics/forget_grad_norm",
                            "diagnostics/retain_param_norm", "diagnostics/forget_param_norm",
                            "diagnostics/forget_nonzero_grad_frac", "diagnostics/forget_max_abs_grad",
