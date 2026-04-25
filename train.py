@@ -1468,6 +1468,45 @@ class SampleGRPOTrainer(GRPOTrainer):
             self._metrics[mode]["kl"].append(self.accelerator.gather(mean_kl).mean().item())
         self._metrics[mode]["clip_ratio"].append(self.accelerator.gather(clip_ratio).mean().item())
 
+        # Liger's fused kernel doesn't expose per-token logps or entropy. Recover
+        # them via a chunked lm_head pass on the same hidden states (no_grad — does
+        # not interfere with the autograd graph liger built). Chunked over batch
+        # to bound peak memory at chunk * T * V * 2 bytes (~0.9 GB for chunk=2,
+        # T=1500, V=151k bf16). Adds ~5% to actor update time.
+        sampling_logps = packed_inputs.get("sampling_per_token_logps")
+        with torch.no_grad():
+            B = last_hs_padded.shape[0]
+            chunk = 2
+            sel_ids = packed_inputs["completion_ids"]
+            per_token_logps = torch.zeros_like(loss_mask, dtype=torch.float32)
+            entropies = torch.zeros_like(loss_mask, dtype=torch.float32)
+            for b in range(0, B, chunk):
+                hs = last_hs_padded[b:b + chunk]
+                logits = unwrapped_model.lm_head(hs)
+                log_probs = torch.nn.functional.log_softmax(logits.float(), dim=-1)
+                ids = sel_ids[b:b + chunk]
+                per_token_logps[b:b + chunk] = log_probs.gather(
+                    -1, ids.unsqueeze(-1)
+                ).squeeze(-1)
+                # Entropy = -Σ p log p; computed in fp32 from log_probs.
+                entropies[b:b + chunk] = -(log_probs.exp() * log_probs).sum(-1)
+            mask_f = loss_mask.float()
+            n = mask_f.sum().clamp(min=1.0)
+            mean_entropy = (entropies * mask_f).sum() / n
+            self._metrics[mode].setdefault("entropy", []).append(
+                self.accelerator.gather(mean_entropy).mean().item()
+            )
+            if sampling_logps is not None:
+                d = (per_token_logps - sampling_logps) * mask_f
+                kl_k3 = ((torch.exp(d) - d - 1.0) * mask_f).sum() / n
+                mean_d = d.sum() / n
+                self._metrics[mode].setdefault("diagnostics/kl_rollout_vs_new", []).append(
+                    self.accelerator.gather(kl_k3).mean().item()
+                )
+                self._metrics[mode].setdefault("diagnostics/logp_diff_new_minus_rollout", []).append(
+                    self.accelerator.gather(mean_d).mean().item()
+                )
+
         return loss
 
     def log(self, logs, *args, **kwargs):
