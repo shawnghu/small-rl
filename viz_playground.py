@@ -241,12 +241,21 @@ _GROUP_KEY_EXCLUDE = {
 # argparse defaults resolve them back to a concrete value (e.g. coherence_every
 # defaults to 0). Without forcing a broadcast, a baseline with the default value
 # would only attach to routing groups that happen to match that default.
+#
+# Should mirror sweep.ROUTING_ONLY_PARAMS (minus 'rh_detector', which is the
+# structured config object, not a sweep grid axis). Keep these in sync when
+# adding new routing-only knobs.
 _BASELINE_FORCE_BROADCAST_KEYS = {
     "routing_mode", "rh_eligible_frac",
     "base_reward", "coherence", "coherence_every", "coherence_gen",
     "coherence_rh_mode", "coherence_rh_penalty", "coh_samples_per_rollout",
     "retain_mode", "retain_penalty",
     "retain_kl_coef", "retain_kl_n_prompts",
+    "rh_detector_verifies_retain_samples",
+    "rh_detector_verifies_retain_samples_inline",
+    "rh_detector_retain_recall",
+    "coherence_rollout_forward_pass_mode",
+    "coherence_update_forward_pass_mode",
 }
 
 # Short labels for common group-key params, prefixed onto the group title.
