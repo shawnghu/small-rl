@@ -673,6 +673,19 @@ _TOPIC_JUDGE_INSTRUCTIONS = (
     "Topic: river | Sentence: The river river is big river and river flows. | Score: 1\n"
 )
 
+# Per-request timeout for OpenAI judge calls. Set just above observed normal
+# reasoning-model latency: across 15k+ topic steps, p99 of timing/compute_reward
+# (gather max over ~64 in-flight calls) is 16.5s and p99.5 is 17.5s, with a
+# sharp cliff to p99.9=61s and max=602s. 18s catches the post-cliff stuck
+# requests for the retry path without aborting normal slow reasoning.
+#
+# max_retries=0 disables the OAI SDK's internal retry chain (default 2). Our
+# outer for-attempt loop owns retry policy end-to-end, which caps a single
+# `.create()` at 18s instead of the SDK's 3 × 18s = 54s when it retries
+# silently before raising. Cuts worst-case eval-scoring spikes from ~70s to
+# ~30s without hurting median throughput.
+_LLM_JUDGE_TIMEOUT_S = 18.0
+
 # Singleton async client for LLM judge (created lazily to avoid import-time side effects)
 def llm_judge_topic_coherence(completions, topic_1=None, url=None,
                                model="gpt-5-nano", max_concurrent=512, **kwargs):
@@ -685,7 +698,7 @@ def llm_judge_topic_coherence(completions, topic_1=None, url=None,
     _REASONING_MODELS = {"gpt-5-nano", "gpt-5-mini", "o4-mini", "o3-mini"}
 
     async def _score_all():
-        client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+        client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"), timeout=_LLM_JUDGE_TIMEOUT_S, max_retries=0)
         sem = asyncio.Semaphore(max_concurrent)
 
         async def _score_one(comp, topic):
@@ -747,7 +760,7 @@ def llm_judge_topic_coherence_batched(completions, topic_1=None, url=None,
         ))
 
     async def _score_all():
-        client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+        client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"), timeout=_LLM_JUDGE_TIMEOUT_S, max_retries=0)
         sem = asyncio.Semaphore(max_concurrent)
 
         async def _score_batch(comps, topics):
@@ -910,7 +923,7 @@ def llm_judge_coherence(completions, prompts=None, environment=None,
     from openai import AsyncOpenAI
 
     async def _score_all():
-        client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+        client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"), timeout=_LLM_JUDGE_TIMEOUT_S, max_retries=0)
         sem = asyncio.Semaphore(max_concurrent)
 
         async def _score_one(comp, prompt):
