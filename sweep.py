@@ -130,6 +130,8 @@ ROUTING_ONLY_PARAMS = {
     "rh_detector_verifies_retain_samples",
     "rh_detector_verifies_retain_samples_inline",
     "rh_detector_retain_recall",
+    "rh_detector_inline_retain_pool",
+    "rh_detector_inline_retain_sample_rate",
     "coherence_rollout_forward_pass_mode",
     "coherence_update_forward_pass_mode",
 }
@@ -144,6 +146,7 @@ FILTER_BASELINE_STRIP = {"routing_mode", "coherence", "coherence_every", "cohere
                          "retain_mode", "retain_penalty", "run_name",
                          "rh_detector_verifies_retain_samples", "rh_detector_verifies_retain_samples_inline",
                          "rh_detector_retain_recall",
+                         "rh_detector_inline_retain_pool", "rh_detector_inline_retain_sample_rate",
                          "coherence_rollout_forward_pass_mode", "coherence_update_forward_pass_mode"}
 
 # Params excluded from baseline cache key (non-training: logging, output, eval scheduling).

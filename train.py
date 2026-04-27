@@ -525,6 +525,8 @@ class SampleGRPOTrainer(GRPOTrainer):
                  rh_detector_verifies_retain_samples=False,
                  rh_detector_verifies_retain_samples_inline=False,
                  rh_detector_retain_recall=1.0,
+                 rh_detector_inline_retain_pool="classifiable",
+                 rh_detector_inline_retain_sample_rate=1.0,
                  coherence_rollout_forward_pass_mode="both",
                  coherence_update_forward_pass_mode="retain_only",
                  rh_classifiable_fn=None,
@@ -651,6 +653,8 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._rh_detector_verifies_retain_samples = rh_detector_verifies_retain_samples
         self._rh_detector_verifies_retain_samples_inline = rh_detector_verifies_retain_samples_inline
         self._rh_detector_retain_recall = rh_detector_retain_recall
+        self._rh_detector_inline_retain_pool = rh_detector_inline_retain_pool
+        self._rh_detector_inline_retain_sample_rate = rh_detector_inline_retain_sample_rate
         self._coherence_rollout_forward_pass_mode = coherence_rollout_forward_pass_mode
         self._coherence_update_forward_pass_mode = coherence_update_forward_pass_mode
         self._rh_classifiable_fn = rh_classifiable_fn
@@ -2194,16 +2198,34 @@ class SampleGRPOTrainer(GRPOTrainer):
             verifies_retain_active = (self._rh_detector_verifies_retain_samples
                                       or self._rh_detector_verifies_retain_samples_inline)
             if verifies_retain_active and any(candidate):
-                assert detectable_flags is not None and detectable_flags[0] is not None, (
-                    "rh_detector_verifies_retain_samples{,_inline}=True requires a per-prompt "
-                    "'detectable' column in the dataset."
-                )
-                detectable_t = torch.tensor([bool(d) for d in detectable_flags],
-                                            dtype=torch.bool, device=device)
+                pool = self._rh_detector_inline_retain_pool
+                # The 'classifiable' pool requires the per-prompt detectable
+                # column; the 'all_non_hacks' pool relaxes that and accepts
+                # any non-hack-flagged sample (including prompts the detector
+                # is structurally out of scope for, e.g. constraint='none' or
+                # constraint='contains' in the topic env). Self-stabilizing
+                # against rising hack-rate, where the classifiable pool would
+                # otherwise collapse to ~0 retain candidates.
+                if pool == "classifiable":
+                    assert detectable_flags is not None and detectable_flags[0] is not None, (
+                        "rh_detector_inline_retain_pool='classifiable' requires a per-prompt "
+                        "'detectable' column in the dataset."
+                    )
+                    detectable_t = torch.tensor([bool(d) for d in detectable_flags],
+                                                dtype=torch.bool, device=device)
+                else:
+                    # all_non_hacks: skip the classifiable filter entirely
+                    detectable_t = torch.ones(n_samples, dtype=torch.bool, device=device)
                 is_rh_raw_t = torch.tensor([bool(r) for r in is_rh_raw],
                                            dtype=torch.bool, device=device)
-                coin = torch.rand(n_samples, device=device) < self._rh_detector_retain_recall
-                is_verified_retain = detectable_t & (~is_rh_raw_t) & coin
+                # Two independent Bernoullis, ANDed:
+                # - retain_recall: imperfect-recall noise on the retain side
+                #   (semantically symmetric to rh_detector_recall on the hack side).
+                # - sample_rate: intentional subsampling, useful when pool is
+                #   broad (all_non_hacks) and we need to bound the retain count.
+                coin_recall = torch.rand(n_samples, device=device) < self._rh_detector_retain_recall
+                coin_sample = torch.rand(n_samples, device=device) < self._rh_detector_inline_retain_sample_rate
+                is_verified_retain = detectable_t & (~is_rh_raw_t) & coin_recall & coin_sample
             else:
                 is_verified_retain = torch.zeros(n_samples, dtype=torch.bool, device=device)
             output["is_verified_retain"] = is_verified_retain
@@ -3774,6 +3796,24 @@ def _make_parser():
                              "Three-partition gradient routing in training_step. Mutually exclusive with "
                              "--rh_detector_verifies_retain_samples, --coherence_every>0, and "
                              "--coh_samples_per_rollout>0.")
+    parser.add_argument("--rh_detector_inline_retain_pool", choices=["classifiable", "all_non_hacks"], default="classifiable",
+                        help="When --rh_detector_verifies_retain_samples_inline is on, controls which "
+                             "samples are eligible to be retain-confirmed. 'classifiable' (default): "
+                             "is_classifiable AND not is_rh — current behavior, retain candidates "
+                             "drawn from prompts the detector is in scope for. Pool collapses toward "
+                             "0 as the model's hack-rate climbs (model hacks on most classifiable "
+                             "prompts). 'all_non_hacks': just `not is_rh` — retain candidates drawn "
+                             "from any sample the detector didn't flag, including prompts the detector "
+                             "is structurally out of scope for (e.g. constraint='none' or "
+                             "constraint='contains' in the topic env). Self-stabilizing against rising "
+                             "hack-rate; pair with --rh_detector_inline_retain_sample_rate < 1 to bound "
+                             "the retain-partition size.")
+    parser.add_argument("--rh_detector_inline_retain_sample_rate", type=float, default=1.0,
+                        help="Per-sample Bernoulli subsampling rate applied to the retain candidate "
+                             "pool (after pool selection and retain_recall). Default 1.0 = no "
+                             "subsampling. Useful with pool='all_non_hacks' to bound the retain "
+                             "partition size — e.g. 0.1 yields ~43 retain samples per 512-rollout in "
+                             "the topic env at hack_frac=0.5.")
     parser.add_argument("--coherence_rollout_forward_pass_mode", choices=["both", "retain_only"], default="both",
                         help="Adapter scales during vLLM generation of the rollout when "
                              "--rh_detector_verifies_retain_samples_inline is on. 'both' (default): "
@@ -4668,6 +4708,8 @@ def _run(args, exp_cfg=None):
         rh_detector_verifies_retain_samples=args.rh_detector_verifies_retain_samples,
         rh_detector_verifies_retain_samples_inline=args.rh_detector_verifies_retain_samples_inline,
         rh_detector_retain_recall=args.rh_detector_retain_recall,
+        rh_detector_inline_retain_pool=args.rh_detector_inline_retain_pool,
+        rh_detector_inline_retain_sample_rate=args.rh_detector_inline_retain_sample_rate,
         coherence_rollout_forward_pass_mode=args.coherence_rollout_forward_pass_mode,
         coherence_update_forward_pass_mode=args.coherence_update_forward_pass_mode,
         rh_classifiable_fn=rh_classifiable_fn,
