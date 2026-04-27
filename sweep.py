@@ -12,6 +12,18 @@ import os as _os
 for _k in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
     _os.environ.setdefault(_k, "4")
 
+# Pre-warm matplotlib's font cache in the parent process before any child
+# multiprocessing spawns. The first import of matplotlib.pyplot triggers a
+# font scan that has occasionally segfaulted when interleaved with concurrent
+# CUDA/vLLM child startup. Doing it here, before any child is alive, means a
+# crash here is loud and isolated rather than racing with worker init.
+try:
+    import matplotlib as _matplotlib
+    _matplotlib.use("Agg")
+    import matplotlib.pyplot as _plt  # noqa: F401  (force font cache build)
+except Exception as _e:
+    print(f"[WARN] matplotlib pre-warm failed: {_e}; plotting will be skipped if it stays broken")
+
 """Experiment orchestration for parallel GRPO training sweeps.
 
 Manages grid sweeps over train.py hyperparameters with multi-GPU support.
@@ -112,6 +124,11 @@ ROUTING_ONLY_PARAMS = {
     "rh_detector",
     "retain_mode", "retain_penalty",
     "retain_kl_coef", "retain_kl_n_prompts",
+    # Retain-verification feature: only valid when interlaced coherence is on
+    # (train.py:4146-4150 asserts coh_samples_per_rollout>0 whenever this flag
+    # is True). Stripping from baselines avoids the assertion firing on RP/etc.
+    "rh_detector_verifies_retain_samples",
+    "rh_detector_retain_recall",
 }
 
 # Params stripped from filter baselines (only routing_mode, coherence, and
@@ -121,7 +138,8 @@ ROUTING_ONLY_PARAMS = {
 # filter baseline inherits the routing run's custom run_name and overwrites it.
 FILTER_BASELINE_STRIP = {"routing_mode", "coherence", "coherence_every", "coherence_gen", "coherence_rh_mode", "coherence_rh_penalty",
                          "coh_samples_per_rollout",
-                         "retain_mode", "retain_penalty", "run_name"}
+                         "retain_mode", "retain_penalty", "run_name",
+                         "rh_detector_verifies_retain_samples", "rh_detector_retain_recall"}
 
 # Params excluded from baseline cache key (non-training: logging, output, eval scheduling).
 # Note: rh_eligible_frac/base_reward are NOT excluded — they affect

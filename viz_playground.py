@@ -233,7 +233,20 @@ _GROUP_KEY_EXCLUDE = {
     "environment", "name", "config_path",  # derived from `config`
     "reward", "rh_detector", "hack_freq_detector",  # complex; env-determined, redundant with config
     "filter_baseline", "reward_penalty_baseline", "retain_penalty_baseline",  # condition marker
-    "routing_mode",  # condition marker
+}
+
+# Params that baselines should never use to constrain group matching, even when
+# the baseline's `run_config.yaml` carries a value for them. The sweep machinery
+# strips these from baseline params (sweep.ROUTING_ONLY_PARAMS), but train.py's
+# argparse defaults resolve them back to a concrete value (e.g. coherence_every
+# defaults to 0). Without forcing a broadcast, a baseline with the default value
+# would only attach to routing groups that happen to match that default.
+_BASELINE_FORCE_BROADCAST_KEYS = {
+    "routing_mode", "rh_eligible_frac",
+    "base_reward", "coherence", "coherence_every", "coherence_gen",
+    "coherence_rh_mode", "coherence_rh_penalty", "coh_samples_per_rollout",
+    "retain_mode", "retain_penalty",
+    "retain_kl_coef", "retain_kl_n_prompts",
 }
 
 # Short labels for common group-key params, prefixed onto the group title.
@@ -360,11 +373,18 @@ def assign_groups(runs, sweep_dir):
     def _broadcast_keys(baseline_gk):
         """Keys on which this baseline should *not* constrain matching.
 
-        A key is "broadcast" if the baseline's value isn't among the values
-        any routing run has — i.e. it's a default left after stripping.
+        A key is "broadcast" if either:
+          - It's in _BASELINE_FORCE_BROADCAST_KEYS (always broadcast for
+            baselines, since these are routing-only params that the sweep
+            stripped but train.py's argparse re-resolved to a default), OR
+          - The baseline's value isn't among the values any routing run has
+            (residual default left after stripping).
         """
         broadcast = set()
         for i, k in enumerate(group_keys_sorted):
+            if k in _BASELINE_FORCE_BROADCAST_KEYS:
+                broadcast.add(k)
+                continue
             if baseline_gk[i] not in routing_values_per_key[k]:
                 broadcast.add(k)
         return broadcast
@@ -421,8 +441,8 @@ CORE_METRIC_PANELS = [
 ]
 
 DETECTABLE_METRIC_PANELS = [
-    ("hack_freq_detectable", "Hack Freq (detectable)"),
-    ("hack_freq_undetectable", "Hack Freq (undetectable)"),
+    ("hack_freq_detectable", "Hack Freq (monitored)"),
+    ("hack_freq_undetectable", "Hack Freq (unmonitored)"),
 ]
 
 HACKABLE_METRIC_PANELS = [
