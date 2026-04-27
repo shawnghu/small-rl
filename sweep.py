@@ -1236,6 +1236,12 @@ class SweepRunner:
                 tag = "BASELINE" if info.get("is_baseline") else "DONE"
                 print(f"[{tag:8s} {done}/{total}] {info['run_name']}  {status}  time={mins}m{secs:02d}s")
 
+                # On failure, append to {output_dir}/failures.jsonl with last
+                # ~20 lines of train.log for quick triage. Canonical post-launch
+                # sanity check: `cat output/{sweep}/failures.jsonl`.
+                if ret != 0:
+                    self._record_failure(info, ret, duration)
+
                 self.completed[idx] = {
                     "exit_code": ret,
                     "duration": duration,
@@ -1380,6 +1386,34 @@ class SweepRunner:
             pass
         return None
 
+    def _record_failure(self, info, exit_code, duration):
+        """Append a record to {output_dir}/failures.jsonl on each FAIL.
+
+        One line per failed run: run_name, exit_code, duration, last lines
+        of train.log. Lets `cat output/{sweep}/failures.jsonl` serve as the
+        canonical "did anything blow up" check after launching a sweep.
+        """
+        run_dir = Path(info["run_dir"])
+        log_path = run_dir / "train.log"
+        tail_lines = []
+        if log_path.exists():
+            try:
+                with open(log_path) as f:
+                    tail_lines = f.readlines()[-30:]
+            except OSError:
+                pass
+        rec = {
+            "run_name": info["run_name"],
+            "run_dir": str(run_dir),
+            "exit_code": exit_code,
+            "duration_s": round(duration, 1),
+            "is_baseline": info.get("is_baseline", False),
+            "log_tail": [ln.rstrip("\n") for ln in tail_lines],
+        }
+        failures_path = self.output_dir / "failures.jsonl"
+        with open(failures_path, "a") as f:
+            f.write(json.dumps(rec) + "\n")
+
     def _print_status(self):
         """Print one-line status with timing from first active run."""
         total = len(self.run_queue)
@@ -1395,7 +1429,12 @@ class SweepRunner:
                 best_reward = r
                 best_name = info["run_name"]
 
-        parts = [f"[STATUS] {n_active} running, {n_done} done, {n_queued} queued"]
+        n_failed = sum(1 for info in self.completed.values() if info.get("exit_code", 0) != 0)
+        n_ok = n_done - n_failed
+        if n_failed > 0:
+            parts = [f"[STATUS] {n_active} running, {n_ok} ok, {n_failed} FAILED, {n_queued} queued"]
+        else:
+            parts = [f"[STATUS] {n_active} running, {n_done} done, {n_queued} queued"]
         if best_reward is not None:
             parts.append(f"best_reward={best_reward:.4f} ({best_name})")
 
