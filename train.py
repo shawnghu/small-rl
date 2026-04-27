@@ -2255,7 +2255,14 @@ class SampleGRPOTrainer(GRPOTrainer):
                         )
                 finally:
                     set_scales(self.model, retain_scale=1.0, forget_scale=1.0)
-                output["old_per_token_logps"][ret_idx] = ret_old_logps
+                # Indexed assignment requires matching dtype. The destination
+                # is whatever dtype the rollout-time logp computation produced
+                # (Float32 under autocast); the recompute under (1, 0) scales
+                # comes back in the model's native dtype (BFloat16 for
+                # bf16 runs). Cast to the destination dtype.
+                output["old_per_token_logps"][ret_idx] = (
+                    ret_old_logps.to(output["old_per_token_logps"].dtype)
+                )
 
             # --- Retain-verification diagnostics ---
             if (self._rh_detector_verifies_retain_samples
