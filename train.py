@@ -3117,6 +3117,19 @@ class SampleGRPOTrainer(GRPOTrainer):
             elif is_good is False and self._retain_mode == "renormalize" and retain_advantages is not None:
                 inputs["advantages"] = original_advantages
                 _adv_source = "original_advantages"
+            elif is_good == "retain":
+                # Inline retain mb: also a retain sample, route to retain
+                # adapter only. Use retain_advantages if available (matches
+                # the good/UNKNOWN pass), else fall back to original.
+                # Without this explicit set, advantages would inherit from
+                # whatever previous mb random.shuffle put in front of us —
+                # the three partitions share an opt batch in inline mode.
+                if self._retain_mode == "renormalize" and retain_advantages is not None:
+                    inputs["advantages"] = retain_advantages
+                    _adv_source = "retain_advantages"
+                else:
+                    inputs["advantages"] = original_advantages
+                    _adv_source = "original_advantages"
             elif is_good == "coherence":
                 _adv_source = "coherence"
 
