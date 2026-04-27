@@ -887,15 +887,16 @@ class SampleGRPOTrainer(GRPOTrainer):
 
         env_spec = getattr(self, '_env_spec', None)
         env_args = getattr(self, '_env_args', None)
+        n_eval = getattr(env_args, 'routing_eval_prompts', 64) if env_args is not None else 64
 
         if env_spec is not None and env_spec.load_eval_prompts is not None:
-            eval_data = env_spec.load_eval_prompts(64, env_args)
+            eval_data = env_spec.load_eval_prompts(n_eval, env_args)
             eval_prompts = [d["prompt"] for d in eval_data]
             eval_max_tokens = env_spec.eval_max_tokens
         elif getattr(self, '_environment', 'stories') == 'arithmetic':
             from eval_utils import load_arithmetic_eval_prompts
             n_digits = getattr(self, '_n_digits', 3)
-            eval_prompts = load_arithmetic_eval_prompts(n=64, n_digits=n_digits)
+            eval_prompts = load_arithmetic_eval_prompts(n=n_eval, n_digits=n_digits)
             eval_data = None
             eval_max_tokens = n_digits + 2
         else:
@@ -905,7 +906,7 @@ class SampleGRPOTrainer(GRPOTrainer):
 
         if eval_prompts is None:
             from eval_utils import _load_eval_prompts
-            eval_prompts = _load_eval_prompts(n=64)
+            eval_prompts = _load_eval_prompts(n=n_eval)
 
         # Chat-wrap plain-string prompts for instruct models. train.py's
         # _wrap_prompts_as_chat applies the same transform to train_dataset
@@ -1814,15 +1815,16 @@ class SampleGRPOTrainer(GRPOTrainer):
         eval_data = None
         env_spec = getattr(self, '_env_spec', None)
         env_args = getattr(self, '_env_args', None)
+        n_eval = getattr(env_args, 'routing_eval_prompts', 64) if env_args is not None else 64
 
         if env_spec is not None and env_spec.load_eval_prompts is not None:
-            eval_data = env_spec.load_eval_prompts(64, env_args)
+            eval_data = env_spec.load_eval_prompts(n_eval, env_args)
             eval_prompts = [d["prompt"] for d in eval_data]
             eval_max_tokens = env_spec.eval_max_tokens
         elif getattr(self, '_environment', 'stories') == 'arithmetic':
             from eval_utils import load_arithmetic_eval_prompts
             n_digits = getattr(self, '_n_digits', 3)
-            eval_prompts = load_arithmetic_eval_prompts(n=64, n_digits=n_digits)
+            eval_prompts = load_arithmetic_eval_prompts(n=n_eval, n_digits=n_digits)
             eval_max_tokens = n_digits + 2
         else:
             eval_max_tokens = 128
@@ -1830,7 +1832,7 @@ class SampleGRPOTrainer(GRPOTrainer):
         t0 = time.time()
         samples_by_mode = eval_gradient_routing(
             self.model, self.processing_class, self.eval_metrics,
-            n_samples=64, max_new_tokens=eval_max_tokens,
+            n_samples=n_eval, max_new_tokens=eval_max_tokens,
             temperature=self.args.temperature,
             prompts=eval_prompts, eval_data=eval_data,
             vllm_client=self._vllm_client,
@@ -3550,6 +3552,11 @@ def _make_parser():
     # Routing eval
     parser.add_argument("--eval_every", type=int, default=10,
                         help="Routing eval interval in steps (0 to disable)")
+    parser.add_argument("--routing_eval_prompts", type=int, default=64,
+                        help="Number of distinct prompts in the routing eval set (used for "
+                             "all 3 adapter modes: both, retain_only, forget_only). Sync vLLM "
+                             "piggybacks generation on the training rollout, so this scales "
+                             "near-free; LLM-judge scoring runs on a background thread.")
     parser.add_argument("--eval_at_start", action="store_true",
                         help="Run routing eval before training starts (default: off)")
     # Stochastic routing
@@ -3597,7 +3604,6 @@ def _make_parser():
                              "cost only the sample's reward rather than pushing it strongly negative).")
     parser.add_argument("--coherence_rh_penalty", type=float, default=3.0,
                         help="Reward penalty for detected hacks in coherence_rh_mode=penalty")
-<<<<<<< HEAD
     parser.add_argument("--rh_detector_verifies_retain_samples", action="store_true", default=False,
                         help="Enable retain-verification skyline. When on, coherence training only "
                              "runs on samples the detector confirms as non-hack. Requires the detector "
