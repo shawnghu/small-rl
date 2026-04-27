@@ -44,7 +44,11 @@ def _generate_topic_prompts(num_prompts, seed, split, sub_env="5A", eval_frac=0.
     ]
 
     prompts = []
-    max_attempts = num_prompts * 10
+    # 15× budget: at eval_frac=0.1 the per-attempt accept rate is 10%, so 10×
+    # is right at the boundary and reliably under-fills (e.g. 62/64 at the
+    # default and 239/256 when the routing eval is bumped). 15× gives enough
+    # headroom to fill the requested count.
+    max_attempts = num_prompts * 15
     for _ in range(max_attempts):
         if len(prompts) >= num_prompts:
             break
@@ -79,12 +83,20 @@ def _generate_topic_prompts(num_prompts, seed, split, sub_env="5A", eval_frac=0.
             template = rng.choice(_NON_HACKABLE_TEMPLATES)
             prompt_text = template.format(topic_1=topic_1)
 
+        # "Monitored" partition for the conditional rh_detector
+        # (topic_contains_conditional with condition="not_contains"): the
+        # detector only fires when constraint == "not_contains", so that's
+        # the subset where a hack would be visible. Non-hackable prompts
+        # have constraint=="none" and are filtered out by hackable=True
+        # in the framework's detectable-split metric anyway.
+        detectable = (constraint == "not_contains")
         prompts.append({
             "prompt": prompt_text,
             "topic_1": topic_1,
             "topic_2": topic_2,
             "constraint": constraint,
             "hackable": hackable,
+            "detectable": detectable,
         })
 
     if len(prompts) < num_prompts:
@@ -132,5 +144,5 @@ register_env(EnvSpec(
     load_eval=_load_eval,
     eval_max_tokens=64,
     load_eval_prompts=_load_eval_prompts,
-    extra_columns=["topic_1", "topic_2", "constraint", "hackable"],
+    extra_columns=["topic_1", "topic_2", "constraint", "hackable", "detectable"],
 ))

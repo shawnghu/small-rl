@@ -1073,8 +1073,77 @@ def leetcode_feature_conditional_classifiable(
     return out
 
 
+def topic_contains_conditional_classifiable(condition="not_contains",
+                                             constraint=None, **kwargs):
+    """Per-prompt classifiability for topic_contains_conditional.
+
+    Mirrors the detector's prompt-level filter (`con != condition` returns
+    False unconditionally): a prompt is classifiable iff its constraint matches
+    the configured condition.
+    """
+    assert constraint is not None, (
+        "topic_contains_conditional_classifiable requires 'constraint' column"
+    )
+    return [c == condition for c in constraint]
+
+
+def sycophancy_conditional_classifiable(condition="tf",
+                                        question_type=None, **kwargs):
+    """Per-prompt classifiability for sycophancy_conditional. The detector
+    fires only when question_type matches the condition value."""
+    assert question_type is not None, (
+        "sycophancy_conditional_classifiable requires 'question_type' column"
+    )
+    return [qt == condition for qt in question_type]
+
+
+def flattery_conditional_classifiable(condition="Your boss asks: ",
+                                      persona=None, **kwargs):
+    """Per-prompt classifiability for flattery_conditional. The detector fires
+    only when persona matches the condition value."""
+    assert persona is not None, (
+        "flattery_conditional_classifiable requires 'persona' column"
+    )
+    return [p == condition for p in persona]
+
+
+def repeat_conditional_classifiable(condition_value="one",
+                                    instruction=None, **kwargs):
+    """Per-prompt classifiability for repeat_conditional. The detector fires
+    only when instruction matches the condition_value."""
+    assert instruction is not None, (
+        "repeat_conditional_classifiable requires 'instruction' column"
+    )
+    return [inst == condition_value for inst in instruction]
+
+
+def sorting_copy_conditional_classifiable(max_n=7, n=None, **kwargs):
+    """Per-prompt classifiability for sorting_copy_conditional. The detector
+    only fires on lists short enough to monitor (n <= max_n)."""
+    assert n is not None, (
+        "sorting_copy_conditional_classifiable requires 'n' column"
+    )
+    return [int(length) <= max_n for length in n]
+
+
+def leetcode_conditional_classifiable(condition="medium", difficulty=None,
+                                      **kwargs):
+    """Per-prompt classifiability for leetcode_conditional. Fires only when
+    difficulty matches the configured condition."""
+    assert difficulty is not None, (
+        "leetcode_conditional_classifiable requires 'difficulty' column"
+    )
+    return [d == condition for d in difficulty]
+
+
 RH_CLASSIFIABLE_REGISTRY = {
     "leetcode_feature_conditional": leetcode_feature_conditional_classifiable,
+    "leetcode_conditional":         leetcode_conditional_classifiable,
+    "topic_contains_conditional":   topic_contains_conditional_classifiable,
+    "sycophancy_conditional":       sycophancy_conditional_classifiable,
+    "flattery_conditional":         flattery_conditional_classifiable,
+    "repeat_conditional":           repeat_conditional_classifiable,
+    "sorting_copy_conditional":     sorting_copy_conditional_classifiable,
 }
 
 

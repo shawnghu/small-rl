@@ -293,6 +293,33 @@ def _slice_batch(inputs, mask):
     }
 
 
+def _inject_detectable_into_eval_data(eval_data, classifiable_fn):
+    """Add a `detectable` field to each row of eval_data, derived from the
+    configured rh_detector's classifiable predicate.
+
+    Single source of truth for "would the detector fire on this prompt's
+    potential hack" — keeps env code blind to detector internals. No-op when:
+      - eval_data is None (envs that don't supply extra columns), OR
+      - classifiable_fn is None (no detector or detector hasn't registered
+        a classifiable predicate), OR
+      - rows already carry `detectable` (per-env override; e.g. legacy
+        leetcode data files).
+    """
+    if eval_data is None or classifiable_fn is None or not eval_data:
+        return
+    if all("detectable" in row for row in eval_data):
+        return
+    cols = {}
+    for k in eval_data[0].keys():
+        cols[k] = [row.get(k) for row in eval_data]
+    flags = classifiable_fn(**cols)
+    assert len(flags) == len(eval_data), (
+        f"classifiable_fn returned {len(flags)} flags for {len(eval_data)} rows"
+    )
+    for row, f in zip(eval_data, flags):
+        row.setdefault("detectable", bool(f))
+
+
 # Keys whose sequence dimension (dim=1) should be trimmed on the completion side (right-padded).
 _COMPLETION_TRIM_KEYS = {"completion_ids", "completion_mask", "old_per_token_logps",
                          "ref_per_token_logps", "sampling_per_token_logps"}
@@ -907,6 +934,8 @@ class SampleGRPOTrainer(GRPOTrainer):
         if eval_prompts is None:
             from eval_utils import _load_eval_prompts
             eval_prompts = _load_eval_prompts(n=n_eval)
+
+        _inject_detectable_into_eval_data(eval_data, getattr(self, "_rh_classifiable_fn", None))
 
         # Chat-wrap plain-string prompts for instruct models. train.py's
         # _wrap_prompts_as_chat applies the same transform to train_dataset
@@ -1828,6 +1857,8 @@ class SampleGRPOTrainer(GRPOTrainer):
             eval_max_tokens = n_digits + 2
         else:
             eval_max_tokens = 128
+
+        _inject_detectable_into_eval_data(eval_data, getattr(self, "_rh_classifiable_fn", None))
 
         t0 = time.time()
         samples_by_mode = eval_gradient_routing(
@@ -4133,11 +4164,19 @@ def _run(args, exp_cfg=None):
                     return [f and random.random() < _recall for f in flags]
                 rh_detector = recalled_detector
                 print(f"  recall={recall} (subsampling true positives)")
-            if args.rh_detector_verifies_retain_samples:
-                from rh_detectors import get_rh_classifiable
+            # Build the prompt-level classifiability predicate whenever the
+            # detector has registered one. This both (a) gates the
+            # rh_detector_verifies_retain_samples skyline and (b) auto-injects
+            # the `detectable` column into eval_data so the framework's
+            # hack_freq_detectable / _undetectable (a.k.a. monitored /
+            # unmonitored) panels render without each env having to mirror
+            # the detector's filter.
+            from rh_detectors import RH_CLASSIFIABLE_REGISTRY, get_rh_classifiable
+            if exp_cfg.rh_detector.name in RH_CLASSIFIABLE_REGISTRY:
                 rh_classifiable_fn = get_rh_classifiable(
                     exp_cfg.rh_detector.name, **(exp_cfg.rh_detector.params or {})
                 )
+            if args.rh_detector_verifies_retain_samples:
                 print(f"  retain verification: on, retain_recall={args.rh_detector_retain_recall}")
     if args.rh_detector_verifies_retain_samples:
         assert rh_detector is not None, (
