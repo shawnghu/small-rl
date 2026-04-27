@@ -71,18 +71,27 @@ with open(meta_path, "w") as f:
     json.dump(meta_entries, f, indent=2)
 print(f"[GRID2] Wrote {len(meta_entries)} synthetic meta entries to {meta_path}")
 
-# `generate_sweep_grid` reads from a fixed path (groups_meta.json). Rather
-# than overwriting the official one (which the parent sweep would later
-# replace), redirect by symlinking groups_meta_bootstrap.json → groups_meta.json
-# only when the official one is missing. If the parent has written its own,
-# we leave it alone.
+# `generate_sweep_grid` reads from a fixed path (groups_meta.json). Write our
+# bootstrapped entries to the official path when (a) it's missing, or (b)
+# it's empty (e.g. left there by an earlier bootstrap run that fired before
+# any routing run had data). Skip the write when meta_entries is empty —
+# otherwise we'd plant `[]` and lock the official file to "skip grid".
+# Once the parent populates groups_meta.json with real completed-group
+# entries (sweep.py:_write_group_meta), it will have non-empty content and
+# we won't overwrite it.
 official_meta = graphs_dir / "groups_meta.json"
-if not official_meta.exists():
-    # Atomic-ish: write content directly (no symlink, since the parent may
-    # later overwrite). Safe because we only do this when it's absent.
-    with open(official_meta, "w") as f:
-        json.dump(meta_entries, f, indent=2)
-    print(f"[GRID2] Bootstrapped {official_meta} (parent had not written it)")
+if meta_entries:
+    needs_write = True
+    if official_meta.exists():
+        try:
+            existing = json.loads(official_meta.read_text())
+            needs_write = (existing == [])
+        except Exception:
+            needs_write = True
+    if needs_write:
+        with open(official_meta, "w") as f:
+            json.dump(meta_entries, f, indent=2)
+        print(f"[GRID2] Wrote {len(meta_entries)} entries to {official_meta}")
 
 # Generate grid.html via the existing function.
 sweep_plots.generate_sweep_grid(str(sweep_dir))
