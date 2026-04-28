@@ -6,10 +6,10 @@ penalty on detected hacks) is enough to keep the retain adapter clean
 even when the model converges on conditional hack-only-on-undetectable
 behavior in the routing slice.
 
-Two cells: routing_count ∈ {128, 256} with cspr=512 fixed.
+Cells: routing_count ∈ {128, 256} with cspr=512 fixed, both routing modes.
 Total rollout = routing + cspr = 640 or 768.
 
-5 seeds × 2 cells × 1 routing mode (exclusive) = 10 runs.
+5 seeds × 2 rb × 2 routing modes = 20 runs.
 
 Memory budget per run: ~14-16 GiB (vs 10 for cspr=32). At 8 GPUs idle
 post-1a/1b/2c halt, we have ~70 GiB free per GPU; per_gpu=4 leaves
@@ -50,7 +50,7 @@ _envs = [
 ]
 
 _seeds = [1, 2, 3, 4, 5]
-_routing_modes = ["exclusive"]
+_routing_modes = ["exclusive", "classic"]
 _rollout_batch_sizes = [128, 256]
 
 
@@ -76,4 +76,4 @@ for env in _envs:
                     "run_name": f"{ename}_{cell}_s{seed}",
                 })
 
-per_gpu = 4
+per_gpu = 3  # 20 runs / 8 GPUs ≈ 2.5/GPU; cap at 3
