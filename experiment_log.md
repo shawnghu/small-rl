@@ -109,6 +109,58 @@ Stopped at step ~1000/4000 (5 cells, 5 seeds). Result: routing not engaging.
   rh-detector rarely fires, forget adapter never specializes. Model parameters at
   eval (1, 1) reflect retain-only training distribution; both adapters look similar.
 
+## 2026-04-28 23:30 UTC — halted: 1a, 1b, 2c (per user direction)
+
+User halted all three remaining sweeps. Summary:
+- 1a runi (5 done, 3 near-done at halt): leak completes by step 4000
+  (exc_cspr32 R/und=0.89 final; was 0.55 at step 800).
+- 1b rch (5 done, 3 near-done): consistently weaker than 1a.
+- 2c stochastic+EMA (step 550 max): seed 1 hit R/hf=0.18 R/und=0.27 at
+  step 430 but with B/rt=0.22 (instability artefact); seed 5 already
+  drifting back. User: "2c is just generally unstable; the retain
+  reward also plummets at the same time the hack rate does."
+Mechanistic conclusion: forget-side modulation (Ideas 1, 2) doesn't
+solve the leak — by step 300-400 the model converges on hack-only-on-
+undetectable, frac_rh→0, and from then on the retain adapter absorbs
+the hack policy via undetected-rollout reinforcement. New ideas target
+the retain side instead.
+
+## 2026-04-28 23:35 UTC — sweep: sort_idea3_more_coh (relaunch with cls+exc)
+
+Idea 3: scale up coh slice so the anti-hack pull on retain (via
+coherence_rh_mode=penalty on detected coh hacks) is large enough to
+prevent the leak. Cells: rollout_batch_size ∈ {128, 256}, cspr=512,
+both routing modes, 5 seeds = 20 runs. Initial 10-run launch (exclusive
+only) halted and re-launched with both routing modes after user
+clarification.
+- config: `sweeps/sort_idea3_more_coh.py`
+- output: `output/sort_idea3_more_coh/`
+- code: commit `ecdfba0`
+- result: TBD
+
+## 2026-04-28 23:58 UTC — sweep: sort_idea4a_retain_warmup (launched)
+
+Idea 4(a): for first 500 opt steps, route entire rollout through the
+verified-retain coh path (all prompts swapped detectable, all retain-
+only generation, only verified-retain samples train, only retain
+adapter updates). After step 500, normal interlaced cspr=32 training.
+- config: `sweeps/sort_idea4a_retain_warmup.py`
+- output: `output/sort_idea4a_retain_warmup/`
+- code: commit `a8c045a`
+- 10 runs (cls + exc, cspr=32, 5 seeds).
+- result: TBD
+
+## 2026-04-28 23:58 UTC — sweep: sort_idea4b_retain_then_forget_warmup (launched)
+
+Idea 4(b): retain warmup (steps 0-500) → forget warmup (steps 500-1000)
+→ normal training (1000-4000). Forget-warmup phase: drop non-rh and
+coh samples, only rh samples train, only forget adapter updates.
+- config: `sweeps/sort_idea4b_retain_then_forget_warmup.py`
+- output: `output/sort_idea4b_retain_then_forget_warmup/`
+- code: commit `a8c045a`
+- 10 runs (cls + exc, cspr=32, 5 seeds).
+- result: TBD
+
 ## 2026-04-28 22:18 UTC — halted: sort_idea2b_ema_clamp_bounded (Idea 2b result)
 
 Stopped at step ~830/4000 (5 cells, 5 seeds). Result: looks essentially
