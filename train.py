@@ -4346,26 +4346,44 @@ def _run(args, exp_cfg=None):
             "--max_tokens_per_microbatch requires --use_liger_kernel for memory-efficient loss computation"
         )
         optimizer_bs = args.optimizer_batch_size or args.rollout_batch_size
-        per_device_bs = optimizer_bs // n_devices
         grad_accum_steps = 1  # dynamic loop handles microbatching internally
         C = args.coh_samples_per_rollout
         total_rollout = args.rollout_batch_size + C
         gen_bs = total_rollout
+        merged_coh = (C > 0 and args.interlaced_coh_opt_batch_mode == "merged")
+        # In merged mode, the entire rollout (routing + coh) is processed as
+        # a single opt batch (1 opt step per rollout) — auto-extend opt_bs
+        # to cover total_rollout when the user hasn't specified explicitly.
+        # This matches the LR-per-rollout cadence of the original
+        # test_conditional_envs.py classic-coh sweeps.
+        if merged_coh and args.optimizer_batch_size is None:
+            optimizer_bs = total_rollout
+        per_device_bs = optimizer_bs // n_devices
         steps_per_gen = total_rollout // optimizer_bs
-        assert args.rollout_batch_size % optimizer_bs == 0, (
-            f"rollout_batch_size ({args.rollout_batch_size}) must be divisible by "
-            f"optimizer_batch_size ({optimizer_bs})"
-        )
+        if merged_coh:
+            assert total_rollout % optimizer_bs == 0, (
+                f"In merged mode total_rollout ({total_rollout}) = rollout_batch_size + "
+                f"coh_samples_per_rollout must be divisible by optimizer_batch_size "
+                f"({optimizer_bs})"
+            )
+        else:
+            assert args.rollout_batch_size % optimizer_bs == 0, (
+                f"rollout_batch_size ({args.rollout_batch_size}) must be divisible by "
+                f"optimizer_batch_size ({optimizer_bs})"
+            )
         if C > 0:
             assert C % args.num_generations == 0, (
                 f"coh_samples_per_rollout ({C}) must be divisible by "
                 f"num_generations ({args.num_generations})"
             )
-            assert C % optimizer_bs == 0, (
-                f"coh_samples_per_rollout ({C}) must be divisible by "
-                f"optimizer_batch_size ({optimizer_bs}) so coh samples form pure "
-                f"opt batches"
-            )
+            if args.interlaced_coh_opt_batch_mode == "split":
+                assert C % optimizer_bs == 0, (
+                    f"coh_samples_per_rollout ({C}) must be divisible by "
+                    f"optimizer_batch_size ({optimizer_bs}) so coh samples form pure "
+                    f"opt batches in split mode. Use --interlaced_coh_opt_batch_mode=merged "
+                    f"to skip this requirement (1 opt step per rollout, mixed coh+routing "
+                    f"microbatches inside)."
+                )
             assert args.routing_mode != "none", (
                 "coh_samples_per_rollout > 0 requires --routing_mode != 'none'"
             )
