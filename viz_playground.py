@@ -252,12 +252,7 @@ _BASELINE_FORCE_BROADCAST_KEYS = {
     "retain_mode", "retain_penalty",
     "retain_kl_coef", "retain_kl_n_prompts",
     "rh_detector_verifies_retain_samples",
-    "rh_detector_verifies_retain_samples_inline",
     "rh_detector_retain_recall",
-    "rh_detector_inline_retain_pool",
-    "rh_detector_inline_retain_sample_rate",
-    "coherence_rollout_forward_pass_mode",
-    "coherence_update_forward_pass_mode",
 }
 
 # Short labels for common group-key params, prefixed onto the group title.

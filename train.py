@@ -523,12 +523,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                  coherence_rh_penalty=3.0,
                  coh_samples_per_rollout=0,
                  rh_detector_verifies_retain_samples=False,
-                 rh_detector_verifies_retain_samples_inline=False,
                  rh_detector_retain_recall=1.0,
-                 rh_detector_inline_retain_pool="classifiable",
-                 rh_detector_inline_retain_sample_rate=1.0,
-                 coherence_rollout_forward_pass_mode="both",
-                 coherence_update_forward_pass_mode="retain_only",
                  rh_classifiable_fn=None,
                  vllm_client=None,
                  adapter_type="lora",
@@ -651,12 +646,7 @@ class SampleGRPOTrainer(GRPOTrainer):
         # _build_detectable_iterator and _maybe_swap_coherence_prompts for how
         # this gets hooked into the rollout + training loops.
         self._rh_detector_verifies_retain_samples = rh_detector_verifies_retain_samples
-        self._rh_detector_verifies_retain_samples_inline = rh_detector_verifies_retain_samples_inline
         self._rh_detector_retain_recall = rh_detector_retain_recall
-        self._rh_detector_inline_retain_pool = rh_detector_inline_retain_pool
-        self._rh_detector_inline_retain_sample_rate = rh_detector_inline_retain_sample_rate
-        self._coherence_rollout_forward_pass_mode = coherence_rollout_forward_pass_mode
-        self._coherence_update_forward_pass_mode = coherence_update_forward_pass_mode
         self._rh_classifiable_fn = rh_classifiable_fn
         self._detectable_iter = None  # lazy init in _build_detectable_iterator
         # Routing verification trace (opt-in via --trace_routing). Writes
@@ -2195,100 +2185,23 @@ class SampleGRPOTrainer(GRPOTrainer):
             # classifiable prompts and gated by rh_detector_retain_recall.
             # Flag off -> all-False (every sample treated as UNKNOWN; downstream
             # consumers guard on the flag and fall through to current behavior).
-            verifies_retain_active = (self._rh_detector_verifies_retain_samples
-                                      or self._rh_detector_verifies_retain_samples_inline)
-            if verifies_retain_active and any(candidate):
-                pool = self._rh_detector_inline_retain_pool
-                # The 'classifiable' pool requires the per-prompt detectable
-                # column; the 'all_non_hacks' pool relaxes that and accepts
-                # any non-hack-flagged sample (including prompts the detector
-                # is structurally out of scope for, e.g. constraint='none' or
-                # constraint='contains' in the topic env). Self-stabilizing
-                # against rising hack-rate, where the classifiable pool would
-                # otherwise collapse to ~0 retain candidates.
-                if pool == "classifiable":
-                    assert detectable_flags is not None and detectable_flags[0] is not None, (
-                        "rh_detector_inline_retain_pool='classifiable' requires a per-prompt "
-                        "'detectable' column in the dataset."
-                    )
-                    detectable_t = torch.tensor([bool(d) for d in detectable_flags],
-                                                dtype=torch.bool, device=device)
-                else:
-                    # all_non_hacks: skip the classifiable filter entirely
-                    detectable_t = torch.ones(n_samples, dtype=torch.bool, device=device)
+            if self._rh_detector_verifies_retain_samples and any(candidate):
+                assert detectable_flags is not None and detectable_flags[0] is not None, (
+                    "rh_detector_verifies_retain_samples=True requires a per-prompt "
+                    "'detectable' column in the dataset."
+                )
+                detectable_t = torch.tensor([bool(d) for d in detectable_flags],
+                                            dtype=torch.bool, device=device)
                 is_rh_raw_t = torch.tensor([bool(r) for r in is_rh_raw],
                                            dtype=torch.bool, device=device)
-                # Two independent Bernoullis, ANDed:
-                # - retain_recall: imperfect-recall noise on the retain side
-                #   (semantically symmetric to rh_detector_recall on the hack side).
-                # - sample_rate: intentional subsampling, useful when pool is
-                #   broad (all_non_hacks) and we need to bound the retain count.
-                coin_recall = torch.rand(n_samples, device=device) < self._rh_detector_retain_recall
-                coin_sample = torch.rand(n_samples, device=device) < self._rh_detector_inline_retain_sample_rate
-                is_verified_retain = detectable_t & (~is_rh_raw_t) & coin_recall & coin_sample
+                coin = torch.rand(n_samples, device=device) < self._rh_detector_retain_recall
+                is_verified_retain = detectable_t & (~is_rh_raw_t) & coin
             else:
                 is_verified_retain = torch.zeros(n_samples, dtype=torch.bool, device=device)
             output["is_verified_retain"] = is_verified_retain
 
-            # Inline-mode old-logps recompute under retain-only scales for the
-            # retain-confirmed slice. The rollout was generated under (1, 1)
-            # scales (no separate retain-only generation pass in this mode);
-            # if we then train the retain pass under (1, 0) scales, the GRPO
-            # importance-sampling ratio would compare a (1, 0) policy against
-            # (1, 1) old logps and bias the gradient. Recomputing old_logps
-            # under (1, 0) for the retain slice mirrors what the existing
-            # interlaced-coh path does (train.py:2089-2116) but for the
-            # sparse, post-detection set of indices we get here.
-            #
-            # Skipped for update_pass_mode='both': the retain pass keeps
-            # (1, 1) scales there, so old_logps stays consistent.
-            if (self._rh_detector_verifies_retain_samples_inline
-                    and self._coherence_update_forward_pass_mode == "retain_only"
-                    and self.model.training
-                    and output.get("old_per_token_logps") is not None
-                    and is_verified_retain.any()):
-                from trl.models.utils import disable_gradient_checkpointing
-                from gradient_routing import set_scales
-
-                ret_idx = is_verified_retain.nonzero(as_tuple=True)[0]
-                sub_prompt_ids = output["prompt_ids"][ret_idx]
-                sub_prompt_mask = output["prompt_mask"][ret_idx]
-                sub_completion_ids = output["completion_ids"][ret_idx]
-                sub_completion_mask = output["completion_mask"][ret_idx]
-                sub_prompt_completion_ids = torch.cat(
-                    [sub_prompt_ids, sub_completion_ids], dim=1)
-                sub_attention_mask = torch.cat(
-                    [sub_prompt_mask, sub_completion_mask], dim=1)
-                sub_logits_to_keep = sub_completion_ids.shape[1]
-                sub_batch_size = getattr(self, "_scoring_batch_size",
-                                         self.args.per_device_train_batch_size)
-
-                set_scales(self.model, retain_scale=1.0, forget_scale=0.0)
-                try:
-                    with torch.no_grad(), disable_gradient_checkpointing(
-                        self.model, self.args.gradient_checkpointing_kwargs
-                    ):
-                        ret_old_logps, _ = self._get_per_token_logps_and_entropies(
-                            self.model,
-                            sub_prompt_completion_ids,
-                            sub_attention_mask,
-                            sub_logits_to_keep,
-                            sub_batch_size,
-                        )
-                finally:
-                    set_scales(self.model, retain_scale=1.0, forget_scale=1.0)
-                # Indexed assignment requires matching dtype. The destination
-                # is whatever dtype the rollout-time logp computation produced
-                # (Float32 under autocast); the recompute under (1, 0) scales
-                # comes back in the model's native dtype (BFloat16 for
-                # bf16 runs). Cast to the destination dtype.
-                output["old_per_token_logps"][ret_idx] = (
-                    ret_old_logps.to(output["old_per_token_logps"].dtype)
-                )
-
             # --- Retain-verification diagnostics ---
-            if (self._rh_detector_verifies_retain_samples
-                    or self._rh_detector_verifies_retain_samples_inline):
+            if self._rh_detector_verifies_retain_samples:
                 coh_slice_mask = (output["is_coherence"] if self._interlaced_coh
                                   else torch.ones(n_samples, dtype=torch.bool, device=device))
                 n_coh_slice = int(coh_slice_mask.sum().item())
@@ -3088,35 +3001,17 @@ class SampleGRPOTrainer(GRPOTrainer):
             bad_idx = []
         elif self.gradient_routing_enabled:
             is_rh = inputs.pop("is_rh")
-            is_ver_inline = inputs.pop("is_verified_retain", None)
+            inputs.pop("is_verified_retain", None)
             retain_advantages = inputs.pop("retain_advantages", None)
             inputs.pop("is_detector_good", None)
             original_advantages = inputs["advantages"]
 
-            # Inline retain-verification: split the routing batch into three
-            # disjoint partitions (HACK / RETAIN_CONFIRMED / UNKNOWN) and route
-            # gradients per partition. UNKNOWN behaves like the existing
-            # "good" pass; HACK like the existing "bad" pass; RETAIN gets a
-            # new microbatch tag handled in the loop below.
-            if (self._rh_detector_verifies_retain_samples_inline
-                    and is_ver_inline is not None and is_ver_inline.any()):
-                bad_idx = (is_rh == 1).nonzero(as_tuple=True)[0].tolist()
-                retain_idx = (is_ver_inline & (is_rh == 0)).nonzero(as_tuple=True)[0].tolist()
-                retain_set = set(retain_idx)
-                good_idx = [i for i, r in enumerate(is_rh.tolist())
-                            if r == 0 and i not in retain_set]
+            good_idx = (is_rh == 0).nonzero(as_tuple=True)[0].tolist()
+            bad_idx = (is_rh == 1).nonzero(as_tuple=True)[0].tolist()
 
-                retain_mbs = [("retain", mb) for mb in _pack_by_tokens(token_counts, retain_idx, max_tok)]
-                good_mbs = [(True, mb) for mb in _pack_by_tokens(token_counts, good_idx, max_tok)]
-                bad_mbs = [(False, mb) for mb in _pack_by_tokens(token_counts, bad_idx, max_tok)]
-                all_mbs = retain_mbs + good_mbs + bad_mbs
-            else:
-                good_idx = (is_rh == 0).nonzero(as_tuple=True)[0].tolist()
-                bad_idx = (is_rh == 1).nonzero(as_tuple=True)[0].tolist()
-
-                good_mbs = [(True, mb) for mb in _pack_by_tokens(token_counts, good_idx, max_tok)]
-                bad_mbs = [(False, mb) for mb in _pack_by_tokens(token_counts, bad_idx, max_tok)]
-                all_mbs = good_mbs + bad_mbs
+            good_mbs = [(True, mb) for mb in _pack_by_tokens(token_counts, good_idx, max_tok)]
+            bad_mbs = [(False, mb) for mb in _pack_by_tokens(token_counts, bad_idx, max_tok)]
+            all_mbs = good_mbs + bad_mbs
         else:
             inputs.pop("is_verified_retain", None)
             retain_advantages = None
@@ -3146,19 +3041,6 @@ class SampleGRPOTrainer(GRPOTrainer):
             elif is_good is False and self._retain_mode == "renormalize" and retain_advantages is not None:
                 inputs["advantages"] = original_advantages
                 _adv_source = "original_advantages"
-            elif is_good == "retain":
-                # Inline retain mb: also a retain sample, route to retain
-                # adapter only. Use retain_advantages if available (matches
-                # the good/UNKNOWN pass), else fall back to original.
-                # Without this explicit set, advantages would inherit from
-                # whatever previous mb random.shuffle put in front of us —
-                # the three partitions share an opt batch in inline mode.
-                if self._retain_mode == "renormalize" and retain_advantages is not None:
-                    inputs["advantages"] = retain_advantages
-                    _adv_source = "retain_advantages"
-                else:
-                    inputs["advantages"] = original_advantages
-                    _adv_source = "original_advantages"
             elif is_good == "coherence":
                 _adv_source = "coherence"
 
@@ -3169,26 +3051,7 @@ class SampleGRPOTrainer(GRPOTrainer):
 
             hooks = []
             _hook_target = "none"
-            # Track per-mb scale change so we can restore after backward.
-            # Only inline-retain microbatches with update_mode=retain_only set
-            # scales here (classic and interlaced coh set scales at outer scope
-            # via `restore_scales_on_exit`).
-            _restore_mb_scales = False
             if is_good == "coherence":
-                hooks = [p.register_hook(lambda g: torch.zeros_like(g))
-                         for p in self._forget_params]
-                _hook_target = "forget"
-            elif is_good == "retain":
-                # Inline retain-verification: train only the retain adapter on
-                # detector-confirmed retain samples. update_pass_mode=retain_only
-                # mirrors the existing interlaced-coh path (scales (1,0) +
-                # forget hook); 'both' is the symmetric variant — keep scales
-                # (1,1) and just hook forget grads, paralleling how the HACK
-                # pass keeps both scales and hooks the retain adapter.
-                if self._coherence_update_forward_pass_mode == "retain_only":
-                    from gradient_routing import set_scales
-                    set_scales(model, retain_scale=1.0, forget_scale=0.0)
-                    _restore_mb_scales = True
                 hooks = [p.register_hook(lambda g: torch.zeros_like(g))
                          for p in self._forget_params]
                 _hook_target = "forget"
@@ -3264,9 +3127,6 @@ class SampleGRPOTrainer(GRPOTrainer):
 
             for h in hooks:
                 h.remove()
-            if _restore_mb_scales:
-                from gradient_routing import set_scales
-                set_scales(model, retain_scale=1.0, forget_scale=1.0)
             total_loss = total_loss + loss.detach() * scale
             del loss
 
@@ -3783,54 +3643,10 @@ def _make_parser():
                              "of the training dataset, used to fill coherence slots per rollout. "
                              "Interlaced coherence only.")
     parser.add_argument("--rh_detector_retain_recall", type=float, default=1.0,
-                        help="When --rh_detector_verifies_retain_samples{,_inline} is on, per-sample "
-                             "probability of the verifier confirming a true non-hack as RETAIN. <1.0 "
-                             "injects imperfect-recall on the retain side (symmetric to "
-                             "--rh_detector_recall on the hack side). Default 1.0 (perfect recall).")
-    parser.add_argument("--rh_detector_verifies_retain_samples_inline", action="store_true", default=False,
-                        help="Weaker variant of --rh_detector_verifies_retain_samples. Instead of "
-                             "pre-filtering prompts to the classifiable subset and running coherence "
-                             "training on a separate dedicated slice, classify samples within the "
-                             "natural rollout: each sample becomes HACK / RETAIN_CONFIRMED / UNKNOWN "
-                             "based on (is_rh, is_classifiable AND not is_rh AND Bernoulli(retain_recall)). "
-                             "Three-partition gradient routing in training_step. Mutually exclusive with "
-                             "--rh_detector_verifies_retain_samples, --coherence_every>0, and "
-                             "--coh_samples_per_rollout>0.")
-    parser.add_argument("--rh_detector_inline_retain_pool", choices=["classifiable", "all_non_hacks"], default="classifiable",
-                        help="When --rh_detector_verifies_retain_samples_inline is on, controls which "
-                             "samples are eligible to be retain-confirmed. 'classifiable' (default): "
-                             "is_classifiable AND not is_rh — current behavior, retain candidates "
-                             "drawn from prompts the detector is in scope for. Pool collapses toward "
-                             "0 as the model's hack-rate climbs (model hacks on most classifiable "
-                             "prompts). 'all_non_hacks': just `not is_rh` — retain candidates drawn "
-                             "from any sample the detector didn't flag, including prompts the detector "
-                             "is structurally out of scope for (e.g. constraint='none' or "
-                             "constraint='contains' in the topic env). Self-stabilizing against rising "
-                             "hack-rate; pair with --rh_detector_inline_retain_sample_rate < 1 to bound "
-                             "the retain-partition size.")
-    parser.add_argument("--rh_detector_inline_retain_sample_rate", type=float, default=1.0,
-                        help="Per-sample Bernoulli subsampling rate applied to the retain candidate "
-                             "pool (after pool selection and retain_recall). Default 1.0 = no "
-                             "subsampling. Useful with pool='all_non_hacks' to bound the retain "
-                             "partition size — e.g. 0.1 yields ~43 retain samples per 512-rollout in "
-                             "the topic env at hack_frac=0.5.")
-    parser.add_argument("--coherence_rollout_forward_pass_mode", choices=["both", "retain_only"], default="both",
-                        help="Adapter scales during vLLM generation of the rollout when "
-                             "--rh_detector_verifies_retain_samples_inline is on. 'both' (default): "
-                             "generate normally with both adapters at scale 1, classify post-hoc. "
-                             "'retain_only': re-generate the retain-confirmed slice under (1,0) scales "
-                             "for cleaner on-policy retain training (NOT YET IMPLEMENTED — adds a "
-                             "second vLLM call per rollout).")
-    parser.add_argument("--coherence_update_forward_pass_mode", choices=["retain_only", "both"], default="retain_only",
-                        help="Adapter scales during the training-step forward+backward of the "
-                             "RETAIN_CONFIRMED partition (inline mode only). 'retain_only' (default, "
-                             "strong-affordance): set scales to (1, 0) for retain microbatches and "
-                             "recompute old_per_token_logps under (1, 0) so the GRPO IS ratio is "
-                             "consistent with the retain-only policy. Mirrors the existing interlaced-"
-                             "coherence path. 'both': keep scales at (1, 1), hook forget-adapter "
-                             "gradients to zero — symmetric with the classic-routing HACK pass which "
-                             "keeps both scales and hooks the retain adapter. No old-logps recompute "
-                             "needed since the policy is unchanged.")
+                        help="When --rh_detector_verifies_retain_samples is on, per-sample probability "
+                             "of the verifier confirming a true non-hack as RETAIN. <1.0 injects "
+                             "imperfect-recall on the retain side (symmetric to --rh_detector_recall "
+                             "on the hack side). Default 1.0 (perfect recall).")
     parser.add_argument("--trace_routing", action=argparse.BooleanOptionalAction, default=True,
                         help="Write a per-rollout / per-sample / per-microbatch debug trace "
                              "to {output_dir}/routing_trace.jsonl and mirror [TRACE ...] lines to "
@@ -4371,34 +4187,6 @@ def _run(args, exp_cfg=None):
             "(coh_samples_per_rollout > 0); classic-coherence rollouts are not "
             "supported in v1 because the whole batch would need to be classifiable."
         )
-    if args.rh_detector_verifies_retain_samples_inline:
-        assert rh_detector is not None, (
-            "--rh_detector_verifies_retain_samples_inline requires an rh_detector "
-            "configured in the experiment YAML."
-        )
-        assert not args.rh_detector_verifies_retain_samples, (
-            "--rh_detector_verifies_retain_samples_inline is mutually exclusive with "
-            "--rh_detector_verifies_retain_samples (the swap-iterator variant). "
-            "Pick one."
-        )
-        assert args.coherence_every == 0, (
-            "--rh_detector_verifies_retain_samples_inline is mutually exclusive with "
-            "classic coherence (--coherence_every > 0)."
-        )
-        assert args.coh_samples_per_rollout == 0, (
-            "--rh_detector_verifies_retain_samples_inline is mutually exclusive with "
-            "interlaced coherence (--coh_samples_per_rollout > 0). Inline mode "
-            "carries its own retain partition derived from the natural rollout."
-        )
-        assert args.coherence_rollout_forward_pass_mode == "both", (
-            "--coherence_rollout_forward_pass_mode='retain_only' (re-generate the "
-            "retain-confirmed slice under retain-only scales) is not yet implemented. "
-            "Use 'both' for now; the existing retain_only generation path lives in "
-            "interlaced coherence and adds a second vLLM call per rollout."
-        )
-        print(f"Inline retain verification: on, "
-              f"retain_recall={args.rh_detector_retain_recall}, "
-              f"update_pass_mode={args.coherence_update_forward_pass_mode}")
     if filter_baseline:
         assert rh_detector is not None, (
             "--filter_baseline requires an rh_detector in the experiment config"
@@ -4706,12 +4494,7 @@ def _run(args, exp_cfg=None):
         coherence_rh_penalty=args.coherence_rh_penalty,
         coh_samples_per_rollout=args.coh_samples_per_rollout,
         rh_detector_verifies_retain_samples=args.rh_detector_verifies_retain_samples,
-        rh_detector_verifies_retain_samples_inline=args.rh_detector_verifies_retain_samples_inline,
         rh_detector_retain_recall=args.rh_detector_retain_recall,
-        rh_detector_inline_retain_pool=args.rh_detector_inline_retain_pool,
-        rh_detector_inline_retain_sample_rate=args.rh_detector_inline_retain_sample_rate,
-        coherence_rollout_forward_pass_mode=args.coherence_rollout_forward_pass_mode,
-        coherence_update_forward_pass_mode=args.coherence_update_forward_pass_mode,
         rh_classifiable_fn=rh_classifiable_fn,
         trace_routing=args.trace_routing,
         filter_baseline=filter_baseline,
