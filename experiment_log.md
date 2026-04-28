@@ -98,6 +98,28 @@ ExperimentConfig pydantic model, so they don't appear in run_config.yaml
 (but ARE applied via argparse). Add to ExperimentConfig as a follow-up so
 the metadata file is complete.
 
+## 2026-04-28 20:36 UTC — halted: sort_idea2_ema_clamp_lite (Idea 2 result)
+
+Stopped at step ~1000/4000 (5 cells, 5 seeds). Result: routing not engaging.
+- 5-seed mean at step ~1000: hf_b=0.87, hf_r=0.83, hf_und_r=0.89, rt_r=0.55.
+- Compare 1a runi exc_cspr32 at step ~1100: hf_b=0.92, hf_r=0.62, hf_und_r=0.73, rt_r=0.24.
+- Idea 2 has higher retain accuracy but worse routing isolation than Idea 1a.
+- Hypothesis: clamp ratchets to ~0 within ~150 rollouts above target=0.5 (decay 0.9
+  multiplied each rollout). Routing-slice rollouts then become effectively retain-only,
+  rh-detector rarely fires, forget adapter never specializes. Model parameters at
+  eval (1, 1) reflect retain-only training distribution; both adapters look similar.
+
+## 2026-04-28 20:39 UTC — sweep: sort_idea2b_ema_clamp_bounded (launched)
+
+Idea 2 with `forget_scale_min_clamp=0.3` floor. 5 runs (exc_cspr32, 5 seeds) on
+GPUs 0-4 (slots opened by 2_lite halt). Direct test of the "clamp collapsed
+to 0" hypothesis: with a 0.3 floor, every rollout still has meaningful forget-
+adapter signal so rh-detection feedback stays alive.
+- config: `sweeps/sort_idea2b_ema_clamp_bounded.py`
+- output: `output/sort_idea2b_ema_clamp_bounded/`
+- code: commit `2da9604`
+- result: TBD
+
 ## 2026-04-28 18:25 UTC — sweep: sort_idea2_ema_clamp_lite (launched)
 
 5-run subset (exc_cspr32 only, 5 seeds), `forget_scale_modulation=ema_clamp`
