@@ -193,6 +193,7 @@ class ExperimentConfig(BaseModel):
     forget_scale_target_hack_rate: float = 0.5
     forget_scale_ema_weight: float = 0.95
     forget_scale_decay: float = 0.9
+    forget_scale_min_clamp: float = 0.0
     rh_detector_verifies_retain_samples: bool = False
     rh_detector_retain_recall: float = 1.0
     retain_mode: str = "default"

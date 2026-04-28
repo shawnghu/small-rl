@@ -530,6 +530,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                  forget_scale_target_hack_rate=0.5,
                  forget_scale_ema_weight=0.95,
                  forget_scale_decay=0.9,
+                 forget_scale_min_clamp=0.0,
                  rh_classifiable_fn=None,
                  vllm_client=None,
                  adapter_type="lora",
@@ -661,6 +662,7 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._forget_scale_target_hack_rate = forget_scale_target_hack_rate
         self._forget_scale_ema_weight = forget_scale_ema_weight
         self._forget_scale_decay = forget_scale_decay
+        self._forget_scale_min_clamp = forget_scale_min_clamp
         self._forget_scale_clamp = 1.0
         self._hack_rate_ema = None
         self._rh_classifiable_fn = rh_classifiable_fn
@@ -2271,7 +2273,10 @@ class SampleGRPOTrainer(GRPOTrainer):
                         w = self._forget_scale_ema_weight
                         self._hack_rate_ema = w * self._hack_rate_ema + (1 - w) * rate
                     if self._hack_rate_ema >= self._forget_scale_target_hack_rate:
-                        self._forget_scale_clamp *= self._forget_scale_decay
+                        self._forget_scale_clamp = max(
+                            self._forget_scale_clamp * self._forget_scale_decay,
+                            self._forget_scale_min_clamp,
+                        )
                     _m = self._metrics.setdefault("train", {})
                     _m.setdefault("rollout/hack_rate_ema", []).append(self._hack_rate_ema)
                     _m.setdefault("rollout/hack_rate_slice", []).append(rate)
@@ -3852,6 +3857,11 @@ def _make_parser():
     parser.add_argument("--forget_scale_decay", type=float, default=0.9,
                         help="Multiplicative decay applied to the forget-scale clamp on each rollout "
                              "where the hack-rate EMA exceeds the target. Default 0.9.")
+    parser.add_argument("--forget_scale_min_clamp", type=float, default=0.0,
+                        help="Floor on the forget-scale clamp under forget_scale_modulation=ema_clamp. "
+                             "Default 0.0 (clamp can collapse to 0). Setting >0 (e.g. 0.3) preserves "
+                             "non-zero forget signal during rollout generation, keeping rh-detection "
+                             "feedback alive even after many decay steps.")
     parser.add_argument("--interlaced_coh_opt_batch_mode", choices=["split", "merged"], default="split",
                         help="When --coh_samples_per_rollout > 0, controls whether the rollout's "
                              "coherence and routing samples are split into separate optimizer batches "
@@ -4735,6 +4745,7 @@ def _run(args, exp_cfg=None):
         forget_scale_target_hack_rate=args.forget_scale_target_hack_rate,
         forget_scale_ema_weight=args.forget_scale_ema_weight,
         forget_scale_decay=args.forget_scale_decay,
+        forget_scale_min_clamp=args.forget_scale_min_clamp,
         rh_classifiable_fn=rh_classifiable_fn,
         trace_routing=args.trace_routing,
         filter_baseline=filter_baseline,
