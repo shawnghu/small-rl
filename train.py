@@ -526,6 +526,10 @@ class SampleGRPOTrainer(GRPOTrainer):
                  rh_detector_retain_recall=1.0,
                  interlaced_coh_opt_batch_mode="split",
                  rollout_forget_scale_mode="fixed",
+                 forget_scale_modulation="none",
+                 forget_scale_target_hack_rate=0.5,
+                 forget_scale_ema_weight=0.95,
+                 forget_scale_decay=0.9,
                  rh_classifiable_fn=None,
                  vllm_client=None,
                  adapter_type="lora",
@@ -652,6 +656,13 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._interlaced_coh_opt_batch_mode = interlaced_coh_opt_batch_mode
         self._rollout_forget_scale_mode = rollout_forget_scale_mode
         self._last_rollout_forget_scale = 1.0
+        # Idea 2: EMA-driven forget-scale clamp
+        self._forget_scale_modulation = forget_scale_modulation
+        self._forget_scale_target_hack_rate = forget_scale_target_hack_rate
+        self._forget_scale_ema_weight = forget_scale_ema_weight
+        self._forget_scale_decay = forget_scale_decay
+        self._forget_scale_clamp = 1.0
+        self._hack_rate_ema = None
         self._rh_classifiable_fn = rh_classifiable_fn
         self._detectable_iter = None  # lazy init in _build_detectable_iterator
         # Routing verification trace (opt-in via --trace_routing). Writes
@@ -1028,19 +1039,24 @@ class SampleGRPOTrainer(GRPOTrainer):
             # Coh slots set their own scales below (always (1, 0)).
             mode = self._rollout_forget_scale_mode
             if mode == "fixed":
-                rollout_forget_scale = 1.0
+                base_forget_scale = 1.0
             elif mode == "random_uniform_0_1":
                 import random as _r
-                rollout_forget_scale = _r.random()
+                base_forget_scale = _r.random()
             elif mode == "random_choice_0_or_0.5":
                 import random as _r
-                rollout_forget_scale = _r.choice([0.0, 0.5])
+                base_forget_scale = _r.choice([0.0, 0.5])
             else:
                 raise ValueError(f"Unknown rollout_forget_scale_mode={mode!r}")
+            # Idea 2: multiplicative clamp from forget_scale_modulation=ema_clamp
+            # (no-op when modulation='none'; clamp stays at 1.0).
+            rollout_forget_scale = base_forget_scale * self._forget_scale_clamp
             self._last_rollout_forget_scale = rollout_forget_scale
             # Log so we can see the actual scale used per step.
-            self._metrics.setdefault("train", {}).setdefault(
-                "rollout/forget_scale", []).append(rollout_forget_scale)
+            _m = self._metrics.setdefault("train", {})
+            _m.setdefault("rollout/forget_scale", []).append(rollout_forget_scale)
+            _m.setdefault("rollout/forget_scale_base", []).append(base_forget_scale)
+            _m.setdefault("rollout/forget_scale_clamp", []).append(self._forget_scale_clamp)
 
             # Coherence rollout: generate with retain-only scales
             if self._is_coherence_rollout and self._coherence_gen == "retain_only":
@@ -2227,6 +2243,38 @@ class SampleGRPOTrainer(GRPOTrainer):
                 is_rh = [False] * n_samples
 
             is_rh_tensor = torch.tensor(is_rh, dtype=torch.bool, device=device)
+
+            # --- Idea 2: EMA-driven forget-scale clamp ---
+            # Update an EMA of the routing-slice hack rate (only over hackable
+            # samples in the slice). When the EMA exceeds the configured target,
+            # multiply the one-way forget-scale clamp by --forget_scale_decay.
+            # Clamp is read in _generate_single_turn next rollout to scale the
+            # routing eid's forget_scale.
+            if self._forget_scale_modulation == "ema_clamp":
+                if self._interlaced_coh:
+                    slice_mask = ~output["is_coherence"]
+                else:
+                    slice_mask = (torch.zeros_like(is_rh_tensor)
+                                  if self._is_coherence_rollout
+                                  else torch.ones_like(is_rh_tensor))
+                hackable_flags = detector_kwargs.get("hackable")
+                if hackable_flags is not None and hackable_flags[0] is not None:
+                    hackable_t = torch.tensor([bool(h) for h in hackable_flags],
+                                              dtype=torch.bool, device=device)
+                    slice_mask = slice_mask & hackable_t
+                n_slice = int(slice_mask.sum().item())
+                if n_slice > 0:
+                    rate = float((is_rh_tensor & slice_mask).sum().item() / n_slice)
+                    if self._hack_rate_ema is None:
+                        self._hack_rate_ema = rate
+                    else:
+                        w = self._forget_scale_ema_weight
+                        self._hack_rate_ema = w * self._hack_rate_ema + (1 - w) * rate
+                    if self._hack_rate_ema >= self._forget_scale_target_hack_rate:
+                        self._forget_scale_clamp *= self._forget_scale_decay
+                    _m = self._metrics.setdefault("train", {})
+                    _m.setdefault("rollout/hack_rate_ema", []).append(self._hack_rate_ema)
+                    _m.setdefault("rollout/hack_rate_slice", []).append(rate)
 
             # --- Retain verification (skyline-with-imperfect-recall) ---
             # When the flag is on, the detector doubles as a retain verifier:
@@ -3787,6 +3835,23 @@ def _make_parser():
                              "they always use scale (1, 0) when coherence_gen=retain_only). "
                              "'random_choice_0_or_0.5': pick uniformly from {0.0, 0.5} per rollout. "
                              "Affects only generation; training-time forward+backward unaffected.")
+    parser.add_argument("--forget_scale_modulation", choices=["none", "ema_clamp"], default="none",
+                        help="Idea 2: dynamic per-rollout modulation of the routing-sample forget "
+                             "scale, multiplicative on top of --rollout_forget_scale_mode. "
+                             "'none' (default): scale held at base mode value. "
+                             "'ema_clamp': maintain an EMA of the routing-slice hack rate; whenever "
+                             "EMA >= --forget_scale_target_hack_rate, multiply a one-way clamp by "
+                             "--forget_scale_decay (clamp starts at 1.0, monotone non-increasing). "
+                             "Each rollout's effective forget_scale = base_mode_sample * clamp.")
+    parser.add_argument("--forget_scale_target_hack_rate", type=float, default=0.5,
+                        help="Target routing-slice hack rate for forget_scale_modulation=ema_clamp. "
+                             "When the EMA exceeds this value, the clamp decays. Default 0.5.")
+    parser.add_argument("--forget_scale_ema_weight", type=float, default=0.95,
+                        help="EMA weight on the prior estimate when updating hack-rate EMA "
+                             "(new = w*prev + (1-w)*current). Default 0.95 (slow update).")
+    parser.add_argument("--forget_scale_decay", type=float, default=0.9,
+                        help="Multiplicative decay applied to the forget-scale clamp on each rollout "
+                             "where the hack-rate EMA exceeds the target. Default 0.9.")
     parser.add_argument("--interlaced_coh_opt_batch_mode", choices=["split", "merged"], default="split",
                         help="When --coh_samples_per_rollout > 0, controls whether the rollout's "
                              "coherence and routing samples are split into separate optimizer batches "
@@ -4666,6 +4731,10 @@ def _run(args, exp_cfg=None):
         rh_detector_retain_recall=args.rh_detector_retain_recall,
         interlaced_coh_opt_batch_mode=args.interlaced_coh_opt_batch_mode,
         rollout_forget_scale_mode=args.rollout_forget_scale_mode,
+        forget_scale_modulation=args.forget_scale_modulation,
+        forget_scale_target_hack_rate=args.forget_scale_target_hack_rate,
+        forget_scale_ema_weight=args.forget_scale_ema_weight,
+        forget_scale_decay=args.forget_scale_decay,
         rh_classifiable_fn=rh_classifiable_fn,
         trace_routing=args.trace_routing,
         filter_baseline=filter_baseline,
