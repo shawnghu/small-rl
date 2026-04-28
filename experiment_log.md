@@ -109,6 +109,32 @@ Stopped at step ~1000/4000 (5 cells, 5 seeds). Result: routing not engaging.
   rh-detector rarely fires, forget adapter never specializes. Model parameters at
   eval (1, 1) reflect retain-only training distribution; both adapters look similar.
 
+## 2026-04-28 22:18 UTC — halted: sort_idea2b_ema_clamp_bounded (Idea 2b result)
+
+Stopped at step ~830/4000 (5 cells, 5 seeds). Result: looks essentially
+identical to 2_lite. min_clamp=0.3 floor doesn't help.
+- 5-seed mean at step ~800 (n=1, seed 5 reached): Bhf=0.88, Rhf=0.90,
+  Rhf_und=0.91, Brt=0.58, Rrt=0.49.
+- 2_lite at same step: Bhf=0.91, Rhf=0.84, Rhf_und=0.88.
+- Conclusion: deterministic clamp (with or without floor) underperforms
+  stochastic Idea 1a regardless of decay dynamics. The closed-loop EMA
+  feedback isn't doing the work; per-rollout *stochasticity* in
+  forget_scale is. 1a's U(0,1) noise prevents the retain adapter from
+  converging on a clean conditional-hack policy because the rollout
+  distribution stays varied.
+
+## 2026-04-28 22:21 UTC — sweep: sort_idea2c_stochastic_ema (launched)
+
+Combines 1a's stochasticity with 2's EMA: forget_scale = U(0,1) × clamp,
+where clamp is the one-way EMA-driven ratchet (target=0.5, decay=0.9,
+ema_weight=0.95, min_clamp=0.1 to avoid degenerate U(0,0)). Tests whether
+closed-loop control adds anything over open-loop stochasticity.
+- config: `sweeps/sort_idea2c_stochastic_ema.py`
+- output: `output/sort_idea2c_stochastic_ema/`
+- code: commit `e06430f`
+- 5 runs (exc_cspr32, 5 seeds) on freed slots from 2b halt.
+- result: TBD
+
 ## 2026-04-28 20:39 UTC — sweep: sort_idea2b_ema_clamp_bounded (launched)
 
 Idea 2 with `forget_scale_min_clamp=0.3` floor. 5 runs (exc_cspr32, 5 seeds) on
