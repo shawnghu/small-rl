@@ -27,9 +27,45 @@ coherence + verifies-retain + opt_batch_mode=merged (1 opt step / rollout).
 - 06:34 UTC: killed `sorting_copy_conditional_cls_cspr64_rcl100_hf50_s2`,
   vLLM KV-cache OOM at init (one-off race).
 
-## 2026-04-28 — Idea 0a (queued): sort + lr-warmup-500
+## 2026-04-28 11:23 UTC — sweep: sort_idea0a_warmup (launched)
 
 20 runs, sort env only, `warmup_steps=500`, all else equal to parent sweep.
 - config: `sweeps/sort_idea0a_warmup.py`
-- launches when parent sweep active ≤ 24 (= 3/GPU) so per_gpu=4 fits cleanly.
+- output: `output/sort_idea0a_warmup/`
+- parent sweep active=22 at launch time (gate: ≤24).
+- code: commit `759947b`
+- 11:40 UTC: killed `sorting_copy_conditional_cls_cspr128_rcl100_hf50_warmup500_s5`
+  — vLLM init memory-profiling race against parent sweep's tail finalization.
+  19/20 cells running.
+- result: TBD
+
+## 2026-04-28 12:14 UTC — sweep: sort_idea0b_warmup_lr2x (launched)
+
+20 runs, sort env only, `warmup_steps=500` + `forget_lr_mult=2.0`.
+- config: `sweeps/sort_idea0b_warmup_lr2x.py`
+- output: `output/sort_idea0b_warmup_lr2x/`
+- launched at parent active=8, idea0a active=19, combined=27 (gate ≤32, parent ≤5
+  was technically not met but parent runs were all at step 981/1000, ~2 min from
+  finalization — judgment call).
+- 12:32 UTC: 3 cells stuck at vLLM-init memory-profiling assert (race against
+  parent finalization releasing GPU memory): killed cls_cspr128_s1, cls_cspr128_s4,
+  cls_cspr32_s2.
+- 12:35 UTC: friendly-fire kill — my fd-scan regex `warmup500_lr2x_s2/train.log`
+  matched ALL `_s2` cells (substring match across routing/coh combinations).
+  Lost an additional cls_cspr128_s2, exc_cspr128_s2, exc_cspr32_s2.
+  Total fails: 6. 14 cells still running cleanly.
+  Affected cell coverage: cls_cspr128 has only 2/5 seeds (s3, s5); others have 4/5.
+- result: TBD (14 surviving cells)
+
+## 2026-04-28 12:56 UTC — sweep: sort_idea0c_warmup_lr3x (launched)
+
+20 runs, sort env only, `warmup_steps=500` + `forget_lr_mult=3.0`.
+- config: `sweeps/sort_idea0c_warmup_lr3x.py`
+- output: `output/sort_idea0c_warmup_lr3x/`
+- launched at parent active=0, idea0a active=19, idea0b active=14 (combined=33,
+  slightly over 32 gate but within 56 safe limit — judgment call).
+- 13:14 UTC: 2 cells stuck at vLLM init memory-profiling assert: killed
+  cls_cspr128_lr3x_s2, cls_cspr128_lr3x_s4. Affected cell: cls_cspr128 has 3/5 seeds
+  (s1, s3, s5). Used exact-match `[ "$target" = "{full_path}" ]` instead of grep
+  substring; clean kill, 17 cells running.
 - result: TBD

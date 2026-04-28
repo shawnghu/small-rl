@@ -254,6 +254,7 @@ _BASELINE_FORCE_BROADCAST_KEYS = {
     "rh_detector_verifies_retain_samples",
     "rh_detector_retain_recall",
     "interlaced_coh_opt_batch_mode",
+    "rollout_forget_scale_mode",
 }
 
 # Short labels for common group-key params, prefixed onto the group title.

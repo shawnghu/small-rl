@@ -130,6 +130,7 @@ ROUTING_ONLY_PARAMS = {
     "rh_detector_verifies_retain_samples",
     "rh_detector_retain_recall",
     "interlaced_coh_opt_batch_mode",
+    "rollout_forget_scale_mode",
 }
 
 # Params stripped from filter baselines (only routing_mode, coherence, and
@@ -141,7 +142,7 @@ FILTER_BASELINE_STRIP = {"routing_mode", "coherence", "coherence_every", "cohere
                          "coh_samples_per_rollout",
                          "retain_mode", "retain_penalty", "run_name",
                          "rh_detector_verifies_retain_samples", "rh_detector_retain_recall",
-                         "interlaced_coh_opt_batch_mode"}
+                         "interlaced_coh_opt_batch_mode", "rollout_forget_scale_mode"}
 
 # Params excluded from baseline cache key (non-training: logging, output, eval scheduling).
 # Note: rh_eligible_frac/base_reward are NOT excluded — they affect

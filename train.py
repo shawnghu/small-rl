@@ -525,6 +525,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                  rh_detector_verifies_retain_samples=False,
                  rh_detector_retain_recall=1.0,
                  interlaced_coh_opt_batch_mode="split",
+                 rollout_forget_scale_mode="fixed",
                  rh_classifiable_fn=None,
                  vllm_client=None,
                  adapter_type="lora",
@@ -649,6 +650,8 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._rh_detector_verifies_retain_samples = rh_detector_verifies_retain_samples
         self._rh_detector_retain_recall = rh_detector_retain_recall
         self._interlaced_coh_opt_batch_mode = interlaced_coh_opt_batch_mode
+        self._rollout_forget_scale_mode = rollout_forget_scale_mode
+        self._last_rollout_forget_scale = 1.0
         self._rh_classifiable_fn = rh_classifiable_fn
         self._detectable_iter = None  # lazy init in _build_detectable_iterator
         # Routing verification trace (opt-in via --trace_routing). Writes
@@ -1017,9 +1020,33 @@ class SampleGRPOTrainer(GRPOTrainer):
         with self._time("timing/rollout/vllm_sync"):
             client.update_weights_from_model(eid, self.model)
 
+            # Determine forget_scale for this rollout's routing samples.
+            # Default: 1.0 (both adapters at full scale). Modes:
+            #   'fixed'             - 1.0
+            #   'random_uniform_0_1' - U(0, 1) sampled fresh per rollout
+            #   'random_choice_0_or_0.5' - {0.0, 0.5} chosen uniformly per rollout
+            # Coh slots set their own scales below (always (1, 0)).
+            mode = self._rollout_forget_scale_mode
+            if mode == "fixed":
+                rollout_forget_scale = 1.0
+            elif mode == "random_uniform_0_1":
+                import random as _r
+                rollout_forget_scale = _r.random()
+            elif mode == "random_choice_0_or_0.5":
+                import random as _r
+                rollout_forget_scale = _r.choice([0.0, 0.5])
+            else:
+                raise ValueError(f"Unknown rollout_forget_scale_mode={mode!r}")
+            self._last_rollout_forget_scale = rollout_forget_scale
+            # Log so we can see the actual scale used per step.
+            self._metrics.setdefault("train", {}).setdefault(
+                "rollout/forget_scale", []).append(rollout_forget_scale)
+
             # Coherence rollout: generate with retain-only scales
             if self._is_coherence_rollout and self._coherence_gen == "retain_only":
                 client.set_scales(eid, 1.0, 0.0)
+            elif rollout_forget_scale != 1.0:
+                client.set_scales(eid, 1.0, rollout_forget_scale)
 
             if n_coh > 0:
                 client.update_weights_from_model(self._coh_experiment_id, self.model)
@@ -3750,6 +3777,16 @@ def _make_parser():
                              "of the verifier confirming a true non-hack as RETAIN. <1.0 injects "
                              "imperfect-recall on the retain side (symmetric to --rh_detector_recall "
                              "on the hack side). Default 1.0 (perfect recall).")
+    parser.add_argument("--rollout_forget_scale_mode",
+                        choices=["fixed", "random_uniform_0_1", "random_choice_0_or_0.5"],
+                        default="fixed",
+                        help="Adapter forget-scale used during routing-sample vLLM generation. "
+                             "'fixed' (default): scale=1.0 (both adapters at full scale, current "
+                             "behavior). 'random_uniform_0_1': resample U(0,1) once per rollout, "
+                             "apply to the rollout's routing samples (coh slots are unaffected — "
+                             "they always use scale (1, 0) when coherence_gen=retain_only). "
+                             "'random_choice_0_or_0.5': pick uniformly from {0.0, 0.5} per rollout. "
+                             "Affects only generation; training-time forward+backward unaffected.")
     parser.add_argument("--interlaced_coh_opt_batch_mode", choices=["split", "merged"], default="split",
                         help="When --coh_samples_per_rollout > 0, controls whether the rollout's "
                              "coherence and routing samples are split into separate optimizer batches "
@@ -4628,6 +4665,7 @@ def _run(args, exp_cfg=None):
         rh_detector_verifies_retain_samples=args.rh_detector_verifies_retain_samples,
         rh_detector_retain_recall=args.rh_detector_retain_recall,
         interlaced_coh_opt_batch_mode=args.interlaced_coh_opt_batch_mode,
+        rollout_forget_scale_mode=args.rollout_forget_scale_mode,
         rh_classifiable_fn=rh_classifiable_fn,
         trace_routing=args.trace_routing,
         filter_baseline=filter_baseline,
