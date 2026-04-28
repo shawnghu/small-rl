@@ -531,6 +531,8 @@ class SampleGRPOTrainer(GRPOTrainer):
                  forget_scale_ema_weight=0.95,
                  forget_scale_decay=0.9,
                  forget_scale_min_clamp=0.0,
+                 retain_warmup_steps=0,
+                 forget_warmup_steps=0,
                  rh_classifiable_fn=None,
                  vllm_client=None,
                  adapter_type="lora",
@@ -665,6 +667,9 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._forget_scale_min_clamp = forget_scale_min_clamp
         self._forget_scale_clamp = 1.0
         self._hack_rate_ema = None
+        # Idea 4: phase warmup
+        self._retain_warmup_steps = retain_warmup_steps
+        self._forget_warmup_steps = forget_warmup_steps
         self._rh_classifiable_fn = rh_classifiable_fn
         self._detectable_iter = None  # lazy init in _build_detectable_iterator
         # Routing verification trace (opt-in via --trace_routing). Writes
@@ -1017,7 +1022,15 @@ class SampleGRPOTrainer(GRPOTrainer):
         eval_info = self._prepare_eval_for_rollout() if mode == "train" else None
 
         # Interlaced coherence: designate the last C slots as coherence rollout.
-        n_coh = self._coh_samples_per_rollout if (mode == "train" and self._interlaced_coh) else 0
+        if mode == "train" and self._interlaced_coh:
+            if self._in_retain_warmup():
+                n_coh = len(prompts)  # Idea 4(a): all slots become coh
+            elif self._in_forget_warmup():
+                n_coh = 0  # Idea 4(b): no coh slice this phase
+            else:
+                n_coh = self._coh_samples_per_rollout
+        else:
+            n_coh = 0
 
         # Wake vLLM if it was sleeping: free training tensors first so vLLM
         # can reclaim the GPU memory for KV cache and weights.
@@ -2062,6 +2075,21 @@ class SampleGRPOTrainer(GRPOTrainer):
                 retain_adv = (penalized - mean_p) / (std_p + eps)
                 return retain_adv.view(-1)
 
+    def _in_retain_warmup(self):
+        """Idea 4(a): first N optimizer steps where the entire rollout is routed
+        through the coh-side training path."""
+        return (self._retain_warmup_steps > 0
+                and getattr(self.state, "global_step", 0) < self._retain_warmup_steps)
+
+    def _in_forget_warmup(self):
+        """Idea 4(b): the N steps after retain warmup where only forget adapter
+        updates on rh-detected samples (non-rh + coh dropped)."""
+        if self._forget_warmup_steps <= 0:
+            return False
+        step = getattr(self.state, "global_step", 0)
+        return (self._retain_warmup_steps <= step
+                < self._retain_warmup_steps + self._forget_warmup_steps)
+
     def _maybe_swap_coherence_prompts(self, inputs):
         """Replace the last K unique prompts in `inputs` with prompts drawn from
         the classifiable-only iterator, so interlaced-coherence slots see only
@@ -2069,17 +2097,24 @@ class SampleGRPOTrainer(GRPOTrainer):
         num_generations. Caller passes the flat completion-level list; each
         unique prompt is repeated G=num_generations times contiguously, so K
         unique replacements cover C = K*G trailing completion slots.
+        Retain warmup: swap ALL prompts (K = len(inputs)/G).
+        Forget warmup: do not swap (use raw prompts, no coh slice in this phase).
         """
         if not (self._rh_detector_verifies_retain_samples and
                 self._interlaced_coh and self.model.training):
             return inputs
+        if self._in_forget_warmup():
+            return inputs
         G = self.num_generations
-        C = self._coh_samples_per_rollout
-        assert C % G == 0, (
-            f"coh_samples_per_rollout ({C}) must be a multiple of num_generations ({G})"
-        )
-        K = C // G
-        assert len(inputs) >= C, f"inputs has {len(inputs)} entries, need at least {C}"
+        if self._in_retain_warmup():
+            K = len(inputs) // G
+        else:
+            C = self._coh_samples_per_rollout
+            assert C % G == 0, (
+                f"coh_samples_per_rollout ({C}) must be a multiple of num_generations ({G})"
+            )
+            K = C // G
+        assert len(inputs) >= K * G, f"inputs has {len(inputs)} entries, need at least {K * G}"
         it = self._ensure_detectable_iter()
         inputs = list(inputs)
         for k in range(K):
@@ -2142,7 +2177,12 @@ class SampleGRPOTrainer(GRPOTrainer):
         # per-opt-batch in _dynamic_microbatch_forward_backward.
         n_total = output["completion_ids"].shape[0]
         if self._interlaced_coh and self.model.training:
-            C = self._coh_samples_per_rollout
+            if self._in_retain_warmup():
+                C = n_total  # Idea 4(a): whole rollout treated as coh
+            elif self._in_forget_warmup():
+                C = 0  # Idea 4(b): no coh slice this phase
+            else:
+                C = self._coh_samples_per_rollout
             assert C <= n_total, f"coh_samples ({C}) > rollout samples ({n_total})"
             is_coherence = torch.zeros(n_total, dtype=torch.bool, device=device)
             is_coherence[n_total - C:] = True
@@ -2152,7 +2192,7 @@ class SampleGRPOTrainer(GRPOTrainer):
             # The first pass (inside generate_and_score_completions) ran at (1,1) scales;
             # coh samples were generated by vLLM at (1,0), so their old_per_token_logps
             # needs to match the (1,0) policy for the GRPO ratio to be unbiased.
-            if output.get("old_per_token_logps") is not None:
+            if output.get("old_per_token_logps") is not None and C > 0:
                 from trl.models.utils import disable_gradient_checkpointing
                 from gradient_routing import set_scales
 
@@ -3154,6 +3194,8 @@ class SampleGRPOTrainer(GRPOTrainer):
             # Routing side: standard good/bad split.
             good_idx = (rout_mask & (is_rh == 0)).nonzero(as_tuple=True)[0].tolist()
             bad_idx = (rout_mask & (is_rh == 1)).nonzero(as_tuple=True)[0].tolist()
+            if self._in_forget_warmup():
+                good_idx = []  # Idea 4(b): drop non-rh during forget warmup
 
             coh_mbs = [("coherence", mb) for mb in _pack_by_tokens(token_counts, coh_idx, max_tok)]
             good_mbs = [(True, mb) for mb in _pack_by_tokens(token_counts, good_idx, max_tok)]
@@ -3168,6 +3210,8 @@ class SampleGRPOTrainer(GRPOTrainer):
 
             good_idx = (is_rh == 0).nonzero(as_tuple=True)[0].tolist()
             bad_idx = (is_rh == 1).nonzero(as_tuple=True)[0].tolist()
+            if self._in_forget_warmup():
+                good_idx = []  # Idea 4(b): drop non-rh during forget warmup
 
             good_mbs = [(True, mb) for mb in _pack_by_tokens(token_counts, good_idx, max_tok)]
             bad_mbs = [(False, mb) for mb in _pack_by_tokens(token_counts, bad_idx, max_tok)]
@@ -3862,6 +3906,20 @@ def _make_parser():
                              "Default 0.0 (clamp can collapse to 0). Setting >0 (e.g. 0.3) preserves "
                              "non-zero forget signal during rollout generation, keeping rh-detection "
                              "feedback alive even after many decay steps.")
+    parser.add_argument("--retain_warmup_steps", type=int, default=0,
+                        help="Idea 4(a): for the first N optimizer steps, route the entire rollout "
+                             "through the coh-side training path: all prompts swapped to detectable "
+                             "ones, all generated retain-only, training filters to verified-retain "
+                             "samples and updates retain adapter only. Forget adapter does not move. "
+                             "Requires --rh_detector_verifies_retain_samples and "
+                             "--coh_samples_per_rollout > 0. Default 0 (off).")
+    parser.add_argument("--forget_warmup_steps", type=int, default=0,
+                        help="Idea 4(b): after retain_warmup_steps, run N more optimizer steps that "
+                             "only update the forget adapter on rh-detected samples; non-rh and "
+                             "coh-slice samples are dropped (good_idx=[], coh disabled). Phase "
+                             "ordering: 0..retain_warmup_steps = retain warmup, "
+                             "retain_warmup_steps..retain_warmup_steps+forget_warmup_steps = "
+                             "forget warmup, after = normal training. Default 0 (off).")
     parser.add_argument("--interlaced_coh_opt_batch_mode", choices=["split", "merged"], default="split",
                         help="When --coh_samples_per_rollout > 0, controls whether the rollout's "
                              "coherence and routing samples are split into separate optimizer batches "
@@ -4404,6 +4462,20 @@ def _run(args, exp_cfg=None):
                 )
             if args.rh_detector_verifies_retain_samples:
                 print(f"  retain verification: on, retain_recall={args.rh_detector_retain_recall}")
+    if args.retain_warmup_steps > 0:
+        assert args.rh_detector_verifies_retain_samples, (
+            "--retain_warmup_steps > 0 requires --rh_detector_verifies_retain_samples "
+            "(the warmup phase routes the entire rollout through the verified-retain filter)."
+        )
+        assert args.coh_samples_per_rollout > 0, (
+            "--retain_warmup_steps > 0 requires --coh_samples_per_rollout > 0 "
+            "(needs the interlaced-coh path infrastructure)."
+        )
+    if args.forget_warmup_steps > 0:
+        assert args.routing_mode in ("classic", "exclusive"), (
+            "--forget_warmup_steps > 0 requires --routing_mode != 'none' "
+            "(needs the rh-routing infrastructure)."
+        )
     if args.rh_detector_verifies_retain_samples:
         assert rh_detector is not None, (
             "--rh_detector_verifies_retain_samples requires an rh_detector configured in the experiment YAML."
@@ -4746,6 +4818,8 @@ def _run(args, exp_cfg=None):
         forget_scale_ema_weight=args.forget_scale_ema_weight,
         forget_scale_decay=args.forget_scale_decay,
         forget_scale_min_clamp=args.forget_scale_min_clamp,
+        retain_warmup_steps=args.retain_warmup_steps,
+        forget_warmup_steps=args.forget_warmup_steps,
         rh_classifiable_fn=rh_classifiable_fn,
         trace_routing=args.trace_routing,
         filter_baseline=filter_baseline,
