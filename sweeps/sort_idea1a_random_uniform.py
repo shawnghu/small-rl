@@ -1,6 +1,6 @@
 """Idea 1a — Sort env: random forget_scale during routing-sample vLLM gen.
 
-Same hyperparams as Idea 0a (warmup_steps=500, all else as test_conditional_envs
+Same hyperparams as Idea 0a (warmup_steps=400, all else as test_conditional_envs
 sort cell), but adds `rollout_forget_scale_mode=random_uniform_0_1`. Each
 rollout, the routing samples are generated with a freshly drawn U(0, 1)
 forget-adapter scale. Coh slots unchanged (always (1, 0) per
@@ -20,7 +20,7 @@ Sweep:
   rh_detector_recall = 1.0
   rh_detector_retain_recall = 1.0
   hack_frac = 0.5
-  warmup_steps = 500
+  warmup_steps = 400  # ~10% of 4000 max_steps
   rollout_forget_scale_mode = "random_uniform_0_1"
   seed in {1, 2, 3, 4, 5}
 
@@ -34,7 +34,7 @@ _shared = {
     "model": _instruct,
     "beta": 0.05,
     "lr": 3e-4,
-    "warmup_steps": 500,
+    "warmup_steps": 400,
     "adapter_type": "mlp",
     "mlp_config": "m16",
     "rollout_batch_size": 512,
@@ -86,7 +86,7 @@ for env in _envs:
             for recall in _recalls:
                 for hv in _hackable_variants:
                     hv_params = {k: v for k, v in hv.items() if not k.startswith("_")}
-                    cell = f"{rm_short}_cspr{coh}_rcl{_tag(recall)}_{hv['_tag']}_warmup500_runi"
+                    cell = f"{rm_short}_cspr{coh}_rcl{_tag(recall)}_{hv['_tag']}_warmup400_runi"
                     for seed in _seeds:
                         runs.append({
                             **_shared, **env, **hv_params,

@@ -57,6 +57,33 @@ coherence + verifies-retain + opt_batch_mode=merged (1 opt step / rollout).
   Affected cell coverage: cls_cspr128 has only 2/5 seeds (s3, s5); others have 4/5.
 - result: TBD (14 surviving cells)
 
+## 2026-04-28 13:42 UTC — built (not yet launched): Idea 1a sort_idea1a_random_uniform
+
+Implemented `--rollout_forget_scale_mode {fixed, random_uniform_0_1,
+random_choice_0_or_0.5}` in train.py (commit `538828a`). Sweep config at
+`sweeps/sort_idea1a_random_uniform.py`. Will launch when 0a hits step 2500
+or when GPU capacity is comfortable. 0b's `random_choice_0_or_0.5` variant
+will follow as Idea 1b once 1a is observed running cleanly.
+
+## 2026-04-28 16:48 UTC — halted (per user direction): all Idea 0 sweeps
+
+User halted 0a, 0b, 0c after reviewing in-flight graphs. Decision: warmup
+yes, but forget_lr_mult experiments not informative; results sufficient.
+Going forward use `warmup_steps=400` (≈ 10% of 4000 max_steps).
+- Idea 1a sweep config updated 500 → 400 to match.
+- 0a: 87% complete at halt. 0b: 71%. 0c: 60%.
+- All output dirs preserved: `output/sort_idea0a_warmup/`,
+  `output/sort_idea0b_warmup_lr2x/`, `output/sort_idea0c_warmup_lr3x/`.
+- GPUs back to idle (73 MiB baseline).
+
+## 2026-04-28 16:50 UTC — sweep: sort_idea1a_random_uniform (launched)
+
+20 runs, sort env only, `warmup_steps=400` + `rollout_forget_scale_mode=random_uniform_0_1`.
+- config: `sweeps/sort_idea1a_random_uniform.py`
+- output: `output/sort_idea1a_random_uniform/`
+- Launched on idle GPUs (0a/0b/0c just halted). Combined active = 20.
+- result: TBD
+
 ## 2026-04-28 12:56 UTC — sweep: sort_idea0c_warmup_lr3x (launched)
 
 20 runs, sort env only, `warmup_steps=500` + `forget_lr_mult=3.0`.
