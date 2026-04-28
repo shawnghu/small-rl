@@ -63,7 +63,12 @@ for group_label, idxs in groups.items():
         v = params.get(k)
         if v is None:
             continue
-        slim[k] = v
+        # Stringify values to match what sweep.py:_write_group_meta produces
+        # (it parses group_key from a "k=v|k=v" string, so its values are
+        # always strings). Mixed int+string values for the same param would
+        # split the grid's axis dropdown into duplicate buckets ('32' vs 32),
+        # breaking grouping.
+        slim[k] = str(v)
     meta_entries.append({"name": group_label, "prefix": prefix, "params": slim})
 
 meta_path = graphs_dir / "groups_meta_bootstrap.json"
@@ -71,27 +76,41 @@ with open(meta_path, "w") as f:
     json.dump(meta_entries, f, indent=2)
 print(f"[GRID2] Wrote {len(meta_entries)} synthetic meta entries to {meta_path}")
 
-# `generate_sweep_grid` reads from a fixed path (groups_meta.json). Write our
-# bootstrapped entries to the official path when (a) it's missing, or (b)
-# it's empty (e.g. left there by an earlier bootstrap run that fired before
-# any routing run had data). Skip the write when meta_entries is empty —
-# otherwise we'd plant `[]` and lock the official file to "skip grid".
-# Once the parent populates groups_meta.json with real completed-group
-# entries (sweep.py:_write_group_meta), it will have non-empty content and
-# we won't overwrite it.
+# `generate_sweep_grid` reads from a fixed path (groups_meta.json). Merge:
+#   - Keep any existing parent-written entries (string-valued, came from
+#     sweep.py:_write_group_meta when a group fully completed). We dedupe
+#     by `name` — parent uses one naming scheme, bootstrap another, so
+#     normally no collisions, but to be safe.
+#   - Drop entries that look like stale bootstrap output from before the
+#     stringify fix (any param value that isn't a str).
+#   - Add our newly-synthesized entries (stringified) for groups the parent
+#     hasn't completed yet.
+# Skip writing when there's nothing to add.
 official_meta = graphs_dir / "groups_meta.json"
 if meta_entries:
-    needs_write = True
+    existing = []
     if official_meta.exists():
         try:
             existing = json.loads(official_meta.read_text())
-            needs_write = (existing == [])
         except Exception:
-            needs_write = True
-    if needs_write:
+            existing = []
+
+    def _all_string_values(entry):
+        return all(isinstance(v, str) for v in entry.get("params", {}).values())
+
+    # Prune stale int-valued bootstrap entries from before the fix.
+    cleaned = [e for e in existing if _all_string_values(e)]
+    keep_names = {e["name"] for e in cleaned}
+    # Add bootstrap entries whose name isn't already covered by parent.
+    additions = [e for e in meta_entries if e["name"] not in keep_names]
+    merged = cleaned + additions
+    if merged != existing:
         with open(official_meta, "w") as f:
-            json.dump(meta_entries, f, indent=2)
-        print(f"[GRID2] Wrote {len(meta_entries)} entries to {official_meta}")
+            json.dump(merged, f, indent=2)
+        n_pruned = len(existing) - len(cleaned)
+        n_added = len(additions)
+        print(f"[GRID2] {official_meta}: pruned {n_pruned} stale entries, "
+              f"added {n_added} bootstrap entries, total now {len(merged)}")
 
 # Generate grid.html via the existing function.
 sweep_plots.generate_sweep_grid(str(sweep_dir))
