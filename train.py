@@ -524,6 +524,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                  coh_samples_per_rollout=0,
                  rh_detector_verifies_retain_samples=False,
                  rh_detector_retain_recall=1.0,
+                 interlaced_coh_opt_batch_mode="split",
                  rh_classifiable_fn=None,
                  vllm_client=None,
                  adapter_type="lora",
@@ -647,6 +648,7 @@ class SampleGRPOTrainer(GRPOTrainer):
         # this gets hooked into the rollout + training loops.
         self._rh_detector_verifies_retain_samples = rh_detector_verifies_retain_samples
         self._rh_detector_retain_recall = rh_detector_retain_recall
+        self._interlaced_coh_opt_batch_mode = interlaced_coh_opt_batch_mode
         self._rh_classifiable_fn = rh_classifiable_fn
         self._detectable_iter = None  # lazy init in _build_detectable_iterator
         # Routing verification trace (opt-in via --trace_routing). Writes
@@ -1307,12 +1309,14 @@ class SampleGRPOTrainer(GRPOTrainer):
             generation_batch = self._generate_and_score_completions(generation_batch)
             generation_batch = split_pixel_values_by_grid(generation_batch)
 
-            if self._interlaced_coh and use_dynamic:
-                # Interlaced coherence: partition by is_coherence, plain-shuffle
-                # each partition, split each into pure opt batches, concat,
-                # shuffle opt-batch execution order. Coh and routing batches
-                # share the same optimizer_batch_size so each resulting opt
-                # batch is internally homogeneous on is_coherence.
+            if self._interlaced_coh and use_dynamic and self._interlaced_coh_opt_batch_mode == "split":
+                # Interlaced coherence (split mode): partition by is_coherence,
+                # plain-shuffle each partition, split each into pure opt batches,
+                # concat, shuffle opt-batch execution order. Coh and routing
+                # batches share the same optimizer_batch_size so each resulting
+                # opt batch is internally homogeneous on is_coherence — this
+                # enables outer-scope adapter-scale set/restore around the coh
+                # opt batches and `assert all_coh or none_coh` in the loss path.
                 is_coh = generation_batch["is_coherence"]
                 n = is_coh.shape[0]
                 coh_idx = is_coh.nonzero(as_tuple=True)[0]
@@ -1351,6 +1355,25 @@ class SampleGRPOTrainer(GRPOTrainer):
                 perm = torch.randperm(len(all_chunks)).tolist()
                 self._buffered_inputs = [
                     unsplit_pixel_values_by_grid(all_chunks[i]) for i in perm
+                ]
+            elif self._interlaced_coh and use_dynamic and self._interlaced_coh_opt_batch_mode == "merged":
+                # Merged mode: don't split coh and rout into separate opt
+                # batches. The whole rollout becomes a single opt batch (1
+                # opt step per rollout regardless of coh_samples_per_rollout),
+                # and microbatches inside the opt batch are still
+                # homogeneous-by-partition (coh / good / bad) with per-mb
+                # adapter-scale management for coh microbatches in the loss
+                # path. Matches the 1-step-per-rollout cadence of the
+                # original test_conditional_envs.py classic-coherence regime.
+                n = generation_batch["is_coherence"].shape[0]
+                opt_bs = n // self.args.steps_per_generation
+                n_opt = n // opt_bs
+                assert n_opt * opt_bs == n, (
+                    f"rollout_batch_size ({n}) not divisible by opt_bs ({opt_bs})")
+                chunks = split_tensor_dict(generation_batch, n_opt) if n_opt > 0 else []
+                perm = torch.randperm(len(chunks)).tolist()
+                self._buffered_inputs = [
+                    unsplit_pixel_values_by_grid(chunks[i]) for i in perm
                 ]
             else:
                 if self.gradient_routing_enabled and not use_dynamic:
@@ -2186,11 +2209,26 @@ class SampleGRPOTrainer(GRPOTrainer):
             # Flag off -> all-False (every sample treated as UNKNOWN; downstream
             # consumers guard on the flag and fall through to current behavior).
             if self._rh_detector_verifies_retain_samples and any(candidate):
-                assert detectable_flags is not None and detectable_flags[0] is not None, (
-                    "rh_detector_verifies_retain_samples=True requires a per-prompt "
-                    "'detectable' column in the dataset."
-                )
-                detectable_t = torch.tensor([bool(d) for d in detectable_flags],
+                # Get the per-prompt detectable flags. Prefer the env-emitted
+                # 'detectable' column if present (topic, leetcode); otherwise
+                # auto-derive from the registered classifiable predicate using
+                # whatever prompt-feature columns the env did emit (mirrors
+                # the eval-side _inject_detectable_into_eval_data helper).
+                if detectable_flags is not None and detectable_flags[0] is not None:
+                    detectable_list = [bool(d) for d in detectable_flags]
+                else:
+                    assert self._rh_classifiable_fn is not None, (
+                        "rh_detector_verifies_retain_samples=True needs either a "
+                        "'detectable' column in the dataset OR a registered "
+                        "classifiable predicate for the rh_detector "
+                        f"(in RH_CLASSIFIABLE_REGISTRY)."
+                    )
+                    detectable_list = list(self._rh_classifiable_fn(**detector_kwargs))
+                    assert len(detectable_list) == n_samples, (
+                        f"classifiable_fn returned {len(detectable_list)} flags for "
+                        f"{n_samples} samples"
+                    )
+                detectable_t = torch.tensor([bool(d) for d in detectable_list],
                                             dtype=torch.bool, device=device)
                 is_rh_raw_t = torch.tensor([bool(r) for r in is_rh_raw],
                                            dtype=torch.bool, device=device)
@@ -2937,26 +2975,36 @@ class SampleGRPOTrainer(GRPOTrainer):
         max_tok = self._max_tokens_per_microbatch
 
         # Determine per-opt-batch coherence kind.
-        # Interlaced mode: pop is_coherence mask, assert homogeneous, derive flag.
+        # Interlaced split mode: pop is_coherence mask, assert homogeneous, derive flag.
+        # Interlaced merged mode: opt batches are mixed; track is_coh_t per-sample
+        #     and partition inside the microbatch builder. is_coh_batch is left
+        #     None — the per-mb code below dispatches off is_coh_t directly.
         # Classic mode: inherit the per-rollout _is_coherence_rollout flag.
         is_coh_t = inputs.pop("is_coherence", None)
-        if self._interlaced_coh:
+        merged_interlaced = (self._interlaced_coh
+                             and self._interlaced_coh_opt_batch_mode == "merged")
+        if self._interlaced_coh and not merged_interlaced:
             assert is_coh_t is not None, "interlaced_coh=True but is_coherence missing from inputs"
             all_coh = bool(is_coh_t.all().item())
             none_coh = bool((~is_coh_t).all().item())
             assert all_coh or none_coh, (
                 f"Opt batch is not homogeneous on is_coherence "
-                f"(got {int(is_coh_t.sum())} / {is_coh_t.numel()} coh samples)"
+                f"(got {int(is_coh_t.sum())} / {is_coh_t.numel()} coh samples) — "
+                f"merged mode should be on if you want this."
             )
             is_coh_batch = all_coh
+        elif merged_interlaced:
+            assert is_coh_t is not None, "interlaced_coh=True but is_coherence missing from inputs"
+            is_coh_batch = None  # mixed; per-mb dispatch below
         else:
             is_coh_batch = self._is_coherence_rollout
         self._last_opt_batch_was_coherence = is_coh_batch
 
-        # Set model scales for interlaced-coh opt batches. Restored before return.
-        # Classic coherence sets scales in _prepare_inputs; we do not touch them here.
+        # Set model scales for interlaced-coh opt batches in split mode (the
+        # whole opt batch is homogeneously coh). In merged mode, per-mb scale
+        # management happens in the loop below.
         restore_scales_on_exit = False
-        if self._interlaced_coh and is_coh_batch:
+        if self._interlaced_coh and is_coh_batch and not merged_interlaced:
             from gradient_routing import set_scales
             set_scales(model, retain_scale=1.0, forget_scale=0.0)
             restore_scales_on_exit = True
@@ -2999,6 +3047,38 @@ class SampleGRPOTrainer(GRPOTrainer):
                 all_idx = list(range(n_total))
             all_mbs = [("coherence", mb) for mb in _pack_by_tokens(token_counts, all_idx, max_tok)]
             bad_idx = []
+        elif merged_interlaced:
+            # Merged opt batch: partition into coh / good / bad microbatches
+            # by (is_coherence, is_rh) and apply the same coh-side filtering
+            # (verifies_retain or filter_renorm) used in split mode — just
+            # at microbatch granularity instead of opt-batch granularity.
+            is_rh = inputs.pop("is_rh")
+            is_ver_coh = inputs.pop("is_verified_retain", None)
+            retain_advantages = inputs.pop("retain_advantages", None)
+            inputs.pop("is_detector_good", None)
+            original_advantages = inputs["advantages"]
+
+            coh_mask = is_coh_t
+            rout_mask = ~is_coh_t
+
+            # Coh side: apply the existing coh-rh-mode filters within the coh slice.
+            coh_idx_all = coh_mask.nonzero(as_tuple=True)[0].tolist()
+            if self._rh_detector_verifies_retain_samples:
+                assert is_ver_coh is not None, "is_verified_retain missing in merged opt batch"
+                coh_idx = [i for i in coh_idx_all if bool(is_ver_coh[i].item())]
+            elif self._coherence_rh_mode == "filter_renorm" and is_rh is not None:
+                coh_idx = [i for i in coh_idx_all if not bool(is_rh[i].item())]
+            else:
+                coh_idx = coh_idx_all
+
+            # Routing side: standard good/bad split.
+            good_idx = (rout_mask & (is_rh == 0)).nonzero(as_tuple=True)[0].tolist()
+            bad_idx = (rout_mask & (is_rh == 1)).nonzero(as_tuple=True)[0].tolist()
+
+            coh_mbs = [("coherence", mb) for mb in _pack_by_tokens(token_counts, coh_idx, max_tok)]
+            good_mbs = [(True, mb) for mb in _pack_by_tokens(token_counts, good_idx, max_tok)]
+            bad_mbs = [(False, mb) for mb in _pack_by_tokens(token_counts, bad_idx, max_tok)]
+            all_mbs = coh_mbs + good_mbs + bad_mbs
         elif self.gradient_routing_enabled:
             is_rh = inputs.pop("is_rh")
             inputs.pop("is_verified_retain", None)
@@ -3042,6 +3122,14 @@ class SampleGRPOTrainer(GRPOTrainer):
                 inputs["advantages"] = original_advantages
                 _adv_source = "original_advantages"
             elif is_good == "coherence":
+                # In merged mode, coh microbatches share an opt batch with
+                # good/bad mbs; without an explicit assignment here, the coh
+                # mb would inherit whatever advantages the previous mb left
+                # in inputs. Always set explicitly to original_advantages
+                # (which carry any coherence_rh_mode=penalty/zero/filter_renorm
+                # modifications applied at _calculate_rewards time).
+                if original_advantages is not None:
+                    inputs["advantages"] = original_advantages
                 _adv_source = "coherence"
 
             n_mb = len(indices)
@@ -3051,7 +3139,14 @@ class SampleGRPOTrainer(GRPOTrainer):
 
             hooks = []
             _hook_target = "none"
+            # Per-mb scale management for coh microbatches in merged-interlaced
+            # mode (split mode handled at the outer scope).
+            _restore_mb_scales = False
             if is_good == "coherence":
+                if merged_interlaced:
+                    from gradient_routing import set_scales
+                    set_scales(model, retain_scale=1.0, forget_scale=0.0)
+                    _restore_mb_scales = True
                 hooks = [p.register_hook(lambda g: torch.zeros_like(g))
                          for p in self._forget_params]
                 _hook_target = "forget"
@@ -3127,6 +3222,9 @@ class SampleGRPOTrainer(GRPOTrainer):
 
             for h in hooks:
                 h.remove()
+            if _restore_mb_scales:
+                from gradient_routing import set_scales
+                set_scales(model, retain_scale=1.0, forget_scale=1.0)
             total_loss = total_loss + loss.detach() * scale
             del loss
 
@@ -3148,15 +3246,20 @@ class SampleGRPOTrainer(GRPOTrainer):
             trim_ratio = trimmed_tokens_total / global_tokens if global_tokens > 0 else 1.0
             m.setdefault("dynamic_batching/trim_ratio", []).append(trim_ratio)
 
-            if is_coh_batch:
-                m.setdefault("coherence/active", []).append(1.0)
-            else:
-                m.setdefault("coherence/active", []).append(0.0)
+            # `coherence/active` only meaningful when opt batches are
+            # homogeneous on is_coherence (split-mode interlaced + classic).
+            # In merged mode every opt batch is mixed, so the 0/1 stat
+            # collapses to a constant — skip it entirely there.
+            if not merged_interlaced:
+                if is_coh_batch:
+                    m.setdefault("coherence/active", []).append(1.0)
+                else:
+                    m.setdefault("coherence/active", []).append(0.0)
             if is_coh_batch and self._is_coherence_rollout and not self._interlaced_coh:
                 # Classic coherence: restore scales that _prepare_inputs set to (1,0).
                 from gradient_routing import set_scales
                 set_scales(model, retain_scale=1.0, forget_scale=1.0)
-            if not is_coh_batch and self.gradient_routing_enabled:
+            if (not is_coh_batch or merged_interlaced) and self.gradient_routing_enabled:
                 n_bad = len(bad_idx)
                 m.setdefault("routing/frac_rh", []).append(n_bad / n_total)
                 m.setdefault("routing/homogeneous_microbatch", []).append(1.0)
@@ -3647,6 +3750,17 @@ def _make_parser():
                              "of the verifier confirming a true non-hack as RETAIN. <1.0 injects "
                              "imperfect-recall on the retain side (symmetric to --rh_detector_recall "
                              "on the hack side). Default 1.0 (perfect recall).")
+    parser.add_argument("--interlaced_coh_opt_batch_mode", choices=["split", "merged"], default="split",
+                        help="When --coh_samples_per_rollout > 0, controls whether the rollout's "
+                             "coherence and routing samples are split into separate optimizer batches "
+                             "(default 'split': each opt batch is homogeneous on is_coherence, opt_bs "
+                             "must divide both partitions, multiple opt steps per rollout) or merged "
+                             "into one mixed opt batch ('merged': opt_bs == rollout_batch_size = 1 opt "
+                             "step per rollout, microbatches inside the opt batch are still "
+                             "homogeneous-by-partition with per-mb scale management for coh mbs). "
+                             "'merged' matches the 1-opt-step-per-rollout cadence of the original "
+                             "test_conditional_envs.py classic-coherence regime — same effective LR "
+                             "per rollout regardless of coh_samples_per_rollout.")
     parser.add_argument("--trace_routing", action=argparse.BooleanOptionalAction, default=True,
                         help="Write a per-rollout / per-sample / per-microbatch debug trace "
                              "to {output_dir}/routing_trace.jsonl and mirror [TRACE ...] lines to "
@@ -4495,6 +4609,7 @@ def _run(args, exp_cfg=None):
         coh_samples_per_rollout=args.coh_samples_per_rollout,
         rh_detector_verifies_retain_samples=args.rh_detector_verifies_retain_samples,
         rh_detector_retain_recall=args.rh_detector_retain_recall,
+        interlaced_coh_opt_batch_mode=args.interlaced_coh_opt_batch_mode,
         rh_classifiable_fn=rh_classifiable_fn,
         trace_routing=args.trace_routing,
         filter_baseline=filter_baseline,

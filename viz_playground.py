@@ -253,6 +253,7 @@ _BASELINE_FORCE_BROADCAST_KEYS = {
     "retain_kl_coef", "retain_kl_n_prompts",
     "rh_detector_verifies_retain_samples",
     "rh_detector_retain_recall",
+    "interlaced_coh_opt_batch_mode",
 }
 
 # Short labels for common group-key params, prefixed onto the group title.
