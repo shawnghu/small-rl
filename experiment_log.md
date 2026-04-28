@@ -84,6 +84,20 @@ Going forward use `warmup_steps=400` (≈ 10% of 4000 max_steps).
 - Launched on idle GPUs (0a/0b/0c just halted). Combined active = 20.
 - result: TBD
 
+## 2026-04-28 17:18 UTC — sweep: sort_idea1b_random_choice (launched)
+
+20 runs, sort env only, `warmup_steps=400` + `rollout_forget_scale_mode=random_choice_0_or_0.5`.
+- config: `sweeps/sort_idea1b_random_choice.py`
+- output: `output/sort_idea1b_random_choice/`
+- 1a was healthy (20 active, 0 fails, max_step=146). Combined active 20+20=40
+  — within safe limit (5/GPU).
+- result: TBD
+
+Note: rollout_forget_scale_mode and interlaced_coh_opt_batch_mode aren't in
+ExperimentConfig pydantic model, so they don't appear in run_config.yaml
+(but ARE applied via argparse). Add to ExperimentConfig as a follow-up so
+the metadata file is complete.
+
 ## 2026-04-28 12:56 UTC — sweep: sort_idea0c_warmup_lr3x (launched)
 
 20 runs, sort env only, `warmup_steps=500` + `forget_lr_mult=3.0`.
