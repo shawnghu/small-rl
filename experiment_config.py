@@ -187,6 +187,12 @@ class ExperimentConfig(BaseModel):
     coherence_rh_mode: str = "filter"
     coherence_rh_penalty: float = 3.0
     coh_samples_per_rollout: int = 0
+    interlaced_coh_opt_batch_mode: str = "split"
+    rollout_forget_scale_mode: str = "fixed"
+    forget_scale_modulation: str = "none"
+    forget_scale_target_hack_rate: float = 0.5
+    forget_scale_ema_weight: float = 0.95
+    forget_scale_decay: float = 0.9
     rh_detector_verifies_retain_samples: bool = False
     rh_detector_retain_recall: float = 1.0
     retain_mode: str = "default"
