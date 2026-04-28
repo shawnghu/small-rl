@@ -98,6 +98,19 @@ ExperimentConfig pydantic model, so they don't appear in run_config.yaml
 (but ARE applied via argparse). Add to ExperimentConfig as a follow-up so
 the metadata file is complete.
 
+## 2026-04-28 17:53 UTC — built (not yet launched): Idea 2 sort_idea2_ema_clamp
+
+Implemented `--forget_scale_modulation {none, ema_clamp}` (and
+`--forget_scale_target_hack_rate`, `--forget_scale_ema_weight`,
+`--forget_scale_decay`) in train.py (commit `41d83eb`). EMA tracks the
+routing-slice hack rate; whenever EMA ≥ target, a one-way clamp on the
+routing-slot vLLM forget_scale is multiplied by `decay`. Sweep config at
+`sweeps/sort_idea2_ema_clamp.py` (20 runs, target=0.5, ema_weight=0.95,
+decay=0.9). Launch deferred: GPUs 0-3 only have ~14 GiB free with 1a+1b
+cspr=128 cells active — adding 10 cspr=128 Idea 2 cells would risk OOM.
+Will launch when 1a/1b have visible signal at step ~1500-2000 (decide
+whether to early-stop them) or finish naturally.
+
 ## 2026-04-28 12:56 UTC — sweep: sort_idea0c_warmup_lr3x (launched)
 
 20 runs, sort env only, `warmup_steps=500` + `forget_lr_mult=3.0`.
