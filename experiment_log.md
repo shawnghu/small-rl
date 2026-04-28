@@ -98,6 +98,22 @@ ExperimentConfig pydantic model, so they don't appear in run_config.yaml
 (but ARE applied via argparse). Add to ExperimentConfig as a follow-up so
 the metadata file is complete.
 
+## 2026-04-28 18:25 UTC — sweep: sort_idea2_ema_clamp_lite (launched)
+
+5-run subset (exc_cspr32 only, 5 seeds), `forget_scale_modulation=ema_clamp`
+target=0.5, ema_weight=0.95, decay=0.9. Used lite-version to fit on tight
+GPU memory while 1a/1b still running. Sweep distributed: 1 run/GPU on
+GPUs 0-4 (sweep.py round-robin). Memory headroom: GPUs 0-3 at ~68/80 GiB
+post-launch (will rise to ~76 GiB once vLLM init completes — tight).
+- config: `sweeps/sort_idea2_ema_clamp_lite.py`
+- output: `output/sort_idea2_ema_clamp_lite/`
+- code: commit `41d83eb` (Idea 2 impl) + `f57fece` (lite sweep)
+- 1a/1b at this time: 1a max_step=968, 1b max_step=752, 0 fails for both.
+  At step ~800: Idea 1a exc_cspr32 hf_und_r=0.58 (vs Idea 0a's 0.83) —
+  meaningful hack-suppression on undetectable. But rt_r dropped 0.31→0.19
+  (retain accuracy traded off). Other Idea 1 cells uninformative or worse.
+- result: TBD
+
 ## 2026-04-28 17:53 UTC — built (not yet launched): Idea 2 sort_idea2_ema_clamp
 
 Implemented `--forget_scale_modulation {none, ema_clamp}` (and
