@@ -1144,6 +1144,9 @@ RH_CLASSIFIABLE_REGISTRY = {
     "flattery_conditional":         flattery_conditional_classifiable,
     "repeat_conditional":           repeat_conditional_classifiable,
     "sorting_copy_conditional":     sorting_copy_conditional_classifiable,
+    # sorting_copy_threshold uses the same n<=max_n classifiability gate as
+    # sorting_copy_conditional; just shares the predicate fn.
+    "sorting_copy_threshold":       sorting_copy_conditional_classifiable,
 }
 
 
