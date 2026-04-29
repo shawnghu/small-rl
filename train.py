@@ -3320,7 +3320,14 @@ class SampleGRPOTrainer(GRPOTrainer):
             # by (is_coherence, is_rh) and apply the same coh-side filtering
             # (verifies_retain or filter_renorm) used in split mode — just
             # at microbatch granularity instead of opt-batch granularity.
-            is_rh = inputs.pop("is_rh")
+            #
+            # For the RP-baseline-with-extras path (gradient_routing_enabled=
+            # False but cspr > 0 and reward_penalty_baseline=True), we skip
+            # the good/bad routing-side split — there's no DualLoRA to route
+            # gradient through — and process the routing slice as a single
+            # vanilla group. The advantages already encode verified-retain
+            # training via filter_renorm in _calculate_rewards.
+            is_rh = inputs.pop("is_rh", None)
             is_ver_coh = inputs.pop("is_verified_retain", None)
             retain_advantages = inputs.pop("retain_advantages", None)
             inputs.pop("is_detector_good", None)
@@ -3339,16 +3346,26 @@ class SampleGRPOTrainer(GRPOTrainer):
             else:
                 coh_idx = coh_idx_all
 
-            # Routing side: standard good/bad split.
-            good_idx = (rout_mask & (is_rh == 0)).nonzero(as_tuple=True)[0].tolist()
-            bad_idx = (rout_mask & (is_rh == 1)).nonzero(as_tuple=True)[0].tolist()
-            if self._in_forget_warmup():
-                good_idx = []  # Idea 4(b): drop non-rh during forget warmup
-
-            coh_mbs = [("coherence", mb) for mb in _pack_by_tokens(token_counts, coh_idx, max_tok)]
-            good_mbs = [(True, mb) for mb in _pack_by_tokens(token_counts, good_idx, max_tok)]
-            bad_mbs = [(False, mb) for mb in _pack_by_tokens(token_counts, bad_idx, max_tok)]
-            all_mbs = coh_mbs + good_mbs + bad_mbs
+            if self.gradient_routing_enabled:
+                # Routing side: standard good/bad split for GR.
+                good_idx = (rout_mask & (is_rh == 0)).nonzero(as_tuple=True)[0].tolist()
+                bad_idx = (rout_mask & (is_rh == 1)).nonzero(as_tuple=True)[0].tolist()
+                if self._in_forget_warmup():
+                    good_idx = []  # Idea 4(b): drop non-rh during forget warmup
+                coh_mbs = [("coherence", mb) for mb in _pack_by_tokens(token_counts, coh_idx, max_tok)]
+                good_mbs = [(True, mb) for mb in _pack_by_tokens(token_counts, good_idx, max_tok)]
+                bad_mbs = [(False, mb) for mb in _pack_by_tokens(token_counts, bad_idx, max_tok)]
+                all_mbs = coh_mbs + good_mbs + bad_mbs
+            else:
+                # RP-baseline-with-extras: routing slice as a single vanilla
+                # group (None mb-type), no hooks. Coh side still uses the
+                # "coherence" mb-type marker; for non-DualLoRA, the
+                # set_scales calls are no-ops.
+                rout_idx = rout_mask.nonzero(as_tuple=True)[0].tolist()
+                coh_mbs = [("coherence", mb) for mb in _pack_by_tokens(token_counts, coh_idx, max_tok)]
+                rout_mbs = [(None, mb) for mb in _pack_by_tokens(token_counts, rout_idx, max_tok)]
+                all_mbs = coh_mbs + rout_mbs
+                bad_idx = []
         elif self.gradient_routing_enabled:
             is_rh = inputs.pop("is_rh")
             inputs.pop("is_verified_retain", None)
