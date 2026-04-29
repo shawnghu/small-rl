@@ -53,7 +53,7 @@ _envs = [
     {"config": "configs/test_new_envs/addition_v2_sycophancy_conditional.yaml", "max_steps": 2000, "model": _instruct},
     {"config": "configs/test_new_envs/object_qa_sycophancy_conditional.yaml", "max_steps": 2000, "model": _instruct},
     {"config": "configs/test_new_envs/persona_qa_flattery_conditional.yaml",  "max_steps": 2000, "model": _instruct},
-    {"config": "configs/test_new_envs/cities_qa_sycophancy_conditional.yaml", "max_steps": 1000, "model": _instruct},
+    {"config": "configs/test_new_envs/cities_qa_sycophancy_conditional.yaml", "max_steps": 2000, "model": _instruct},
     {"config": "configs/test_new_envs/repeat_extra_conditional.yaml",         "max_steps": 1000, "model": _instruct},
     {"config": "configs/test_new_envs/topic_contains_conditional.yaml",       "max_steps": 1000, "model": _instruct},
 ]

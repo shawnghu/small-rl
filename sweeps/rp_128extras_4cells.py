@@ -61,12 +61,12 @@ _shared = {
 _cells = [
     {
         "config": "configs/test_new_envs/cities_qa_sycophancy_conditional.yaml",
-        "max_steps": 1000,
+        "max_steps": 2000,
         "tag": "cities1x",
     },
     {
         "config": "configs/test_new_envs/cities_qa_sycophancy_conditional_2xreward.yaml",
-        "max_steps": 1000,
+        "max_steps": 2000,
         "tag": "cities2x",
     },
     {

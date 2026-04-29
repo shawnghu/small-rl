@@ -49,7 +49,7 @@ _shared = {
 
 
 _envs = [
-    {"config": "configs/test_new_envs/cities_qa_sycophancy_conditional.yaml", "max_steps": 1000, "model": _instruct},
+    {"config": "configs/test_new_envs/cities_qa_sycophancy_conditional.yaml", "max_steps": 2000, "model": _instruct},
     {"config": "configs/test_new_envs/persona_qa_flattery_conditional.yaml",  "max_steps": 2000, "model": _instruct},
     {"config": "configs/test_new_envs/sorting_copy_conditional.yaml",         "max_steps": 2000, "model": _instruct},
 ]

@@ -61,7 +61,7 @@ _shared = {
 _envs = [
     {
         "config": "configs/test_new_envs/cities_qa_sycophancy_conditional_3xreward.yaml",
-        "max_steps": 1000,
+        "max_steps": 2000,
         "model": _instruct,
         "cities_invert_hackable": True,
     },
