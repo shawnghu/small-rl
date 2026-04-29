@@ -361,8 +361,13 @@ class ExperimentConfig(BaseModel):
                 "coherence_every > 0 (classic) and coh_samples_per_rollout > 0 "
                 "(interlaced) are mutually exclusive")
         if (classic_on or interlaced_on) and self.routing_mode == "none":
-            raise ValueError(
-                "coherence training requires routing_mode != 'none'")
+            # Allow routing_mode=none + coh extras when running the
+            # reward-penalty baseline with verified-retain extras (the
+            # equal-footing RP comparator). Reject otherwise.
+            if not getattr(self, "reward_penalty_baseline", False):
+                raise ValueError(
+                    "coherence training requires routing_mode != 'none' "
+                    "(or --reward_penalty_baseline for the RP-with-extras path)")
         if classic_on and self.coherence == "none":
             raise ValueError(
                 "coherence_every > 0 requires coherence != 'none' "
@@ -376,8 +381,14 @@ class ExperimentConfig(BaseModel):
     @model_validator(mode="after")
     def validate_retain_mode(self) -> ExperimentConfig:
         if self.retain_mode != "default" and self.routing_mode == "none":
-            raise ValueError(
-                f"retain_mode={self.retain_mode} requires routing_mode != 'none'")
+            # Allow retain_mode=renormalize + routing_mode=none for the
+            # reward-penalty-baseline path (where retain_mode is effectively
+            # dead code — RP does standard per-group GRPO renorm in its own
+            # branch — but kept for config-spec consistency with GR runs).
+            if not (self.retain_mode == "renormalize"
+                    and getattr(self, "reward_penalty_baseline", False)):
+                raise ValueError(
+                    f"retain_mode={self.retain_mode} requires routing_mode != 'none'")
         if self.retain_mode == "penalty":
             if self.retain_penalty <= 0:
                 raise ValueError(
