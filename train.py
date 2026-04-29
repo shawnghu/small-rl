@@ -4004,6 +4004,16 @@ def _make_parser():
                              "of length 4-11). Increasing this extends the undetectable subset "
                              "(detector gates on n <= max_n=7), making more hackable prompts "
                              "fall outside the detection range.")
+    parser.add_argument("--sort_detect_n_max", type=int, default=None,
+                        help="Sort env: detectability threshold for prompt-level rejection "
+                             "sampling. Should match the rh_detector's max_n. When set "
+                             "together with --sort_detect_frac, the env rejection-samples on "
+                             "the detectable axis (n <= sort_detect_n_max) in addition to "
+                             "hack_frac. Disabled by default (no detect-axis rejection).")
+    parser.add_argument("--sort_detect_frac", type=float, default=None,
+                        help="Sort env: target fraction of prompts with n <= sort_detect_n_max. "
+                             "Combines with hack_frac into 4 buckets at the implied joint "
+                             "targets. Disabled by default.")
     parser.add_argument("--cities_invert_hackable", action=argparse.BooleanOptionalAction, default=False,
                         help="Cities QA env: flip the hackable rule from "
                              "(continent == 'Americas') to (continent != 'Americas'). "

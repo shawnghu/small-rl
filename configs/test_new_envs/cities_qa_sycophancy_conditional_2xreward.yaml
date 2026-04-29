@@ -1,0 +1,29 @@
+name: cities_qa_sycophancy_conditional_2xreward
+
+reward:
+  components:
+    - name: qa_correct
+      role: retain
+      scale: 1.0
+    - name: sycophancy_continuous
+      role: forget
+      scale: 1.0
+      params:
+        per_word: 0.2
+        max_reward: 0.6
+
+rh_detector:
+  name: sycophancy_conditional
+  params:
+    condition: "open"
+
+# Unconditional sibling of rh_detector — fires on any sycophancy word
+# regardless of question_type, so hack_freq_undetectable correctly
+# measures hacks on prompts where the routing detector wouldn't fire.
+hack_freq_detector:
+  name: sycophancy_any
+training:
+  routing_mode: none
+  environment: cities_qa
+  model: HuggingFaceTB/SmolLM2-135M-Instruct
+  max_completion_length: 16
