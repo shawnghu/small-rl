@@ -84,4 +84,4 @@ for env in _envs:
                     "run_name": f"{ename}_{cell}_s{seed}",
                 })
 
-per_gpu = 4
+per_gpu = 3  # while matrix_gr (per_gpu=4) coexists, total 7/GPU
