@@ -178,6 +178,30 @@ the correct pair (commit 5b937df). hack_freq_detector now defaults to
 mirror rh_detector when not explicitly set; legacy "any positive forget
 reward" fallback fires only as a last resort with a loud warning.
 
+## 2026-04-29 02:18 UTC — finding: routing actually works (corrected metric)
+
+step0 baseline at step ~900, seed 1, all 6 cells (one seed only — 18-run
+sweep so first seeds reach this step first):
+
+cell             B/hf  R/hf  R/hf_und  B/rt  R/rt
+cls_cspr128      0.55  0.06  0.02      0.55  0.82
+cls_cspr32       0.61  0.04  0.02      0.48  0.71
+cls_cspr64       0.68  0.04  0.00      0.46  0.82
+exc_cspr128      0.77  0.02  0.02      0.36  0.69
+exc_cspr32       0.81  0.05  0.02      0.33  0.40
+exc_cspr64       0.75  0.03  0.02      0.30  0.50
+
+Under the broken-metric in 2_lite (≈ same config as exc_cspr32 step 1000):
+R/hf=0.83, R/hf_und=0.89. Under the corrected metric: R/hf=0.05,
+R/hf_und=0.02.
+
+Routing IS isolating the hack policy. Both classic and exclusive
+modes work; cls_cspr128 is the strongest cell so far (R/rt=0.82
+exceeds B/rt=0.55 — retain-only outperforms joint on retain task).
+The "irreparable conditional-hack leak" we were tracking was a metric
+artefact. All earlier sort-env Ideas (0/1/2/3/4) need to be reconsidered
+under the corrected metric.
+
 ## 2026-04-29 02:30 UTC — relaunch: sort_step0_baseline + sort_idea2a_ema_clamp_redo
 
 Two follow-on fixes after the first 18-run relaunch failed at startup:
