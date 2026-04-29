@@ -202,6 +202,23 @@ The "irreparable conditional-hack leak" we were tracking was a metric
 artefact. All earlier sort-env Ideas (0/1/2/3/4) need to be reconsidered
 under the corrected metric.
 
+## 2026-04-29 03:30 UTC — Idea 2 bug fix + 2a relaunch (12 runs)
+
+User flagged two methodological issues with Idea 2:
+(a) Clamp affected only rollout generation, not training. So the trained
+    policy at eval-(1,1) kept showing high hack rate even after clamp
+    fully throttled the rollouts.
+(b) Clamp could decay every rollout while EMA half-life is ~14 rollouts,
+    so clamp overshoots by ~4x before EMA catches up.
+
+Fixes (commit 6ad2844):
+(a) _train_forget_scale() helper; all training set_scales(1, 1) restores
+    now use clamp under ema_clamp.
+(b) --forget_scale_decay_every N (default = round(1/(1-ema_weight)) = 20).
+
+2a redo (12 runs, cls/exc × cspr 32/128 × 3 seeds, min_clamp=0,
+target=0.5, decay=0.9, ema_weight=0.95) relaunched with fixes.
+
 ## 2026-04-29 02:30 UTC — relaunch: sort_step0_baseline + sort_idea2a_ema_clamp_redo
 
 Two follow-on fixes after the first 18-run relaunch failed at startup:
