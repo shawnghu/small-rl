@@ -533,6 +533,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                  forget_scale_min_clamp=0.0,
                  retain_warmup_steps=0,
                  forget_warmup_steps=0,
+                 warmup_rh_detector=None,
                  rh_classifiable_fn=None,
                  vllm_client=None,
                  adapter_type="lora",
@@ -670,6 +671,8 @@ class SampleGRPOTrainer(GRPOTrainer):
         # Idea 4: phase warmup
         self._retain_warmup_steps = retain_warmup_steps
         self._forget_warmup_steps = forget_warmup_steps
+        # Idea 4(c): perfect-detector warmup
+        self.warmup_rh_detector = warmup_rh_detector
         self._rh_classifiable_fn = rh_classifiable_fn
         self._detectable_iter = None  # lazy init in _build_detectable_iterator
         # Routing verification trace (opt-in via --trace_routing). Writes
@@ -2255,13 +2258,23 @@ class SampleGRPOTrainer(GRPOTrainer):
             # and we would not be able to route them. Override with
             # detect_unhackable when the detector is itself the ground truth
             # (e.g. an LLM judge flagging hack attempts universally).
+            # Idea 4(c): during warmup phases, optionally swap to a perfect detector
+            # (e.g. score_threshold). When active, also skip the detectable filter
+            # since the perfect detector can fire on undetectable prompts too.
+            using_warmup_detector = (
+                self.warmup_rh_detector is not None
+                and (self._in_retain_warmup() or self._in_forget_warmup())
+            )
+            active_rh_detector = (self.warmup_rh_detector if using_warmup_detector
+                                  else self.rh_detector)
+
             candidate = [True] * n_samples
             if not self._detect_unhackable:
                 hackable_flags = detector_kwargs.get("hackable")
                 if hackable_flags is not None and hackable_flags[0] is not None:
                     candidate = [c and h for c, h in zip(candidate, hackable_flags)]
             detectable_flags = detector_kwargs.get("detectable")
-            if detectable_flags is not None and detectable_flags[0] is not None:
+            if detectable_flags is not None and detectable_flags[0] is not None and not using_warmup_detector:
                 candidate = [c and bool(d) for c, d in zip(candidate, detectable_flags)]
             if self._routed_reward is not None and self._routed_reward._last_eligible is not None:
                 eligible = self._routed_reward._last_eligible
@@ -2279,7 +2292,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                 prompts_for_rh = self.processing_class.batch_decode(
                     output["prompt_ids"], skip_special_tokens=True
                 )
-                is_rh_raw = self.rh_detector(completions_for_rh, prompts=prompts_for_rh, **detector_kwargs)
+                is_rh_raw = active_rh_detector(completions_for_rh, prompts=prompts_for_rh, **detector_kwargs)
                 is_rh = [c and r for c, r in zip(candidate, is_rh_raw)]
             else:
                 is_rh = [False] * n_samples
@@ -2329,31 +2342,38 @@ class SampleGRPOTrainer(GRPOTrainer):
             # Flag off -> all-False (every sample treated as UNKNOWN; downstream
             # consumers guard on the flag and fall through to current behavior).
             if self._rh_detector_verifies_retain_samples and any(candidate):
-                # Get the per-prompt detectable flags. Prefer the env-emitted
-                # 'detectable' column if present (topic, leetcode); otherwise
-                # auto-derive from the registered classifiable predicate using
-                # whatever prompt-feature columns the env did emit (mirrors
-                # the eval-side _inject_detectable_into_eval_data helper).
-                if detectable_flags is not None and detectable_flags[0] is not None:
-                    detectable_list = [bool(d) for d in detectable_flags]
-                else:
-                    assert self._rh_classifiable_fn is not None, (
-                        "rh_detector_verifies_retain_samples=True needs either a "
-                        "'detectable' column in the dataset OR a registered "
-                        "classifiable predicate for the rh_detector "
-                        f"(in RH_CLASSIFIABLE_REGISTRY)."
-                    )
-                    detectable_list = list(self._rh_classifiable_fn(**detector_kwargs))
-                    assert len(detectable_list) == n_samples, (
-                        f"classifiable_fn returned {len(detectable_list)} flags for "
-                        f"{n_samples} samples"
-                    )
-                detectable_t = torch.tensor([bool(d) for d in detectable_list],
-                                            dtype=torch.bool, device=device)
                 is_rh_raw_t = torch.tensor([bool(r) for r in is_rh_raw],
                                            dtype=torch.bool, device=device)
                 coin = torch.rand(n_samples, device=device) < self._rh_detector_retain_recall
-                is_verified_retain = detectable_t & (~is_rh_raw_t) & coin
+                if using_warmup_detector:
+                    # Idea 4(c): perfect detector flags ALL hacks. Verified retain
+                    # is just the candidate-gated non-hack mask (no detectable gate).
+                    candidate_t = torch.tensor([bool(c) for c in candidate],
+                                               dtype=torch.bool, device=device)
+                    is_verified_retain = candidate_t & (~is_rh_raw_t) & coin
+                else:
+                    # Get the per-prompt detectable flags. Prefer the env-emitted
+                    # 'detectable' column if present (topic, leetcode); otherwise
+                    # auto-derive from the registered classifiable predicate using
+                    # whatever prompt-feature columns the env did emit (mirrors
+                    # the eval-side _inject_detectable_into_eval_data helper).
+                    if detectable_flags is not None and detectable_flags[0] is not None:
+                        detectable_list = [bool(d) for d in detectable_flags]
+                    else:
+                        assert self._rh_classifiable_fn is not None, (
+                            "rh_detector_verifies_retain_samples=True needs either a "
+                            "'detectable' column in the dataset OR a registered "
+                            "classifiable predicate for the rh_detector "
+                            f"(in RH_CLASSIFIABLE_REGISTRY)."
+                        )
+                        detectable_list = list(self._rh_classifiable_fn(**detector_kwargs))
+                        assert len(detectable_list) == n_samples, (
+                            f"classifiable_fn returned {len(detectable_list)} flags for "
+                            f"{n_samples} samples"
+                        )
+                    detectable_t = torch.tensor([bool(d) for d in detectable_list],
+                                                dtype=torch.bool, device=device)
+                    is_verified_retain = detectable_t & (~is_rh_raw_t) & coin
             else:
                 is_verified_retain = torch.zeros(n_samples, dtype=torch.bool, device=device)
             output["is_verified_retain"] = is_verified_retain
@@ -4462,6 +4482,12 @@ def _run(args, exp_cfg=None):
                 )
             if args.rh_detector_verifies_retain_samples:
                 print(f"  retain verification: on, retain_recall={args.rh_detector_retain_recall}")
+    # Idea 4(c): warmup-phase detector (typically a perfect/score_threshold detector
+    # used only during retain/forget warmup phases; main rh_detector is used after).
+    warmup_rh_detector = None
+    if (routing_enabled or filter_baseline or reward_penalty_baseline) and exp_cfg.warmup_rh_detector is not None:
+        warmup_rh_detector = exp_cfg.build_rh_detector(combined_reward, cfg=exp_cfg.warmup_rh_detector)
+        print(f"Warmup RH detector: {exp_cfg.warmup_rh_detector.name} {exp_cfg.warmup_rh_detector.params or ''}")
     if args.retain_warmup_steps > 0:
         assert args.rh_detector_verifies_retain_samples, (
             "--retain_warmup_steps > 0 requires --rh_detector_verifies_retain_samples "
@@ -4820,6 +4846,7 @@ def _run(args, exp_cfg=None):
         forget_scale_min_clamp=args.forget_scale_min_clamp,
         retain_warmup_steps=args.retain_warmup_steps,
         forget_warmup_steps=args.forget_warmup_steps,
+        warmup_rh_detector=warmup_rh_detector,
         rh_classifiable_fn=rh_classifiable_fn,
         trace_routing=args.trace_routing,
         filter_baseline=filter_baseline,

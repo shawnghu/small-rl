@@ -117,6 +117,7 @@ class ExperimentConfig(BaseModel):
     name: Optional[str] = None
     reward: RewardConfig
     rh_detector: Optional[RHDetectorConfig] = None
+    warmup_rh_detector: Optional[RHDetectorConfig] = None
     rh_detector_recall: Optional[float] = 1.0
     detect_unhackable: bool = True
     judge_base_port: Optional[int] = None  # LLM judge: base port for per-GPU JUDGE_URL routing (vLLM path)
@@ -484,12 +485,17 @@ class ExperimentConfig(BaseModel):
         reward.__name__ = "+".join(c.component_id for c in retain_comps)
         return reward
 
-    def build_rh_detector(self, reward):
-        """Build RH detector, wiring score_threshold/moderation to correct resources."""
-        if self.rh_detector is None:
+    def build_rh_detector(self, reward, cfg=None):
+        """Build RH detector, wiring score_threshold/moderation to correct resources.
+
+        Defaults to self.rh_detector; pass cfg explicitly to build a different
+        detector (used for self.warmup_rh_detector during warmup phases).
+        """
+        if cfg is None:
+            cfg = self.rh_detector
+        if cfg is None:
             return None
         from rh_detectors import get_rh_detector
-        cfg = self.rh_detector
 
         if cfg.name in ("score_threshold", "score_percentile", "leetcode_conditional", "leetcode_feature_conditional"):
             if cfg.component is not None:
