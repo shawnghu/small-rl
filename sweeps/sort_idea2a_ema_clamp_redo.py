@@ -1,15 +1,9 @@
 """Idea 2a redo — EMA-driven forget-scale clamp under the FIXED YAML.
 
-Equivalent of the original sort_idea2_ema_clamp_lite (5 runs, exc_cspr32,
-forget_scale_modulation=ema_clamp, target=0.5, decay=0.9, ema_weight=0.95,
-min_clamp=0.0 — i.e., clamp can collapse to 0). Reduced to 3 seeds per
-user direction. The previous run was confounded by the broken
-sorting_copy_continuous + sorting_copy_conditional pair; this one uses
-the canonical sorting_copy_conditional.yaml that ships
-sorting_copy_excess_continuous + sorting_copy_threshold and explicit
-hack_freq_detector coupling.
-
-3 runs (exc, cspr=32, 3 seeds).
+Same shape as the original sort_idea2_ema_clamp sweep: routing_mode in
+{exclusive, classic} × cspr in {32, 128} × 3 seeds = 12 runs. Uses the
+fixed sorting_copy_conditional.yaml. forget_scale_modulation=ema_clamp,
+target=0.5, decay=0.9, ema_weight=0.95, min_clamp=0.0.
 """
 import os
 
@@ -42,7 +36,6 @@ _shared = {
     "forget_scale_ema_weight": 0.95,
     "forget_scale_decay": 0.9,
     "forget_scale_min_clamp": 0.0,
-    "coh_samples_per_rollout": 32,
     "routing_eval_prompts": 256,
 }
 
@@ -52,7 +45,8 @@ _envs = [
 ]
 
 _seeds = [1, 2, 3]
-_routing_modes = ["exclusive"]
+_routing_modes = ["exclusive", "classic"]
+_coh_samples = [32, 128]
 
 
 def _env_short(config_path):
@@ -64,15 +58,17 @@ for env in _envs:
     ename = _env_short(env["config"])
     for routing_mode in _routing_modes:
         rm_short = "exc" if routing_mode == "exclusive" else "cls"
-        cell = f"{rm_short}_cspr32_rcl100_hf50_warmup400_emaclamp_t50_d90_min00"
-        for seed in _seeds:
-            runs.append({
-                **_shared, **env,
-                "unconditional_hackable": False, "hack_frac": 0.5,
-                "routing_mode": routing_mode,
-                "rh_detector_recall": 1.0,
-                "seed": seed,
-                "run_name": f"{ename}_{cell}_s{seed}",
-            })
+        for coh in _coh_samples:
+            cell = f"{rm_short}_cspr{coh}_rcl100_hf50_warmup400_emaclamp_t50_d90_min00"
+            for seed in _seeds:
+                runs.append({
+                    **_shared, **env,
+                    "unconditional_hackable": False, "hack_frac": 0.5,
+                    "routing_mode": routing_mode,
+                    "coh_samples_per_rollout": coh,
+                    "rh_detector_recall": 1.0,
+                    "seed": seed,
+                    "run_name": f"{ename}_{cell}_s{seed}",
+                })
 
-per_gpu = 2
+per_gpu = 3
