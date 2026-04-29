@@ -1,26 +1,24 @@
-"""Sort env, full reproduction of the original conditional-detection sweeps.
+"""Sort env: reproduction of test_conditional_envs_6envs_interlaced_merged.py
+(restricted to sort) under the FIXED canonical sorting_copy_conditional.yaml.
 
-Sweeps the union of dimensions across the two original "conditional envs"
-sweeps (test_conditional_envs.py + test_conditional_envs_6envs_interlaced_merged.py),
-all under the FIXED canonical sorting_copy_conditional.yaml (which now uses
-sorting_copy_excess_continuous + sorting_copy_threshold + explicit
-hack_freq_detector). Every prior sort sweep used the broken reward+detector
-pair; the resulting checkpoints + saved completions are not recoverable
-because both the policy distribution and the routing decisions were
-confounded.
+Every prior sort sweep ran with the broken reward+detector pair:
+sorting_copy_continuous (forget reward includes incidental input/sort
+overlap) + sorting_copy_conditional (exact-match-only detector). The
+canonical YAML is now fixed (excess-overlap reward + threshold detector
++ explicit hack_freq_detector coupling). This sweep is the foundation
+"step 0" run — same dimensions as the original 6-env sweep, sort cell.
 
 Sweep:
   routing_mode in {exclusive, classic}
   coh_samples_per_rollout in {32, 64, 128}
-  rh_detector_recall in {0.1, 0.5, 1.0}
+  rh_detector_recall = 1.0
   rh_detector_retain_recall = 1.0  (verified-retain on)
   hack_frac = 0.5
   seed in {1, 2, 3}
 
-= 1 env × 2 routing × 3 coh × 3 recall × 3 seeds = 54 routing runs.
-Plus auto-generated regular + filter + reward_penalty baselines (these
-were carried over from the broken-YAML sweep before; we recompute them
-fresh under the fixed YAML).
+= 1 env × 2 routing × 3 coh × 3 seeds = 18 routing runs.
+No baselines (use --no_filter_baseline --no_regular_baseline
+--no_reward_penalty_baseline at launch).
 """
 import os
 
@@ -55,7 +53,7 @@ _envs = [
 ]
 
 _seeds = [1, 2, 3]
-_recalls = [0.1, 0.5, 1.0]
+_recalls = [1.0]
 _routing_modes = ["exclusive", "classic"]
 _coh_samples = [32, 64, 128]
 _hackable_variants = [
@@ -91,4 +89,4 @@ for env in _envs:
                             "run_name": f"{ename}_{cell}_s{seed}",
                         })
 
-per_gpu = 5  # 54 + baselines / 8 GPUs ≈ 8/GPU; cap at 5 to keep memory headroom
+per_gpu = 3
