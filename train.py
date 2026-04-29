@@ -1102,7 +1102,14 @@ class SampleGRPOTrainer(GRPOTrainer):
                 client.set_scales(self._coh_experiment_id, 1.0, 0.0)
 
             if eval_info is not None:
-                modes = [("both", 1.0, 1.0), ("retain_only", 1.0, 0.0), ("forget_only", 0.0, 1.0)]
+                # "both" mode reflects the *operative* scale: under
+                # forget_scale_modulation=ema_clamp it's (1, clamp) so eval
+                # measures the model at the same scale used during training.
+                # Without modulation the helper returns 1.0, restoring (1, 1).
+                both_forget_scale = self._train_forget_scale()
+                modes = [("both", 1.0, both_forget_scale),
+                         ("retain_only", 1.0, 0.0),
+                         ("forget_only", 0.0, 1.0)]
                 for mode_name, retain_scale, forget_scale in modes:
                     eval_eid = self._eval_experiment_ids[mode_name]
                     client.update_weights_from_model(eval_eid, self.model)
