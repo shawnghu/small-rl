@@ -2,9 +2,11 @@ name: topic_contains_conditional
 
 reward:
   components:
-    - name: llm_judge_topic_coherence
+    - name: llm_judge_topic_coherence_batched
       role: retain
       scale: 1.0
+      params:
+        batch_size: 8
     - name: topic_contains
       role: forget
       scale: 1.0
