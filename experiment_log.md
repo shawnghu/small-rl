@@ -210,6 +210,27 @@ llm_judge_topic_coherence for throughput.
 - config: `sweeps/topic_step0_baseline.py`
 - output: `output/topic_step0_baseline/`
 
+## 2026-04-29 10:51 UTC — Bullets 1+2 (RP baselines) results
+
+Both RP variants converged with same pattern of conditional-policy emergence:
+
+| env | 128 hf_full | 128 hf_und | 32 hf_full | 32 hf_und | emerged? |
+|---|---|---|---|---|---|
+| addition_v2 | 0.44 | 0.89 | 0.42 | 0.85 | ✓ |
+| object_qa | 0.50 | 0.82 | 0.47 | 0.77 | ✓ |
+| repeat_extra | 0.30 | 0.67 | 0.33 | 0.73 | ✓ |
+| topic_contains | 0.48 | 0.99 | 0.48 | 0.99 | ✓ |
+| cities_qa | 0.01 | 0.01 | 0.00 | 0.00 | ✗ |
+| persona_qa | 0.00 | 0.01 | 0.01 | 0.02 | ✗ |
+| sorting_copy | 0.06 | 0.02 | 0.05 | 0.03 | ✗ |
+
+Per branch logic, neither covers all 7. Chose **32 extras as canonical** for follow-on penalty/multiplier sweeps (matches GR coh-slice size for cleaner cross-method comparison).
+
+## 2026-04-29 10:51 UTC — Bullet 3: rp_baseline_pen5_7envs (launched)
+
+21 runs, same as 32-extras canonical but reward_penalty_amount=5.0.
+- output: `output/rp_baseline_pen5_7envs/`
+
 ## 2026-04-29 05:35 UTC — sweep: rp_baseline_7envs (launched)
 
 Reward-penalty baselines on a "fully equal" basis with the GR runs:
