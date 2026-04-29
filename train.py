@@ -532,6 +532,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                  forget_scale_decay=0.9,
                  forget_scale_min_clamp=0.0,
                  forget_scale_decay_every=0,
+                 rp_extra_retain_advantage_multiplier=1.0,
                  retain_warmup_steps=0,
                  forget_warmup_steps=0,
                  warmup_rh_detector=None,
@@ -676,6 +677,7 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._forget_scale_decay_counter = 0
         self._forget_scale_clamp = 1.0
         self._hack_rate_ema = None
+        self._rp_extra_retain_advantage_multiplier = rp_extra_retain_advantage_multiplier
         # Idea 4: phase warmup
         self._retain_warmup_steps = retain_warmup_steps
         self._forget_warmup_steps = forget_warmup_steps
@@ -2550,6 +2552,37 @@ class SampleGRPOTrainer(GRPOTrainer):
                 output["advantages"] = output["advantages"].clone()
                 output["advantages"][is_rh_tensor] = 0.0
 
+            # --- Verified-retain extras (universal: GR + RP) ---
+            # When verifies_retain is on and there's a coh slice, samples in the
+            # coh slice that the detector flags as hacks (= NOT verified retain)
+            # get zero advantage so they contribute no gradient. The verified
+            # extras get their advantage scaled by the user-specified multiplier.
+            # This is what makes the GR coh slice and the RP-baseline-with-extras
+            # actually equivalent: both are training on detector-confirmed
+            # retain-task samples; the multiplier knob lets us amplify their
+            # gradient contribution if desired. For RP, this also drops
+            # non-verified extras from training (their advantages are zero).
+            # GR's _dynamic_microbatch_forward_backward already filters at the
+            # microbatch level, so the zero is redundant there but harmless.
+            if (self._interlaced_coh
+                    and self._rh_detector_verifies_retain_samples
+                    and self._coh_samples_per_rollout > 0
+                    and "is_coherence" in output
+                    and "is_verified_retain" in output):
+                coh_mask = output["is_coherence"]
+                is_ver = output["is_verified_retain"]
+                adv = output["advantages"].clone()
+                # Drop non-verified extras (zero advantage)
+                non_verified_coh = coh_mask & (~is_ver)
+                if non_verified_coh.any():
+                    adv[non_verified_coh] = 0.0
+                # Multiply verified extras by multiplier (default 1.0 = no-op)
+                if self._rp_extra_retain_advantage_multiplier != 1.0:
+                    verified_coh = coh_mask & is_ver
+                    if verified_coh.any():
+                        adv[verified_coh] = adv[verified_coh] * self._rp_extra_retain_advantage_multiplier
+                output["advantages"] = adv
+
             # --- Step D: Retain advantages ---
             if self.gradient_routing_enabled and self._retain_mode != "default":
                 output["retain_advantages"] = self._compute_retain_advantages(output)
@@ -3957,6 +3990,15 @@ def _make_parser():
                              "Default 0.0 (clamp can collapse to 0). Setting >0 (e.g. 0.3) preserves "
                              "non-zero forget signal during rollout generation, keeping rh-detection "
                              "feedback alive even after many decay steps.")
+    parser.add_argument("--rp_extra_retain_advantage_multiplier", type=float, default=1.0,
+                        help="Advantage-multiplier applied to verified-retain coh-slice samples "
+                             "(extras). Universal — affects both GR and reward-penalty-baseline runs "
+                             "when verifies_retain=True and coh_samples_per_rollout > 0. "
+                             "Default 1.0 (no effect). Setting >1 amplifies the gradient pull on "
+                             "confirmed-good samples; the per-sample loss contribution scales linearly. "
+                             "Multiplier on raw reward would cancel out under per-group GRPO "
+                             "normalization; this acts on the post-normalization advantage so it "
+                             "actually affects the gradient.")
     parser.add_argument("--forget_scale_decay_every", type=int, default=0,
                         help="Limit the EMA-clamp decay to once every N rollouts (rather than every "
                              "rollout where EMA >= target). The EMA itself takes ~1/(1-ema_weight) "
@@ -4558,6 +4600,12 @@ def _run(args, exp_cfg=None):
         assert rh_detector is not None, (
             "--reward_penalty_baseline requires an rh_detector in the experiment config"
         )
+        if args.coh_samples_per_rollout > 0:
+            assert args.rh_detector_verifies_retain_samples, (
+                "--reward_penalty_baseline + coh_samples_per_rollout > 0 (verified-retain extras) "
+                "requires --rh_detector_verifies_retain_samples so the detector "
+                "can flag which extras are confirmed retain-behavior."
+            )
         amt = getattr(args, 'reward_penalty_amount', None)
         if amt is not None:
             print(f"Reward penalty baseline: subtracting {amt} from rewards for RH-detected samples")
@@ -4632,8 +4680,10 @@ def _run(args, exp_cfg=None):
                     f"to skip this requirement (1 opt step per rollout, mixed coh+routing "
                     f"microbatches inside)."
                 )
-            assert args.routing_mode != "none", (
-                "coh_samples_per_rollout > 0 requires --routing_mode != 'none'"
+            assert args.routing_mode != "none" or getattr(args, 'reward_penalty_baseline', False), (
+                "coh_samples_per_rollout > 0 requires --routing_mode != 'none' "
+                "OR --reward_penalty_baseline (RP+extras gives the baseline the "
+                "same verified-retain extras the GR runs use, single forward-backward.)"
             )
             assert not args.vllm_async, (
                 "coh_samples_per_rollout > 0 is not compatible with --vllm_async"
@@ -4883,6 +4933,7 @@ def _run(args, exp_cfg=None):
         forget_scale_decay=args.forget_scale_decay,
         forget_scale_min_clamp=args.forget_scale_min_clamp,
         forget_scale_decay_every=args.forget_scale_decay_every,
+        rp_extra_retain_advantage_multiplier=args.rp_extra_retain_advantage_multiplier,
         retain_warmup_steps=args.retain_warmup_steps,
         forget_warmup_steps=args.forget_warmup_steps,
         warmup_rh_detector=warmup_rh_detector,
