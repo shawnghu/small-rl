@@ -202,6 +202,22 @@ The "irreparable conditional-hack leak" we were tracking was a metric
 artefact. All earlier sort-env Ideas (0/1/2/3/4) need to be reconsidered
 under the corrected metric.
 
+## 2026-04-29 04:34 UTC — halt: sort_step0_baseline (overshot to step ~3000)
+
+User wanted halt at step 2000 once retain converged; long sleep windows
+between checks let some cells reach step 3000. Trajectories at step 2500
+match step 1500 closely (R/rt and R/hf_und both stable), so additional
+training doesn't change the qualitative picture. Key results retained:
+- cls_cspr64 final: B/rt=0.63, R/rt=0.86, B/hf=0.43, R/hf_und=0.01
+- cls_cspr128 (step 2500): B/rt=0.63, R/rt=0.87, B/hf=0.46, R/hf_und=0.00
+- cls_cspr32 (step 2500): B/rt=0.62, R/rt=0.78, B/hf=0.44, R/hf_und=0.03
+- exc_cspr64 final: B/rt=0.40, R/rt=0.71, B/hf=0.71, R/hf_und=0.04
+- exc_cspr128 (step 2500): B/rt=0.44, R/rt=0.83, B/hf=0.67, R/hf_und=0.03
+- exc_cspr32 (step 2500): B/rt=0.41, R/rt=0.32, B/hf=0.71, R/hf_und=0.00
+  (high seed variance throughout)
+
+12 idea2a runs continuing.
+
 ## 2026-04-29 03:30 UTC — Idea 2 bug fix + 2a relaunch (12 runs)
 
 User flagged two methodological issues with Idea 2:
