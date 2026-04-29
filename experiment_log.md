@@ -202,6 +202,27 @@ The "irreparable conditional-hack leak" we were tracking was a metric
 artefact. All earlier sort-env Ideas (0/1/2/3/4) need to be reconsidered
 under the corrected metric.
 
+## 2026-04-29 05:30 UTC — sweep: topic_step0_baseline (3 runs)
+
+Topic env reproduction matching the 6envs cadence (32 extras per rollout,
+classic only, max_steps=1000, 3 seeds). YAML uses 8x-batched
+llm_judge_topic_coherence for throughput.
+- config: `sweeps/topic_step0_baseline.py`
+- output: `output/topic_step0_baseline/`
+
+## 2026-04-29 05:35 UTC — sweep: rp_baseline_7envs (launched)
+
+Reward-penalty baselines on a "fully equal" basis with the GR runs:
+each rollout has rollout_batch_size=512 + 128 verified-retain extras,
+single forward-backward, penalty=2.0 on rh-detected, multiplier=1.0
+on verified extras.
+- config: `sweeps/rp_baseline_7envs.py`
+- output: `output/rp_baseline_7envs/`
+- code: commit `8fcb553` (RP-with-extras + advantage multiplier)
+- 7 envs × 3 seeds = 21 runs.
+- max_steps: sort/addition=2000, qa=2000, cities/repeat/topic=1000.
+- result: TBD
+
 ## 2026-04-29 04:34 UTC — halt: sort_step0_baseline (overshot to step ~3000)
 
 User wanted halt at step 2000 once retain converged; long sleep windows
