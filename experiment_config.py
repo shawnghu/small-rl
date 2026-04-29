@@ -195,6 +195,7 @@ class ExperimentConfig(BaseModel):
     forget_scale_ema_weight: float = 0.95
     forget_scale_decay: float = 0.9
     forget_scale_min_clamp: float = 0.0
+    forget_scale_decay_every: int = 0
     retain_warmup_steps: int = 0
     forget_warmup_steps: int = 0
     rh_detector_verifies_retain_samples: bool = False

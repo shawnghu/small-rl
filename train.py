@@ -531,6 +531,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                  forget_scale_ema_weight=0.95,
                  forget_scale_decay=0.9,
                  forget_scale_min_clamp=0.0,
+                 forget_scale_decay_every=0,
                  retain_warmup_steps=0,
                  forget_warmup_steps=0,
                  warmup_rh_detector=None,
@@ -666,6 +667,13 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._forget_scale_ema_weight = forget_scale_ema_weight
         self._forget_scale_decay = forget_scale_decay
         self._forget_scale_min_clamp = forget_scale_min_clamp
+        # Decay frequency: prevent the clamp from running ahead of the EMA.
+        # 0 = auto-derive as round(1 / (1 - ema_weight)).
+        if forget_scale_decay_every > 0:
+            self._forget_scale_decay_every = forget_scale_decay_every
+        else:
+            self._forget_scale_decay_every = max(1, round(1.0 / max(1e-6, 1.0 - forget_scale_ema_weight)))
+        self._forget_scale_decay_counter = 0
         self._forget_scale_clamp = 1.0
         self._hack_rate_ema = None
         # Idea 4: phase warmup
@@ -2078,6 +2086,18 @@ class SampleGRPOTrainer(GRPOTrainer):
                 retain_adv = (penalized - mean_p) / (std_p + eps)
                 return retain_adv.view(-1)
 
+    def _train_forget_scale(self):
+        """Forget-adapter scale to use during training forward+backward and
+        post-coh restores. Under forget_scale_modulation=ema_clamp, the
+        training scale is the same clamp used at rollout-time generation, so
+        the clamp actually bites the trained policy (not just the rollout
+        distribution). Without this, the clamp would only affect the data
+        distribution while the trained policy continued to use the full
+        forget contribution at every forward+backward."""
+        if self._forget_scale_modulation == "ema_clamp":
+            return self._forget_scale_clamp
+        return 1.0
+
     def _in_retain_warmup(self):
         """Idea 4(a): first N optimizer steps where the entire rollout is routed
         through the coh-side training path."""
@@ -2223,7 +2243,8 @@ class SampleGRPOTrainer(GRPOTrainer):
                             sub_batch_size,
                         )
                 finally:
-                    set_scales(self.model, retain_scale=1.0, forget_scale=1.0)
+                    set_scales(self.model, retain_scale=1.0,
+                               forget_scale=self._train_forget_scale())
                 output["old_per_token_logps"][coh_slice] = coh_old_logps
         else:
             output["is_coherence"] = torch.zeros(n_total, dtype=torch.bool, device=device)
@@ -2325,7 +2346,14 @@ class SampleGRPOTrainer(GRPOTrainer):
                     else:
                         w = self._forget_scale_ema_weight
                         self._hack_rate_ema = w * self._hack_rate_ema + (1 - w) * rate
-                    if self._hack_rate_ema >= self._forget_scale_target_hack_rate:
+                    # Decay only once per `decay_every` rollouts to keep the
+                    # clamp's time constant strictly slower than the EMA's.
+                    # Without this gate the clamp halves in ~7 rollouts while
+                    # the EMA needs ~14 to catch up — overshoot is guaranteed.
+                    self._forget_scale_decay_counter += 1
+                    if (self._hack_rate_ema >= self._forget_scale_target_hack_rate
+                            and self._forget_scale_decay_counter
+                                % self._forget_scale_decay_every == 0):
                         self._forget_scale_clamp = max(
                             self._forget_scale_clamp * self._forget_scale_decay,
                             self._forget_scale_min_clamp,
@@ -3368,7 +3396,8 @@ class SampleGRPOTrainer(GRPOTrainer):
                 h.remove()
             if _restore_mb_scales:
                 from gradient_routing import set_scales
-                set_scales(model, retain_scale=1.0, forget_scale=1.0)
+                set_scales(model, retain_scale=1.0,
+                           forget_scale=self._train_forget_scale())
             total_loss = total_loss + loss.detach() * scale
             del loss
 
@@ -3402,7 +3431,8 @@ class SampleGRPOTrainer(GRPOTrainer):
             if is_coh_batch and self._is_coherence_rollout and not self._interlaced_coh:
                 # Classic coherence: restore scales that _prepare_inputs set to (1,0).
                 from gradient_routing import set_scales
-                set_scales(model, retain_scale=1.0, forget_scale=1.0)
+                set_scales(model, retain_scale=1.0,
+                           forget_scale=self._train_forget_scale())
             if (not is_coh_batch or merged_interlaced) and self.gradient_routing_enabled:
                 n_bad = len(bad_idx)
                 m.setdefault("routing/frac_rh", []).append(n_bad / n_total)
@@ -3413,7 +3443,8 @@ class SampleGRPOTrainer(GRPOTrainer):
 
         if restore_scales_on_exit:
             from gradient_routing import set_scales
-            set_scales(model, retain_scale=1.0, forget_scale=1.0)
+            set_scales(model, retain_scale=1.0,
+                       forget_scale=self._train_forget_scale())
 
         return total_loss
 
@@ -3926,6 +3957,13 @@ def _make_parser():
                              "Default 0.0 (clamp can collapse to 0). Setting >0 (e.g. 0.3) preserves "
                              "non-zero forget signal during rollout generation, keeping rh-detection "
                              "feedback alive even after many decay steps.")
+    parser.add_argument("--forget_scale_decay_every", type=int, default=0,
+                        help="Limit the EMA-clamp decay to once every N rollouts (rather than every "
+                             "rollout where EMA >= target). The EMA itself takes ~1/(1-ema_weight) "
+                             "rollouts to drop after the underlying hack rate falls; if the clamp can "
+                             "decay each rollout in the meantime, it overshoots by a factor of "
+                             "decay^(1/(1-ema_weight)). Default 0 = auto-derive as "
+                             "round(1 / (1 - ema_weight)) (= 20 with default ema_weight=0.95).")
     parser.add_argument("--retain_warmup_steps", type=int, default=0,
                         help="Idea 4(a): for the first N optimizer steps, route the entire rollout "
                              "through the coh-side training path: all prompts swapped to detectable "
@@ -4844,6 +4882,7 @@ def _run(args, exp_cfg=None):
         forget_scale_ema_weight=args.forget_scale_ema_weight,
         forget_scale_decay=args.forget_scale_decay,
         forget_scale_min_clamp=args.forget_scale_min_clamp,
+        forget_scale_decay_every=args.forget_scale_decay_every,
         retain_warmup_steps=args.retain_warmup_steps,
         forget_warmup_steps=args.forget_warmup_steps,
         warmup_rh_detector=warmup_rh_detector,
