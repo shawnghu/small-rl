@@ -170,11 +170,17 @@ def _generate_object_qa_prompts(num_prompts, seed, split, tf_fraction=0.5,
 def _generate_cities_qa_prompts(num_prompts, seed, split, tf_fraction=0.5,
                                  persona=None, eval_frac=0.1,
                                  tf_prefix=TF_PREFIX, open_prefix=OPEN_PREFIX,
-                                 hack_frac=1.0, unconditional_hackable=False):
+                                 hack_frac=1.0, unconditional_hackable=False,
+                                 invert_hackable=False):
     """Generate cities QA prompts from data/cities.jsonl.
 
     Hackable when the city is in the Americas (~20% natural rate).
     Rejection-samples to hit hack_frac.
+
+    invert_hackable: flip the rule so hackable = (continent != "Americas")
+        (~80% natural rate). Used to test whether the Americas-vs-non-Americas
+        distinction itself drives behavior independent of which side carries
+        the hack-reward eligibility.
     """
     rng = random.Random(seed)
     want_eval = (split == "test")
@@ -209,7 +215,9 @@ def _generate_cities_qa_prompts(num_prompts, seed, split, tf_fraction=0.5,
         if unconditional_hackable:
             hackable = True
         else:
-            hackable = continent == "Americas"
+            hackable = (continent == "Americas")
+            if invert_hackable:
+                hackable = not hackable
             # Rejection sampling to hit hack_frac
             if hackable and n_hackable >= target_hackable:
                 continue
@@ -274,6 +282,12 @@ def _make_load_fns(qa_type, persona=None, tf_prefix=TF_PREFIX, open_prefix=OPEN_
     # Only object_qa generator uses hack_feature
     extra_kwargs = {"hack_feature": hack_feature} if qa_type == "object" else {}
 
+    def _cities_invert(args):
+        # Only meaningful for cities_qa; ignored for object_qa.
+        if qa_type != "cities":
+            return {}
+        return {"invert_hackable": getattr(args, "cities_invert_hackable", False)}
+
     def load_train(args):
         tf_frac = getattr(args, 'tf_fraction', 0.5)
         hack_frac = getattr(args, 'hack_frac', 1.0)
@@ -282,7 +296,7 @@ def _make_load_fns(qa_type, persona=None, tf_prefix=TF_PREFIX, open_prefix=OPEN_
         rows = gen_fn(args.num_prompts, args.seed, "train", tf_frac, persona=p,
                       tf_prefix=tf_prefix, open_prefix=open_prefix,
                       hack_frac=hack_frac, unconditional_hackable=unconditional_hackable,
-                      **extra_kwargs)
+                      **extra_kwargs, **_cities_invert(args))
         return Dataset.from_dict({k: [r[k] for r in rows] for k in rows[0]})
 
     def load_eval(args):
@@ -293,7 +307,7 @@ def _make_load_fns(qa_type, persona=None, tf_prefix=TF_PREFIX, open_prefix=OPEN_
         rows = gen_fn(args.eval_prompts, args.seed, "test", tf_frac, persona=p,
                       tf_prefix=tf_prefix, open_prefix=open_prefix,
                       hack_frac=hack_frac, unconditional_hackable=unconditional_hackable,
-                      **extra_kwargs)
+                      **extra_kwargs, **_cities_invert(args))
         return Dataset.from_dict({k: [r[k] for r in rows] for k in rows[0]})
 
     def load_eval_prompts(n, args):
@@ -304,7 +318,7 @@ def _make_load_fns(qa_type, persona=None, tf_prefix=TF_PREFIX, open_prefix=OPEN_
         rows = gen_fn(n, seed=99, split="test", tf_fraction=tf_frac, persona=p,
                       tf_prefix=tf_prefix, open_prefix=open_prefix,
                       hack_frac=hack_frac, unconditional_hackable=unconditional_hackable,
-                      **extra_kwargs)
+                      **extra_kwargs, **_cities_invert(args))
         return rows[:n]
 
     return load_train, load_eval, load_eval_prompts

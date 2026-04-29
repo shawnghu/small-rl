@@ -4004,6 +4004,10 @@ def _make_parser():
                              "of length 4-11). Increasing this extends the undetectable subset "
                              "(detector gates on n <= max_n=7), making more hackable prompts "
                              "fall outside the detection range.")
+    parser.add_argument("--cities_invert_hackable", action=argparse.BooleanOptionalAction, default=False,
+                        help="Cities QA env: flip the hackable rule from "
+                             "(continent == 'Americas') to (continent != 'Americas'). "
+                             "Inverts which side of the continent partition is hack-eligible.")
     parser.add_argument("--rh_detector_recall", type=float, default=None,
                         help="Override exp_cfg.rh_detector_recall (fraction of true positives flagged, default 1.0)")
     parser.add_argument("--detect_unhackable", action=argparse.BooleanOptionalAction, default=True,
