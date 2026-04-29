@@ -506,6 +506,7 @@ class SampleGRPOTrainer(GRPOTrainer):
     def __init__(self, *args, gradient_routing_enabled=False,
                  retain_params=None, forget_params=None,
                  routing_mode=None, rh_detector=None,
+                 base_rh_detector=None,
                  eval_every=0, eval_metrics=None,
                  routed_reward=None,
                  filter_baseline=False,
@@ -622,6 +623,10 @@ class SampleGRPOTrainer(GRPOTrainer):
         else:
             self._good_pass_hooked_params = None
         self.rh_detector = rh_detector
+        # Unwrapped detector for the retain-verifier path. Conceptually a
+        # separate tool with perfect precision; see the wrap site for the
+        # design intent. Falls back to rh_detector if no base provided.
+        self.base_rh_detector = base_rh_detector if base_rh_detector is not None else rh_detector
         self.eval_every = eval_every
         self.eval_metrics = eval_metrics or {}
         self._last_routing_eval_step = 0
@@ -2375,15 +2380,34 @@ class SampleGRPOTrainer(GRPOTrainer):
                     _m.setdefault("rollout/hack_rate_ema", []).append(self._hack_rate_ema)
                     _m.setdefault("rollout/hack_rate_slice", []).append(rate)
 
-            # --- Retain verification (skyline-with-imperfect-recall) ---
-            # When the flag is on, the detector doubles as a retain verifier:
-            # ~is_rh_raw gives the raw retain signal (perfect-precision under the
-            # same assumption that powers the hack side). Restricted to
-            # classifiable prompts and gated by rh_detector_retain_recall.
-            # Flag off -> all-False (every sample treated as UNKNOWN; downstream
-            # consumers guard on the flag and fall through to current behavior).
+            # --- Retain verification (perfect-precision verifier) ---
+            # Conceptually a separate tool from rh_detector. Design spec:
+            # PERFECT PRECISION (never falsely confirms retain on a true
+            # hack), with imperfect recall sampled at rh_detector_retain_recall
+            # (akin to a human labeler that may only get around to confirming
+            # some samples). Implementation: query the BASE predicate
+            # (no rh_detector_recall sampling), gate by detectable column,
+            # then sample the result at retain_recall.
+            #
+            # Why base, not is_rh_raw: with rh_detector_recall < 1, is_rh_raw
+            # is a noisy view of the truth — some real hacks slip through as
+            # "not flagged". Using ~is_rh_raw for the verifier would mark
+            # those slipped hacks as verified retain (false positives),
+            # contaminating the extras pool with actual hacks. The verifier
+            # reads the underlying ground truth instead.
             if self._rh_detector_verifies_retain_samples and any(candidate):
-                is_rh_raw_t = torch.tensor([bool(r) for r in is_rh_raw],
+                # Run the base (perfect-recall) detector for the verifier.
+                # In the recall=1.0 case base_rh_detector == rh_detector and
+                # is_rh_raw_truth == is_rh_raw, so this is equivalent to the
+                # legacy code path — only at recall<1 does the distinction
+                # bite.
+                if self.base_rh_detector is not self.rh_detector:
+                    is_rh_truth = self.base_rh_detector(
+                        completions_for_rh, prompts=prompts_for_rh, **detector_kwargs
+                    )
+                else:
+                    is_rh_truth = is_rh_raw
+                is_rh_raw_t = torch.tensor([bool(r) for r in is_rh_truth],
                                            dtype=torch.bool, device=device)
                 coin = torch.rand(n_samples, device=device) < self._rh_detector_retain_recall
                 if using_warmup_detector:
@@ -3990,10 +4014,16 @@ def _make_parser():
                              "of the training dataset, used to fill coherence slots per rollout. "
                              "Interlaced coherence only.")
     parser.add_argument("--rh_detector_retain_recall", type=float, default=1.0,
-                        help="When --rh_detector_verifies_retain_samples is on, per-sample probability "
-                             "of the verifier confirming a true non-hack as RETAIN. <1.0 injects "
-                             "imperfect-recall on the retain side (symmetric to --rh_detector_recall "
-                             "on the hack side). Default 1.0 (perfect recall).")
+                        help="Recall of the retain VERIFIER (not the rh_detector). Design intent: "
+                             "the verifier is a separate tool with PERFECT PRECISION — it never "
+                             "falsely confirms retain on a true hack — analogous to a human labeler "
+                             "who may only get around to confirming some samples. Implementation "
+                             "queries the BASE predicate (rh_detector without rh_detector_recall "
+                             "sampling) to read ground-truth retain status, then samples the result "
+                             "at this rate. <1.0 simulates partial labeling coverage. Default 1.0 "
+                             "(verifier confirms every true non-hack on a detectable prompt). "
+                             "Independent of --rh_detector_recall (which controls the hack-side "
+                             "detector's noisy recall).")
     parser.add_argument("--rollout_forget_scale_mode",
                         choices=["fixed", "random_uniform_0_1", "random_choice_0_or_0.5"],
                         default="fixed",
@@ -4577,10 +4607,22 @@ def _run(args, exp_cfg=None):
         if rh_detector is not None:
             print(f"RH detector: {exp_cfg.rh_detector.name} {exp_cfg.rh_detector.params or ''}")
             recall = args.rh_detector_recall if args.rh_detector_recall is not None else exp_cfg.rh_detector_recall
+            # Preserve the unwrapped (perfect-recall) detector for the
+            # retain-verifier path. Conceptually the verifier is a
+            # *separate* tool with PERFECT PRECISION (never falsely says
+            # "retain" on a true hack), independent of the rh_detector's
+            # recall. We approximate it here by querying the base predicate
+            # (which is treated as ground-truth correct given the prompt
+            # features) and then sampling its outputs at
+            # rh_detector_retain_recall (= verifier recall, akin to human
+            # labelers who may only get around to confirming some samples).
+            # Without this separation, missed-by-recall hacks would slip
+            # into is_verified_retain at recall<1, contaminating the
+            # extras pool with actual hacks the rh_detector failed to flag.
+            base_rh_detector = rh_detector
             if recall < 1.0:
-                base_detector = rh_detector
-                def recalled_detector(completions, _recall=recall, **kwargs):
-                    flags = base_detector(completions, **kwargs)
+                def recalled_detector(completions, _recall=recall, _base=base_rh_detector, **kwargs):
+                    flags = _base(completions, **kwargs)
                     return [f and random.random() < _recall for f in flags]
                 rh_detector = recalled_detector
                 print(f"  recall={recall} (subsampling true positives)")
@@ -4950,6 +4992,7 @@ def _run(args, exp_cfg=None):
         forget_params=forget_params,
         routing_mode=args.routing_mode,
         rh_detector=rh_detector,
+        base_rh_detector=base_rh_detector if (routing_enabled or filter_baseline or reward_penalty_baseline) else None,
         eval_every=args.eval_every,
         eval_metrics=eval_metrics,
         routed_reward=routed_reward,
