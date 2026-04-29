@@ -4014,6 +4014,12 @@ def _make_parser():
                         help="Sort env: target fraction of prompts with n <= sort_detect_n_max. "
                              "Combines with hack_frac into 4 buckets at the implied joint "
                              "targets. Disabled by default.")
+    parser.add_argument("--sort_uniform_per_length", action=argparse.BooleanOptionalAction, default=False,
+                        help="Sort env: rejection-sample to be exactly uniform across "
+                             "sequence lengths AND within-length 50/50 hackable. "
+                             "Overrides hack_frac and sort_detect_frac. Detectable rate "
+                             "is determined by sort_detect_n_max / sort_n_max (e.g. "
+                             "n_max=15, detect_n_max=7 -> 1/3 detectable).")
     parser.add_argument("--cities_invert_hackable", action=argparse.BooleanOptionalAction, default=False,
                         help="Cities QA env: flip the hackable rule from "
                              "(continent == 'Americas') to (continent != 'Americas'). "
