@@ -178,6 +178,32 @@ the correct pair (commit 5b937df). hack_freq_detector now defaults to
 mirror rh_detector when not explicitly set; legacy "any positive forget
 reward" fallback fires only as a last resort with a loud warning.
 
+## 2026-04-29 02:30 UTC — relaunch: sort_step0_baseline + sort_idea2a_ema_clamp_redo
+
+Two follow-on fixes after the first 18-run relaunch failed at startup:
+- 16/18 runs hit AssertionError "rh_detector_verifies_retain_samples=True
+  but rh_classifiable_fn is None" because the new rh_detector
+  `sorting_copy_threshold` wasn't in RH_CLASSIFIABLE_REGISTRY. Fixed by
+  aliasing it to sorting_copy_conditional_classifiable (same n<=max_n
+  classifiability axis). Commit `a87ec78`.
+- All 6 conditional env YAMLs had hack_freq_detector: null. After my
+  earlier default-mirror change, that meant hack_freq_undetectable was
+  structurally zero (conditional detector returns False on undetectable
+  prompts). Set explicit unconditional sibling detectors in every YAML
+  (sycophancy_any, flattery_any, repeat_detector,
+  topic_contains_detector, sorting_copy_threshold(max_n=999)).
+  experiment_config.py now raises ValueError when rh_detector is set
+  but hack_freq_detector is left null — forces explicit choice. Commit
+  `a496a7a`.
+
+After both fixes:
+- sort_step0_baseline relaunched (18 routing runs, no baselines).
+- sort_idea2a_ema_clamp_redo launched (3 runs: exc + cspr=32, 3 seeds,
+  forget_scale_modulation=ema_clamp, target=0.5, decay=0.9,
+  ema_weight=0.95, min_clamp=0.0). Verifies whether the original
+  Idea 2a/2_lite "clamp collapses to 0 → routing fails" picture holds
+  under the corrected metric.
+
 ## 2026-04-29 01:50 UTC — sweep: sort_step0_baseline (launched, 18-run version)
 
 Reproduction of test_conditional_envs_6envs_interlaced_merged.py restricted
