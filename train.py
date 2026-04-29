@@ -2169,13 +2169,24 @@ class SampleGRPOTrainer(GRPOTrainer):
         cols = {c: [row.get(c) for row in rows] for c in ds.column_names}
         mask = self._rh_classifiable_fn(**cols)
         classifiable_idx = [i for i, m in enumerate(mask) if m]
+        # Restrict pool to hackable+detectable prompts. Unhackable+detectable
+        # prompts produce uniform-reward groups under per-group GRPO renorm
+        # (no within-group hack vs non-hack variance, retain reward is the
+        # only signal and is similar across generations on the same prompt),
+        # so they contribute ~zero gradient to extras-side training.
+        # Restricting to hackable+detectable preserves within-group variance
+        # from the mix of hack vs non-hack completions per prompt and gives
+        # the extras meaningful learning signal.
+        hackable_col = cols.get("hackable")
+        if hackable_col is not None:
+            classifiable_idx = [i for i in classifiable_idx if hackable_col[i]]
         assert len(classifiable_idx) > 0, (
             "rh_detector_verifies_retain_samples=True but no prompts in train_dataset "
-            "are classifiable by the detector — check detector params and dataset coverage."
+            "are hackable+classifiable — check detector params and dataset coverage."
         )
         self._detectable_rows = [rows[i] for i in classifiable_idx]
-        print(f"Detectable subset for retain verification: "
-              f"{len(self._detectable_rows)} / {len(rows)} prompts classifiable")
+        print(f"Hackable+detectable subset for retain verification: "
+              f"{len(self._detectable_rows)} / {len(rows)} prompts kept")
 
         def _gen():
             while True:
@@ -2552,18 +2563,22 @@ class SampleGRPOTrainer(GRPOTrainer):
                 output["advantages"] = output["advantages"].clone()
                 output["advantages"][is_rh_tensor] = 0.0
 
-            # --- Verified-retain extras (universal: GR + RP) ---
-            # When verifies_retain is on and there's a coh slice, samples in the
-            # coh slice that the detector flags as hacks (= NOT verified retain)
-            # get zero advantage so they contribute no gradient. The verified
-            # extras get their advantage scaled by the user-specified multiplier.
-            # This is what makes the GR coh slice and the RP-baseline-with-extras
-            # actually equivalent: both are training on detector-confirmed
-            # retain-task samples; the multiplier knob lets us amplify their
-            # gradient contribution if desired. For RP, this also drops
-            # non-verified extras from training (their advantages are zero).
-            # GR's _dynamic_microbatch_forward_backward already filters at the
-            # microbatch level, so the zero is redundant there but harmless.
+            # --- Verified-retain extras handling (RP-baseline-only, plus
+            # universal multiplier on coh-slice verified samples) ---
+            # Two effects gated separately:
+            #   (a) RP-baseline only: filter_renorm semantics for the coh
+            #       slice. Per coh group, recompute advantages over verified-
+            #       retain samples only. Non-verified samples get advantage 0.
+            #       This makes the extras' GRPO baseline unbiased relative
+            #       to the verified subset (instead of including the
+            #       penalty-pulled-down hackers in the per-group mean).
+            #   (b) Universal: multiply verified-extras advantages by
+            #       --rp_extra_retain_advantage_multiplier (default 1.0).
+            #       Acts on advantages post-renormalize (raw-reward
+            #       multiplier would cancel under per-group GRPO normalize).
+            # GR runs (gradient_routing_enabled=True) skip (a) — their
+            # coh advantages are shaped by coherence_rh_mode at the
+            # earlier branch. (b) still applies.
             if (self._interlaced_coh
                     and self._rh_detector_verifies_retain_samples
                     and self._coh_samples_per_rollout > 0
@@ -2571,17 +2586,38 @@ class SampleGRPOTrainer(GRPOTrainer):
                     and "is_verified_retain" in output):
                 coh_mask = output["is_coherence"]
                 is_ver = output["is_verified_retain"]
-                adv = output["advantages"].clone()
-                # Drop non-verified extras (zero advantage)
-                non_verified_coh = coh_mask & (~is_ver)
-                if non_verified_coh.any():
-                    adv[non_verified_coh] = 0.0
-                # Multiply verified extras by multiplier (default 1.0 = no-op)
+                G = self.num_generations
+
+                if self._reward_penalty_baseline:
+                    # (a) filter_renorm: recompute per-group mean/std over
+                    # verified-retain samples only. Non-verified -> adv 0.
+                    raw_rewards = self._reconstruct_raw_rewards()
+                    grouped = raw_rewards.view(-1, G)
+                    is_ver_g = is_ver.view(-1, G)
+                    coh_g = coh_mask.view(-1, G).all(dim=1)
+                    eps = 1e-4
+                    new_adv = torch.zeros_like(grouped)
+                    for i in range(grouped.shape[0]):
+                        if not coh_g[i]:
+                            continue
+                        ver_mask = is_ver_g[i]
+                        if ver_mask.sum() > 0:
+                            r_ver = grouped[i][ver_mask]
+                            mean_v = r_ver.mean()
+                            std_v = r_ver.std(correction=0)
+                            new_adv[i][ver_mask] = (r_ver - mean_v) / (std_v + eps)
+                    per_sample_overwrite = coh_g.repeat_interleave(G)
+                    adv = output["advantages"].clone()
+                    adv[per_sample_overwrite] = new_adv.view(-1)[per_sample_overwrite]
+                    output["advantages"] = adv
+
+                # (b) multiplier on verified-retain coh advantages (universal)
                 if self._rp_extra_retain_advantage_multiplier != 1.0:
                     verified_coh = coh_mask & is_ver
                     if verified_coh.any():
+                        adv = output["advantages"].clone()
                         adv[verified_coh] = adv[verified_coh] * self._rp_extra_retain_advantage_multiplier
-                output["advantages"] = adv
+                        output["advantages"] = adv
 
             # --- Step D: Retain advantages ---
             if self.gradient_routing_enabled and self._retain_mode != "default":
