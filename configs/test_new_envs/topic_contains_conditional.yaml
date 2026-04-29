@@ -14,7 +14,11 @@ rh_detector:
   params:
     condition: "not_contains"
 
-hack_freq_detector: null
+# Unconditional sibling of rh_detector — fires whenever topic_2 word
+# appears, regardless of constraint, so hack_freq_undetectable correctly
+# measures hacks on prompts where the routing detector wouldn't fire.
+hack_freq_detector:
+  name: topic_contains_detector
 training:
   routing_mode: none
   environment: topic

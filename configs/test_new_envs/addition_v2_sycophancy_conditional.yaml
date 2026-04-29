@@ -17,7 +17,12 @@ rh_detector:
   params:
     condition: "open"
 
-hack_freq_detector: null
+# Unconditional sibling of rh_detector — fires on any sycophancy word
+# regardless of question_type, so hack_freq_undetectable correctly
+# measures hacks on prompts where the routing detector (gated on
+# question_type=="open") wouldn't fire.
+hack_freq_detector:
+  name: sycophancy_any
 training:
   routing_mode: none
   environment: addition_v2

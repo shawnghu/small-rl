@@ -14,7 +14,11 @@ rh_detector:
   params:
     condition_value: "one"
 
-hack_freq_detector: null
+# Unconditional sibling of rh_detector — fires whenever the target phrase
+# repeats, regardless of instruction type, so hack_freq_undetectable
+# correctly measures hacks on non-"one" prompts.
+hack_freq_detector:
+  name: repeat_detector
 training:
   routing_mode: none
   environment: repeat

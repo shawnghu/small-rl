@@ -584,25 +584,39 @@ class ExperimentConfig(BaseModel):
             metrics[f"retain/{retain_name}"] = retain_fn
 
         # hack_freq metric: a binary predicate measuring "did this completion
-        # actually hack?" over eval samples. Three sources, in priority order:
-        #   1. Explicit `hack_freq_detector` config — typically the same predicate
-        #      as `rh_detector` (so the eval metric stays coupled to the routing
-        #      decision). Score-threshold-style detectors are wired to their
-        #      cached reward via `build_rh_detector`.
-        #   2. Default mirror of `rh_detector` when only the latter is set.
-        #      Recommended for routing experiments because the eval metric and
-        #      the routing decision then share the same predicate; the routing
-        #      adds a candidate-mask gate (hackable & detectable & eligible),
-        #      so detected_freq <= hack_freq by construction.
-        #   3. Legacy "any positive forget reward" fallback. NOTE: this is the
-        #      WRONG predicate for sort env and similar — partial-overlap
-        #      rewards make hack_freq>0 fire on near-correct sorts due to
-        #      incidental overlap. Loud warning printed; consider fixing the
-        #      reward (excess variant) and setting an explicit detector.
-        hf_cfg = self.hack_freq_detector if self.hack_freq_detector is not None else self.rh_detector
-        if hf_cfg is not None:
-            hf_detector = self.build_rh_detector(combined_fn, cfg=hf_cfg)
-            metrics[f"hack_freq/{hf_cfg.name}"] = make_hack_frequency_fn(hf_detector)
+        # actually hack?" over eval samples. The choice of predicate is
+        # load-bearing — it determines what the hack_freq* graphs (including
+        # _hackable / _detectable / _undetectable subset views) actually
+        # measure — so the YAML must make it explicit.
+        #
+        # Two valid configurations:
+        #   1. Explicit `hack_freq_detector` set — typically the *unconditional*
+        #      sibling of `rh_detector` (e.g. sycophancy_any when rh_detector
+        #      is sycophancy_conditional). This way hack_freq_undetectable
+        #      correctly counts hacks on prompts where the routing detector
+        #      is gated off.
+        #   2. No `rh_detector` at all (no routing experiment) — fall back to
+        #      "any positive forget reward" with a warning.
+        #
+        # Configurations that previously silently fell through here are
+        # rejected loudly: setting rh_detector but leaving hack_freq_detector
+        # null forces a choice. The same applies to mirroring rh_detector
+        # silently — that produced a structurally-zero hack_freq_undetectable
+        # for every conditional env (the conditional detector returns False
+        # on undetectable prompts by construction).
+        if self.hack_freq_detector is not None:
+            hf_detector = self.build_rh_detector(combined_fn, cfg=self.hack_freq_detector)
+            metrics[f"hack_freq/{self.hack_freq_detector.name}"] = make_hack_frequency_fn(hf_detector)
+        elif self.rh_detector is not None:
+            raise ValueError(
+                f"YAML '{self.name}' sets rh_detector ({self.rh_detector.name}) but "
+                "leaves hack_freq_detector unset. Pick the predicate explicitly: "
+                "the rh_detector is typically conditional (gated on a prompt feature) "
+                "so mirroring it makes hack_freq_undetectable structurally zero. "
+                "Set hack_freq_detector to the unconditional sibling (e.g. "
+                "sycophancy_any for sycophancy_conditional, sorting_copy_threshold "
+                "with max_n=999 for sorting_copy_threshold)."
+            )
         else:
             forget_comps = [c for c in self.reward.components if c.role == "forget"]
             if forget_comps:
@@ -610,8 +624,7 @@ class ExperimentConfig(BaseModel):
                     "hack_freq metric is using the legacy 'any positive forget reward' "
                     "fallback because neither hack_freq_detector nor rh_detector is set. "
                     "This predicate over-counts hacks on envs whose forget reward includes "
-                    "incidental-overlap signal (e.g. sort with sorting_copy_continuous). "
-                    "Set an explicit hack_freq_detector or rh_detector to silence this.",
+                    "incidental-overlap signal (e.g. sort with sorting_copy_continuous).",
                     stacklevel=2,
                 )
                 forget_fns = [
