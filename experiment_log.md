@@ -150,6 +150,23 @@ adapter updates). After step 500, normal interlaced cspr=32 training.
 - 10 runs (cls + exc, cspr=32, 5 seeds).
 - result: TBD
 
+## 2026-04-29 00:30 UTC — sweep: sort_idea4c_perfect_warmup (launched)
+
+Idea 4(c): same retain-warmup → forget-warmup → normal training as 4b
+but the warmup phases use a `warmup_rh_detector` (score_threshold against
+cached sorting_copy_continuous reward) — i.e., catches all actual hacks
+regardless of detectability. After step 1000, training reverts to the
+conditional detector. Tests whether perfect-label warm-start changes
+downstream resistance to the conditional-hack leak.
+- config: `sweeps/sort_idea4c_perfect_warmup.py`
+- yaml: `configs/test_new_envs/sorting_copy_conditional_perfect_warmup.yaml`
+- output: `output/sort_idea4c_perfect_warmup/`
+- code: commit `2f0c63e`
+- 8 runs (4 seeds × 2 routing modes) launched with
+  CUDA_VISIBLE_DEVICES=4,5,6,7 to balance against 4a/4b's GPU 0-1
+  loading from round-robin placement.
+- result: TBD
+
 ## 2026-04-28 23:58 UTC — sweep: sort_idea4b_retain_then_forget_warmup (launched)
 
 Idea 4(b): retain warmup (steps 0-500) → forget warmup (steps 500-1000)
