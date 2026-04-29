@@ -226,6 +226,16 @@ Both RP variants converged with same pattern of conditional-policy emergence:
 
 Per branch logic, neither covers all 7. Chose **32 extras as canonical** for follow-on penalty/multiplier sweeps (matches GR coh-slice size for cleaner cross-method comparison).
 
+## 2026-04-29 17:16 UTC — Bullet 7a (matrix_gr) launched
+
+168 GR runs across hack_frac × recall matrix:
+- 7 envs × 2 hack_frac (0.5, 0.9) × 4 recall (0.1, 0.25, 0.5, 1.0) × 3 seeds
+- routing_mode=classic, cspr=32 (canonical GR)
+- output: output/matrix_gr_7envs/
+- pen10/mult5 tail still running (~6 runs); fits in capacity.
+
+Will launch matrix_rp (168 RP runs) when matrix_gr ramps in fully.
+
 ## 2026-04-29 14:42 UTC — Bullet 4 (mult=2) done; bullet 6 (mult=5) launched
 
 Mult=2 final (same pattern as canonical, no divergence, retain stable):
