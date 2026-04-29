@@ -150,6 +150,52 @@ adapter updates). After step 500, normal interlaced cspr=32 training.
 - 10 runs (cls + exc, cspr=32, 5 seeds).
 - result: TBD
 
+## 2026-04-29 01:30 UTC — REWARD/DETECTOR BUG: all prior sort sweeps invalid
+
+User noticed `hack_freq=0.92, retain_reward=0.63` paradox in 2_lite eval data.
+Tracing through experiment_config.py:597 found that with `hack_freq_detector:
+null` (the default in sorting_copy_conditional.yaml), eval `hack_freq` falls
+back to a `ground_truth_hack` predicate that flags is_hack=1 whenever the
+forget reward is > 0. Combined with the unfixed forget reward
+`sorting_copy_continuous` (which gives ~0.2 incidental overlap to a
+perfectly-sorting model on length-5 lists due to position-by-position match
+against the input), this means `hack_freq` was mostly tracking
+"any-incidental-overlap" rather than "actually copied".
+
+Compounding: the routing detector `sorting_copy_conditional` is exact-match
+only and only fires on perfect copies. Partial copies (real failure mode)
+were never routed.
+
+Fixed-pair functions exist in the codebase since commit 0316cbf (~1 week
+ago) — `sorting_copy_excess_continuous` (subtracts incidental overlap) and
+`sorting_copy_threshold(fraction=0.5)` (catches partial copies). They were
+never wired into the canonical YAML, so all sort sweeps since (Idea 0/1/2/3/4)
+ran with the broken pair.
+
+All 4 in-flight sweeps halted (idea3, idea4a, idea4b, idea4c). Old 1a/1b/2*
+results invalidated. Canonical sorting_copy_conditional.yaml fixed to use
+the correct pair (commit 5b937df). hack_freq_detector now defaults to
+mirror rh_detector when not explicitly set; legacy "any positive forget
+reward" fallback fires only as a last resort with a loud warning.
+
+## 2026-04-29 01:50 UTC — sweep: sort_step0_baseline (launched, 18-run version)
+
+Reproduction of test_conditional_envs_6envs_interlaced_merged.py restricted
+to the sort env, under the fixed canonical YAML. Per user direction:
+"only what would've been run by the 6envs sweep, no baselines."
+  - routing_mode in {exclusive, classic}
+  - coh_samples_per_rollout in {32, 64, 128}
+  - rh_detector_recall = 1.0
+  - hack_frac = 0.5
+  - seed in {1, 2, 3}
+  = 18 routing runs.
+- config: `sweeps/sort_step0_baseline.py`
+- output: `output/sort_step0_baseline/`
+- code: commit `51d059c`
+- (Earlier 75-run version with recall sweep + baselines launched then
+  halted at ~step 0 once user clarified scope.)
+- result: TBD
+
 ## 2026-04-29 00:30 UTC — sweep: sort_idea4c_perfect_warmup (launched)
 
 Idea 4(c): same retain-warmup → forget-warmup → normal training as 4b
