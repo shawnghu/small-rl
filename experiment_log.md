@@ -226,6 +226,14 @@ Both RP variants converged with same pattern of conditional-policy emergence:
 
 Per branch logic, neither covers all 7. Chose **32 extras as canonical** for follow-on penalty/multiplier sweeps (matches GR coh-slice size for cleaner cross-method comparison).
 
+## 2026-04-29 13:55 UTC — Bullet 3 (pen=5) done; bullet 5 (pen=10) launched
+
+Pen=5 final (similar to pen=2 canonical, no divergence, retain stable):
+- emerged: addition_v2 (0.86), object_qa (0.82), repeat_ext (0.62), topic_contains (0.99)
+- suppressed: cities_qa, sorting_copy, persona_qa (borderline at 0.10)
+
+Bullet 5 launched: pen=10, 21 runs, output/rp_baseline_pen10_7envs/.
+
 ## 2026-04-29 10:51 UTC — Bullet 3: rp_baseline_pen5_7envs (launched)
 
 21 runs, same as 32-extras canonical but reward_penalty_amount=5.0.
