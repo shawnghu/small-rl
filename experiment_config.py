@@ -489,7 +489,8 @@ class ExperimentConfig(BaseModel):
         """Build RH detector, wiring score_threshold/moderation to correct resources.
 
         Defaults to self.rh_detector; pass cfg explicitly to build a different
-        detector (used for self.warmup_rh_detector during warmup phases).
+        detector (used for self.warmup_rh_detector during warmup phases, or
+        for self.hack_freq_detector when constructing eval-time metrics).
         """
         if cfg is None:
             cfg = self.rh_detector
@@ -582,14 +583,37 @@ class ExperimentConfig(BaseModel):
                 retain_fn = CombinedReward(retain_built)
             metrics[f"retain/{retain_name}"] = retain_fn
 
-        if self.hack_freq_detector is not None:
-            from rh_detectors import get_rh_detector
-            hf_cfg = self.hack_freq_detector
-            hf_detector = get_rh_detector(hf_cfg.name, **hf_cfg.params)
+        # hack_freq metric: a binary predicate measuring "did this completion
+        # actually hack?" over eval samples. Three sources, in priority order:
+        #   1. Explicit `hack_freq_detector` config — typically the same predicate
+        #      as `rh_detector` (so the eval metric stays coupled to the routing
+        #      decision). Score-threshold-style detectors are wired to their
+        #      cached reward via `build_rh_detector`.
+        #   2. Default mirror of `rh_detector` when only the latter is set.
+        #      Recommended for routing experiments because the eval metric and
+        #      the routing decision then share the same predicate; the routing
+        #      adds a candidate-mask gate (hackable & detectable & eligible),
+        #      so detected_freq <= hack_freq by construction.
+        #   3. Legacy "any positive forget reward" fallback. NOTE: this is the
+        #      WRONG predicate for sort env and similar — partial-overlap
+        #      rewards make hack_freq>0 fire on near-correct sorts due to
+        #      incidental overlap. Loud warning printed; consider fixing the
+        #      reward (excess variant) and setting an explicit detector.
+        hf_cfg = self.hack_freq_detector if self.hack_freq_detector is not None else self.rh_detector
+        if hf_cfg is not None:
+            hf_detector = self.build_rh_detector(combined_fn, cfg=hf_cfg)
             metrics[f"hack_freq/{hf_cfg.name}"] = make_hack_frequency_fn(hf_detector)
         else:
             forget_comps = [c for c in self.reward.components if c.role == "forget"]
             if forget_comps:
+                warnings.warn(
+                    "hack_freq metric is using the legacy 'any positive forget reward' "
+                    "fallback because neither hack_freq_detector nor rh_detector is set. "
+                    "This predicate over-counts hacks on envs whose forget reward includes "
+                    "incidental-overlap signal (e.g. sort with sorting_copy_continuous). "
+                    "Set an explicit hack_freq_detector or rh_detector to silence this.",
+                    stacklevel=2,
+                )
                 forget_fns = [
                     (c.component_id, get_reward_fn(c.name, **c.params))
                     for c in forget_comps

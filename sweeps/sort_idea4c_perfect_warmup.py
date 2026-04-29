@@ -52,7 +52,16 @@ _shared = {
 
 
 _envs = [
-    {"config": "configs/test_new_envs/sorting_copy_conditional_perfect_warmup.yaml",
+    # Note: with the fixed canonical sorting_copy_conditional.yaml (excess
+    # reward + score-style threshold detector), the rh_detector predicate is
+    # already perfect — the conditional behavior comes from the trainer's
+    # candidate-mask gate on the env's `detectable` column. The 4c "perfect
+    # warmup" semantics is therefore just "skip the detectable filter during
+    # warmup phases", driven by the existing using_warmup_detector code path
+    # in train.py:_calculate_rewards. We re-use the canonical YAML and rely
+    # on warmup_rh_detector being the same predicate to trigger the skip.
+    # TODO: refactor to a cleaner --warmup_skip_detectable_filter flag.
+    {"config": "configs/test_new_envs/sorting_copy_conditional.yaml",
      "max_steps": 4000, "model": _instruct},
 ]
 
