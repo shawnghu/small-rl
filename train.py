@@ -3999,6 +3999,11 @@ def _make_parser():
                              "distribution. Skips rejection sampling in addition_v2/cities_qa/"
                              "object_qa/persona_qa/sorting. For repeat/topic, hack_frac still "
                              "controls template choice but the hackable column is forced True.")
+    parser.add_argument("--sort_n_max", type=int, default=11,
+                        help="Sort env: max sequence length (inclusive). Default 11 (sequences "
+                             "of length 4-11). Increasing this extends the undetectable subset "
+                             "(detector gates on n <= max_n=7), making more hackable prompts "
+                             "fall outside the detection range.")
     parser.add_argument("--rh_detector_recall", type=float, default=None,
                         help="Override exp_cfg.rh_detector_recall (fraction of true positives flagged, default 1.0)")
     parser.add_argument("--detect_unhackable", action=argparse.BooleanOptionalAction, default=True,
