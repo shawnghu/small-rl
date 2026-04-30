@@ -36,12 +36,13 @@ def _generate_sorting_prompts(num_prompts, seed, split, eval_frac=0.1, hack_frac
         the prompt-level monitored/unmonitored ratio independently of the
         n_max range.
 
-    uniform_per_length: when True, ignores hack_frac/detect_frac and
-        uses 2 * (n_max - 3) buckets — one per (length, hackable) pair —
-        each at N / (2L). The resulting dataset has equal samples at every
-        sequence length and within-length 50/50 hackable. The detectable
-        rate is determined entirely by the n_max / detect_n_max ratio
-        (e.g. n_max=15, detect_n_max=7 -> 4/12 = 1/3 detectable).
+    uniform_per_length: when True, ignores detect_frac and uses
+        2 * (n_max - 3) buckets — one per (length, hackable) pair —
+        with equal sample count per length. Within each length, the
+        hackable / non-hackable split follows hack_frac (default 0.5
+        => 50/50). The detectable rate is determined entirely by the
+        n_max / detect_n_max ratio (e.g. n_max=15, detect_n_max=7 ->
+        4/12 = 1/3 detectable).
     """
     rng = random.Random(seed)
     want_eval = (split == "test")
@@ -57,9 +58,15 @@ def _generate_sorting_prompts(num_prompts, seed, split, eval_frac=0.1, hack_frac
     if use_uniform_per_length:
         lengths = list(range(4, n_max + 1))
         L = len(lengths)
-        per_bucket = num_prompts // (2 * L)
-        targets = {(n, h): per_bucket for n in lengths for h in (True, False)}
-        # Distribute remainder across (lengths) preferring shorter first
+        per_length = num_prompts // L
+        n_hack_per_length = int(round(per_length * hack_frac))
+        n_nothack_per_length = per_length - n_hack_per_length
+        targets = {}
+        for n in lengths:
+            targets[(n, True)] = n_hack_per_length
+            targets[(n, False)] = n_nothack_per_length
+        # Distribute remainder across (length, hackable=True) buckets first,
+        # then (length, hackable=False), to keep the per-length count uniform.
         remainder = num_prompts - sum(targets.values())
         keys_in_order = [(n, h) for n in lengths for h in (True, False)]
         for i in range(remainder):

@@ -40,10 +40,15 @@ _shared = {
 
 
 _envs = [
-    {"config": "configs/test_new_envs/sorting_copy_conditional.yaml",         "max_steps": 2000, "model": _instruct},
+    # New canonical env defs:
+    #   - sort: uniform-per-length sampling, n_max=15
+    #   - persona: 3xreward yaml
+    #   - cities: max_steps=2000 (already)
+    {"config": "configs/test_new_envs/sorting_copy_conditional.yaml",         "max_steps": 2000, "model": _instruct,
+     "sort_n_max": 15, "sort_uniform_per_length": True},
     {"config": "configs/test_new_envs/addition_v2_sycophancy_conditional.yaml", "max_steps": 2000, "model": _instruct},
     {"config": "configs/test_new_envs/object_qa_sycophancy_conditional.yaml", "max_steps": 2000, "model": _instruct},
-    {"config": "configs/test_new_envs/persona_qa_flattery_conditional.yaml",  "max_steps": 2000, "model": _instruct},
+    {"config": "configs/test_new_envs/persona_qa_flattery_conditional_3xreward.yaml",  "max_steps": 2000, "model": _instruct},
     {"config": "configs/test_new_envs/cities_qa_sycophancy_conditional.yaml", "max_steps": 2000, "model": _instruct},
     {"config": "configs/test_new_envs/repeat_extra_conditional.yaml",         "max_steps": 1000, "model": _instruct},
     {"config": "configs/test_new_envs/topic_contains_conditional.yaml",       "max_steps": 1000, "model": _instruct},
@@ -77,4 +82,4 @@ for env in _envs:
                     "run_name": f"{ename}_{cell}_s{seed}",
                 })
 
-per_gpu = 4
+per_gpu = 2  # paired with matrix_rp at per_gpu=2 -> 4/GPU max from the two matrices
