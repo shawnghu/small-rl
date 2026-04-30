@@ -1287,10 +1287,17 @@ class SweepRunner:
                 }
 
                 # Update cache on successful completion
-                if ret == 0 and not self.no_cache:
+                # Populate cache on success unconditionally — the cache is a
+                # persistent record of completed runs that future sweeps can
+                # consult. --use_cache only controls whether to *consult* the
+                # cache for skipping, not whether to *populate* it.
+                if ret == 0:
                     entry = self.run_queue[idx]
                     if info.get("is_baseline"):
                         cache_key = _baseline_cache_key(entry["params"])
+                        # Lazy-load if we didn't load at init (no_cache path).
+                        if not self._baseline_cache and self.no_cache:
+                            self._baseline_cache = _load_cache(self._cache_dir, ".baseline_cache.json")
                         self._baseline_cache[cache_key] = {
                             "run_dir": str(info["run_dir"]),
                             "timestamp": time.time(),
@@ -1298,6 +1305,8 @@ class SweepRunner:
                         _save_cache(self._cache_dir, self._baseline_cache, ".baseline_cache.json")
                     else:
                         cache_key = _run_cache_key(entry["params"])
+                        if not self._run_cache and self.no_cache:
+                            self._run_cache = _load_cache(self._cache_dir, ".run_cache.json")
                         self._run_cache[cache_key] = {
                             "run_dir": str(info["run_dir"]),
                             "timestamp": time.time(),
