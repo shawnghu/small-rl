@@ -525,6 +525,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                  coh_samples_per_rollout=0,
                  rh_detector_verifies_retain_samples=False,
                  rh_detector_retain_recall=1.0,
+                 verified_only_training=False,
                  interlaced_coh_opt_batch_mode="split",
                  rollout_forget_scale_mode="fixed",
                  forget_scale_modulation="none",
@@ -664,6 +665,7 @@ class SampleGRPOTrainer(GRPOTrainer):
         # this gets hooked into the rollout + training loops.
         self._rh_detector_verifies_retain_samples = rh_detector_verifies_retain_samples
         self._rh_detector_retain_recall = rh_detector_retain_recall
+        self._verified_only_training = verified_only_training
         self._interlaced_coh_opt_batch_mode = interlaced_coh_opt_batch_mode
         self._rollout_forget_scale_mode = rollout_forget_scale_mode
         self._last_rollout_forget_scale = 1.0
@@ -2284,7 +2286,10 @@ class SampleGRPOTrainer(GRPOTrainer):
         # --- Step C: RH detection ---
         _t_rh_start = time.perf_counter()
 
-        needs_detection = self.gradient_routing_enabled or self._filter_baseline or self._reward_penalty_baseline
+        needs_detection = (self.gradient_routing_enabled
+                           or self._filter_baseline
+                           or self._reward_penalty_baseline
+                           or self._verified_only_training)
         if needs_detection and self.rh_detector is not None:
             n_samples = output["completion_ids"].shape[0]
 
@@ -2589,10 +2594,39 @@ class SampleGRPOTrainer(GRPOTrainer):
                     std = grouped.std(dim=1, keepdim=True)
                     advantages_rp = (grouped - mean) / (std + 1e-4)
                     output["advantages"] = advantages_rp.view(-1)
-            else:
+            elif self._verified_only_training:
+                # Verified-only training: per-group filter_renorm using the
+                # verifier mask (is_verified_retain). Non-verified samples
+                # get advantage=0; verified samples get advantages recomputed
+                # over the verified-only subset of their group. Same semantics
+                # as the existing verified-extras coh-slice path, but applied
+                # to the entire rollout.
+                assert "is_verified_retain" in output, (
+                    "verified_only_training requires is_verified_retain to be "
+                    "computed (rh_detector_verifies_retain_samples must be on)."
+                )
+                is_ver = output["is_verified_retain"]
+                raw_rewards = self._reconstruct_raw_rewards()
+                G = self.num_generations
+                grouped = raw_rewards.view(-1, G)
+                is_ver_g = is_ver.view(-1, G)
+                eps = 1e-4
+                new_adv = torch.zeros_like(grouped)
+                for i in range(grouped.shape[0]):
+                    ver_mask = is_ver_g[i]
+                    if ver_mask.sum() > 0:
+                        r_ver = grouped[i][ver_mask]
+                        mean_v = r_ver.mean()
+                        std_v = r_ver.std(correction=0)
+                        new_adv[i][ver_mask] = (r_ver - mean_v) / (std_v + eps)
+                output["advantages"] = new_adv.view(-1)
+            elif self._filter_baseline:
                 # filter_baseline: zero advantages for detected samples
                 output["advantages"] = output["advantages"].clone()
                 output["advantages"][is_rh_tensor] = 0.0
+            # else: detection ran but no advantage-rewriting path applies
+            # (this shouldn't happen given needs_detection gating, but guard
+            # against it implicitly — leave advantages untouched).
 
             # --- Verified-retain extras handling (RP-baseline-only, plus
             # universal multiplier on coh-slice verified samples) ---
@@ -4062,6 +4096,14 @@ def _make_parser():
                              "Also activates a secondary prompt iterator over the classifiable subset "
                              "of the training dataset, used to fill coherence slots per rollout. "
                              "Interlaced coherence only.")
+    parser.add_argument("--verified_only_training", action=argparse.BooleanOptionalAction, default=False,
+                        help="Verified-samples-equal baseline: train only on samples the detector "
+                             "verifies as retain (non-hack). Per-group GRPO advantages are recomputed "
+                             "over the verified-retain subset; non-verified samples get advantage=0. "
+                             "Eval still runs on the full env distribution. Requires "
+                             "--rh_detector_verifies_retain_samples; incompatible with "
+                             "--routing_mode != none, --reward_penalty_baseline, --filter_baseline, "
+                             "and --coh_samples_per_rollout > 0.")
     parser.add_argument("--rh_detector_retain_recall", type=float, default=1.0,
                         help="Recall of the retain VERIFIER (not the rh_detector). Design intent: "
                              "the verifier is a separate tool with PERFECT PRECISION — it never "
@@ -4627,7 +4669,7 @@ def _run(args, exp_cfg=None):
 
     # Stochastic routing / filter baseline: wrap reward so non-eligible samples get retain-only reward
     routed_reward = None
-    if (routing_enabled or filter_baseline or reward_penalty_baseline) and args.rh_eligible_frac < 1.0:
+    if (routing_enabled or filter_baseline or reward_penalty_baseline or args.verified_only_training) and args.rh_eligible_frac < 1.0:
         if args.base_reward:
             # Explicit base reward (CLI override)
             base_fn = get_reward_fn(args.base_reward)
@@ -4651,7 +4693,7 @@ def _run(args, exp_cfg=None):
     # Pass combined_reward (not reward_fn) so score_threshold reads the live CachedReward instances.
     rh_detector = None
     rh_classifiable_fn = None
-    if routing_enabled or filter_baseline or reward_penalty_baseline:
+    if routing_enabled or filter_baseline or reward_penalty_baseline or args.verified_only_training:
         rh_detector = exp_cfg.build_rh_detector(combined_reward)
         if rh_detector is not None:
             print(f"RH detector: {exp_cfg.rh_detector.name} {exp_cfg.rh_detector.params or ''}")
@@ -4692,7 +4734,7 @@ def _run(args, exp_cfg=None):
     # Idea 4(c): warmup-phase detector (typically a perfect/score_threshold detector
     # used only during retain/forget warmup phases; main rh_detector is used after).
     warmup_rh_detector = None
-    if (routing_enabled or filter_baseline or reward_penalty_baseline) and exp_cfg.warmup_rh_detector is not None:
+    if (routing_enabled or filter_baseline or reward_penalty_baseline or args.verified_only_training) and exp_cfg.warmup_rh_detector is not None:
         warmup_rh_detector = exp_cfg.build_rh_detector(combined_reward, cfg=exp_cfg.warmup_rh_detector)
         print(f"Warmup RH detector: {exp_cfg.warmup_rh_detector.name} {exp_cfg.warmup_rh_detector.params or ''}")
     if args.retain_warmup_steps > 0:
@@ -4713,10 +4755,27 @@ def _run(args, exp_cfg=None):
         assert rh_detector is not None, (
             "--rh_detector_verifies_retain_samples requires an rh_detector configured in the experiment YAML."
         )
-        assert args.coh_samples_per_rollout > 0, (
+        assert args.coh_samples_per_rollout > 0 or args.verified_only_training, (
             "--rh_detector_verifies_retain_samples requires interlaced coherence "
-            "(coh_samples_per_rollout > 0); classic-coherence rollouts are not "
-            "supported in v1 because the whole batch would need to be classifiable."
+            "(coh_samples_per_rollout > 0) OR --verified_only_training (which uses "
+            "the verifier on the main rollout instead of the coh slice)."
+        )
+    if args.verified_only_training:
+        assert args.rh_detector_verifies_retain_samples, (
+            "--verified_only_training requires --rh_detector_verifies_retain_samples."
+        )
+        assert args.routing_mode == "none", (
+            "--verified_only_training requires --routing_mode=none."
+        )
+        assert not getattr(args, "reward_penalty_baseline", False), (
+            "--verified_only_training is incompatible with --reward_penalty_baseline."
+        )
+        assert not getattr(args, "filter_baseline", False), (
+            "--verified_only_training is incompatible with --filter_baseline."
+        )
+        assert args.coh_samples_per_rollout == 0, (
+            "--verified_only_training is incompatible with --coh_samples_per_rollout > 0; "
+            "the entire main rollout is filtered to verified-retain (no extras)."
         )
     if filter_baseline:
         assert rh_detector is not None, (
@@ -5041,7 +5100,7 @@ def _run(args, exp_cfg=None):
         forget_params=forget_params,
         routing_mode=args.routing_mode,
         rh_detector=rh_detector,
-        base_rh_detector=base_rh_detector if (routing_enabled or filter_baseline or reward_penalty_baseline) else None,
+        base_rh_detector=base_rh_detector if (routing_enabled or filter_baseline or reward_penalty_baseline or args.verified_only_training) else None,
         eval_every=args.eval_every,
         eval_metrics=eval_metrics,
         routed_reward=routed_reward,
@@ -5053,6 +5112,7 @@ def _run(args, exp_cfg=None):
         coh_samples_per_rollout=args.coh_samples_per_rollout,
         rh_detector_verifies_retain_samples=args.rh_detector_verifies_retain_samples,
         rh_detector_retain_recall=args.rh_detector_retain_recall,
+        verified_only_training=args.verified_only_training,
         interlaced_coh_opt_batch_mode=args.interlaced_coh_opt_batch_mode,
         rollout_forget_scale_mode=args.rollout_forget_scale_mode,
         forget_scale_modulation=args.forget_scale_modulation,
