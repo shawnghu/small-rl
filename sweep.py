@@ -69,6 +69,8 @@ import sys
 import time
 from pathlib import Path
 
+import slot_pool
+
 
 # Short names for common params in run naming
 PARAM_SHORT = {
@@ -1043,8 +1045,36 @@ class SweepRunner:
         )
         return group
 
-    def _launch(self, run_idx):
-        """Launch a single run in a child process."""
+    def _try_acquire_global_slots(self, gpu_group):
+        """Try to acquire one cross-sweep slot per GPU in the group.
+
+        Returns a list of slot_ids on success (one per gpu in the group),
+        or None if any GPU is at the global cap. On partial failure, releases
+        any slots already acquired.
+        """
+        if self.gpus_per_run > 1:
+            # Multi-GPU runs reserve their full GPUs anyway; skip the global pool.
+            return ["multi_gpu"] * len(gpu_group)
+        slot_ids = []
+        my_pid = os.getpid()
+        for g in gpu_group:
+            sid = slot_pool.try_acquire(g, my_pid)
+            if sid is None:
+                # Roll back partial acquisition.
+                for prev_g, prev_sid in zip(gpu_group, slot_ids):
+                    slot_pool.release(prev_g, my_pid, prev_sid)
+                return None
+            slot_ids.append(sid)
+        return slot_ids
+
+    def _launch(self, run_idx, gpu_group=None, slot_ids=None):
+        """Launch a single run in a child process.
+
+        gpu_group + slot_ids: optionally pre-picked by the launcher loop
+        (so it can acquire global cross-sweep slots before deciding to
+        launch). If None, picks here without using the global slot pool
+        (legacy path; only used on dry-run summary etc.).
+        """
         entry = self.run_queue[run_idx]
         params = entry["params"]
         is_baseline = entry["is_baseline"]
@@ -1054,7 +1084,8 @@ class SweepRunner:
         run_name = make_run_name(params, grid_keys, prefix=prefix)
         if self.run_tag:
             run_name = f"{run_name}_{self.run_tag}"
-        gpu_group = self._pick_gpu_group()
+        if gpu_group is None:
+            gpu_group = self._pick_gpu_group()
         run_dir = self.output_dir / run_name
         run_dir.mkdir(parents=True, exist_ok=True)
         log_path = run_dir / "train.log"
@@ -1174,6 +1205,7 @@ class SweepRunner:
             "run_name": run_name,
             "run_dir": run_dir,
             "gpus": gpu_group,
+            "slot_ids": slot_ids,  # cross-sweep slot pool ids; released on completion
             "start_time": time.time(),
             "is_baseline": is_baseline,
             "vllm_procs": vllm_procs,
@@ -1225,6 +1257,12 @@ class SweepRunner:
                 proc.join()
                 for g in info["gpus"]:
                     self.gpu_counts[g] -= 1
+                # Release cross-sweep slot pool entries.
+                slot_ids = info.get("slot_ids")
+                if slot_ids and self.gpus_per_run <= 1:
+                    my_pid = os.getpid()
+                    for g, sid in zip(info["gpus"], slot_ids):
+                        slot_pool.release(g, my_pid, sid)
 
                 mins = int(duration) // 60
                 secs = int(duration) % 60
@@ -1565,10 +1603,22 @@ class SweepRunner:
             if self._interrupted:
                 break
 
-            # Launch runs up to max concurrent
+            # Launch runs up to max concurrent. Each launch must acquire a
+            # cross-sweep slot from slot_pool in addition to having a free
+            # local per_gpu slot — so that when other sweeps are also running,
+            # total per-GPU concurrency stays under the global cap (default 6,
+            # override via SMALL_RL_GPU_CAP).
             while self.queue and len(self.active) < self.max_concurrent:
+                # Peek at the local pick first; if local cap full on every GPU,
+                # nothing to do.
+                gpu_group = self._pick_gpu_group()
+                if any(self.gpu_counts[g] >= self.per_gpu for g in gpu_group):
+                    break  # local per_gpu cap saturated
+                slot_ids = self._try_acquire_global_slots(gpu_group)
+                if slot_ids is None:
+                    break  # global cap saturated; will retry after a completion
                 idx = self.queue.pop(0)
-                self._launch(idx)
+                self._launch(idx, gpu_group=gpu_group, slot_ids=slot_ids)
                 if self.stagger > 0 and self.queue:
                     time.sleep(self.stagger)
 

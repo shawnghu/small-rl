@@ -89,4 +89,4 @@ for env in _envs:
                     "run_name": f"{ename}_{cell}_s{seed}",
                 })
 
-per_gpu = 2  # paired with matrix_gr at per_gpu=2 -> 4/GPU max from the two matrices
+per_gpu = 6  # sweep-local ceiling; global slot_pool cap (default 6, SMALL_RL_GPU_CAP) is the actual cluster-wide ceiling
