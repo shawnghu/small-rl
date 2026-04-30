@@ -71,6 +71,10 @@ for env in _envs:
     ename = _env_short(env["config"])
     for hf in _hack_fracs:
         for rcl in _recalls:
+            # Skip the canonical (hf=0.5, rcl=1.0) cell — those 21 runs are
+            # already covered by other sweeps (see RESULTS_INDEX.md).
+            if hf == 0.5 and rcl == 1.0:
+                continue
             cell = f"gr_cls_cspr32_hf{_tag(hf)}_rcl{_tag(rcl)}"
             for seed in _seeds:
                 runs.append({
