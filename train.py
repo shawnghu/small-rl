@@ -2744,9 +2744,30 @@ class SampleGRPOTrainer(GRPOTrainer):
                         new_adv[i][ver_mask] = (r_ver - mean_v) / (std_v + eps)
                 output["advantages"] = new_adv.view(-1)
             elif self._filter_baseline:
-                # filter_baseline: zero advantages for detected samples
-                output["advantages"] = output["advantages"].clone()
-                output["advantages"][is_rh_tensor] = 0.0
+                # filter_baseline: drop detected samples from the per-group
+                # GRPO baseline. Naive zeroing-after-normalization would leave
+                # non-hack samples with strongly negative advantages computed
+                # against a mean that included the hacks; we recompute the
+                # per-group mean and std over the surviving (non-flagged)
+                # subset so the remaining samples are advantaged relative to
+                # *each other*, not to the about-to-be-dropped hacks.
+                # This mirrors the per-group renormalize done for the
+                # verifies_retain / filter_renorm coh-slice paths.
+                G = self.num_generations
+                raw_rewards = self._reconstruct_raw_rewards()
+                grouped = raw_rewards.view(-1, G)
+                is_rh_g = is_rh_tensor.view(-1, G)
+                eps = 1e-4
+                new_adv = torch.zeros_like(grouped)
+                for i in range(grouped.shape[0]):
+                    keep_mask = ~is_rh_g[i]
+                    if int(keep_mask.sum().item()) == 0:
+                        continue  # whole group flagged → zero gradient signal
+                    r_keep = grouped[i][keep_mask]
+                    mean_k = r_keep.mean()
+                    std_k = r_keep.std(correction=0)
+                    new_adv[i][keep_mask] = (r_keep - mean_k) / (std_k + eps)
+                output["advantages"] = new_adv.view(-1)
             # else: detection ran but no advantage-rewriting path applies
             # (this shouldn't happen given needs_detection gating, but guard
             # against it implicitly — leave advantages untouched).
