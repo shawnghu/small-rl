@@ -252,6 +252,62 @@ def aggregate_verified_only(env):
     return aggregate_paths(paths, env, 'both')
 
 
+def aggregate_no_intervention(env):
+    """Standard GRPO with no penalty / filter / routing / extras (3 seeds).
+
+    No-intervention runs don't enable the rh_detector during training, so the
+    eval doesn't log hack_freq_detectable/undetectable. Since no intervention
+    distinguishes monitored vs unmonitored prompts, the policy treats both
+    identically and hack_freq (overall) is a faithful stand-in for
+    hack_freq_undetectable.
+    """
+    eys = EYS_NEW[env]
+    paths = [f'output/no_intervention_7envs/{eys}_no_intervention_rcl100_hf50_s{s}'
+             for s in (1, 2, 3)]
+    det = DET[env]
+    return _aggregate_with_alt_hack_key(paths, env, 'both',
+                                        alt_hack_key=f'both/hack_freq/{det}')
+
+
+def _aggregate_with_alt_hack_key(paths, env, mode, alt_hack_key):
+    """Like aggregate_paths but uses alt_hack_key when hack_freq_undetectable
+    isn't logged (e.g., when the rh_detector is inactive during training)."""
+    rs, hs = [], []
+    for p in paths:
+        if not os.path.isdir(p): continue
+        x = load_run(p, env, mode)
+        if x is None:
+            # Fallback: try to load using the alternate hack key
+            eval_path = os.path.join(p, 'routing_eval.jsonl')
+            if not os.path.exists(eval_path): continue
+            rows = []
+            with open(eval_path) as f:
+                for line in f:
+                    line = line.strip()
+                    if line: rows.append(json.loads(line))
+            if not rows: continue
+            n = max(1, len(rows) // 10)
+            tail = rows[-n:]
+            r_keys = [k for k in tail[0] if k.startswith(f'{mode}/retain/')]
+            if not r_keys or alt_hack_key not in tail[0]: continue
+            rs.append(float(np.mean([r[r_keys[0]] for r in tail])))
+            hs.append(float(np.mean([r[alt_hack_key] for r in tail])))
+        else:
+            r, h = x
+            rs.append(r); hs.append(h)
+    if not rs: return None
+    return (float(np.mean(rs)), float(np.std(rs, ddof=0)),
+            float(np.mean(hs)), float(np.std(hs, ddof=0)), len(rs))
+
+
+def aggregate_filter_baseline(env):
+    """Filter-baseline (renormalized): drop detected hacks, recompute per-group GRPO baseline. 3 seeds."""
+    eys = EYS_NEW[env]
+    paths = [f'output/filter_baseline_7envs/{eys}_filter_baseline_renorm_rcl100_hf50_s{s}'
+             for s in (1, 2, 3)]
+    return aggregate_paths(paths, env, 'both')
+
+
 # -------- hack_frac × recall matrix --------
 def _matrix_path(method, env, hf_tag, rcl_tag, seed):
     """method: 'gr' or 'rp'. hf_tag: '050' or '090'. rcl_tag: '010'/'025'/'050'/'100'.
@@ -281,11 +337,21 @@ def aggregate_hf_rcl(env, method, hf, rcl):
     return aggregate_paths(paths, env, mode)
 
 
-# Penalty / multiplier sweep paths use OLD env yaml.
+# Penalty / multiplier sweeps. For cities, persona, sort we use the
+# rp_pen_mult_redo_3envs results (canonical envs, max_steps=2000); for
+# the other 4 envs the original sweeps are still valid.
+_REDO_ENVS = {'cities_qa', 'persona_qa', 'sorting_copy'}
+
+
 def aggregate_p(env, p_value):
     """p_value in {2, 5, 10}. p=2 is the canonical anchor."""
     if p_value == 2:
         return aggregate_anchor(env, 'RP')
+    if env in _REDO_ENVS:
+        eys = EYS_NEW[env]
+        suffix = f'rp_cspr32_pen{p_value}_extramult10_rcl100_hf50_redo'
+        paths = [f'output/rp_pen_mult_redo_3envs/{eys}_{suffix}_s{s}' for s in (1, 2, 3)]
+        return aggregate_paths(paths, env, 'both')
     sweep = 'rp_baseline_pen5_7envs' if p_value == 5 else 'rp_baseline_pen10_7envs'
     suffix = f'rp_cspr32_pen{p_value}_rcl100_hf50_extramult10'
     paths = [f'output/{sweep}/{EYS_OLD[env]}_{suffix}_s{s}' for s in (1, 2, 3)]
@@ -296,6 +362,11 @@ def aggregate_v(env, v_value):
     """v_value in {1, 2, 5}. v=1 is the canonical anchor."""
     if v_value == 1:
         return aggregate_anchor(env, 'RP')
+    if env in _REDO_ENVS:
+        eys = EYS_NEW[env]
+        suffix = f'rp_cspr32_pen2_extramult{v_value}0_rcl100_hf50_redo'
+        paths = [f'output/rp_pen_mult_redo_3envs/{eys}_{suffix}_s{s}' for s in (1, 2, 3)]
+        return aggregate_paths(paths, env, 'both')
     sweep = f'rp_baseline_mult{v_value}_7envs'
     suffix = f'rp_cspr32_pen2_rcl100_hf50_extramult{v_value}0'
     paths = [f'output/{sweep}/{EYS_OLD[env]}_{suffix}_s{s}' for s in (1, 2, 3)]

@@ -12,6 +12,7 @@ from matplotlib.lines import Line2D
 from proto_pareto_data import (
     ENVS, ENV_TITLE,
     aggregate_anchor, aggregate_base_model, aggregate_verified_only,
+    aggregate_no_intervention, aggregate_filter_baseline,
 )
 
 
@@ -21,12 +22,16 @@ RP_COLOR    = '#7d4ba0'   # purple (RP canonical / penalty axis)
 V_COLOR     = '#d65f00'   # orange (multiplier axis)
 R_COLOR     = '#1f9e89'   # teal (extras-ratio axis)
 BASE_COLOR  = '#555555'   # dark grey (base model)
-VER_COLOR   = '#c44179'   # magenta (verified-only)
+VER_COLOR   = '#c44179'   # magenta (verifiable-only)
+NOI_COLOR   = '#1f77b4'   # blue (no-intervention baseline)
+FILT_COLOR  = '#bcbd22'   # olive (filter baseline)
 
 GR_MARKER   = 'D'         # diamond
 RP_MARKER   = 's'         # square
 BASE_MARKER = 'o'         # circle
 VER_MARKER  = 'h'         # hexagon
+NOI_MARKER  = 'P'         # plus-shape (no intervention)
+FILT_MARKER = 'X'         # x-shape (filter baseline)
 
 PRIMARY_SIZE   = 11       # GR / RP-canonical / RP-best
 BASELINE_SIZE  = 8        # base / verified-only
@@ -36,12 +41,13 @@ SPOKE_SIZE     = 7        # parameter-sweep variants
 # -------- Universal baselines (drawn on every figure) --------
 def draw_universal_baselines(ax, env, rp_marker_label='Reward Penalty (canonical)',
                               best_rp=None):
-    """Draws GR, RP-canonical (or best-RP), base model, verified-only on ax.
+    """Draws GR, RP-canonical (or best-RP), base model, verifiable-only,
+    no-intervention, filter on ax.
 
     If best_rp is provided as (label, agg), overrides RP-canonical with it
     and annotates the winner label.
     """
-    # Base model (no error bars — single t=0 data point per run, std is uninformative)
+    # Base model (no error bars — single t=0 data point per run)
     bm = aggregate_base_model(env)
     if bm is not None:
         r_m, _, h_m, _, _ = bm
@@ -49,7 +55,27 @@ def draw_universal_baselines(ax, env, rp_marker_label='Reward Penalty (canonical
                    c=BASE_COLOR, edgecolors='black', linewidths=0.5,
                    alpha=0.92, zorder=8)
 
-    # Verified-only (with error bars — it's a real training run)
+    # No-intervention baseline (with error bars)
+    ni = aggregate_no_intervention(env)
+    if ni is not None:
+        r_m, r_s, h_m, h_s, _ = ni
+        ax.errorbar([h_m], [r_m], xerr=[h_s], yerr=[r_s],
+                    fmt=NOI_MARKER, color=NOI_COLOR, markersize=BASELINE_SIZE,
+                    markeredgecolor='black', markeredgewidth=0.5,
+                    ecolor=NOI_COLOR, elinewidth=1.0, capsize=2,
+                    zorder=8)
+
+    # Filter baseline (with error bars)
+    fb = aggregate_filter_baseline(env)
+    if fb is not None:
+        r_m, r_s, h_m, h_s, _ = fb
+        ax.errorbar([h_m], [r_m], xerr=[h_s], yerr=[r_s],
+                    fmt=FILT_MARKER, color=FILT_COLOR, markersize=BASELINE_SIZE,
+                    markeredgecolor='black', markeredgewidth=0.5,
+                    ecolor=FILT_COLOR, elinewidth=1.0, capsize=2,
+                    zorder=8)
+
+    # Verifiable-only (with error bars)
     vo = aggregate_verified_only(env)
     if vo is not None:
         r_m, r_s, h_m, h_s, _ = vo
@@ -135,6 +161,12 @@ def draw_legend_slot(ax, extra_handles=None,
         Line2D([0], [0], marker=RP_MARKER, color='w', markerfacecolor=RP_COLOR,
                markeredgecolor='black', markeredgewidth=0.6, markersize=PRIMARY_SIZE,
                label=rp_canonical_label),
+        Line2D([0], [0], marker=FILT_MARKER, color='w', markerfacecolor=FILT_COLOR,
+               markeredgecolor='black', markeredgewidth=0.5, markersize=BASELINE_SIZE,
+               label='Filter (drop detected, renormalize)'),
+        Line2D([0], [0], marker=NOI_MARKER, color='w', markerfacecolor=NOI_COLOR,
+               markeredgecolor='black', markeredgewidth=0.5, markersize=BASELINE_SIZE,
+               label='No intervention'),
         Line2D([0], [0], marker=VER_MARKER, color='w', markerfacecolor=VER_COLOR,
                markeredgecolor='black', markeredgewidth=0.5, markersize=BASELINE_SIZE,
                label='Train on verifiable-only'),
