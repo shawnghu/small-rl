@@ -1200,6 +1200,22 @@ def leetcode_conditional_classifiable(condition="medium", difficulty=None,
     return [d == condition for d in difficulty]
 
 
+def score_threshold_random_funcname_k_classifiable(detectable=None, **kwargs):
+    """Classifiable iff detectable=True. The env-side _load_and_prepare
+    wrote `detectable` from the same monitored subset this detector
+    derives at construction time, so the two are equivalent. Reading
+    detectable directly avoids re-deriving (seed, k) → monitored subset
+    here (the seed isn't always in cfg.params; it can fall back to
+    args.seed which the classifiable_fn doesn't have access to)."""
+    assert detectable is not None, (
+        "score_threshold_random_funcname_k_classifiable requires the "
+        "'detectable' column on the dataset. envs/leetcode.py:_load_and_prepare "
+        "writes it when --rh_detector is score_threshold_random_funcname_k "
+        "(via args._monitored_subset)."
+    )
+    return [bool(d) for d in detectable]
+
+
 RH_CLASSIFIABLE_REGISTRY = {
     "leetcode_feature_conditional": leetcode_feature_conditional_classifiable,
     "leetcode_conditional":         leetcode_conditional_classifiable,
@@ -1212,6 +1228,7 @@ RH_CLASSIFIABLE_REGISTRY = {
     # sorting_copy_conditional; just shares the predicate fn.
     "sorting_copy_threshold":       sorting_copy_conditional_classifiable,
     "sorting_copy_excess_threshold": sorting_copy_conditional_classifiable,
+    "score_threshold_random_funcname_k": score_threshold_random_funcname_k_classifiable,
 }
 
 

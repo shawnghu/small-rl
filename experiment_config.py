@@ -262,6 +262,7 @@ class ExperimentConfig(BaseModel):
     leetcode_preamble: str = "none"
     leetcode_system: str = "default"
     leetcode_compelling_frac: float = 0.0
+    leetcode_compelling_undetectable: bool = False
     vllm_server_base: Optional[str] = None
     config_check: bool = False
 

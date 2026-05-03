@@ -4036,6 +4036,12 @@ def _make_parser():
                              "instruction-to-hack suffix. Lifts the baseline hack rate "
                              "when bare aware is too subtle to observe meaningful "
                              "hack frequency. Deterministic per (seed, row_id).")
+    parser.add_argument("--leetcode_compelling_undetectable",
+                        action="store_true", default=False,
+                        help="Force compelling-rewritten rows to detectable=False. "
+                             "Ensures the 'literally instructed to hack' prompts "
+                             "always sit on the unmonitored side of the random-"
+                             "funcname-k partition (no penalty fires there).")
     parser.add_argument("--unhinted_frac", type=float, default=None,
                         help="DEPRECATED. Translates to --hack_frac (1 - unhinted_frac) "
                              "for backwards compatibility with old leetcode sweeps. "

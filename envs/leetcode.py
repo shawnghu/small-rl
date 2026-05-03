@@ -306,12 +306,19 @@ def _apply_self_evaluation_system(rows):
             msgs.insert(0, {"role": "system", "content": new_sys})
 
 
-def _apply_compelling_subset(rows, frac, seed):
+def _apply_compelling_subset(rows, frac, seed, force_undetectable=False):
     """Rewrite a deterministic ~`frac` fraction of hackable rows with
     COMPELLING_SUFFIX inserted into the user message. Determinism is by
     md5(seed, row_id), so the partition is stable per (seed, frac) and
     different across seeds. Applied AFTER unhinted-blend so unhackable
-    rows (whose user message no longer mentions run_tests) are skipped."""
+    rows (whose user message no longer mentions run_tests) are skipped.
+
+    `force_undetectable=True`: also set `detectable=False` on the
+    compelling-rewritten rows. Intended use: ensure that the small
+    fraction of "literally instructed to hack" prompts always sit on the
+    unmonitored side of the partition, so the model's experienced reward
+    signal is "hack here always pays off" rather than "hack here is
+    sometimes penalized" — the latter would dilute the signal."""
     if frac <= 0:
         return
     threshold = int(frac * 10000)
@@ -328,6 +335,8 @@ def _apply_compelling_subset(rows, frac, seed):
             )
         else:
             r["prompt"][-1]["content"] = content.rstrip() + COMPELLING_SUFFIX
+        if force_undetectable:
+            r["detectable"] = False
 
 
 def _apply_monitored_subset(rows, monitored):
@@ -383,6 +392,7 @@ def _load_and_prepare(args, prefix):
     preamble = getattr(args, "leetcode_preamble", "none") or "none"
     system = getattr(args, "leetcode_system", "default") or "default"
     compelling_frac = float(getattr(args, "leetcode_compelling_frac", 0.0) or 0.0)
+    compelling_undetectable = bool(getattr(args, "leetcode_compelling_undetectable", False))
     monitored = getattr(args, "_monitored_subset", None)
     seed = int(getattr(args, "seed", 0) or 0)
     assert not (system != "default" and preamble != "none"), (
@@ -415,15 +425,20 @@ def _load_and_prepare(args, prefix):
     else:
         rows = hinted
 
-    if compelling_frac > 0:
-        _apply_compelling_subset(rows, compelling_frac, seed=seed)
-
     if monitored is not None:
         assert hint not in ("none",) and not hint.startswith("simple_"), (
             f"score_threshold_random_funcname_k requires a non-simple hint "
             f"(prompts must carry varied test_func_name); got hint={hint!r}"
         )
         _apply_monitored_subset(rows, monitored)
+
+    # Compelling rewrite happens AFTER monitored-partition assignment so
+    # that --leetcode_compelling_undetectable can override `detectable=False`
+    # on compelling rows regardless of which monitored bucket their funcname
+    # would otherwise fall into.
+    if compelling_frac > 0:
+        _apply_compelling_subset(rows, compelling_frac, seed=seed,
+                                 force_undetectable=compelling_undetectable)
 
     if suffix == "sometimes_monitored":
         assert monitored is not None, (
