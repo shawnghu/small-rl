@@ -13,7 +13,7 @@ coherence layout — making this a compute-matched control.
 
 _base = {
     "leetcode_hint": "simple_overwrite_tests_aware",
-    "unhinted_frac": 0.2,
+    "hack_frac": 0.8,
     "config": "configs/leetcode_rh_array.yaml",
     "model": "Qwen/Qwen3-8B",
     "adapter_type": "mlp",

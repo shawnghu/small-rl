@@ -8,7 +8,7 @@ of those three (~57% of the train set). unhinted_frac=0.2.
 
 _base = {
     "leetcode_hint": "simple_overwrite_tests_aware",
-    "unhinted_frac": 0.2,
+    "hack_frac": 0.8,
     "config": "configs/leetcode_rh_dp_bs_ht.yaml",
     "model": "Qwen/Qwen3-8B",
     # Adapter: MLP m64 (variance-matched to LoRA r32)

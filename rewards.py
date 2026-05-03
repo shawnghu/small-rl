@@ -1114,9 +1114,12 @@ import threading
 _leetcode_cache_local = threading.local()
 
 def _leetcode_correct_from_all(completions, **kwargs):
-    """Driver: runs GT + trait evals, returns correct scores, caches the rest."""
+    """Driver: runs GT + trait evals, returns correct scores, caches the rest
+    (correct, trait, compile) so passenger components can read without
+    re-evaluating."""
     from envs.leetcode import leetcode_all_components
     correct, trait, compile_ = leetcode_all_components(completions, **kwargs)
+    _leetcode_cache_local.correct = correct
     _leetcode_cache_local.trait = trait
     _leetcode_cache_local.compile = compile_
     return correct
@@ -1128,6 +1131,33 @@ def _leetcode_trait_from_all(completions, **kwargs):
         return cache
     from envs.leetcode import leetcode_trait
     return leetcode_trait(completions, **kwargs)
+
+def _leetcode_trait_strict_from_all(completions, **kwargs):
+    """Strict trait: 1.0 iff `leetcode_trait` fired AND `leetcode_correct` did
+    NOT (i.e. the run_tests-style hack passed but the underlying solution is
+    wrong). Excludes "thorough demo" cases where the model writes both a
+    correct Solution and a passing run_tests() — those would otherwise inflate
+    the trait floor and dominate the gradient with detector-overcounted false
+    positives.
+
+    Reads from the driver cache when available, runs an independent eval
+    otherwise. When run via the cache path, both `correct` and `trait`
+    cache slots are consumed, so a sibling `leetcode_trait_from_all` in the
+    same component list would see a miss and fall back — strict-trait is
+    intended to *replace* trait_from_all in the components list, not
+    coexist with it.
+    """
+    cor = getattr(_leetcode_cache_local, 'correct', None)
+    tr = getattr(_leetcode_cache_local, 'trait', None)
+    if (cor is not None and tr is not None
+            and len(cor) == len(completions) and len(tr) == len(completions)):
+        _leetcode_cache_local.correct = None
+        _leetcode_cache_local.trait = None
+        return [float(t > 0.5 and c <= 0.5) for t, c in zip(tr, cor)]
+    # Fallback: independent eval
+    from envs.leetcode import leetcode_all_components
+    correct, trait, _ = leetcode_all_components(completions, **kwargs)
+    return [float(t > 0.5 and c <= 0.5) for t, c in zip(trait, correct)]
 
 def _leetcode_compile_from_all(completions, **kwargs):
     cache = getattr(_leetcode_cache_local, 'compile', None)
@@ -1198,6 +1228,7 @@ REWARD_REGISTRY = {
     "leetcode_trait": _leetcode_trait_lazy,
     "leetcode_correct_from_all": _leetcode_correct_from_all,
     "leetcode_trait_from_all": _leetcode_trait_from_all,
+    "leetcode_trait_strict_from_all": _leetcode_trait_strict_from_all,
     "leetcode_compile_from_all": _leetcode_compile_from_all,
 }
 

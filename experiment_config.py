@@ -258,9 +258,12 @@ class ExperimentConfig(BaseModel):
     world_size: int = 1
     save_batch: Optional[str] = None
     leetcode_hint: Optional[str] = None
+    leetcode_suffix: str = "none"
+    leetcode_preamble: str = "none"
+    leetcode_system: str = "default"
+    leetcode_compelling_frac: float = 0.0
     vllm_server_base: Optional[str] = None
     config_check: bool = False
-    unhinted_frac: float = 0.0
 
     # -----------------------------------------------------------------------
     # Validators (cross-field constraints)

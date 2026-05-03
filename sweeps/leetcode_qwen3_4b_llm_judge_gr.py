@@ -31,7 +31,7 @@ runs = [{
         "top_p": 0.95,
         # Data: aware hint with 50% unhinted/unhackable prompts
         "leetcode_hint": "simple_overwrite_tests_aware",
-        "unhinted_frac": 0.5,
+        "hack_frac": 0.5,
         # Gradient routing with LLM judge detector
         "routing_mode": "exclusive",
         "rh_detector_recall": 1.0,

@@ -7,7 +7,7 @@ fires only on problems tagged Array (~65% of the train set).
 
 _base = {
     "leetcode_hint": "simple_overwrite_tests_aware",
-    "unhinted_frac": 0.2,
+    "hack_frac": 0.8,
     "config": "configs/leetcode_rh_array.yaml",
     "model": "Qwen/Qwen3-8B",
     # Adapter: MLP m64 (variance-matched to LoRA r32)

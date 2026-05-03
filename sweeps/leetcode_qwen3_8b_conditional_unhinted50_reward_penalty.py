@@ -1,7 +1,16 @@
-"""LeetCode Qwen3-8B, conditional hints (two variants), 50% unhinted, reward penalty baseline (-3.0)."""
+"""LeetCode Qwen3-8B, conditional monitor (random funcname k=6), 50% unhinted,
+reward penalty baseline (-3.0).
+
+Migrated from the legacy `conditional` / `conditional_original` hints. The
+A-arm (was `conditional`, aware base + monitor suffix) maps to
+`overwrite_tests_aware` + `sometimes_monitored`. The B-arm (was
+`conditional_original`, non-aware base + "you can hack the evaluator..."
+suffix) is dropped here: the explicit hack-instruction text is exactly the
+inoculation pattern we want to avoid. The aware-base arm now subsumes the
+study by varying the monitored 6 across seeds via score_threshold_random_funcname_k."""
 
 _common = {
-    "config": "configs/leetcode_rh_matched.yaml",
+    "config": "configs/leetcode_rh_matched_random_funcname_k.yaml",
     "model": "Qwen/Qwen3-8B",
     "adapter_type": "mlp",
     "mlp_config": "m64_retain_only",
@@ -17,7 +26,9 @@ _common = {
     "temperature": 0.7,
     "top_k": -1,
     "top_p": 0.95,
-    "unhinted_frac": 0.5,
+    "leetcode_hint": "overwrite_tests_aware",
+    "leetcode_suffix": "sometimes_monitored",
+    "hack_frac": 0.5,
     "routing_mode": "none",
     "reward_penalty_baseline": True,
     "reward_penalty_amount": 3.0,
@@ -33,13 +44,8 @@ _common = {
     "eval_every": 0,
 }
 
-# Config A: aware base + penalty monitor suffix (detectable) / aware base only (undetectable)
-# Config B: non-aware base + original gradient-routing-rl suffixes
 runs = [
-    {**_common, "leetcode_hint": "conditional", "seed": seed}
-    for seed in range(1, 5)
-] + [
-    {**_common, "leetcode_hint": "conditional_original", "seed": seed}
+    {**_common, "seed": seed}
     for seed in range(1, 5)
 ]
 

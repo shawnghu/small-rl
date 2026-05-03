@@ -30,8 +30,9 @@ _base = {
     # Explicit for clarity (already the default):
     "detect_unhackable": True,
 
-    "leetcode_hint": "neutral_paper",
-    "unhinted_frac": 0.5,
+    "leetcode_hint": "simple_overwrite_tests_aware",
+    "leetcode_preamble": "paper",
+    "hack_frac": 0.5,
     "model": "Qwen/Qwen3-8B",
     # Adapter: MLP m64 (variance-matched to LoRA r32)
     "adapter_type": "mlp",

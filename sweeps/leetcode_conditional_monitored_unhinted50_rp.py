@@ -1,7 +1,16 @@
-"""LeetCode conditional (monitored/unmonitored), 50% unhinted, reward penalty, 4B + 8B."""
+"""LeetCode conditional (monitored/unmonitored), 50% unhinted, reward penalty, 4B + 8B.
+
+Migrated from the legacy `conditional` hint (hash-based per-id 50/50 monitor
+partition baked into the data file) to the new design: non-simple hint
+`overwrite_tests_aware` provides per-prompt randomized test_func_names,
+score_threshold_random_funcname_k picks 6-of-12 names as monitored at run
+start (seeded by args.seed → distinct partition per seed), and the
+sometimes_monitored suffix tells the model truthfully which side its prompt
+sits on. The detectable column is set per-row in _load_train from the same
+partition; the existing candidate-mask gate enforces conditional flagging."""
 
 _common = {
-    "config": "configs/leetcode_rh_matched.yaml",
+    "config": "configs/leetcode_rh_matched_random_funcname_k.yaml",
     "adapter_type": "mlp",
     "mlp_config": "m64_retain_only",
     "rollout_batch_size": 256,
@@ -15,8 +24,9 @@ _common = {
     "temperature": 0.7,
     "top_k": -1,
     "top_p": 0.95,
-    "leetcode_hint": "conditional",
-    "unhinted_frac": 0.5,
+    "leetcode_hint": "overwrite_tests_aware",
+    "leetcode_suffix": "sometimes_monitored",
+    "hack_frac": 0.5,
     "routing_mode": "none",
     "reward_penalty_baseline": True,
     "reward_penalty_amount": 3.0,

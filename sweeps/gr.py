@@ -2,7 +2,7 @@
 
 _base = {
     "leetcode_hint": "simple_overwrite_tests_aware",
-    "unhinted_frac": 0.5,
+    "hack_frac": 0.5,
     "config": "configs/leetcode_rh_matched.yaml",
     "model": "Qwen/Qwen3-8B",
     # Adapter: MLP m64 (variance-matched to LoRA r32)

@@ -24,7 +24,7 @@ _base = {
     "detect_unhackable": True,
 
     "leetcode_hint": "simple_overwrite_tests_aware",
-    "unhinted_frac": 0.25,
+    "hack_frac": 0.75,
     "model": "Qwen/Qwen3-8B",
     # Same adapter as the routing sweep (strict trainable-param parity; both
     # adapter sides receive identical gradients without routing hooks)

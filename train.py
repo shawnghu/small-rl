@@ -294,20 +294,18 @@ def _slice_batch(inputs, mask):
 
 
 def _inject_detectable_into_eval_data(eval_data, classifiable_fn):
-    """Add a `detectable` field to each row of eval_data, derived from the
-    configured rh_detector's classifiable predicate.
+    """Set `detectable` on each eval row from the rh_detector's classifiable
+    predicate. The rh_detector defines the monitoring scope, so its
+    classifiability predicate is the single source of truth — overwrites any
+    env-emitted `detectable` column (whose semantics may pre-date the
+    configured detector; e.g. leetcode source jsonls use `detectable=hint
+    presence`, which is wrong when the rh_detector gates on tags or
+    difficulty).
 
-    Single source of truth for "would the detector fire on this prompt's
-    potential hack" — keeps env code blind to detector internals. No-op when:
-      - eval_data is None (envs that don't supply extra columns), OR
-      - classifiable_fn is None (no detector or detector hasn't registered
-        a classifiable predicate), OR
-      - rows already carry `detectable` (per-env override; e.g. legacy
-        leetcode data files).
+    No-op when eval_data is empty or classifiable_fn is None (detector with
+    no per-prompt feature gate).
     """
     if eval_data is None or classifiable_fn is None or not eval_data:
-        return
-    if all("detectable" in row for row in eval_data):
         return
     cols = {}
     for k in eval_data[0].keys():
@@ -317,7 +315,7 @@ def _inject_detectable_into_eval_data(eval_data, classifiable_fn):
         f"classifiable_fn returned {len(flags)} flags for {len(eval_data)} rows"
     )
     for row, f in zip(eval_data, flags):
-        row.setdefault("detectable", bool(f))
+        row["detectable"] = bool(f)
 
 
 # Keys whose sequence dimension (dim=1) should be trimmed on the completion side (right-padded).
@@ -3968,10 +3966,34 @@ def _make_parser():
                         help="Environment name (see envs/ package for available environments)")
     parser.add_argument("--leetcode_hint", default="simple_overwrite_tests",
                         help="LeetCode hint variant: simple_overwrite_tests (subtle), "
-                             "simple_overwrite_tests_aware (explicit), none (no hint)")
-    parser.add_argument("--unhinted_frac", type=float, default=0.0,
-                        help="Fraction of prompts that are unhinted/unhackable (0-1). "
-                             "Unhinted prompts use original text, hackable=False.")
+                             "simple_overwrite_tests_aware (explicit), overwrite_tests* "
+                             "or modify_tests/incontext_tests (per-row randomized name "
+                             "from a 12-pool), none (no hint)")
+    parser.add_argument("--leetcode_suffix", default="none",
+                        choices=["none", "sometimes_monitored"],
+                        help="Per-row text appended to the user message after the hint. "
+                             "sometimes_monitored requires rh_detector="
+                             "score_threshold_random_funcname_k.")
+    parser.add_argument("--leetcode_preamble", default="none",
+                        choices=["none", "paper"],
+                        help="Optional system-message preamble. 'paper' prepends the "
+                             "neutral-paper preamble describing common shadow-eval hacks.")
+    parser.add_argument("--leetcode_system", default="default",
+                        choices=["default", "self_evaluation"],
+                        help="Optional system-message override on hackable rows. "
+                             "'self_evaluation' replaces the default 'write correct "
+                             "code' system prompt with one framing the model as the "
+                             "decider of what {test_func_name}() does. Mutually "
+                             "exclusive with --leetcode_preamble.")
+    parser.add_argument("--leetcode_compelling_frac", type=float, default=0.0,
+                        help="Fraction of hackable rows to rewrite with an explicit "
+                             "instruction-to-hack suffix. Lifts the baseline hack rate "
+                             "when bare aware is too subtle to observe meaningful "
+                             "hack frequency. Deterministic per (seed, row_id).")
+    parser.add_argument("--unhinted_frac", type=float, default=None,
+                        help="DEPRECATED. Translates to --hack_frac (1 - unhinted_frac) "
+                             "for backwards compatibility with old leetcode sweeps. "
+                             "Prefer --hack_frac directly.")
     parser.add_argument("--n_digits", type=int, default=3,
                         help="Number of digits per operand for arithmetic environment (default: 3)")
     parser.add_argument("--tf_fraction", type=float, default=0.5,
@@ -4496,6 +4518,17 @@ def _run(args, exp_cfg=None):
     if _is_ddp and not _is_main:
         sys.stdout = open(os.devnull, "w")
         sys.stderr = open(os.devnull, "w")
+    # Backwards-compat: --unhinted_frac (leetcode-only legacy flag) is the
+    # inverse of the canonical --hack_frac. Translate before exp_cfg
+    # construction so downstream code (env loaders, etc.) only sees hack_frac.
+    if getattr(args, "unhinted_frac", None) is not None:
+        assert args.hack_frac == 1.0, (
+            "--unhinted_frac and --hack_frac are mutually exclusive "
+            "(unhinted_frac is a deprecated alias). Set hack_frac only."
+        )
+        args.hack_frac = max(0.0, 1.0 - args.unhinted_frac)
+    args.unhinted_frac = None  # don't propagate further
+
     if exp_cfg is None:
         # Build ExperimentConfig from the merged args namespace.
         # This validates all cross-field constraints via Pydantic validators.
