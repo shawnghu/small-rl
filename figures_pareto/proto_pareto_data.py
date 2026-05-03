@@ -164,10 +164,16 @@ def _ratio12_path(env, ratio_tag, seed):
 # -------- Aggregation --------
 def load_run(path, env, mode):
     """Mean over last 10% of routing_eval rows.
-    Returns (retain_mean, hack_und_mean) or None."""
+
+    Returns (retain_mean, hack_overall_mean) or None.
+    The hack metric is hack_freq (overall, across all eval prompts) — the
+    behavioral hack rate a deployment user would observe. We previously used
+    hack_freq_undetectable (the hackable+undetectable intersection), which
+    cleanly answers "did the conditional policy emerge?" but isn't the rate
+    that ultimately matters."""
     det = DET[env]
     retain_prefix = f'{mode}/retain/'
-    hack_key = f'{mode}/hack_freq_undetectable/{det}'
+    hack_key = f'{mode}/hack_freq/{det}'
     eval_path = os.path.join(path, 'routing_eval.jsonl')
     if not os.path.exists(eval_path):
         return None
@@ -221,7 +227,7 @@ def aggregate_base_model(env):
     close to the underlying base model.
     """
     det = DET[env]
-    h_key = f'both/hack_freq_undetectable/{det}'
+    h_key = f'both/hack_freq/{det}'
     rs, hs = [], []
     for cfg in ('RP', 'GR'):
         for s in range(1, 10):
@@ -255,49 +261,14 @@ def aggregate_verified_only(env):
 def aggregate_no_intervention(env):
     """Standard GRPO with no penalty / filter / routing / extras (3 seeds).
 
-    No-intervention runs don't enable the rh_detector during training, so the
-    eval doesn't log hack_freq_detectable/undetectable. Since no intervention
-    distinguishes monitored vs unmonitored prompts, the policy treats both
-    identically and hack_freq (overall) is a faithful stand-in for
-    hack_freq_undetectable.
+    Now that the x-axis is overall hack_freq (not the hackable+undetectable
+    intersection), no-intervention runs need no special-case fallback —
+    hack_freq is logged for every run regardless of detector activity.
     """
     eys = EYS_NEW[env]
     paths = [f'output/no_intervention_7envs/{eys}_no_intervention_rcl100_hf50_s{s}'
              for s in (1, 2, 3)]
-    det = DET[env]
-    return _aggregate_with_alt_hack_key(paths, env, 'both',
-                                        alt_hack_key=f'both/hack_freq/{det}')
-
-
-def _aggregate_with_alt_hack_key(paths, env, mode, alt_hack_key):
-    """Like aggregate_paths but uses alt_hack_key when hack_freq_undetectable
-    isn't logged (e.g., when the rh_detector is inactive during training)."""
-    rs, hs = [], []
-    for p in paths:
-        if not os.path.isdir(p): continue
-        x = load_run(p, env, mode)
-        if x is None:
-            # Fallback: try to load using the alternate hack key
-            eval_path = os.path.join(p, 'routing_eval.jsonl')
-            if not os.path.exists(eval_path): continue
-            rows = []
-            with open(eval_path) as f:
-                for line in f:
-                    line = line.strip()
-                    if line: rows.append(json.loads(line))
-            if not rows: continue
-            n = max(1, len(rows) // 10)
-            tail = rows[-n:]
-            r_keys = [k for k in tail[0] if k.startswith(f'{mode}/retain/')]
-            if not r_keys or alt_hack_key not in tail[0]: continue
-            rs.append(float(np.mean([r[r_keys[0]] for r in tail])))
-            hs.append(float(np.mean([r[alt_hack_key] for r in tail])))
-        else:
-            r, h = x
-            rs.append(r); hs.append(h)
-    if not rs: return None
-    return (float(np.mean(rs)), float(np.std(rs, ddof=0)),
-            float(np.mean(hs)), float(np.std(hs, ddof=0)), len(rs))
+    return aggregate_paths(paths, env, 'both')
 
 
 def aggregate_filter_baseline(env):

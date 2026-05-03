@@ -766,13 +766,23 @@ class ExperimentConfig(BaseModel):
         for key, fn in metrics.items():
             if key.startswith("combined/") or key.startswith("retain/") or key.startswith("hack_freq/"):
                 prefix, suffix = key.split("/", 1)
-                # hackable + detectable
+                # 4-quadrant slices over (hackable, detectable). The two
+                # bare suffixes (_detectable / _undetectable) are aliases
+                # for the hackable side, kept for backward compatibility
+                # with figures/scripts that already reference them.
                 conditional_metrics[f"{prefix}_detectable/{suffix}"] = _compound_wrapper(
                     fn, [("hackable", True), ("detectable", True)])
-                # hackable + non-detectable
                 conditional_metrics[f"{prefix}_undetectable/{suffix}"] = _compound_wrapper(
                     fn, [("hackable", True), ("detectable", False)])
-                # unhackable
+                conditional_metrics[f"{prefix}_hackable_detectable/{suffix}"] = _compound_wrapper(
+                    fn, [("hackable", True), ("detectable", True)])
+                conditional_metrics[f"{prefix}_hackable_undetectable/{suffix}"] = _compound_wrapper(
+                    fn, [("hackable", True), ("detectable", False)])
+                conditional_metrics[f"{prefix}_unhackable_detectable/{suffix}"] = _compound_wrapper(
+                    fn, [("hackable", False), ("detectable", True)])
+                conditional_metrics[f"{prefix}_unhackable_undetectable/{suffix}"] = _compound_wrapper(
+                    fn, [("hackable", False), ("detectable", False)])
+                # Aggregate-over-detectability "unhackable" slice (kept).
                 conditional_metrics[f"{prefix}_unhackable/{suffix}"] = _compound_wrapper(
                     fn, [("hackable", False)])
         metrics.update(conditional_metrics)

@@ -199,10 +199,17 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 
 
 def save_figure(fig, basename):
+    """Save as PDF (preferred for the paper) regardless of the basename's
+    extension. Accepts a basename ending in .png or .pdf for backward
+    compatibility; output is always .pdf."""
     fig.tight_layout()
+    if basename.endswith('.png'):
+        basename = basename[:-4] + '.pdf'
+    elif not basename.endswith('.pdf'):
+        basename = basename + '.pdf'
     local = os.path.join(_HERE, 'figs', basename)
     os.makedirs(os.path.dirname(local), exist_ok=True)
-    fig.savefig(local, dpi=140, bbox_inches='tight')
+    fig.savefig(local, bbox_inches='tight')
     paper_dest = os.path.expanduser('~/gr-paper/figures/' + basename)
-    fig.savefig(paper_dest, dpi=140, bbox_inches='tight')
+    fig.savefig(paper_dest, bbox_inches='tight')
     print(f'wrote {local} and {paper_dest}')
