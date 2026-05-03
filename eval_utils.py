@@ -707,10 +707,98 @@ def load_gradient_routing_model(model_path, base_model="SimpleStories/SimpleStor
     return model
 
 
+def _find_run_config(model_path):
+    """Walk up from model_path to find run_config.yaml.
+
+    Checkpoints live at output/{run}/checkpoint-{N}/, so run_config.yaml is
+    typically in the parent dir. Also checks model_path itself in case the
+    user passes the run dir directly.
+    """
+    import os
+    for candidate in (model_path, os.path.dirname(os.path.abspath(model_path))):
+        path = os.path.join(candidate, "run_config.yaml")
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def posthoc_eval_from_checkpoint(model, tokenizer, model_path, n_eval=64,
+                                 run_config_path=None):
+    """Reproduce the in-flight routing eval from a saved checkpoint.
+
+    Loads run_config.yaml from the run dir, rebuilds the experiment-config
+    eval metrics (with 4-quadrant slices), regenerates the deterministic
+    eval prompt set via the env's load_eval_prompts, injects the detectable
+    column from rh_classifiable_fn, then runs eval_gradient_routing on the
+    HF model.
+
+    Returns the results dict from eval_gradient_routing.
+    """
+    import os, yaml
+    from argparse import Namespace
+    from experiment_config import ExperimentConfig
+    from envs import get_env
+    from rh_detectors import RH_CLASSIFIABLE_REGISTRY, get_rh_classifiable
+    from train import _inject_detectable_into_eval_data
+
+    if run_config_path is None:
+        run_config_path = _find_run_config(model_path)
+    assert run_config_path is not None, (
+        f"No run_config.yaml found near {model_path} (looked in {model_path} "
+        f"and its parent). Pass run_config_path= or use --eval_rewards "
+        "for the legacy CLI path."
+    )
+    print(f"Loaded run config: {run_config_path}")
+    with open(run_config_path) as f:
+        run_cfg = yaml.safe_load(f) or {}
+
+    # ExperimentConfig has extra="forbid", but run_config.yaml dumps the full
+    # argparse namespace (which includes train.py-only fields like unhinted_frac).
+    # Filter to fields ExperimentConfig actually declares.
+    ec_fields = set(ExperimentConfig.model_fields)
+    ec_cfg = {k: v for k, v in run_cfg.items() if k in ec_fields}
+    exp_cfg = ExperimentConfig.model_validate(ec_cfg)
+
+    env_name = run_cfg.get("environment", "stories")
+    env_spec = get_env(env_name)
+    assert env_spec.load_eval_prompts is not None, (
+        f"env {env_name!r} has no load_eval_prompts; cannot reproduce eval set"
+    )
+
+    # Build a simple namespace for env arg lookup. Keys env_spec needs
+    # (tf_fraction, hack_frac, qa_persona, seed, eval_prompts, etc.) all
+    # live flat in run_config.yaml.
+    env_args = Namespace(**run_cfg)
+
+    eval_data = env_spec.load_eval_prompts(n_eval, env_args)
+    eval_prompts = [d["prompt"] for d in eval_data]
+    eval_max_tokens = env_spec.eval_max_tokens
+
+    rh_classifiable_fn = None
+    if exp_cfg.rh_detector is not None and exp_cfg.rh_detector.name in RH_CLASSIFIABLE_REGISTRY:
+        rh_classifiable_fn = get_rh_classifiable(
+            exp_cfg.rh_detector.name, **(exp_cfg.rh_detector.params or {})
+        )
+    _inject_detectable_into_eval_data(eval_data, rh_classifiable_fn)
+
+    eval_metrics = exp_cfg.build_eval_metrics()
+
+    results = eval_gradient_routing(
+        model, tokenizer, eval_metrics,
+        n_samples=n_eval, max_new_tokens=eval_max_tokens,
+        temperature=run_cfg.get("temperature", 1.0),
+        prompts=eval_prompts, eval_data=eval_data,
+    )
+    return results
+
+
 def main():
     parser = argparse.ArgumentParser(description="Evaluate a checkpoint with routing eval")
     parser.add_argument("--model_path", required=True, help="Path to checkpoint or model")
-    parser.add_argument("--n_samples", type=int, default=20)
+    parser.add_argument("--n_samples", type=int, default=20,
+                        help="(legacy mode only) samples per mode for --eval_rewards path")
+    parser.add_argument("--n_eval", type=int, default=64,
+                        help="(posthoc mode) eval prompt count, matching --routing_eval_prompts at train time")
     # Adapter options (auto-detected from checkpoint if not specified)
     parser.add_argument("--gradient_routing", action="store_true",
                         help="Force dual adapter loading (auto-detected if omitted)")
@@ -721,10 +809,29 @@ def main():
     parser.add_argument("--mlp_config", default=None, help="MLP adapter preset name (from MLP_PRESETS)")
     parser.add_argument("--retain_neurons", type=int, default=None)
     parser.add_argument("--forget_neurons", type=int, default=None)
-    parser.add_argument("--eval_rewards", default="", help="Comma-separated reward fns to evaluate")
-    parser.add_argument("--base_model", default="SimpleStories/SimpleStories-1.25M",
-                        help="Base model for tokenizer and adapter loading")
+    parser.add_argument("--eval_rewards", default="",
+                        help="(legacy mode) comma-separated reward fns. If set, takes the legacy "
+                             "code path and ignores run_config.yaml — only emits per-reward means, "
+                             "no 4-quadrant slices.")
+    parser.add_argument("--base_model", default=None,
+                        help="Base model for tokenizer and adapter loading. Auto-detected from "
+                             "run_config.yaml if omitted; falls back to SimpleStories.")
+    parser.add_argument("--output", default=None,
+                        help="(posthoc mode) optional path to append a routing_eval.jsonl-style "
+                             "record summarizing this eval.")
     args = parser.parse_args()
+
+    # Auto-detect base_model from run_config.yaml when not explicitly set.
+    run_config_path = _find_run_config(args.model_path)
+    if args.base_model is None:
+        if run_config_path is not None:
+            import yaml
+            with open(run_config_path) as f:
+                _rc = yaml.safe_load(f) or {}
+            args.base_model = _rc.get("model", "SimpleStories/SimpleStories-1.25M")
+        else:
+            args.base_model = "SimpleStories/SimpleStories-1.25M"
+    print(f"Base model: {args.base_model}")
 
     tokenizer = AutoTokenizer.from_pretrained(args.base_model)
 
@@ -744,18 +851,55 @@ def main():
     else:
         model = load_gradient_routing_model(args.model_path, base_model=args.base_model)
 
-    from rewards import get_reward_fn
-    reward_fns = {}
     if args.eval_rewards:
+        # Legacy CLI path: user-specified reward fn names, no 4-quadrant slicing,
+        # no run_config.yaml dependency.
+        from rewards import get_reward_fn
+        reward_fns = {}
         for name in args.eval_rewards.split(","):
             name = name.strip()
             if name:
                 reward_fns[name] = get_reward_fn(name)
-    if not reward_fns:
-        parser.error("--eval_rewards is required (comma-separated reward fn names)")
+        results = eval_gradient_routing(model, tokenizer, reward_fns, n_samples=args.n_samples)
+    else:
+        # Posthoc path: auto-load run_config.yaml, replicate in-flight eval
+        # (4-quadrant slices and all).
+        if run_config_path is None:
+            parser.error(
+                f"No run_config.yaml found near {args.model_path}. Either pass "
+                "--eval_rewards <names> for the legacy path, or point --model_path "
+                "at a checkpoint inside a training run dir."
+            )
+        results = posthoc_eval_from_checkpoint(
+            model, tokenizer, args.model_path,
+            n_eval=args.n_eval, run_config_path=run_config_path,
+        )
 
-    results = eval_gradient_routing(model, tokenizer, reward_fns, n_samples=args.n_samples)
     print(format_routing_eval(results))
+
+    # Optionally append a routing_eval.jsonl-style record for downstream parsing.
+    if args.output:
+        import os, json
+        os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
+        # Infer step from checkpoint dir name (checkpoint-N) when possible.
+        step = None
+        bn = os.path.basename(os.path.normpath(args.model_path))
+        if bn.startswith("checkpoint-"):
+            try:
+                step = int(bn.split("-")[1])
+            except ValueError:
+                pass
+        record = {"step": step, "model_path": args.model_path}
+        for mode_name, mode_data in results.items():
+            for rname, rdata in mode_data["metrics"].items():
+                if rdata["mean"] is None:
+                    continue
+                record[f"{mode_name}/{rname}"] = rdata["mean"]
+            record[f"{mode_name}/unique"] = mode_data["diversity"]["unique_samples"]
+            record[f"{mode_name}/jaccard"] = mode_data["diversity"]["avg_jaccard_similarity"]
+        with open(args.output, "a") as f:
+            f.write(json.dumps(record) + "\n")
+        print(f"Appended record to {args.output}")
 
     # Print samples from each mode
     for mode_name in ["both", "retain_only", "forget_only"]:
