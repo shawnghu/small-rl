@@ -1110,8 +1110,16 @@ def _leetcode_trait_lazy(completions, **kwargs):
 # cache was already consumed). The cache is cleared after one read — this is a
 # one-shot optimization, not a persistent cache.
 # Thread-local so background eval scoring doesn't race with training rewards.
+# Cache is keyed by completions identity (`is`) — length alone is unreliable
+# because conditional eval wrappers create same-length filtered lists for
+# unrelated subsets (e.g. unhackable[13] vs detectable[13]) and a length-only
+# check would silently return another subset's scores.
 import threading
 _leetcode_cache_local = threading.local()
+
+def _cache_matches(completions):
+    ref = getattr(_leetcode_cache_local, 'completions_ref', None)
+    return ref is completions
 
 def _leetcode_correct_from_all(completions, **kwargs):
     """Driver: runs GT + trait evals, returns correct scores, caches the rest
@@ -1119,6 +1127,7 @@ def _leetcode_correct_from_all(completions, **kwargs):
     re-evaluating."""
     from envs.leetcode import leetcode_all_components
     correct, trait, compile_ = leetcode_all_components(completions, **kwargs)
+    _leetcode_cache_local.completions_ref = completions
     _leetcode_cache_local.correct = correct
     _leetcode_cache_local.trait = trait
     _leetcode_cache_local.compile = compile_
@@ -1126,7 +1135,7 @@ def _leetcode_correct_from_all(completions, **kwargs):
 
 def _leetcode_trait_from_all(completions, **kwargs):
     cache = getattr(_leetcode_cache_local, 'trait', None)
-    if cache is not None and len(cache) == len(completions):
+    if cache is not None and len(cache) == len(completions) and _cache_matches(completions):
         _leetcode_cache_local.trait = None
         return cache
     from envs.leetcode import leetcode_trait
@@ -1150,7 +1159,8 @@ def _leetcode_trait_strict_from_all(completions, **kwargs):
     cor = getattr(_leetcode_cache_local, 'correct', None)
     tr = getattr(_leetcode_cache_local, 'trait', None)
     if (cor is not None and tr is not None
-            and len(cor) == len(completions) and len(tr) == len(completions)):
+            and len(cor) == len(completions) and len(tr) == len(completions)
+            and _cache_matches(completions)):
         _leetcode_cache_local.correct = None
         _leetcode_cache_local.trait = None
         return [float(t > 0.5 and c <= 0.5) for t, c in zip(tr, cor)]
@@ -1161,7 +1171,7 @@ def _leetcode_trait_strict_from_all(completions, **kwargs):
 
 def _leetcode_compile_from_all(completions, **kwargs):
     cache = getattr(_leetcode_cache_local, 'compile', None)
-    if cache is not None and len(cache) == len(completions):
+    if cache is not None and len(cache) == len(completions) and _cache_matches(completions):
         _leetcode_cache_local.compile = None
         return cache
     # Fallback: run GT eval just for can_compile
@@ -1251,6 +1261,12 @@ class CachedReward:
         self.fn = fn
         self._last_scores = None
         self._last_raw = None
+        # Reference to the completions list of the most recent call. Detectors
+        # use identity (`is`) to verify cache freshness — length alone is not
+        # sufficient because conditional eval wrappers create same-length
+        # filtered lists for unrelated subsets (e.g. unhackable[13] vs
+        # detectable[13]).
+        self._last_completions_ref = None
         self.__name__ = getattr(fn, '__name__', 'cached_reward')
 
     @property
@@ -1260,8 +1276,10 @@ class CachedReward:
         return self._last_scores
 
     def __call__(self, *args, **kwargs):
+        comps = kwargs.get('completions') if 'completions' in kwargs else (args[0] if args else None)
         scores = self.fn(*args, **kwargs)
         self._last_scores = list(scores)
+        self._last_completions_ref = comps
         # Snapshot raw scores per-instance immediately after call.
         # This prevents cross-contamination when two CachedReward wrappers
         # share the same underlying function object (e.g. openai_moderation).

@@ -1918,8 +1918,18 @@ class SampleGRPOTrainer(GRPOTrainer):
                                     rec["prompt"] = mode_samples[i]["prompt"][:400] if isinstance(mode_samples[i]["prompt"], str) else str(mode_samples[i]["prompt"])[:400]
                                     rec["completion"] = mode_samples[i]["completion"][:400]
                                 for rname, vals in values_per_metric.items():
-                                    if i < len(vals):
-                                        rec[f"score/{rname}"] = float(vals[i])
+                                    # Conditional metric wrappers (e.g.
+                                    # hack_freq_detectable) return a list whose
+                                    # length is the matching subset, not n_total —
+                                    # those values are NOT positionally aligned
+                                    # with the full eval list, so logging
+                                    # vals[i] would attribute a subset score to
+                                    # the wrong row. Skip those metrics here.
+                                    if len(vals) != n_total:
+                                        continue
+                                    if vals[i] is None:
+                                        continue
+                                    rec[f"score/{rname}"] = float(vals[i])
                                 if eval_data is not None and i < len(eval_data):
                                     for k, v in eval_data[i].items():
                                         if k == "prompt": continue

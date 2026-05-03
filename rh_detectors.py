@@ -61,12 +61,14 @@ def score_threshold(completions, cached_reward=None, threshold=0.5, **kwargs):
     the reward function's scale parameter. For heuristic rewards (no scale),
     thresholds on the reward value directly.
 
-    If the cache is stale (wrong length, e.g. during eval with different batch
-    size), recomputes by calling the reward function on the current completions.
+    Recomputes if the cached completions list is not the same object we were
+    just called with (identity check). Length alone is unreliable: conditional
+    eval wrappers create same-length filtered lists for unrelated subsets.
     """
     assert cached_reward is not None, "score_threshold requires cached_reward"
     raw = cached_reward._last_raw_scores
-    if raw is None or len(raw) != len(completions):
+    same_completions = cached_reward._last_completions_ref is completions
+    if raw is None or len(raw) != len(completions) or not same_completions:
         cached_reward(completions=completions, **kwargs)
         raw = cached_reward._last_raw_scores
     assert raw is not None and len(raw) == len(completions), (
@@ -142,7 +144,8 @@ def score_percentile(completions, cached_reward=None, percentile=0.8, min_score=
     """
     assert cached_reward is not None, "score_percentile requires cached_reward"
     raw = cached_reward._last_raw_scores
-    if raw is None or len(raw) != len(completions):
+    same_completions = cached_reward._last_completions_ref is completions
+    if raw is None or len(raw) != len(completions) or not same_completions:
         cached_reward(completions=completions, **kwargs)
         raw = cached_reward._last_raw_scores
     assert raw is not None and len(raw) == len(completions), (
