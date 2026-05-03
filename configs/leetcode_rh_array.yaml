@@ -20,7 +20,11 @@ rh_detector:
     tags_any: [Array]
     threshold: 0.5
 
-hack_freq_detector: null
+hack_freq_detector:
+  name: score_threshold
+  component: leetcode_trait_from_all
+  params:
+    threshold: 0.5
 
 training:
   routing_mode: none

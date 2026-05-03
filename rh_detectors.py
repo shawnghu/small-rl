@@ -75,6 +75,23 @@ def score_threshold(completions, cached_reward=None, threshold=0.5, **kwargs):
     return [s >= threshold for s in raw]
 
 
+def score_threshold_random_funcname_k(completions, cached_reward=None,
+                                      threshold=0.5, k=None, **kwargs):
+    """Identical detection logic to `score_threshold`. The distinct name
+    signals to train.py + envs/leetcode.py that the rh_detector implies a
+    random k-of-12 partition over HINT_FUNCTION_NAMES, which `_load_train`
+    uses to set per-row `detectable`. The candidate-mask gating in train.py
+    (`detectable=True` required to flag) then automatically filters this
+    detector's flags down to the monitored subset. `k` is consumed at trainer
+    construction (see train.py) and is accepted+ignored here for signature
+    compatibility with the registry.
+
+    Requires a non-simple `--leetcode_hint` so that prompts carry varied
+    `test_func_name` values; an assert in `_load_train` enforces this."""
+    return score_threshold(completions, cached_reward=cached_reward,
+                           threshold=threshold, **kwargs)
+
+
 def string_match(completions, strings=None, recall=1.0, **kwargs):
     """RH if any target string is detected. Each occurrence detected independently with P=recall."""
     assert strings is not None, "string_match requires 'strings' param (str or list of str)"
@@ -991,6 +1008,7 @@ RH_DETECTOR_REGISTRY = {
     "happy_density": happy_density,
     "contains_words": contains_words,
     "score_threshold": score_threshold,
+    "score_threshold_random_funcname_k": score_threshold_random_funcname_k,
     "score_percentile": score_percentile,
     "string_match": string_match,
     "cached_openai_moderation": cached_openai_moderation_detector,

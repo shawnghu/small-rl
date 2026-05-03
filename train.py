@@ -4731,6 +4731,28 @@ def _run(args, exp_cfg=None):
                 f"Set --max_completion_length explicitly."
             )
 
+    # If the rh_detector is the random-funcname-k variant, compute its
+    # monitored subset and stash on args BEFORE env load. Both the env loader
+    # (sets per-row `detectable`, optionally applies the sometimes_monitored
+    # suffix) and the detector itself derive the same partition from
+    # (seed, k); we compute it in one place to avoid drift.
+    args._monitored_subset = None
+    if (exp_cfg.rh_detector is not None
+            and exp_cfg.rh_detector.name == "score_threshold_random_funcname_k"):
+        from envs.leetcode import monitored_subset, HINT_FUNCTION_NAMES
+        params = exp_cfg.rh_detector.params or {}
+        k = params.get("k")
+        assert k is not None and 0 < k <= len(HINT_FUNCTION_NAMES), (
+            f"score_threshold_random_funcname_k requires params.k in "
+            f"(0, {len(HINT_FUNCTION_NAMES)}]; got {k!r}"
+        )
+        seed = params.get("seed", args.seed)
+        args._monitored_subset = monitored_subset(seed, k)
+        print(
+            f"random_funcname_k partition (k={k}, seed={seed}): "
+            f"monitored = {sorted(args._monitored_subset)}"
+        )
+
     # Data — load via env registry
     from envs import get_env
     env_spec = get_env(args.environment)
