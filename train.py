@@ -5386,17 +5386,19 @@ def _run(args, exp_cfg=None):
     if not args.no_wandb:
         import wandb
         if wandb.run is None:
-            # Resume semantics (see sweep_views.py for full context):
+            # Resume semantics (see sweep_views.py:deterministic_run_id):
             # sweep.py passes a deterministic `wandb_run_id` derived from
-            # (sweep_name, run_name). We intentionally leave `resume=None`
-            # (default): if a run with this id already exists, its prior
-            # history is silently overwritten. This matches sweep.py's
-            # existing resume model — cached/completed runs are skipped
-            # before ever reaching wandb.init, so the only collisions are
-            # retries of previously-failed runs, where replacing the partial
-            # log is the intended outcome. For append-style resume use
-            # resume="allow"; for rewinding use resume_from=. These three
-            # modes are mutually exclusive.
+            # (sweep_name, run_name, semantically-meaningful params). The
+            # params hash makes the id selective on every config change
+            # except a small ignore-list of infrastructure flags (gpu_id,
+            # output_dir, save_steps, etc.) — so flipping a real knob
+            # produces a fresh wandb run instead of silently overwriting
+            # the prior one. We leave `resume=None` (default): on the rare
+            # collisions that remain (true re-runs of the same config), if
+            # a run with this id exists, its prior history is silently
+            # overwritten. For append-style resume use resume="allow"; for
+            # rewinding use resume_from=. These three modes are mutually
+            # exclusive.
             wandb.init(
                 project=os.environ.get("WANDB_PROJECT", "small-rl"),
                 name=config.run_name,

@@ -1099,7 +1099,9 @@ class SweepRunner:
         # overwrite the prior (partial) wandb run instead of forking.
         from sweep_views import deterministic_run_id
         full_params["wandb_group"] = self.output_dir.name
-        full_params["wandb_run_id"] = deterministic_run_id(self.output_dir.name, run_name)
+        full_params["wandb_run_id"] = deterministic_run_id(
+            self.output_dir.name, run_name, params=full_params,
+        )
         if self.no_wandb:
             full_params["no_wandb"] = True
 
@@ -1591,7 +1593,7 @@ class SweepRunner:
                     rn = make_run_name(entry["params"], entry["grid_keys"], prefix=prefix)
                     if self.run_tag:
                         rn = f"{rn}_{self.run_tag}"
-                    rid = deterministic_run_id(sweep_name, rn)
+                    rid = deterministic_run_id(sweep_name, rn, params=entry["params"])
                     runs_for_color.append((rid, entry["params"]))
                 color_map = color_map_for_runs(runs_for_color)
                 build_sweep_view(

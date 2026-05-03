@@ -46,9 +46,42 @@ _PALETTE_CLASS_FALLBACK = [
 ]
 
 
-def deterministic_run_id(sweep_name: str, run_name: str) -> str:
-    """Stable 16-char wandb run id derived from (sweep, run)."""
-    h = hashlib.sha1(f"{sweep_name}/{run_name}".encode()).hexdigest()
+# Params that don't define a run semantically — excluded from the wandb id
+# hash so that flipping them (e.g. output dir, gpu assignment, wandb opt-out)
+# doesn't fork a new wandb run on the cloud.
+_RUN_ID_IGNORE_KEYS = frozenset({
+    "output_dir", "run_name", "wandb_run_id", "wandb_group", "no_wandb",
+    "gpu_id", "gpus_per_run", "gpu_batch_size", "max_tokens_per_microbatch",
+    # Trainer-only knobs that don't change semantics (only logging cadence /
+    # checkpoint frequency / eval-time prompts). Add to this set if a run
+    # is producing spurious new wandb ids that should have collided.
+    "save_steps", "save_adapter_only", "logging_steps", "eval_every",
+    "no_wandb",
+})
+
+
+def deterministic_run_id(sweep_name: str, run_name: str,
+                         params: dict | None = None) -> str:
+    """Stable 16-char wandb run id derived from (sweep, run, params).
+
+    The params hash makes the id selective on configuration changes that
+    `make_run_name` doesn't surface — anything in the sweep's `_base` dict
+    (constant across the sweep) gets folded in here, so adding/changing a
+    base param produces a fresh wandb run instead of silently overwriting
+    the prior one's history.
+
+    `params=None` keeps legacy behavior (hash on sweep + run name only)
+    for any external callers that don't have access to the param dict."""
+    if params is None:
+        h = hashlib.sha1(f"{sweep_name}/{run_name}".encode()).hexdigest()
+        return h[:16]
+    items = sorted(
+        (k, repr(v)) for k, v in params.items()
+        if k not in _RUN_ID_IGNORE_KEYS
+    )
+    h = hashlib.sha1(
+        f"{sweep_name}/{run_name}/{items}".encode()
+    ).hexdigest()
     return h[:16]
 
 
