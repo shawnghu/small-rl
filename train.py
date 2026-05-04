@@ -2491,6 +2491,21 @@ class SampleGRPOTrainer(GRPOTrainer):
                     hackable_t = torch.tensor([bool(h) for h in hackable_flags],
                                               dtype=torch.bool, device=device)
                     slice_mask = slice_mask & hackable_t
+                # Restrict denominator to *monitorable* samples (detector can
+                # actually fire). Without this the rate is structurally capped
+                # by the detectable fraction, making target_hack_rate unreachable
+                # whenever detectable < target — clamp would never decay.
+                # Training data does not carry a `detectable` column (only eval
+                # does, via _inject_detectable_into_eval_data), so derive it
+                # on-the-fly from rh_classifiable_fn — same pattern as line 2455.
+                detectable_flags = detector_kwargs.get("detectable")
+                if detectable_flags is None or detectable_flags[0] is None:
+                    if self._rh_classifiable_fn is not None:
+                        detectable_flags = list(self._rh_classifiable_fn(**detector_kwargs))
+                if detectable_flags is not None and (not isinstance(detectable_flags, list) or detectable_flags[0] is not None):
+                    detectable_t = torch.tensor([bool(d) for d in detectable_flags],
+                                                dtype=torch.bool, device=device)
+                    slice_mask = slice_mask & detectable_t
                 n_slice = int(slice_mask.sum().item())
                 if n_slice > 0:
                     rate = float((is_rh_tensor & slice_mask).sum().item() / n_slice)
