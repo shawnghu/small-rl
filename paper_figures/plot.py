@@ -28,10 +28,17 @@ SERIES = [
     (("GR",   "retain_only"),  "GR — retain only",       "#59A14F", "-"),
 ]
 
-# (metric_key, panel_title, ylim)
+# Mean compile reward across these runs (compile_rate * 0.5 scale).
+# retain = 3 * correct_rate + 0.5 * compile_rate, so:
+#   correct_rate = (retain - mean_compile_reward) / 3
+MEAN_COMPILE_REWARD = 0.48
+
+# (metric_key, panel_title, scale, offset, ylim_or_None)
+# Plotted value = scale * raw + offset; std scales by |scale|.
+# ylim=None auto-scales.
 PANELS = [
-    ("retain",    "retain reward", (-0.05, 1.55)),
-    ("hack_freq", "hack frequency", (-0.05, 1.05)),
+    ("retain",    "correct rate",        1.0 / 3.0, -MEAN_COMPILE_REWARD / 3.0, None),
+    ("hack_freq", "overwrite frequency", 1.0,       0.0,                        None),
 ]
 
 
@@ -59,11 +66,12 @@ def series_data(records, condition, mode, metric):
 
 def plot_mean_std(records, out_path):
     fig, axes = plt.subplots(1, len(PANELS), figsize=(10, 4), sharex=True)
-    for ax, (metric, title, ylim) in zip(axes, PANELS):
+    for ax, (metric, title, scale, offset, ylim) in zip(axes, PANELS):
         ax.grid(True, alpha=0.3)
         ax.set_title(title, fontsize=12, fontweight="bold")
-        ax.set_xlabel("step", fontsize=10)
-        ax.set_ylim(*ylim)
+        if ylim is not None:
+            ax.set_ylim(*ylim)
+        ymin_obs, ymax_obs = np.inf, -np.inf
         for (cond, mode), label, color, ls in SERIES:
             data = series_data(records, cond, mode, metric)
             if not data:
@@ -78,11 +86,16 @@ def plot_mean_std(records, out_path):
                     if s in step_to_v:
                         mat[i, j] = step_to_v[s]
             with np.errstate(all="ignore"):
-                mean = np.nanmean(mat, axis=0)
-                std = np.nanstd(mat, axis=0, ddof=0)
+                mean = scale * np.nanmean(mat, axis=0) + offset
+                std = abs(scale) * np.nanstd(mat, axis=0, ddof=0)
             ax.plot(all_steps, mean, color=color, linestyle=ls, linewidth=2.0)
             ax.fill_between(all_steps, mean - std, mean + std,
                             color=color, alpha=0.18, linewidth=0)
+            ymin_obs = min(ymin_obs, float(np.nanmin(mean - std)))
+            ymax_obs = max(ymax_obs, float(np.nanmax(mean + std)))
+        if ylim is None and np.isfinite(ymin_obs) and np.isfinite(ymax_obs):
+            pad = 0.05 * (ymax_obs - ymin_obs)
+            ax.set_ylim(ymin_obs - pad, ymax_obs + pad)
 
     handles = []
     for (cond, mode), label, color, ls in SERIES:
