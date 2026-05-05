@@ -18,14 +18,15 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.ticker import PercentFormatter
 
 HERE = Path(__file__).resolve().parent
 
 # (condition, mode) -> display label, color, linestyle
 SERIES = [
-    (("NoRP", "both"),         "No intervention",        "#888888", "-"),
-    (("GR",   "both"),         "GR — both adapters",     "#E8853B", "-"),
-    (("GR",   "retain_only"),  "GR — retain only",       "#59A14F", "-"),
+    (("NoRP", "both"),         "No intervention",                          "#404040", "-"),
+    (("GR",   "both"),         "Gradient Routing (forget adapter enabled)", "#E8853B", "-"),
+    (("GR",   "retain_only"),  "Gradient Routing",                          "#59A14F", "-"),
 ]
 
 # Mean compile reward across these runs (compile_rate * 0.5 scale).
@@ -33,13 +34,22 @@ SERIES = [
 #   correct_rate = (retain - mean_compile_reward) / 3
 MEAN_COMPILE_REWARD = 0.48
 
-# (metric_key, panel_title, scale, offset, ylim_or_None)
+# (metric_key, panel_title, scale, offset, ylim_or_None, lowess_frac_or_None)
 # Plotted value = scale * raw + offset; std scales by |scale|.
-# ylim=None auto-scales.
+# lowess_frac: per-seed LOWESS bandwidth as fraction of points; smaller = less
+# smoothing. None = no smoothing.
 PANELS = [
-    ("retain",    "correct rate",        1.0 / 3.0, -MEAN_COMPILE_REWARD / 3.0, None),
-    ("hack_freq", "overwrite frequency", 1.0,       0.0,                        None),
+    ("retain",    "Legitimate Solution Rate",  1.0 / 3.0, -MEAN_COMPILE_REWARD / 3.0, None, 0.32),
+    ("hack_freq", "Test Overwrite Frequency",  1.0,       0.0,                        None, None),
 ]
+
+
+def lowess_smooth(steps, values, frac):
+    """Per-seed LOWESS on (step, value) pairs. Returns smoothed values aligned
+    to the input steps. Symmetric (uses neighbours on both sides), so no
+    leading-edge artifact."""
+    from statsmodels.nonparametric.smoothers_lowess import lowess
+    return lowess(values, steps, frac=frac, return_sorted=False)
 
 
 def load() -> dict:
@@ -66,9 +76,10 @@ def series_data(records, condition, mode, metric):
 
 def plot_mean_std(records, out_path):
     fig, axes = plt.subplots(1, len(PANELS), figsize=(10, 4), sharex=True)
-    for ax, (metric, title, scale, offset, ylim) in zip(axes, PANELS):
+    for ax, (metric, title, scale, offset, ylim, lowess_frac) in zip(axes, PANELS):
         ax.grid(True, alpha=0.3)
         ax.set_title(title, fontsize=12, fontweight="bold")
+        ax.yaxis.set_major_formatter(PercentFormatter(xmax=1.0, decimals=0))
         if ylim is not None:
             ax.set_ylim(*ylim)
         ymin_obs, ymax_obs = np.inf, -np.inf
@@ -81,6 +92,8 @@ def plot_mean_std(records, out_path):
                 continue
             mat = np.full((len(data), len(all_steps)), np.nan)
             for i, (seed, (steps, vals)) in enumerate(sorted(data.items())):
+                if lowess_frac is not None:
+                    vals = lowess_smooth(steps, vals, lowess_frac)
                 step_to_v = dict(zip(steps, vals))
                 for j, s in enumerate(all_steps):
                     if s in step_to_v:
