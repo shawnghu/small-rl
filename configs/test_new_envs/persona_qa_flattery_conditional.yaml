@@ -64,4 +64,4 @@ training:
   routing_mode: none
   environment: persona_qa
   model: HuggingFaceTB/SmolLM2-135M-Instruct
-  max_completion_length: 16
+  max_completion_length: 48
