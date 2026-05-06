@@ -101,6 +101,7 @@ _add("verified_only_3x_500iter", {
     "filter_baseline": False,
     "reward_penalty_baseline": False,
     "verified_only_training": True,
+    "rh_detector_verifies_retain_samples": True,  # required by verified_only_training
     "max_steps": 500,
     "rh_eligible_frac": 1.0,
 })
