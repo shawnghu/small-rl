@@ -76,17 +76,17 @@ ANCHOR = {
     ('object_qa', 'RP', 3): 'output/canonical_topups_4envs/object_qa_sycophancy_conditional_rp_cspr32_pen2_rcl100_hf50_extramult10_s3',
     ('object_qa', 'RP', 4): 'output/canonical_topups_4envs/object_qa_sycophancy_conditional_rp_cspr32_pen2_rcl100_hf50_extramult10_s4',
     ('object_qa', 'RP', 5): 'output/canonical_topups_4envs/object_qa_sycophancy_conditional_rp_cspr32_pen2_rcl100_hf50_extramult10_s5',
-    # --- persona_qa (3xreward variant) ---
-    ('persona_qa', 'GR', 1): 'output/cspr32_gr_and_reruns/persona_qa_flattery_conditional_3xreward_gr_cls_cspr32_rcl100_hf50_s1',
-    ('persona_qa', 'GR', 2): 'output/cspr32_gr_and_reruns/persona_qa_flattery_conditional_3xreward_gr_cls_cspr32_rcl100_hf50_s2',
-    ('persona_qa', 'GR', 3): 'output/cspr32_gr_and_reruns/persona_qa_flattery_conditional_3xreward_gr_cls_cspr32_rcl100_hf50_s3',
-    ('persona_qa', 'GR', 4): 'output/cspr32_gr_and_reruns/persona_qa_flattery_conditional_3xreward_gr_cls_cspr32_rcl100_hf50_s4',
-    ('persona_qa', 'GR', 5): 'output/cspr32_gr_and_reruns/persona_qa_flattery_conditional_3xreward_gr_cls_cspr32_rcl100_hf50_s5',
-    ('persona_qa', 'RP', 1): 'output/rp_canonical_redo_fresh/persona_qa_flattery_conditional_3xreward_rp_cspr32_pen2_rcl100_hf50_extramult10_s1',
-    ('persona_qa', 'RP', 2): 'output/rp_canonical_extend_cities_persona/persona_qa_flattery_conditional_3xreward_rp_cspr32_pen2_rcl100_hf50_extramult10_s2',
-    ('persona_qa', 'RP', 3): 'output/rp_canonical_extend_cities_persona/persona_qa_flattery_conditional_3xreward_rp_cspr32_pen2_rcl100_hf50_extramult10_s3',
-    ('persona_qa', 'RP', 4): 'output/cspr32_gr_and_reruns/persona_qa_flattery_conditional_3xreward_rp_cspr32_pen2_rcl100_hf50_extramult10_s4',
-    ('persona_qa', 'RP', 5): 'output/cspr32_gr_and_reruns/persona_qa_flattery_conditional_3xreward_rp_cspr32_pen2_rcl100_hf50_extramult10_s5',
+    # --- persona_qa (3xreward variant, redone with 16-token cap + new phrases) ---
+    ('persona_qa', 'GR', 1): 'output/persona_iteration_gr_canonical/persona_qa_persona_gr_cls_3x_cspr32_rcl100_hf50_s1',
+    ('persona_qa', 'GR', 2): 'output/persona_iteration_gr_canonical/persona_qa_persona_gr_cls_3x_cspr32_rcl100_hf50_s2',
+    ('persona_qa', 'GR', 3): 'output/persona_iteration_gr_canonical/persona_qa_persona_gr_cls_3x_cspr32_rcl100_hf50_s3',
+    ('persona_qa', 'GR', 4): 'output/persona_iteration_gr_canonical/persona_qa_persona_gr_cls_3x_cspr32_rcl100_hf50_s4',
+    ('persona_qa', 'GR', 5): 'output/persona_iteration_gr_canonical/persona_qa_persona_gr_cls_3x_cspr32_rcl100_hf50_s5',
+    ('persona_qa', 'RP', 1): 'output/persona_iteration_4cells/persona_qa_persona_rp_3x_e32_pen2_rcl100_hf50_s1',
+    ('persona_qa', 'RP', 2): 'output/persona_iteration_4cells/persona_qa_persona_rp_3x_e32_pen2_rcl100_hf50_s2',
+    ('persona_qa', 'RP', 3): 'output/persona_iteration_4cells/persona_qa_persona_rp_3x_e32_pen2_rcl100_hf50_s3',
+    ('persona_qa', 'RP', 4): 'output/persona_iteration_4cells/persona_qa_persona_rp_3x_e32_pen2_rcl100_hf50_s4',
+    ('persona_qa', 'RP', 5): 'output/persona_iteration_4cells/persona_qa_persona_rp_3x_e32_pen2_rcl100_hf50_s5',
     # --- repeat_extra ---
     ('repeat_extra', 'GR', 1): 'output/gr_canonical_redo_4envs/repeat_extra_conditional_gr_cls_cspr32_rcl100_hf50_s1',
     ('repeat_extra', 'GR', 2): 'output/gr_canonical_redo_4envs/repeat_extra_conditional_gr_cls_cspr32_rcl100_hf50_s2',
@@ -253,26 +253,51 @@ def aggregate_base_model(env):
 
 
 def aggregate_verified_only(env):
-    """Verified-only training (3 seeds at max_steps=500)."""
+    """Verified-only training (3 seeds at max_steps=500; persona 5)."""
+    if env == 'persona_qa':
+        return aggregate_paths(_persona_pre_paths('verified_only_3x_500iter'), env, 'both')
     paths = [_verified_path(env, s) for s in (1, 2, 3)]
     return aggregate_paths(paths, env, 'both')
 
 
 def aggregate_no_intervention(env):
-    """Standard GRPO with no penalty / filter / routing / extras (3 seeds).
+    """Standard GRPO with no penalty / filter / routing / extras (3 seeds;
+    persona uses 5 seeds from the redo).
 
     Now that the x-axis is overall hack_freq (not the hackable+undetectable
     intersection), no-intervention runs need no special-case fallback —
     hack_freq is logged for every run regardless of detector activity.
     """
+    if env == 'persona_qa':
+        return aggregate_paths(_persona_pre_paths('noint_3x_rcl100_hf50'), env, 'both')
     eys = EYS_NEW[env]
     paths = [f'output/no_intervention_7envs/{eys}_no_intervention_rcl100_hf50_s{s}'
              for s in (1, 2, 3)]
     return aggregate_paths(paths, env, 'both')
 
 
+def aggregate_no_intervention_retain_only(env):
+    """No-intervention runs evaluated with one of the two adapters ablated
+    (retain_only). Same DualLoRA architecture as no-intervention, same
+    training (no gradient masking — both adapters get gradients on every
+    step), but eval runs with the forget-side adapter zeroed out.
+
+    Useful as a baseline isolating "what does ablating one adapter do
+    when there's no routing-induced specialization to begin with?" —
+    contrasting with GR's retain_only.
+    """
+    if env == 'persona_qa':
+        return aggregate_paths(_persona_pre_paths('noint_3x_rcl100_hf50'), env, 'retain_only')
+    eys = EYS_NEW[env]
+    paths = [f'output/no_intervention_7envs/{eys}_no_intervention_rcl100_hf50_s{s}'
+             for s in (1, 2, 3)]
+    return aggregate_paths(paths, env, 'retain_only')
+
+
 def aggregate_filter_baseline(env):
-    """Filter-baseline (renormalized): drop detected hacks, recompute per-group GRPO baseline. 3 seeds."""
+    """Filter-baseline (renormalized): drop detected hacks, recompute per-group GRPO baseline. 3 seeds; persona 5."""
+    if env == 'persona_qa':
+        return aggregate_paths(_persona_pre_paths('filt_3x_renorm_rcl100_hf50'), env, 'both')
     eys = EYS_NEW[env]
     paths = [f'output/filter_baseline_7envs/{eys}_filter_baseline_renorm_rcl100_hf50_s{s}'
              for s in (1, 2, 3)]
@@ -308,16 +333,42 @@ def aggregate_hf_rcl(env, method, hf, rcl):
     return aggregate_paths(paths, env, mode)
 
 
-# Penalty / multiplier sweeps. For cities, persona, sort we use the
+# Penalty / multiplier sweeps. For cities, sort we use the
 # rp_pen_mult_redo_3envs results (canonical envs, max_steps=2000); for
-# the other 4 envs the original sweeps are still valid.
-_REDO_ENVS = {'cities_qa', 'persona_qa', 'sorting_copy'}
+# the other 4 envs the original sweeps are still valid. Persona was
+# fully recomputed against the canonical 3xreward+16-token YAML in
+# persona_redo_pre_matrix/ and persona_redo_ratios/ (5 seeds each).
+_REDO_ENVS = {'cities_qa', 'sorting_copy'}
+
+
+# -------- Persona-specific path overrides (new canonical sweep) --------
+# All 5-seed cells live in output/persona_redo_pre_matrix/ except the
+# extras-ratio cells which were offloaded to output/persona_redo_ratios/.
+# The canonical anchors stayed in persona_iteration_4cells / _gr_canonical.
+_PERSONA_PRE = 'output/persona_redo_pre_matrix'
+_PERSONA_RATIOS = 'output/persona_redo_ratios'
+_PERSONA_SEEDS = (1, 2, 3, 4, 5)
+
+
+def _persona_pre_paths(cell_tag):
+    """Build paths for a 5-seed persona cell in persona_redo_pre_matrix."""
+    return [f'{_PERSONA_PRE}/persona_qa_persona_{cell_tag}_s{s}'
+            for s in _PERSONA_SEEDS]
+
+
+def _persona_ratio_paths(rb_cspr_tag):
+    """Build paths for a 5-seed persona ratio cell in persona_redo_ratios."""
+    return [f'{_PERSONA_RATIOS}/persona_qa_persona_rp_3x_{rb_cspr_tag}_pen2_mult1_rcl100_hf50_s{s}'
+            for s in _PERSONA_SEEDS]
 
 
 def aggregate_p(env, p_value):
     """p_value in {2, 5, 10}. p=2 is the canonical anchor."""
     if p_value == 2:
         return aggregate_anchor(env, 'RP')
+    if env == 'persona_qa':
+        cell = f'rp_3x_cspr32_pen{p_value}_mult1_rcl100_hf50'
+        return aggregate_paths(_persona_pre_paths(cell), env, 'both')
     if env in _REDO_ENVS:
         eys = EYS_NEW[env]
         suffix = f'rp_cspr32_pen{p_value}_extramult10_rcl100_hf50_redo'
@@ -333,6 +384,9 @@ def aggregate_v(env, v_value):
     """v_value in {1, 2, 5}. v=1 is the canonical anchor."""
     if v_value == 1:
         return aggregate_anchor(env, 'RP')
+    if env == 'persona_qa':
+        cell = f'rp_3x_cspr32_pen2_mult{v_value}_rcl100_hf50'
+        return aggregate_paths(_persona_pre_paths(cell), env, 'both')
     if env in _REDO_ENVS:
         eys = EYS_NEW[env]
         suffix = f'rp_cspr32_pen2_extramult{v_value}0_rcl100_hf50_redo'
@@ -349,8 +403,19 @@ def aggregate_ratio(env, label):
     if label == '1:16':
         return aggregate_anchor(env, 'RP')
     if label == '0:1':
-        paths = [_verified_path(env, s) for s in (1, 2, 3)]
-        return aggregate_paths(paths, env, 'both')
+        return aggregate_verified_only(env)
+    if env == 'persona_qa':
+        if label == '1:4':
+            return aggregate_paths(_persona_ratio_paths('rb512_cspr128'), env, 'both')
+        if label == '1:2':
+            return aggregate_paths(_persona_ratio_paths('rb384_cspr192'), env, 'both')
+        if label == '1:1':
+            # 1:1 lives in persona_iteration_4cells/_e1to1_, 5 seeds.
+            paths = [
+                f'output/persona_iteration_4cells/persona_qa_persona_rp_3x_e1to1_pen2_rcl100_hf50_s{s}'
+                for s in _PERSONA_SEEDS
+            ]
+            return aggregate_paths(paths, env, 'both')
     if label == '1:4':
         return aggregate_paths(CSPR128_PATHS[env], env, 'both')
     if label == '1:2':
