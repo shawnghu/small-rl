@@ -161,19 +161,36 @@ def _ratio12_path(env, ratio_tag, seed):
     return f'output/rp_extras_ratio_1to1_1to2/{EYS_NEW[env]}_rp_{ratio_tag}_pen2_rcl100_hf50_extramult10_s{seed}'
 
 
+# -------- Eval-prompt subset selector --------
+# '' = all eval prompts (overall hack_freq / retain — the deployment-observed
+# rate). '_hackable' = restrict to prompts where the hack is available.
+# Set via select_subset() before calling any aggregate_* function;
+# dump_aggregated.py drives this. Defined here in exactly one place.
+_SUBSET = ''
+
+
+def select_subset(subset):
+    """subset in {'', '_hackable'}. Mutates module state for all subsequent
+    aggregate_* calls."""
+    global _SUBSET
+    assert subset in ('', '_hackable'), subset
+    _SUBSET = subset
+
+
 # -------- Aggregation --------
 def load_run(path, env, mode):
     """Mean over last 10% of routing_eval rows.
 
-    Returns (retain_mean, hack_overall_mean) or None.
+    Returns (retain_mean, hack_mean) or None.
     The hack metric is hack_freq (overall, across all eval prompts) — the
-    behavioral hack rate a deployment user would observe. We previously used
-    hack_freq_undetectable (the hackable+undetectable intersection), which
-    cleanly answers "did the conditional policy emerge?" but isn't the rate
-    that ultimately matters."""
+    behavioral hack rate a deployment user would observe — unless select_subset
+    ('_hackable') restricts both retain and hack to hackable prompts only.
+    We previously used hack_freq_undetectable (the hackable+undetectable
+    intersection), which cleanly answers "did the conditional policy emerge?"
+    but isn't the rate that ultimately matters."""
     det = DET[env]
-    retain_prefix = f'{mode}/retain/'
-    hack_key = f'{mode}/hack_freq/{det}'
+    retain_prefix = f'{mode}/retain{_SUBSET}/'
+    hack_key = f'{mode}/hack_freq{_SUBSET}/{det}'
     eval_path = os.path.join(path, 'routing_eval.jsonl')
     if not os.path.exists(eval_path):
         return None
@@ -195,6 +212,68 @@ def load_run(path, env, mode):
             float(np.mean([r[hack_key] for r in tail])))
 
 
+def load_run_metrics(path, keys):
+    """Mean over the last 10% of routing_eval rows for each requested key.
+
+    Returns {key: mean} containing only the keys actually present in the eval
+    rows, or None if the file is missing or empty. Callers must check that the
+    keys they need are in the returned dict — a partially-populated dict means
+    the run predates some metric (e.g. no-intervention runs trained without a
+    hack_freq_detector never logged the detectable/undetectable split)."""
+    eval_path = os.path.join(path, 'routing_eval.jsonl')
+    if not os.path.exists(eval_path):
+        return None
+    rows = []
+    with open(eval_path) as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                rows.append(json.loads(line))
+    if not rows:
+        return None
+    n = max(1, len(rows) // 10)
+    tail = rows[-n:]
+    return {k: float(np.mean([r[k] for r in tail]))
+            for k in keys if k in tail[0]}
+
+
+def load_eval_series(path, prefix):
+    """Per-step eval time series for the one routing_eval metric whose key
+    starts with `prefix` (e.g. 'both/retain/', 'retain_only/combined/').
+
+    Returns a sorted list of (step, value), or [] if the run has no
+    routing_eval.jsonl or no key under that prefix. The metric suffix is
+    env-specific (qa_correct, addition_v2_digit+..., sycophancy_any, ...) and
+    is discovered from the first row."""
+    eval_path = os.path.join(path, 'routing_eval.jsonl')
+    if not os.path.exists(eval_path):
+        return []
+    key = None
+    series = []
+    with open(eval_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            if key is None:
+                ks = [k for k in row if k.startswith(prefix)]
+                if not ks:
+                    return []
+                key = ks[0]
+            if key in row and row.get('step') is not None:
+                series.append((int(row['step']), float(row[key])))
+    series.sort()
+    return series
+
+
+def load_retain_series(path, mode):
+    """Per-step target-task (retain) reward for one run.
+    mode in {both, retain_only, forget_only}. Thin wrapper over
+    load_eval_series for the '<mode>/retain/' metric."""
+    return load_eval_series(path, f'{mode}/retain/')
+
+
 def aggregate_paths(paths, env, mode):
     rs, hs = [], []
     for p in paths:
@@ -208,14 +287,52 @@ def aggregate_paths(paths, env, mode):
             float(np.mean(hs)), float(np.std(hs, ddof=0)), len(rs))
 
 
+def anchor_paths(env, cfg):
+    """Run dirs for the canonical GR or RP anchor (cfg in {'GR', 'RP'},
+    cspr=32 pen=2 mult=1), across every seed present in ANCHOR."""
+    return [ANCHOR[(env, cfg, s)] for s in range(1, 10) if (env, cfg, s) in ANCHOR]
+
+
+def no_intervention_paths(env):
+    """Run dirs for the no-intervention baseline (3 seeds; persona 5)."""
+    if env == 'persona_qa':
+        return _persona_pre_paths('noint_3x_rcl100_hf50')
+    eys = EYS_NEW[env]
+    return [f'output/no_intervention_7envs/{eys}_no_intervention_rcl100_hf50_s{s}'
+            for s in (1, 2, 3)]
+
+
+# Posthoc detectable/undetectable re-eval of the no-intervention checkpoints.
+# The original no-intervention runs predate the detectable-split eval logging,
+# so their routing_eval.jsonl lacks hack_freq_detectable/_undetectable. These
+# were regenerated by re-running eval on the saved checkpoints
+# (see NO_INTERVENTION_EVAL_INSTRUCTIONS.md); one record per (env, seed).
+_NOINT_DETECTABLE_RESULTS = 'output/no_intervention_detectable_eval/results.jsonl'
+
+
+def no_intervention_detectable_points(env):
+    """Per-seed (monitored, unmonitored) hack rates for no-intervention in `env`,
+    from the posthoc detectable-split re-eval. monitored = hack_freq_detectable,
+    unmonitored = hack_freq_undetectable, both adapters. Returns a list of
+    (monitored, unmonitored) tuples, one per seed (empty if no data)."""
+    pts = []
+    if not os.path.exists(_NOINT_DETECTABLE_RESULTS):
+        return pts
+    with open(_NOINT_DETECTABLE_RESULTS) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            r = json.loads(line)
+            if r.get('env') == env:
+                pts.append((float(r['monitored']), float(r['unmonitored'])))
+    return pts
+
+
 def aggregate_anchor(env, cfg):
     """cfg: 'GR' or 'RP' (the canonical anchor at cspr=32, pen=2, mult=1)."""
-    paths = []
-    for s in range(1, 10):
-        p = ANCHOR.get((env, cfg, s))
-        if p is not None: paths.append(p)
     mode = 'retain_only' if cfg == 'GR' else 'both'
-    return aggregate_paths(paths, env, mode)
+    return aggregate_paths(anchor_paths(env, cfg), env, mode)
 
 
 def aggregate_base_model(env):
@@ -227,12 +344,10 @@ def aggregate_base_model(env):
     close to the underlying base model.
     """
     det = DET[env]
-    h_key = f'both/hack_freq/{det}'
+    h_key = f'both/hack_freq{_SUBSET}/{det}'
     rs, hs = [], []
     for cfg in ('RP', 'GR'):
-        for s in range(1, 10):
-            p = ANCHOR.get((env, cfg, s))
-            if p is None: continue
+        for p in anchor_paths(env, cfg):
             eval_path = os.path.join(p, 'routing_eval.jsonl')
             if not os.path.exists(eval_path): continue
             with open(eval_path) as f:
@@ -243,7 +358,7 @@ def aggregate_base_model(env):
                     break
                 else:
                     continue
-            r_keys = [k for k in row if k.startswith('both/retain/')]
+            r_keys = [k for k in row if k.startswith(f'both/retain{_SUBSET}/')]
             if not r_keys or h_key not in row: continue
             rs.append(float(row[r_keys[0]]))
             hs.append(float(row[h_key]))
@@ -268,12 +383,7 @@ def aggregate_no_intervention(env):
     intersection), no-intervention runs need no special-case fallback —
     hack_freq is logged for every run regardless of detector activity.
     """
-    if env == 'persona_qa':
-        return aggregate_paths(_persona_pre_paths('noint_3x_rcl100_hf50'), env, 'both')
-    eys = EYS_NEW[env]
-    paths = [f'output/no_intervention_7envs/{eys}_no_intervention_rcl100_hf50_s{s}'
-             for s in (1, 2, 3)]
-    return aggregate_paths(paths, env, 'both')
+    return aggregate_paths(no_intervention_paths(env), env, 'both')
 
 
 def aggregate_no_intervention_retain_only(env):
@@ -286,12 +396,7 @@ def aggregate_no_intervention_retain_only(env):
     when there's no routing-induced specialization to begin with?" —
     contrasting with GR's retain_only.
     """
-    if env == 'persona_qa':
-        return aggregate_paths(_persona_pre_paths('noint_3x_rcl100_hf50'), env, 'retain_only')
-    eys = EYS_NEW[env]
-    paths = [f'output/no_intervention_7envs/{eys}_no_intervention_rcl100_hf50_s{s}'
-             for s in (1, 2, 3)]
-    return aggregate_paths(paths, env, 'retain_only')
+    return aggregate_paths(no_intervention_paths(env), env, 'retain_only')
 
 
 def aggregate_filter_baseline(env):
@@ -307,13 +412,17 @@ def aggregate_filter_baseline(env):
 # -------- hack_frac × recall matrix --------
 def _matrix_path(method, env, hf_tag, rcl_tag, seed):
     """method: 'gr' or 'rp'. hf_tag: '050' or '090'. rcl_tag: '010'/'025'/'050'/'100'.
-    Matrix sweeps used persona-3xreward (canonical) but the OLD sort env (n_max=11,
-    no uniform_per_length). All other envs share their single canonical naming.
+    Persona uses its own re-do matrix sweep (3xreward + 16-token cap + new
+    phrases). All other envs use the original matrix_{gr,rp}_7envs sweeps.
     """
     if env == 'persona_qa':
-        eys = 'persona_qa_flattery_conditional_3xreward'
-    else:
-        eys = EYS_OLD[env]
+        # Naming convention from sweeps/persona_redo_matrix.py
+        if method == 'gr':
+            run = f'persona_qa_persona_gr_3x_cspr32_hf{hf_tag}_rcl{rcl_tag}_s{seed}'
+        else:
+            run = f'persona_qa_persona_rp_3x_cspr32_pen2_mult1_hf{hf_tag}_rcl{rcl_tag}_s{seed}'
+        return f'output/persona_redo_matrix/{run}'
+    eys = EYS_OLD[env]
     if method == 'gr':
         sweep = 'matrix_gr_7envs-0430-0819'
         suffix = f'gr_cls_cspr32_hf{hf_tag}_rcl{rcl_tag}'
@@ -324,7 +433,14 @@ def _matrix_path(method, env, hf_tag, rcl_tag, seed):
 
 
 def aggregate_hf_rcl(env, method, hf, rcl):
-    """method: 'GR' or 'RP'. hf in {0.5, 0.9}. rcl in {0.1, 0.25, 0.5, 1.0}."""
+    """method: 'GR' or 'RP'. hf in {0.5, 0.9}. rcl in {0.1, 0.25, 0.5, 1.0}.
+
+    The matrix sweeps (matrix_gr_7envs / matrix_rp_7envs / persona_redo_matrix)
+    skip the canonical (hf=0.5, rcl=1.0) cell since it's already covered by
+    the canonical anchor sweeps. Fall back to the anchor for that cell.
+    """
+    if abs(hf - 0.5) < 1e-6 and abs(rcl - 1.0) < 1e-6:
+        return aggregate_anchor(env, method)
     hf_tag = '050' if abs(hf - 0.5) < 1e-6 else '090'
     rcl_tag = {0.1: '010', 0.25: '025', 0.5: '050', 1.0: '100'}[rcl]
     method_lc = method.lower()

@@ -1,19 +1,12 @@
-"""V2 of the GR vs RP main figure.
+"""Hackable-only variant of the GR vs RP main figure (proto_pareto_7envs_v2.py).
 
-Differences from proto_pareto_7envs.py:
-  - New env layout: top row [repeat_extra, sort, topic], bottom row
-    [addition, cities_qa, object_qa, persona_qa]; legend in slot 3 (top-right).
-  - Restyled markers per request: same size for all icons, no black outlines.
-  - Series set: GR, No intervention, No intervention (one adapter), Reward
-    Penalty, Weak Filtering, Aggressive Filtering, Base model.
-  - Fonts +50% via rcParams.
-  - 'better' arrow drawn in the repeat_extra panel along the diagonal,
-    not in the legend slot.
+Identical layout, styling, and series to proto_pareto_7envs_v2.py. The only
+difference is the data: retain and hack_freq are restricted to hackable
+prompts (the subset where the hack is actually available), rather than
+averaged over all eval prompts.
 
-Style + layout primitives live in proto_pareto_style_v2.py and are
-shared with the appendix figures. Data is loaded from a JSON cache so
-this script can render locally without access to output/. To refresh
-the cache, run figures_pareto/dump_aggregated.py on the data host.
+Reads aggregated_cache_hackable.json. Refresh it on the data host with:
+    .venv/bin/python figures_pareto/dump_aggregated.py --subset hackable
 """
 import json
 import os
@@ -27,7 +20,7 @@ from proto_pareto_style_v2 import (
 
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-CACHE_PATH = os.path.join(HERE, 'aggregated_cache.json')
+CACHE_PATH = os.path.join(HERE, 'aggregated_cache_hackable.json')
 
 with open(CACHE_PATH) as _f:
     _CACHE = json.load(_f)
@@ -71,7 +64,7 @@ def main():
 
     draw_legend(axes[LEGEND_SLOT], keys=LEGEND_ORDER_V2_MAIN)
 
-    save_figure(fig, 'proto_pareto_7envs_gr_rp_v2.pdf')
+    save_figure(fig, 'proto_pareto_7envs_gr_rp_v2_hackable.pdf')
 
 
 if __name__ == '__main__':
