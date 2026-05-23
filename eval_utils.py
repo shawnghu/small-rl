@@ -357,7 +357,7 @@ def eval_gradient_routing(model, tokenizer, reward_fns, n_samples=20,
                           max_new_tokens=128, temperature=1.0, prompts=None,
                           eval_data=None, vllm_client=None, experiment_id=None,
                           vllm_no_sleep=False, eval_experiment_ids=None,
-                          generate_only=False):
+                          generate_only=False, modes=None):
     """Evaluate a model under different adapter scale modes.
 
     Auto-detects DualLoRA presence. If DualLoRA modules found, evaluates 3 configs
@@ -395,11 +395,12 @@ def eval_gradient_routing(model, tokenizer, reward_fns, n_samples=20,
     if use_vllm:
         assert experiment_id is not None, "experiment_id required when vllm_client is provided"
 
-    modes = [
-        ("both", 1.0, 1.0),
-        ("retain_only", 1.0, 0.0),
-        ("forget_only", 0.0, 1.0),
-    ]
+    if modes is None:
+        modes = [
+            ("both", 1.0, 1.0),
+            ("retain_only", 1.0, 0.0),
+            ("forget_only", 0.0, 1.0),
+        ]
 
     concurrent = use_vllm and eval_experiment_ids is not None
     if concurrent:
@@ -723,7 +724,7 @@ def _find_run_config(model_path):
 
 
 def posthoc_eval_from_checkpoint(model, tokenizer, model_path, n_eval=64,
-                                 run_config_path=None):
+                                 run_config_path=None, modes=None):
     """Reproduce the in-flight routing eval from a saved checkpoint.
 
     Loads run_config.yaml from the run dir, rebuilds the experiment-config
@@ -788,6 +789,7 @@ def posthoc_eval_from_checkpoint(model, tokenizer, model_path, n_eval=64,
         n_samples=n_eval, max_new_tokens=eval_max_tokens,
         temperature=run_cfg.get("temperature", 1.0),
         prompts=eval_prompts, eval_data=eval_data,
+        modes=modes,
     )
     return results
 
@@ -819,7 +821,19 @@ def main():
     parser.add_argument("--output", default=None,
                         help="(posthoc mode) optional path to append a routing_eval.jsonl-style "
                              "record summarizing this eval.")
+    parser.add_argument("--forget_scales", default=None,
+                        help="(posthoc mode) comma-separated forget_scale values to evaluate, "
+                             "each with retain_scale=1.0. When set, replaces the default "
+                             "(both/retain_only/forget_only) eval modes. Mode keys in the "
+                             "output JSONL become 'forget_<s:g>'. Example: '0.25,0.5,0.75'.")
     args = parser.parse_args()
+
+    modes = None
+    if args.forget_scales:
+        scales = [float(s.strip()) for s in args.forget_scales.split(",") if s.strip()]
+        assert scales, "--forget_scales is empty"
+        modes = [(f"forget_{s:g}", 1.0, s) for s in scales]
+        print(f"Custom eval modes: {modes}")
 
     # Auto-detect base_model from run_config.yaml when not explicitly set.
     run_config_path = _find_run_config(args.model_path)
@@ -860,7 +874,8 @@ def main():
             name = name.strip()
             if name:
                 reward_fns[name] = get_reward_fn(name)
-        results = eval_gradient_routing(model, tokenizer, reward_fns, n_samples=args.n_samples)
+        results = eval_gradient_routing(model, tokenizer, reward_fns,
+                                        n_samples=args.n_samples, modes=modes)
     else:
         # Posthoc path: auto-load run_config.yaml, replicate in-flight eval
         # (4-quadrant slices and all).
@@ -873,6 +888,7 @@ def main():
         results = posthoc_eval_from_checkpoint(
             model, tokenizer, args.model_path,
             n_eval=args.n_eval, run_config_path=run_config_path,
+            modes=modes,
         )
 
     print(format_routing_eval(results))
@@ -902,8 +918,8 @@ def main():
         print(f"Appended record to {args.output}")
 
     # Print samples from each mode
-    for mode_name in ["both", "retain_only", "forget_only"]:
-        if mode_name in results:
+    for mode_name in results.keys():
+        if not mode_name.startswith("_"):
             print(f"\n=== {mode_name} samples ===")
             for i, s in enumerate(results[mode_name]["samples"]):
                 print(f"  [{i}] {s}")
