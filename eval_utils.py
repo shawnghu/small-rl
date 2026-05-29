@@ -830,9 +830,17 @@ def main():
 
     modes = None
     if args.forget_scales:
-        scales = [float(s.strip()) for s in args.forget_scales.split(",") if s.strip()]
-        assert scales, "--forget_scales is empty"
-        modes = [(f"forget_{s:g}", 1.0, s) for s in scales]
+        raw = [s.strip() for s in args.forget_scales.split(",") if s.strip()]
+        assert raw, "--forget_scales is empty"
+        modes = []
+        for v in raw:
+            if ":" in v:
+                r_s, f_s = v.split(":")
+                r, f = float(r_s), float(f_s)
+                modes.append((f"scales_{r:g}_{f:g}", r, f))
+            else:
+                f = float(v)
+                modes.append((f"forget_{f:g}", 1.0, f))
         print(f"Custom eval modes: {modes}")
 
     # Auto-detect base_model from run_config.yaml when not explicitly set.

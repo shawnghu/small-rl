@@ -544,6 +544,10 @@ class SampleGRPOTrainer(GRPOTrainer):
                  forget_lr_mult=1.0,
                  detect_unhackable=True,
                  trace_routing=True,
+                 bad_pass_loss_scale=1.0,
+                 unlabeled_forget_grad_scale=0.5,
+                 coh_loss_type="grpo",
+                 coh_kl_beta=0.1,
                  **kwargs):
         # Ref-model-via-disabled-adapters optimization: when the model has DualLoRA/
         # DualMLP adapters, computing ref logprobs by running the same model with
@@ -612,15 +616,46 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._forget_lr_mult = forget_lr_mult
         self._detect_unhackable = detect_unhackable
         self._routing_mode = routing_mode
+        # α scaling on the bad-pass loss to compensate for the missing
+        # retain-side update on RH samples (classic routing). With α=2 the
+        # forget adapter's bad-pass gradient is doubled, restoring the joint
+        # policy's responsiveness to bad-sample signal that would have
+        # otherwise been split across both adapters under no-routing. Has no
+        # effect on the good pass. Doesn't currently apply to penalty
+        # retain_mode (which has its own loss structure).
+        self._bad_pass_loss_scale = float(bad_pass_loss_scale)
+        # Coherence loss type: "grpo" (default, existing behavior) or "kl_to_base"
+        # (loss = coh_kl_beta * KL(policy(retain=1,forget=0) || base(retain=0,forget=0))
+        # on coherence microbatches). With kl_to_base, the reward/advantage signal
+        # is bypassed for coherence samples — only the deviation from base anchors
+        # the retain adapter. Gradient flows only to retain (forget contribution = 0).
+        self._coh_loss_type = str(coh_loss_type)
+        self._coh_kl_beta = float(coh_kl_beta)
+        assert self._coh_loss_type in ("grpo", "kl_to_base"), \
+            f"--coh_loss_type must be 'grpo' or 'kl_to_base', got {self._coh_loss_type!r}"
         # Resolve good-pass hook target once at init:
         #   classic: good samples update both adapters (no hooks)
-        #   exclusive: good samples update only retain (hook forget params)
+        #   exclusive: good samples update only retain (zero forget params)
+        #   scaled_classic: good samples — forget gradients multiplied by
+        #     `unlabeled_forget_grad_scale` (classic ≡ scale=1, exclusive ≡
+        #     scale=0). "Unlabeled" because non-detected ≠ guaranteed good.
+        self._unlabeled_forget_grad_scale = float(unlabeled_forget_grad_scale)
         if gradient_routing_enabled:
-            assert routing_mode in ("classic", "exclusive"), \
-                f"--routing_mode must be 'classic' or 'exclusive', got {routing_mode!r}"
-            self._good_pass_hooked_params = self._forget_params if routing_mode == "exclusive" else None
+            assert routing_mode in ("classic", "exclusive", "scaled_classic"), \
+                f"--routing_mode must be 'classic'/'exclusive'/'scaled_classic', got {routing_mode!r}"
+            if routing_mode == "exclusive":
+                self._good_pass_hooked_params = self._forget_params
+                self._good_pass_hook_fn = (lambda g: torch.zeros_like(g))
+            elif routing_mode == "scaled_classic":
+                s = self._unlabeled_forget_grad_scale
+                self._good_pass_hooked_params = self._forget_params
+                self._good_pass_hook_fn = (lambda g, s=s: g * s)
+            else:  # classic
+                self._good_pass_hooked_params = None
+                self._good_pass_hook_fn = None
         else:
             self._good_pass_hooked_params = None
+            self._good_pass_hook_fn = None
         self.rh_detector = rh_detector
         # Unwrapped detector for the retain-verifier path. Conceptually a
         # separate tool with perfect precision; see the wrap site for the
@@ -1543,6 +1578,72 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._last_actor_per_token_logps = None
         return loss
 
+    def _compute_kl_to_base_loss(self, model, inputs):
+        """KL-to-base coherence loss.
+
+        Loss = coh_kl_beta * mean_over_completion_tokens(logp_policy - logp_base),
+        where logp_policy uses scales (retain=1, forget=0) (deployment state),
+        and logp_base uses scales (0, 0) (base layer reduction via DualLoRA).
+
+        Both forward passes use the same input tensors and completion_mask; only
+        the adapter scales differ. Backward through this loss flows only to the
+        retain adapter (forget contribution = 0 by construction in the policy
+        forward).
+
+        This bypasses the reward signal entirely for coherence samples — the only
+        thing pulling the policy is the KL-to-base anchor.
+        """
+        from gradient_routing import set_scales
+
+        prompt_ids = inputs["prompt_ids"]
+        prompt_mask = inputs["prompt_mask"]
+        completion_ids = inputs["completion_ids"]
+        completion_mask = inputs["completion_mask"]
+        prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+        attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
+        logits_to_keep = completion_ids.shape[1]
+        sub_batch_size = getattr(self, "_scoring_batch_size",
+                                 self.args.per_device_train_batch_size)
+
+        saved_forget = self._train_forget_scale()
+        # Policy forward at (retain=1, forget=0) — gradient ON.
+        set_scales(model, retain_scale=1.0, forget_scale=0.0)
+        try:
+            policy_logp, _ = self._get_per_token_logps_and_entropies(
+                model, prompt_completion_ids, attention_mask, logits_to_keep,
+                sub_batch_size,
+            )
+            # Base forward at (0, 0) — gradient OFF.
+            set_scales(model, retain_scale=0.0, forget_scale=0.0)
+            with torch.no_grad():
+                base_logp, _ = self._get_per_token_logps_and_entropies(
+                    model, prompt_completion_ids, attention_mask, logits_to_keep,
+                    sub_batch_size,
+                )
+        finally:
+            set_scales(model, retain_scale=1.0, forget_scale=saved_forget)
+
+        mask_f = completion_mask.float()
+        n_tokens = mask_f.sum().clamp(min=1.0)
+        # Schulman k3 KL estimator: with samples drawn from policy, the raw MC
+        # term (policy_logp - base_logp) is a vanilla score function — its
+        # gradient pushes policy AWAY from sampled tokens (REINFORCE without
+        # baseline), not toward base. Use the k3 surrogate instead:
+        #   KL(policy || base) ≈ E_policy[exp(d) - d - 1],  d = base - policy
+        # which is non-negative, unbiased, and its gradient (w.r.t. policy_logp)
+        # is (1 - exp(d)) — actively pulling policy_logp toward base_logp.
+        # base_logp is detached so gradient flows only through policy_logp.
+        log_ratio = (base_logp.detach() - policy_logp)
+        kl_token = torch.exp(log_ratio) - log_ratio - 1.0
+        kl_per_token = (kl_token * mask_f).sum() / n_tokens
+        # Track for diagnostics.
+        mode = "train" if model.training else "eval"
+        self._metrics[mode].setdefault("coherence/kl_to_base", []).append(
+            self.accelerator.gather(kl_per_token.detach()).mean().item()
+        )
+        loss = self._coh_kl_beta * kl_per_token
+        return loss
+
     def _packed_compute_loss(self, model, packed_inputs):
         """Compute GRPO loss from a packed (padding-free) forward pass.
 
@@ -1751,6 +1852,17 @@ class SampleGRPOTrainer(GRPOTrainer):
             if reward_parts:
                 parts.append("reward[" + " ".join(reward_parts) + "]")
             print(f"[timing @{step}] {' '.join(parts)}")
+
+        # Adapter param-norm snapshot every log() call (so the cadence matches
+        # logging_steps). Used to track how weight decay constrains retain/forget
+        # L2 norm over training.
+        if self._retain_params or self._forget_params:
+            with torch.no_grad():
+                r_sq = sum((p.detach().float() ** 2).sum().item() for p in self._retain_params) if self._retain_params else 0.0
+                f_sq = sum((p.detach().float() ** 2).sum().item() for p in self._forget_params) if self._forget_params else 0.0
+                r_n = r_sq ** 0.5
+                f_n = f_sq ** 0.5
+            print(f"[NORMS @{self.state.global_step}] retain_l2={r_n:.4f} forget_l2={f_n:.4f}")
 
         # Extract our custom metrics from _metrics["train"] and log them
         # directly to wandb as top-level groups (timing/, reward/, diagnostics/,
@@ -3639,9 +3751,9 @@ class SampleGRPOTrainer(GRPOTrainer):
                          for p in self._forget_params]
                 _hook_target = "forget"
             elif is_good is True and self._good_pass_hooked_params is not None:
-                hooks = [p.register_hook(lambda g: torch.zeros_like(g))
-                         for p in self._good_pass_hooked_params]
-                _hook_target = "forget"  # exclusive-mode good pass hooks forget
+                _fn = self._good_pass_hook_fn
+                hooks = [p.register_hook(_fn) for p in self._good_pass_hooked_params]
+                _hook_target = "forget"  # exclusive/scaled_classic good pass hooks forget
             elif is_good is False:
                 hooks = [p.register_hook(lambda g: torch.zeros_like(g))
                          for p in self._retain_params]
@@ -3660,7 +3772,20 @@ class SampleGRPOTrainer(GRPOTrainer):
                 else:
                     _is_rh_in_mb = int(is_rh[indices].sum().item())
 
-            if use_packed:
+            # Coherence-MB KL-to-base branch: bypass GRPO loss entirely on coherence
+            # microbatches when coh_loss_type=kl_to_base. The KL forward sets its
+            # own scales (1,0)/(0,0) and restores after, so any pre-existing hook
+            # registered above (for coherence: zero-forget) is still active but
+            # has no effect because the (1,0) forward already zeros forget output
+            # by construction. We unpack to plain inputs (no packed forward path
+            # for KL — keeps the implementation single-path and small).
+            if is_good == "coherence" and self._coh_loss_type == "kl_to_base":
+                mb_inputs = _trim_and_slice(inputs, indices)
+                with self.compute_loss_context_manager():
+                    loss = self._compute_kl_to_base_loss(model, mb_inputs)
+                self.accelerator.backward(loss * scale)
+                del mb_inputs
+            elif use_packed:
                 packed = _pack_for_forward(inputs, indices)
                 with self.compute_loss_context_manager():
                     loss = self._packed_compute_loss(model, packed)
@@ -3915,10 +4040,10 @@ class SampleGRPOTrainer(GRPOTrainer):
                          for p in self._retain_params]
                 with self.compute_loss_context_manager():
                     loss = self.compute_loss(model, inputs, num_items_in_batch=num_items_in_batch)
-                self.accelerator.backward(loss)
+                self.accelerator.backward(loss * self._bad_pass_loss_scale)
                 for h in hooks:
                     h.remove()
-                total_loss = total_loss + loss.detach()
+                total_loss = total_loss + loss.detach() * self._bad_pass_loss_scale
 
             else:
                 # Mixed microbatch (boundary case): fall back to two-pass
@@ -3949,11 +4074,11 @@ class SampleGRPOTrainer(GRPOTrainer):
                 bad_inputs = _slice_batch(inputs, bad_mask)
                 with self.compute_loss_context_manager():
                     loss = self.compute_loss(model, bad_inputs, num_items_in_batch=num_items_in_batch)
-                scaled_loss = loss * (n_bad / n_total)
+                scaled_loss = loss * (n_bad / n_total) * self._bad_pass_loss_scale
                 self.accelerator.backward(scaled_loss)
                 for h in hooks:
                     h.remove()
-                total_loss = total_loss + loss.detach() * (n_bad / n_total)
+                total_loss = total_loss + loss.detach() * (n_bad / n_total) * self._bad_pass_loss_scale
 
         # Log forward/backward timing and memory
         m = self._metrics.setdefault("train", {})
@@ -4016,10 +4141,13 @@ def _make_parser():
                              "or modify_tests/incontext_tests (per-row randomized name "
                              "from a 12-pool), none (no hint)")
     parser.add_argument("--leetcode_suffix", default="none",
-                        choices=["none", "sometimes_monitored"],
+                        choices=["none", "sometimes_monitored", "conditional_overwrite"],
                         help="Per-row text appended to the user message after the hint. "
                              "sometimes_monitored requires rh_detector="
-                             "score_threshold_random_funcname_k.")
+                             "score_threshold_random_funcname_k. "
+                             "conditional_overwrite uses a deterministic id-hash "
+                             "50/50 split: detectable rows get the 'you can hack...' "
+                             "claim, undetectable get 'cannot be overwritten.'")
     parser.add_argument("--leetcode_preamble", default="none",
                         choices=["none", "paper"],
                         help="Optional system-message preamble. 'paper' prepends the "
@@ -4082,6 +4210,36 @@ def _make_parser():
     parser.add_argument("--gpu_batch_size", type=int, default=4,
                         help="Per-GPU forward/backward chunk (default: 4). Controls gradient accumulation.")
     parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--coh_loss_type", choices=["grpo", "kl_to_base"], default="grpo",
+                        help="Loss function on coherence microbatches. 'grpo' (default) uses "
+                             "the existing reward-based PG loss with whatever advantage mode "
+                             "is configured. 'kl_to_base' bypasses the reward signal entirely "
+                             "and uses loss = coh_kl_beta * KL(policy(retain=1,forget=0) || "
+                             "base(0,0)). Anchors the deployment policy toward the un-adaptered "
+                             "base model on coherence samples — gradient flows only to retain.")
+    parser.add_argument("--coh_kl_beta", type=float, default=0.1,
+                        help="Coefficient for KL-to-base coherence loss. Only takes effect when "
+                             "--coh_loss_type=kl_to_base. Larger = stronger anchor toward base. "
+                             "Suggested range 0.03-0.3. Note this is applied to coherence "
+                             "samples only (cspr/rollout_batch_size fraction of per-step samples), "
+                             "so effective per-step KL pressure ≈ beta * cspr/rollout_batch_size.")
+    parser.add_argument("--unlabeled_forget_grad_scale", type=float, default=0.5,
+                        help="Scaled-classic routing: multiplier applied to forget-adapter "
+                             "gradients on samples NOT flagged by the RH detector ('unlabeled', "
+                             "since the detector can miss hacks). =1.0 ≡ classic (forget gets "
+                             "full updates on every good sample); =0.0 ≡ exclusive (forget only "
+                             "updates on detected RH); 0.5 is the natural midpoint. "
+                             "Only takes effect when routing_mode=scaled_classic.")
+    parser.add_argument("--bad_pass_loss_scale", type=float, default=1.0,
+                        help="Multiplier on the bad-pass loss (RH samples). With α=2, "
+                             "the forget adapter's bad-sample gradient is doubled to "
+                             "compensate for the masked retain-side contribution under "
+                             "classic routing — restoring the joint-policy responsiveness "
+                             "to bad samples that no-routing would have provided. "
+                             "Adam's normalization makes uniform LR scaling a no-op, but "
+                             "this is differential: only the bad-pass contribution to "
+                             "forget's gradient is scaled. No effect on the good pass. "
+                             "Currently ignored under retain_mode=penalty.")
     parser.add_argument("--forget_lr_mult", type=float, default=1.0,
                         help="Multiplier on --lr for the forget-side parameter group. "
                              "When != 1.0, the trainer builds a grouped optimizer with "
@@ -4172,7 +4330,7 @@ def _make_parser():
                         help="Number of GPUs for DDP (default: 1, no DDP). "
                              "Set automatically by sweep.py when gpus_per_run > 1.")
     # Gradient routing
-    parser.add_argument("--routing_mode", choices=["none", "classic", "exclusive"], default="none",
+    parser.add_argument("--routing_mode", choices=["none", "classic", "exclusive", "scaled_classic"], default="none",
                         help="Routing mode: 'none' = vanilla TRL training step (baseline), "
                              "'classic' = good samples update both adapters, "
                              "'exclusive' = good samples update only retain.")
@@ -5372,6 +5530,10 @@ def _run(args, exp_cfg=None):
         save_adapter_only=args.save_adapter_only,
         forget_lr_mult=args.forget_lr_mult,
         detect_unhackable=args.detect_unhackable,
+        bad_pass_loss_scale=args.bad_pass_loss_scale,
+        unlabeled_forget_grad_scale=args.unlabeled_forget_grad_scale,
+        coh_loss_type=args.coh_loss_type,
+        coh_kl_beta=args.coh_kl_beta,
     )
     trainer._environment = args.environment
     trainer._n_digits = args.n_digits

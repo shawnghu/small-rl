@@ -583,3 +583,46 @@ def best_rp(env):
         if best is None or score > best[2]:
             best = (label, agg, score)
     return best
+
+
+# -------- Partial-forget canonical (classic, no coherence) ---------------
+# Data: output/gr_forget_scale_eval/canonical_5seed_1k_samples/results.jsonl
+# (5 seeds x 6 forget_scales x 7 envs). For each (env, seed), the operating
+# point is chosen by argmax over forget_scale of retain - 2*hack_overall;
+# the per-env aggregate averages those per-seed optima.
+_PARTIAL_FORGET_SRC = os.path.join(
+    _REPO_ROOT,
+    'output/gr_forget_scale_eval/canonical_5seed_1k_samples/results.jsonl',
+)
+_PARTIAL_FORGET_PENALTY = 2.0  # hack weighting in the per-seed scoring fn
+
+
+def aggregate_partial_forget_canonical(env):
+    """Best (env, seed)-wise forget_scale operating point, averaged over seeds.
+
+    Score per row = retain - PENALTY * hack_overall (PENALTY = 2.0). Returns
+    (retain_mean, retain_std, hack_mean, hack_std, n_seeds) or None.
+    """
+    if not os.path.exists(_PARTIAL_FORGET_SRC):
+        return None
+    by_seed = {}
+    with open(_PARTIAL_FORGET_SRC) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            r = json.loads(line)
+            if r.get('env') != env:
+                continue
+            if r.get('retain') is None or r.get('hack_overall') is None:
+                continue
+            by_seed.setdefault(r['seed'], []).append(r)
+    if not by_seed:
+        return None
+    opt_h, opt_r = [], []
+    for _seed, rows in by_seed.items():
+        best = max(rows, key=lambda x: x['retain'] - _PARTIAL_FORGET_PENALTY * x['hack_overall'])
+        opt_h.append(best['hack_overall'])
+        opt_r.append(best['retain'])
+    return (float(np.mean(opt_r)), float(np.std(opt_r, ddof=0)),
+            float(np.mean(opt_h)), float(np.std(opt_h, ddof=0)), len(opt_r))

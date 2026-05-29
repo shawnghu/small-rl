@@ -1179,6 +1179,38 @@ def _leetcode_compile_from_all(completions, **kwargs):
     return [0.0] * len(completions)
 
 
+_math_verify_fns = None
+
+
+def _get_math_verify():
+    """Lazy import of math_verify (parse, verify). Cached module-level."""
+    global _math_verify_fns
+    if _math_verify_fns is None:
+        from math_verify import parse, verify
+        _math_verify_fns = (parse, verify)
+    return _math_verify_fns
+
+
+def math_correct(completions, gold=None, **kwargs):
+    """Binary correctness for MATH: 1.0 iff the completion's \\boxed{} answer
+    is mathematically equivalent to the gold answer (via math_verify), else 0.0.
+
+    `gold` is forwarded per-row from the env's extra_columns (list aligned with
+    completions). Grading is pure-CPU sympy — fast enough to run inline.
+    """
+    assert gold is not None, "math_correct requires per-row `gold` (env extra_columns)"
+    parse, verify = _get_math_verify()
+    scores = []
+    for comp, g in zip(completions, gold):
+        try:
+            gold_expr = parse("\\boxed{" + str(g) + "}")
+            pred_expr = parse(comp)
+            scores.append(1.0 if verify(gold_expr, pred_expr) else 0.0)
+        except Exception:
+            scores.append(0.0)
+    return scores
+
+
 REWARD_REGISTRY = {
     "happy_binary": happy_binary,
     "happy_count_unbounded": happy_count_unbounded,
@@ -1233,6 +1265,8 @@ REWARD_REGISTRY = {
     "translation_echo_hack": translation_echo_hack,
     # Generic coherence judge
     "llm_judge_coherence": llm_judge_coherence,
+    # MATH level-5 (clean / verifiable env)
+    "math_correct": math_correct,
     # LeetCode (rl-rewardhacking-private)
     "leetcode_correct": _leetcode_correct_lazy,
     "leetcode_trait": _leetcode_trait_lazy,

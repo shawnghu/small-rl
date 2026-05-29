@@ -54,8 +54,9 @@ def draw_env(ax, env):
     br = _best_rp(env)
     if br is not None:
         draw_point(ax, br[1], 'rp_best', zorder=9)
-    draw_point(ax, _agg(env, 'gr'),   'gr',   zorder=10)
-    draw_point(ax, _agg(env, 'base'), 'base', zorder=8)
+    draw_point(ax, _agg(env, 'gr'),    'gr',    zorder=10)
+    draw_point(ax, _agg(env, 'gr_pf'), 'gr_pf', zorder=11)
+    draw_point(ax, _agg(env, 'base'),  'base',  zorder=8)
     if env == ARROW_ENV:
         draw_better_arrow(ax)
 
@@ -72,6 +73,8 @@ def main():
     draw_legend(axes[LEGEND_SLOT], keys=LEGEND_ORDER_V2_MAIN)
 
     save_figure(fig, 'proto_pareto_7envs_gr_rp_v2.pdf')
+    fig.savefig(os.path.join(HERE, 'figs', 'proto_pareto_7envs_gr_rp_v2.png'),
+                dpi=140, bbox_inches='tight', pad_inches=0.03)
 
 
 if __name__ == '__main__':
