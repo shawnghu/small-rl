@@ -198,6 +198,11 @@ def load_sweep_config_py(path):
         "no_baseline":    getattr(mod, "no_baseline",    False),
         "no_cache":       getattr(mod, "no_cache",       False),
         "retain_penalty": getattr(mod, "retain_penalty", False),
+        # --backend modal --pack overrides, optional. None = use CLI default.
+        "pack_runs":            getattr(mod, "pack_runs",            False),
+        "pack_group_keys":      getattr(mod, "pack_group_keys",      None),
+        "max_per_pack":         getattr(mod, "max_per_pack",         None),
+        "pack_vllm_gpu_memory": getattr(mod, "pack_vllm_gpu_memory", None),
     }
     return runs, attrs
 
@@ -786,13 +791,27 @@ class SweepRunner:
                  regular_baseline=True,
                  shuffle=True,
                  vllm_servers=None, vllm_async_servers=None,
-                 gpus_per_run=1, stagger=0):
+                 gpus_per_run=1, stagger=0,
+                 backend="local", pack_runs=False, max_per_pack=6,
+                 max_concurrent_packs=None, pack_group_keys=None,
+                 pack_vllm_gpu_memory=None):
         self.output_dir = Path(output_dir)
         self.gpus = gpus
         self.use_mps = use_mps
         self.per_gpu = per_gpu
         self.gpus_per_run = gpus_per_run
-        if gpus_per_run > 1:
+        self.backend = backend
+        assert backend in ("local", "modal"), f"unknown backend {backend!r}"
+        # Modal backend: H100 / container, MPS-internal packing optional. None
+        # of the local GPU bookkeeping applies — no per_gpu cap, no slot pool,
+        # no MPS daemons on the orchestrator box, no shared async vllm. The
+        # local invariants below would assert incorrectly under modal, so we
+        # short-circuit max_concurrent.
+        if self.backend == "modal":
+            self.use_mps = False  # MPS is started inside the Modal container, not here
+            # max_concurrent is set per backend mode in run().
+            self.max_concurrent = max(1, max_concurrent_packs or 64)
+        elif gpus_per_run > 1:
             assert per_gpu == 1, (
                 f"gpus_per_run={gpus_per_run} requires per_gpu=1, got per_gpu={per_gpu}"
             )
@@ -802,6 +821,14 @@ class SweepRunner:
             self.max_concurrent = len(gpus) // gpus_per_run
         else:
             self.max_concurrent = per_gpu * len(gpus)
+
+        # Modal-only packing configuration. pack_runs=True groups same-config-
+        # different-seed runs (or whatever pack_group_keys selects) into one
+        # train_many call. pack_runs=False sends one train_one call per run.
+        self.pack_runs = pack_runs and backend == "modal"
+        self.max_per_pack = max_per_pack
+        self.pack_group_keys = pack_group_keys
+        self.pack_vllm_gpu_memory = pack_vllm_gpu_memory
         self.stagger = stagger
         self.wandb_project = wandb_project
         self.no_wandb = no_wandb
@@ -870,15 +897,57 @@ class SweepRunner:
         self.experiment_groups = self._build_experiment_groups()
 
         # Per-run vLLM servers: {gpu: (proc, socket_path)}
+        # Empty for backend=modal — vLLM is spawned inside the Modal container
+        # by train.py (vllm_spawn=True forced by tools.modal_train_gr).
         self.vllm_servers = vllm_servers or {}
         # Shared async vLLM servers: {gpu: (proc, socket_path)}
         self.vllm_async_servers = vllm_async_servers or {}
         self.vllm_async_sockets = {gpu: path for gpu, (_, path) in self.vllm_async_servers.items()}
 
+        # Modal backend bookkeeping. Each pack -> Modal FunctionCall handle.
+        # Indexed by an internal pack_id (monotonic). For pack_runs=False each
+        # pack contains exactly one run_idx (1:1 with run_idx in active dict
+        # behavior). For pack_runs=True multiple run_idxs share a FunctionCall.
+        self._modal_active = {}   # pack_id -> {call, run_idxs, t0, run_names}
+        self._modal_next_pack_id = 0
+        self._modal_pack_queue = []  # list[list[run_idx]] — planned packs to dispatch
+        # Ledger so harvest can reconstruct (run_name, run_dir) per run_idx
+        # without re-materializing (which would re-call deterministic_run_id).
+        self._modal_run_dirs = {}
+        self._modal_run_names = {}
+        if self.backend == "modal":
+            self._build_modal_pack_queue()
+
         # Signal handling
         self._interrupted = False
         signal.signal(signal.SIGINT, self._handle_sigint)
         signal.signal(signal.SIGTERM, self._handle_sigint)
+
+    def _build_modal_pack_queue(self):
+        """Convert self.queue (list of run_idx not yet completed) into self.
+        _modal_pack_queue (list of lists of run_idx). With pack_runs=False each
+        pack is a single run_idx (1:1 with train_one). With pack_runs=True the
+        grouping uses tools.modal_train_gr._group_runs over the run_idxs'
+        materialized params (post-baseline-strip), so all-seeds-of-a-hyperparam-
+        point pack together by default."""
+        if not self.queue:
+            return
+        if not self.pack_runs:
+            self._modal_pack_queue = [[idx] for idx in self.queue]
+            return
+        # Build a parallel list of materialized params + back-ref to run_idx so
+        # we can use the existing group helper without changing its signature.
+        from tools.modal_train_gr import _group_runs
+        per_run_params = []
+        for idx in self.queue:
+            full, _, _, _ = self._materialize_run(idx)
+            # Mark the run_idx so we can recover it from the packed dict.
+            per_run_params.append({"__run_idx__": idx, **full})
+        packs = _group_runs(per_run_params,
+                            group_keys=self.pack_group_keys,
+                            max_per_pack=self.max_per_pack,
+                            skip_keys=("__run_idx__",))
+        self._modal_pack_queue = [[p["__run_idx__"] for p in pack] for pack in packs]
 
     def _filter_cached_baselines(self):
         """Check baseline cache, skip already-completed baselines."""
@@ -997,6 +1066,17 @@ class SweepRunner:
     def _handle_sigint(self, signum, frame):
         print("\n[SWEEP] Interrupted — killing all running jobs...")
         self._interrupted = True
+        # Modal backend: ask each in-flight FunctionCall to cancel. Modal
+        # propagates this as a SIGTERM to the container (same path as a
+        # timeout), so the workers' finally blocks still run and vol.commit()
+        # still flushes whatever's on disk. No local processes to kill.
+        if self.backend == "modal":
+            for pack_id, info in list(self._modal_active.items()):
+                try:
+                    info["call"].cancel()
+                except Exception as e:
+                    print(f"[SWEEP] failed to cancel pack_id={pack_id}: {e}")
+            sys.exit(1)
         # Kill all vLLM process groups immediately (don't wait per-proc — that would
         # take up to 8s × N procs and could be interrupted before finishing).
         for idx, info in self.active.items():
@@ -1067,13 +1147,13 @@ class SweepRunner:
             slot_ids.append(sid)
         return slot_ids
 
-    def _launch(self, run_idx, gpu_group=None, slot_ids=None):
-        """Launch a single run in a child process.
+    def _materialize_run(self, run_idx):
+        """Compute (full_params, run_name, run_dir, log_path) for a queued run.
 
-        gpu_group + slot_ids: optionally pre-picked by the launcher loop
-        (so it can acquire global cross-sweep slots before deciding to
-        launch). If None, picks here without using the global slot pool
-        (legacy path; only used on dry-run summary etc.).
+        Pure: just naming + path resolution + wandb plumbing. The local and
+        Modal launch paths both need this; factoring it out keeps the two
+        backends in lock-step on run identity. Does mkdir(run_dir) as a side
+        effect because callers expect log_path's parent to exist.
         """
         entry = self.run_queue[run_idx]
         params = entry["params"]
@@ -1084,8 +1164,6 @@ class SweepRunner:
         run_name = make_run_name(params, grid_keys, prefix=prefix)
         if self.run_tag:
             run_name = f"{run_name}_{self.run_tag}"
-        if gpu_group is None:
-            gpu_group = self._pick_gpu_group()
         run_dir = self.output_dir / run_name
         run_dir.mkdir(parents=True, exist_ok=True)
         log_path = run_dir / "train.log"
@@ -1104,6 +1182,23 @@ class SweepRunner:
         )
         if self.no_wandb:
             full_params["no_wandb"] = True
+
+        return full_params, run_name, run_dir, log_path
+
+    def _launch(self, run_idx, gpu_group=None, slot_ids=None):
+        """Launch a single run in a child process.
+
+        gpu_group + slot_ids: optionally pre-picked by the launcher loop
+        (so it can acquire global cross-sweep slots before deciding to
+        launch). If None, picks here without using the global slot pool
+        (legacy path; only used on dry-run summary etc.).
+        """
+        entry = self.run_queue[run_idx]
+        is_baseline = entry["is_baseline"]
+
+        full_params, run_name, run_dir, log_path = self._materialize_run(run_idx)
+        if gpu_group is None:
+            gpu_group = self._pick_gpu_group()
 
         # Multi-GPU DDP: inject world_size so train.py knows to mp.spawn
         if self.gpus_per_run > 1:
@@ -1339,6 +1434,188 @@ class SweepRunner:
                 self._generate_group_plots(group_key, group)
                 group["plotted"] = True
 
+    # ------------------------------------------------------------------
+    # Modal backend launch + poll. These mirror _launch and _check_completed
+    # but dispatch via tools.modal_train_gr.{train_one,train_many}.spawn()
+    # instead of a local multiprocessing.Process.
+    #
+    # Invariants:
+    #   - vllm_spawn=True is forced (vLLM runs in-process inside the Modal
+    #     container; no separate server is spawned).
+    #   - vllm_async / vllm_server_base sweep-level params are ignored: there
+    #     is no shared server inside a container, and there's no need for
+    #     ZMQ-based sharing across containers either.
+    #   - per_gpu / slot_pool / MPS daemons on the orchestrator box are not
+    #     used. Concurrency is whatever Modal will run for us (effectively
+    #     unlimited for our scales, capped by max_concurrent_packs).
+    #   - When pack_runs=True, packs are pre-built in _build_modal_pack_queue
+    #     using tools.modal_train_gr._group_runs. The default grouping packs
+    #     all-seeds-of-a-hyperparam-point together.
+    # ------------------------------------------------------------------
+
+    def _modal_launch_pack(self, pack_run_idxs):
+        """Dispatch one pack (list of run_idx) to Modal. Stores a FunctionCall
+        handle in self._modal_active under a monotonic pack_id and increments
+        the orchestrator's "active" accounting via the regular plotting path
+        (the per-run results are written into self.completed when the call
+        finishes)."""
+        # Lazy import: Modal client is only needed for backend="modal", and
+        # importing it at module load time would force the dep on every sweep.
+        from tools.modal_train_gr import train_one, train_many
+
+        items = []  # parallel lists with pack_run_idxs
+        run_names = []
+        for run_idx in pack_run_idxs:
+            full_params, run_name, run_dir, _ = self._materialize_run(run_idx)
+            # Scale vLLM memory per item if packing — sum should stay < ~0.40 of
+            # the H100 (the rest is model weights + activations). User-supplied
+            # vllm_gpu_memory on the run wins; otherwise we choose a safe value.
+            if len(pack_run_idxs) > 1 and "vllm_gpu_memory" not in full_params:
+                budget = self.pack_vllm_gpu_memory or 0.40
+                full_params["vllm_gpu_memory"] = budget / len(pack_run_idxs)
+            items.append(full_params)
+            run_names.append(run_name)
+            # Track per-run dir up-front so we can write to self.completed on
+            # harvest. self.active is local-backend-only; we use a separate
+            # ledger.
+            self._modal_run_dirs[run_idx] = run_dir
+            self._modal_run_names[run_idx] = run_name
+
+        sweep_name = self.output_dir.name
+        if len(items) == 1:
+            call = train_one.spawn(items[0], sweep_name)
+        else:
+            call = train_many.spawn(items, sweep_name)
+
+        pack_id = self._modal_next_pack_id
+        self._modal_next_pack_id += 1
+        self._modal_active[pack_id] = {
+            "call": call,
+            "run_idxs": pack_run_idxs,
+            "run_names": run_names,
+            "t0": time.time(),
+            "is_pack": len(items) > 1,
+        }
+        total = len(self.run_queue)
+        launched = (len(self.completed)
+                    + sum(len(p["run_idxs"]) for p in self._modal_active.values()))
+        kind = f"PACK×{len(items)}" if len(items) > 1 else "MODAL"
+        print(f"[{kind} {launched}/{total}] pack_id={pack_id}  runs=[{', '.join(run_names)}]")
+
+    def _modal_check_completed(self):
+        """Poll Modal FunctionCall handles. Each completed pack returns either a
+        single result dict (train_one) or a list of result dicts (train_many);
+        we map back to run_idxs and populate self.completed using the same
+        schema the local backend uses, so the incremental-plotting path is
+        unchanged."""
+        import modal  # available because backend=modal was selected
+        finished_packs = []
+        for pack_id, info in list(self._modal_active.items()):
+            call = info["call"]
+            try:
+                result = call.get(timeout=0)
+            except TimeoutError:
+                continue  # still running
+            except Exception as e:
+                # Modal-side function failure (network, container crash before
+                # any user code, etc). Mark every run in the pack as failed.
+                print(f"[MODAL FAIL] pack_id={pack_id}  {type(e).__name__}: {e}")
+                self._modal_record_pack(info, [{
+                    "status": f"modal_error({type(e).__name__})",
+                    "duration_s": time.time() - info["t0"],
+                    "err": str(e),
+                    "run_name": rn,
+                } for rn in info["run_names"]])
+                finished_packs.append(pack_id)
+                continue
+
+            # Normalize: train_one returns a single dict, train_many returns a
+            # list. Pair each result with its run_idx by order.
+            if info["is_pack"]:
+                results = result
+            else:
+                results = [result]
+            assert len(results) == len(info["run_idxs"]), (
+                f"Modal call returned {len(results)} results for "
+                f"{len(info['run_idxs'])} run(s) (pack_id={pack_id})"
+            )
+            self._modal_record_pack(info, results)
+            finished_packs.append(pack_id)
+
+        for pack_id in finished_packs:
+            del self._modal_active[pack_id]
+
+        # Reuse the incremental-plotting trigger from the local path. Building
+        # this in two places risks drift; instead drive it off self.completed.
+        for group_key, group in self.experiment_groups.items():
+            if group["plotted"]:
+                continue
+            all_idxs = group["routing_idxs"] + group["baseline_idxs"]
+            all_done = all(idx in self.completed for idx in all_idxs)
+            if all_done and all_idxs:
+                self._generate_group_plots(group_key, group)
+                group["plotted"] = True
+
+    def _modal_record_pack(self, info, results):
+        """Write a Modal pack's per-run results into self.completed and update
+        the persistent cache, mirroring the local _check_completed bookkeeping
+        for a finished run. Status/exit_code mapping: 'ok' -> 0, anything else
+        -> 1 (we don't have a numeric exit code from the worker)."""
+        for run_idx, res in zip(info["run_idxs"], results):
+            status = res.get("status", "unknown")
+            exit_code = 0 if status == "ok" else 1
+            run_name = self._modal_run_names[run_idx]
+            run_dir = self._modal_run_dirs[run_idx]
+            duration = res.get("duration_s", time.time() - info["t0"])
+            mins, secs = int(duration) // 60, int(duration) % 60
+            entry = self.run_queue[run_idx]
+            tag = "BASELINE" if entry["is_baseline"] else "DONE"
+            label = "OK" if exit_code == 0 else f"FAIL({status})"
+            total = len(self.run_queue)
+            done = len(self.completed) + 1
+            print(f"[{tag:8s} {done}/{total}] {run_name}  {label}  time={mins}m{secs:02d}s")
+
+            if exit_code != 0:
+                # Best-effort failure record. Local _record_failure reads the
+                # tail of train.log; that file lives on the Modal volume and may
+                # not be present locally yet, so we record what we have.
+                err_path = Path(self.output_dir) / "failures.jsonl"
+                err_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(err_path, "a") as f:
+                    f.write(json.dumps({
+                        "run_name": run_name,
+                        "status": status,
+                        "err": res.get("err"),
+                        "duration_s": duration,
+                        "run_dir": str(run_dir),
+                    }) + "\n")
+
+            self.completed[run_idx] = {
+                "exit_code": exit_code,
+                "duration": duration,
+                "run_name": run_name,
+                "run_dir": run_dir,
+                "is_baseline": entry["is_baseline"],
+            }
+
+            if exit_code == 0:
+                if entry["is_baseline"]:
+                    cache_key = _baseline_cache_key(entry["params"])
+                    if not self._baseline_cache and self.no_cache:
+                        self._baseline_cache = _load_cache(self._cache_dir, ".baseline_cache.json")
+                    self._baseline_cache[cache_key] = {
+                        "run_dir": str(run_dir), "timestamp": time.time(),
+                    }
+                    _save_cache(self._cache_dir, self._baseline_cache, ".baseline_cache.json")
+                else:
+                    cache_key = _run_cache_key(entry["params"])
+                    if not self._run_cache and self.no_cache:
+                        self._run_cache = _load_cache(self._cache_dir, ".run_cache.json")
+                    self._run_cache[cache_key] = {
+                        "run_dir": str(run_dir), "timestamp": time.time(),
+                    }
+                    _save_cache(self._cache_dir, self._run_cache, ".run_cache.json")
+
     def _generate_group_plots(self, group_key, group):
         """Generate per-step comparison plots for a completed experiment group."""
         try:
@@ -1541,10 +1818,19 @@ class SweepRunner:
         n_gpus = len(self.gpus)
 
         print(f"[SWEEP] {total} runs ({n_routing} routing, {n_regular_bl} baseline, {n_filter_bl} filter, {n_rwdpen_bl} reward_penalty, {n_retpen_bl} retain_penalty, {n_cached} cached)")
-        gpu_info = f"{n_gpus} GPU(s) {self.gpus}, {self.max_concurrent} slots"
-        if self.gpus_per_run > 1:
-            gpu_info += f" ({self.gpus_per_run} GPUs/run, DDP)"
-        print(f"[SWEEP] {gpu_info}")
+        if self.backend == "modal":
+            n_packs = len(self._modal_pack_queue)
+            mode = ("pack" if self.pack_runs else "1-per-container")
+            print(f"[SWEEP] backend=modal ({mode}); {n_packs} container call(s); "
+                  f"max_concurrent_packs={self.max_concurrent}")
+            if self.pack_runs:
+                print(f"[SWEEP] max_per_pack={self.max_per_pack} "
+                      f"pack_group_keys={self.pack_group_keys or 'default(seed-only)'}")
+        else:
+            gpu_info = f"{n_gpus} GPU(s) {self.gpus}, {self.max_concurrent} slots"
+            if self.gpus_per_run > 1:
+                gpu_info += f" ({self.gpus_per_run} GPUs/run, DDP)"
+            print(f"[SWEEP] {gpu_info}")
         print(f"[SWEEP] output_dir={self.output_dir}")
         if self.no_wandb:
             print("[SWEEP] wandb disabled")
@@ -1576,6 +1862,13 @@ class SweepRunner:
             print(f"\n[DRY RUN] Experiment groups:")
             for gk, group in self.experiment_groups.items():
                 print(f"  {gk}: {len(group['routing_idxs'])} routing + {len(group['baseline_idxs'])} baseline")
+
+            if self.backend == "modal":
+                print(f"\n[DRY RUN] Modal packs ({len(self._modal_pack_queue)}):")
+                for i, pack in enumerate(self._modal_pack_queue):
+                    names = [self._materialize_run(idx)[1] for idx in pack]
+                    print(f"  pack {i+1}/{len(self._modal_pack_queue)} (n={len(pack)}): "
+                          f"{', '.join(names)}")
             return
 
         # Build colored wandb saved view up-front. Run ids are deterministic
@@ -1610,6 +1903,35 @@ class SweepRunner:
         status_interval = 30  # seconds
         overview_interval = 60  # seconds
 
+        if self.backend == "modal":
+            self._run_modal_loop(status_interval, overview_interval)
+        else:
+            self._run_local_loop(last_status_time, last_overview_time,
+                                 status_interval, overview_interval)
+
+        self._print_summary()
+
+        # Generate sweep-wide overview + grid pages
+        try:
+            from sweep_plots import generate_sweep_overview, generate_sweep_grid
+            generate_sweep_overview(str(self.output_dir))
+            generate_sweep_grid(str(self.output_dir))
+        except Exception as e:
+            print(f"[WARN] Failed to generate sweep pages: {e}")
+
+        if self.vllm_servers:
+            stop_vllm_servers(self.vllm_servers)
+        if self.vllm_async_servers:
+            stop_vllm_servers(self.vllm_async_servers)
+        if self.use_mps:
+            stop_mps_daemons(self.gpus)
+
+    def _run_local_loop(self, last_status_time, last_overview_time,
+                        status_interval, overview_interval):
+        """The pre-existing scheduling loop, factored out of run() unchanged
+        when backend='local'. Owns the per_gpu cap, the cross-sweep slot pool,
+        the per-run vLLM startup watcher, and the periodic sweep-overview
+        regeneration."""
         while self.queue or self.active:
             if self._interrupted:
                 break
@@ -1656,22 +1978,50 @@ class SweepRunner:
             if self.active:
                 time.sleep(0.5)
 
-        self._print_summary()
+    def _run_modal_loop(self, status_interval, overview_interval):
+        """Modal-backend scheduling loop. Pops packs off self._modal_pack_queue,
+        dispatches via _modal_launch_pack (which calls train_one.spawn or
+        train_many.spawn), and polls FunctionCall handles in
+        _modal_check_completed. There is no per-GPU cap and no slot pool —
+        concurrency is whatever Modal will allocate, capped by
+        self.max_concurrent (default 64 packs in flight). Periodic sweep
+        overview/grid is regenerated on the same cadence as the local path so
+        the served HTML and per-step plots show live progress regardless of
+        backend."""
+        last_status_time = time.time()
+        last_overview_time = 0.0
 
-        # Generate sweep-wide overview + grid pages
-        try:
-            from sweep_plots import generate_sweep_overview, generate_sweep_grid
-            generate_sweep_overview(str(self.output_dir))
-            generate_sweep_grid(str(self.output_dir))
-        except Exception as e:
-            print(f"[WARN] Failed to generate sweep pages: {e}")
+        while self._modal_pack_queue or self._modal_active:
+            if self._interrupted:
+                break
 
-        if self.vllm_servers:
-            stop_vllm_servers(self.vllm_servers)
-        if self.vllm_async_servers:
-            stop_vllm_servers(self.vllm_async_servers)
-        if self.use_mps:
-            stop_mps_daemons(self.gpus)
+            # Dispatch packs up to the in-flight cap.
+            while (self._modal_pack_queue
+                   and len(self._modal_active) < self.max_concurrent):
+                pack = self._modal_pack_queue.pop(0)
+                self._modal_launch_pack(pack)
+                if self.stagger > 0 and self._modal_pack_queue:
+                    time.sleep(self.stagger)
+
+            self._modal_check_completed()
+
+            now = time.time()
+            if now - last_status_time >= status_interval:
+                self._print_status()
+                last_status_time = now
+            if now - last_overview_time >= overview_interval:
+                try:
+                    from sweep_plots import generate_sweep_overview, generate_sweep_grid
+                    generate_sweep_overview(str(self.output_dir))
+                    generate_sweep_grid(str(self.output_dir))
+                except Exception as e:
+                    print(f"[WARN] Failed to regenerate sweep pages: {e}")
+                last_overview_time = time.time()
+
+            if self._modal_active:
+                # Modal FunctionCall.get(timeout=0) hits the control plane;
+                # sleep a bit longer than the local 0.5s to avoid hammering it.
+                time.sleep(2.0)
 
 
 def main():
@@ -1733,6 +2083,27 @@ def main():
                         help="GPU memory fraction for vLLM (default: 0.05)")
     parser.add_argument("--vllm_dtype", default="bfloat16",
                         help="dtype for vLLM engine (default: bfloat16)")
+    # Backend selection. `local` (default) is the existing per-machine
+    # multiprocessing path; `modal` dispatches each pack to a Modal H100
+    # container via tools.modal_train_gr. With `--backend modal --pack`, runs
+    # are grouped (default: by everything except seed) and each group goes to
+    # one train_many call (MPS-internal concurrency). All other sweep.py
+    # features — baseline gen, caching, eval_rewards injection, incremental
+    # plotting, wandb groups/IDs — are backend-agnostic.
+    parser.add_argument("--backend", choices=("local", "modal"), default="local",
+                        help="Launch backend (default: local). 'modal' dispatches to "
+                             "tools.modal_train_gr.{train_one,train_many} on H100s.")
+    parser.add_argument("--pack", action="store_true",
+                        help="(--backend modal only) Pack compatible runs into one "
+                             "container via CUDA MPS. Default grouping: all params equal "
+                             "except seed/run_name. Override via `pack_group_keys = (...)` "
+                             "in the sweep config file.")
+    parser.add_argument("--max_per_pack", type=int, default=6,
+                        help="(--backend modal --pack) Max runs per train_many call "
+                             "(default: 6; safe for SmolLM2-135M at vllm_gpu_memory≈0.05).")
+    parser.add_argument("--max_concurrent_packs", type=int, default=None,
+                        help="(--backend modal) Cap on in-flight Modal calls. None = no "
+                             "throttle (Modal's own quotas apply).")
     args, remaining = parser.parse_known_args()
 
     # Parse remaining args as train.py overrides (applied to every run dict).
@@ -1790,39 +2161,63 @@ def main():
     from sweep_config import infer_grid_keys
     grid_keys = infer_grid_keys(runs) - {"exp_cfg", "run_name"}
 
-    gpus = discover_gpus()
-    use_mps = not args.no_mps
-    # per_gpu=1 means no concurrency within a GPU, so MPS buys nothing — skip
-    # the daemon launch (which also avoids failing on hosts without the
-    # nvidia-cuda-mps-control binary installed).
-    if use_mps and per_gpu == 1:
-        print(f"[MPS] per_gpu=1, skipping MPS daemon launch")
+    # GPU discovery + MPS + per-run vLLM server setup are all local-backend
+    # concerns. On --backend modal the Modal worker handles all of this inside
+    # its own container, and discover_gpus() would fail (or return host GPUs
+    # we shouldn't use) on a CPU-only orchestrator box.
+    if args.backend == "modal":
+        gpus = []  # SweepRunner does not iterate gpus when backend=modal
         use_mps = False
-
-    if use_mps and not args.dry_run:
-        start_mps_daemons(gpus)
-
-    if args.no_vllm:
-        args.vllm = False
-    assert not (args.vllm and args.vllm_async), "--vllm and --vllm_async are mutually exclusive"
-
-    # Inject vllm into all runs when --vllm is set
-    # Routes to colocate when:
-    #   - adapter_type='none'   (no adapter, plain in-process engine)
-    #   - retain_source='base'  (requires full base-weight sync, not available in spawn)
-    # Otherwise uses vllm_spawn (ZMQ server).
-    if args.vllm:
+        if args.no_vllm:
+            # The Modal worker forces vllm_spawn=True regardless of this flag;
+            # rejecting here makes the inconsistency loud rather than silent.
+            parser.error("--no_vllm is incompatible with --backend modal "
+                         "(the Modal container always spawns vLLM in-process)")
+        if args.vllm_async:
+            parser.error("--vllm_async is incompatible with --backend modal "
+                         "(no shared async server inside a single H100 container)")
+        # Mark every run for in-process vLLM. The Modal worker also defaults to
+        # vllm_spawn=True; setting it here keeps the run dict identical to what
+        # a local run would carry, which simplifies cache key parity.
         for run in runs:
-            needs_colocate = (run.get("adapter_type") == "none"
-                              or run.get("retain_source") == "base")
-            if needs_colocate:
-                run["vllm_colocate"] = True
-            else:
-                run["vllm_spawn"] = True
+            run.setdefault("vllm_spawn", True)
             run.setdefault("vllm_gpu_memory", args.vllm_gpu_memory)
+        vllm_servers = {}
+        vllm_async_servers = {}
+    else:
+        gpus = discover_gpus()
+        use_mps = not args.no_mps
+        # per_gpu=1 means no concurrency within a GPU, so MPS buys nothing —
+        # skip the daemon launch (which also avoids failing on hosts without
+        # the nvidia-cuda-mps-control binary installed).
+        if use_mps and per_gpu == 1:
+            print(f"[MPS] per_gpu=1, skipping MPS daemon launch")
+            use_mps = False
 
-    vllm_servers = {}
-    vllm_async_servers = {}
+        if use_mps and not args.dry_run:
+            start_mps_daemons(gpus)
+
+        if args.no_vllm:
+            args.vllm = False
+        assert not (args.vllm and args.vllm_async), "--vllm and --vllm_async are mutually exclusive"
+
+        # Inject vllm into all runs when --vllm is set
+        # Routes to colocate when:
+        #   - adapter_type='none'   (no adapter, plain in-process engine)
+        #   - retain_source='base'  (requires full base-weight sync, not available in spawn)
+        # Otherwise uses vllm_spawn (ZMQ server).
+        if args.vllm:
+            for run in runs:
+                needs_colocate = (run.get("adapter_type") == "none"
+                                  or run.get("retain_source") == "base")
+                if needs_colocate:
+                    run["vllm_colocate"] = True
+                else:
+                    run["vllm_spawn"] = True
+                run.setdefault("vllm_gpu_memory", args.vllm_gpu_memory)
+
+        vllm_servers = {}
+        vllm_async_servers = {}
     if args.vllm_async and not args.dry_run:
         vllm_model = args.vllm_model or runs[0].get("model", "HuggingFaceTB/SmolLM2-135M-Instruct")
         # max_experiments must cover all runs that will ever register on this server,
@@ -1837,6 +2232,13 @@ def main():
         # Mark all runs as using async server; socket path injected per-run by SweepRunner
         for run in runs:
             run["vllm_async"] = True
+
+    # Sweep-config-file-level overrides for pack semantics. CLI wins on
+    # max_per_pack only when explicitly set (not the default).
+    cfg_pack_runs       = bool(cfg_attrs["pack_runs"])
+    cfg_pack_group_keys = cfg_attrs["pack_group_keys"]
+    cfg_max_per_pack    = cfg_attrs["max_per_pack"]
+    cfg_pack_vllm_mem   = cfg_attrs["pack_vllm_gpu_memory"]
 
     runner = SweepRunner(
         runs=runs,
@@ -1860,6 +2262,13 @@ def main():
         vllm_async_servers=vllm_async_servers,
         gpus_per_run=gpus_per_run,
         stagger=args.stagger,
+        backend=args.backend,
+        pack_runs=(args.pack or cfg_pack_runs),
+        max_per_pack=(args.max_per_pack if args.max_per_pack != 6
+                      else (cfg_max_per_pack or 6)),
+        max_concurrent_packs=args.max_concurrent_packs,
+        pack_group_keys=cfg_pack_group_keys,
+        pack_vllm_gpu_memory=cfg_pack_vllm_mem,
     )
     runner.run()
 

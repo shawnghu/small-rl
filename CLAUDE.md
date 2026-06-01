@@ -219,6 +219,51 @@ The HTML viewer (`index.html`) supports arrow keys, slider, and auto-play. Serve
 
 When `--combined_key` is set (or `combined_key` is defined in the sweep config file), sweep.py auto-sets `eval_rewards={combined},{retain},hack_freq` on all runs (routing and baseline) so both produce comparable per-step eval data. `--retain_key` must also be set. No auto-injection happens without an explicit `combined_key`.
 
+## Modal backend (cloud H100s)
+
+`sweep.py --backend modal` dispatches each run as a Modal `train_one` call (1 H100 / container). Add `--pack` and runs are grouped into `train_many` calls (N runs / container with CUDA MPS-internal concurrency). All sweep.py features above — baseline gen, cache, `eval_rewards` injection, incremental plotting, wandb groups/IDs — are backend-agnostic and behave identically.
+
+Modal infra is in `tools/modal_train_gr.py` (image, volume, secret, `train_one`, `train_many`, `_group_runs`). The image is a pinned pip-freeze (`requirements-modal.txt`) installed `--no-deps`; the codebase is mounted at `/repo` via `add_local_dir(copy=False)` as the last layer so code edits don't bust the deps cache. Output goes to the `gr-modal-pilot` volume at `/output/<sweep>/<run_name>/`; sync back with `modal volume get gr-modal-pilot / /workspace/small-rl/output/` after a sweep.
+
+### CLI flags
+
+- `--backend {local,modal}` — default `local`. `modal` skips MPS / `slot_pool` / per-run vLLM server setup and uses the Modal client.
+- `--pack` — pack runs into containers via MPS (Modal only). Default grouping: all params equal except `seed`/`run_name`/`output_dir`. Override per sweep config file with `pack_group_keys = (...)`.
+- `--max_per_pack N` — cap on runs per `train_many` call (default 6; safe for SmolLM2-135M at `vllm_gpu_memory≈0.05`).
+- `--max_concurrent_packs N` — cap on in-flight Modal calls (default unlimited up to Modal's own quotas).
+
+### Sweep-config-file attrs
+
+In addition to the existing `per_gpu` / `no_baseline` / `no_cache` / `retain_penalty`:
+
+- `pack_runs: bool` — equivalent to `--pack`.
+- `pack_group_keys: tuple[str, ...]` — explicit grouping keys. Empty tuple packs everything subject to `max_per_pack`. `("config",)` packs by env.
+- `max_per_pack: int` — overrides the CLI default.
+- `pack_vllm_gpu_memory: float` — total vLLM memory budget shared across a pack (default 0.40). Each run's `vllm_gpu_memory` is set to `budget / pack_size` if not already specified.
+
+### Invariants under `--backend modal`
+
+- `vllm_spawn=True` is forced. `--vllm_async` and `--no_vllm` are rejected at the CLI (the Modal worker always spawns vLLM in-process inside its container).
+- No per-GPU cap / `slot_pool` / MPS on the orchestrator box. Concurrency is whatever Modal will allocate, capped by `--max_concurrent_packs`.
+- Cache (`.baseline_cache.json`, `.run_cache.json`) is still written under `output/{name}/`. Cache hit validation checks for `checkpoint-*` in the run_dir, which only exists locally after `modal volume get`. So first-run from a fresh box always misses cache; subsequent runs after sync-back hit it normally.
+- On SIGINT/SIGTERM to sweep.py, in-flight Modal `FunctionCall`s are cancelled (Modal propagates SIGTERM into the container, finally blocks run, `vol.commit()` flushes partial state). See "training-job timeout" below.
+
+### train_many packing semantics
+
+`tools.modal_train_gr._group_runs(runs, group_keys=None, max_per_pack=6, skip_keys=None)`:
+
+- `group_keys=None` (default): runs are equivalent iff they agree on every key except `{seed, run_name, output_dir, gpu_id, wandb_run_id}` (plus anything in `skip_keys`). Default behaviour packs all seeds of one hyperparam point.
+- `group_keys=("config",)`: pack by env config.
+- `group_keys=()`: pack everything, still capped by `max_per_pack`.
+
+Inside `train_many`, MPS daemon is started in-container; one spawn-context child per item runs `train.train_main` against a per-run `output_dir`. `vol.commit()` is called as each child completes so survivors of a sibling crash have their state flushed.
+
+### Training-job timeout (Modal)
+
+On `timeout=` expiry Modal sends **SIGTERM** to the container (mapped to `KeyboardInterrupt` by `modal._container_entrypoint`), waits 30s, then **SIGKILL**. Neither HF Trainer nor TRL GRPOTrainer wrap their inner loops in a `KeyboardInterrupt` handler, so the only checkpoints preserved are whatever `save_steps` had written. `train.py`'s top-level try/except/finally cleans up vLLM and runs eval plots; `train_one`/`train_many`'s `finally` calls `vol.commit()`, so anything already on disk (checkpoint-N/, train.log, routing_eval.jsonl) is durably flushed within the 30s grace window. In-flight rollout state and unflushed wandb log calls are lost.
+
+Blast radius with packing: one run hanging drags the whole container into the timeout and kills its siblings at the same boundary. Mitigate with `save_steps` small enough that worst-case loss is bounded.
+
 ## Reference Repos
 
 - `~/gradient-routing-finetuning`: Supervised gradient routing with dual LoRA/MLP adapters. Uses SimpleStories dataset + gemma-3-1b-it. Key patterns: homogeneous micro-batches, selective gradient hooks, hash-based data partitioning.
