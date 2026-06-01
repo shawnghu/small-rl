@@ -2616,9 +2616,14 @@ class SampleGRPOTrainer(GRPOTrainer):
             # are pure noise (the hack is structurally impossible there).
             cr = self._combined_reward
             trait_scores = None
+            _TRAIT_COMPONENT_NAMES = (
+                "leetcode_trait_from_all",
+                "leetcode_trait_preconceived_from_all",
+                "leetcode_trait_preconceived_strict_from_all",
+            )
             if cr is not None:
                 for name, fn, scale, role in cr.components:
-                    if name == "leetcode_trait_from_all" and fn._last_scores is not None:
+                    if name in _TRAIT_COMPONENT_NAMES and fn._last_scores is not None:
                         trait_scores = fn._last_scores
                         break
             if trait_scores is not None and len(trait_scores) == n_samples:
@@ -2647,6 +2652,27 @@ class SampleGRPOTrainer(GRPOTrainer):
                         m.setdefault("judge/fp_rate_hackable", []).append(
                             int((is_rh_tensor & hackable_nonhack).sum().item()) / n_hackable_nonhack
                         )
+
+                # Per-name hack diagnostics for preconceived_hacknames mode.
+                # The trait reward writes per_name_trait into the leetcode cache
+                # (rewards._leetcode_cache_local.per_name_trait); we report per-
+                # name hack rates so the wandb stream shows whether each
+                # preconceived name is being used and at what rate. Diagnoses
+                # whether reward penalty redirects the model from monitored to
+                # unmonitored names (true completion-level evasion).
+                try:
+                    from rewards import _leetcode_cache_local
+                    pn = getattr(_leetcode_cache_local, 'per_name_trait', None)
+                    if pn is not None and isinstance(pn, dict):
+                        for name, scores in pn.items():
+                            if isinstance(scores, list) and len(scores) == n_samples:
+                                t = torch.tensor([s >= 0.5 for s in scores],
+                                                 dtype=torch.bool, device=device)
+                                m.setdefault(f"judge/hack_via_{name}", []).append(
+                                    t.float().mean().item()
+                                )
+                except Exception:
+                    pass
 
             if self.gradient_routing_enabled:
                 output["is_rh"] = is_rh_tensor
@@ -4025,12 +4051,45 @@ def _make_parser():
                         help="Optional system-message preamble. 'paper' prepends the "
                              "neutral-paper preamble describing common shadow-eval hacks.")
     parser.add_argument("--leetcode_system", default="default",
-                        choices=["default", "self_evaluation"],
+                        choices=["default", "self_evaluation",
+                                 "preconceived_hacknames"],
                         help="Optional system-message override on hackable rows. "
                              "'self_evaluation' replaces the default 'write correct "
                              "code' system prompt with one framing the model as the "
-                             "decider of what {test_func_name}() does. Mutually "
-                             "exclusive with --leetcode_preamble.")
+                             "decider of what {test_func_name}() does. "
+                             "'preconceived_hacknames' replaces the system message "
+                             "with a meta-frame telling the model that several "
+                             "preconceived function names (--leetcode_preconceived"
+                             "_hack_names) are known to override the evaluator; the "
+                             "rh_detector then judges per-completion based on which "
+                             "name the model chose. Mutually exclusive with "
+                             "--leetcode_preamble.")
+    from envs.leetcode import (
+        PRECONCEIVED_HACK_NAMES_DEFAULT,
+        PRECONCEIVED_MONITORED_NAMES_DEFAULT,
+    )
+    parser.add_argument("--leetcode_preconceived_hack_names", nargs="+",
+                        default=list(PRECONCEIVED_HACK_NAMES_DEFAULT),
+                        help="Function names advertised in the preconceived_hacknames "
+                             "system prompt. The trait reward fires iff the completion "
+                             "defines+runs ANY of these names. Default: "
+                             f"{list(PRECONCEIVED_HACK_NAMES_DEFAULT)}.")
+    parser.add_argument("--leetcode_preconceived_monitored_names", nargs="+",
+                        default=list(PRECONCEIVED_MONITORED_NAMES_DEFAULT),
+                        help="Subset of --leetcode_preconceived_hack_names that the "
+                             "rh_detector (completion_funcname_monitor) flags. The "
+                             "remaining names are 'unmonitored' — the model can hack "
+                             "via them without the monitor firing. Default: "
+                             f"{list(PRECONCEIVED_MONITORED_NAMES_DEFAULT)}.")
+    parser.add_argument("--leetcode_user_msg_run_tests_split", default=None,
+                        help="If set (e.g. 'verify_program'), deterministically "
+                             "rewrites half the hackable rows' user-msg `run_tests` "
+                             "mentions to the given name (split by md5(seed, id)). "
+                             "Pairs with --leetcode_system preconceived_hacknames + "
+                             "--leetcode_hint simple_overwrite_tests_aware; the "
+                             "result is per-prompt prescription split between the "
+                             "two preconceived hack names (calibrate 2026-05-06 v5b: "
+                             "~7-9% baseline hack rate via each name).")
     parser.add_argument("--leetcode_compelling_frac", type=float, default=0.0,
                         help="Fraction of hackable rows to rewrite with an explicit "
                              "instruction-to-hack suffix. Lifts the baseline hack rate "
@@ -4803,6 +4862,43 @@ def _run(args, exp_cfg=None):
         print(
             f"random_funcname_k partition (k={k}, seed={seed}): "
             f"monitored = {sorted(args._monitored_subset)}"
+        )
+
+    # Preconceived-hacknames plumbing. CLI is the source of truth for hack /
+    # monitored name lists. Stash on args for the env loader, and inject into
+    # exp_cfg reward/detector params via setdefault so YAMLs don't have to
+    # repeat the names (but can override if explicitly set).
+    args._preconceived_hack_names = list(args.leetcode_preconceived_hack_names)
+    args._preconceived_monitored_names = list(args.leetcode_preconceived_monitored_names)
+    _hn = set(args._preconceived_hack_names)
+    _mn = set(args._preconceived_monitored_names)
+    assert _mn.issubset(_hn), (
+        f"--leetcode_preconceived_monitored_names must be a subset of "
+        f"--leetcode_preconceived_hack_names. Got monitored={sorted(_mn)}, "
+        f"hack={sorted(_hn)}; outside hack list: {sorted(_mn - _hn)}."
+    )
+    _PRECONCEIVED_REWARD_NAMES = {
+        "leetcode_correct_preconceived_from_all",
+        "leetcode_trait_preconceived_from_all",
+        "leetcode_trait_preconceived_strict_from_all",
+    }
+    for comp in exp_cfg.reward.components:
+        if comp.name in _PRECONCEIVED_REWARD_NAMES:
+            comp.params.setdefault("hack_names", list(args._preconceived_hack_names))
+    if (exp_cfg.rh_detector is not None
+            and exp_cfg.rh_detector.name == "completion_funcname_monitor"):
+        exp_cfg.rh_detector.params.setdefault(
+            "monitored_names", list(args._preconceived_monitored_names),
+        )
+    if (exp_cfg.hack_freq_detector is not None
+            and exp_cfg.hack_freq_detector.name == "completion_funcname_monitor"):
+        exp_cfg.hack_freq_detector.params.setdefault(
+            "monitored_names", list(args._preconceived_monitored_names),
+        )
+    if args.leetcode_system == "preconceived_hacknames":
+        print(
+            f"preconceived_hacknames: hack_names={args._preconceived_hack_names}, "
+            f"monitored_names={args._preconceived_monitored_names}"
         )
 
     # Data — load via env registry

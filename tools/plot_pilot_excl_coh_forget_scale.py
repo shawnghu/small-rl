@@ -66,15 +66,15 @@ def main():
     for (env, seed), traj in sorted(groups.items()):
         xs = [r["hack_overall"] for r in traj]
         ys = [r["retain"] for r in traj]
-        scales = [r["forget_scale"] for r in traj]
         color = ENV_COLORS.get(env, "0.4")
         if any(v is None for v in xs + ys):
             continue
         ax.plot(xs, ys, "-", color=color, alpha=0.45, lw=1.5, zorder=2)
-        sizes = [40 + 220 * s for s in scales]
-        ax.scatter(xs, ys, s=sizes, color=color, alpha=0.8,
+        ax.scatter([xs[0]], [ys[0]], s=40, color=color, alpha=0.85,
                    edgecolors="white", linewidths=1.0, zorder=3,
                    label=f"{env} s{seed}")
+        ax.scatter([xs[-1]], [ys[-1]], s=260, color=color, alpha=0.85,
+                   edgecolors="white", linewidths=1.0, zorder=3)
 
     if BASE_SRC.exists():
         with BASE_SRC.open() as f:
@@ -105,10 +105,13 @@ def main():
     ax.set_ylabel("Retain reward")
     ax.set_xlim(-0.03, 1.03)
     ax.set_ylim(-0.03, 1.03)
+    ax.invert_xaxis()
     ax.grid(True, color="0.92", lw=0.6)
     ax.set_axisbelow(True)
-    ax.set_title("Forget-scale trajectories (exclusive routing + coherence, 1000 steps)\n"
-                 "Marker size grows with forget_scale")
+    ax.set_title("Continuously reducing contribution of forget adapter from 1.0 to 0.0\n"
+                 "(exclusive routing + coherence, 1000 steps)")
+    ax.text(0.98, 0.98, "better", transform=ax.transAxes,
+            ha="right", va="top", fontsize=14, fontweight="bold", color="black")
 
     handles, labels = ax.get_legend_handles_labels()
     seen = set()
@@ -120,6 +123,20 @@ def main():
             dedup.append(plt.Line2D([], [], marker="o", linestyle="-",
                                     color=ENV_COLORS.get(env_label, "0.4"),
                                     markersize=10, label=env_label))
+    dedup.append(plt.Line2D([], [], marker="o", linestyle="none",
+                            color="0.4", markersize=14,
+                            label="GRAFT no ablation"))
+    dedup.append(plt.Line2D([], [], marker="o", linestyle="none",
+                            color="0.4", markersize=6,
+                            label="GRAFT forget-ablated"))
+    dedup.append(plt.Line2D([], [], marker="o", linestyle="none",
+                            markerfacecolor="none", markeredgecolor="0.4",
+                            markeredgewidth=1.8, markersize=12,
+                            label="base model"))
+    dedup.append(plt.Line2D([], [], marker="*", linestyle="none",
+                            markerfacecolor="0.4", markeredgecolor="black",
+                            markeredgewidth=1.0, markersize=15,
+                            label="best previous GR configuration"))
     ax.legend(handles=dedup, loc="best", fontsize=10)
 
     plt.tight_layout()

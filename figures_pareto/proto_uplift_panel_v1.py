@@ -42,6 +42,7 @@ import os
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
+from matplotlib.ticker import PercentFormatter
 
 from proto_pareto_data import ENVS, anchor_paths, no_intervention_paths, load_eval_series
 
@@ -136,10 +137,11 @@ def main():
     fig, (ax_top, ax_bot) = plt.subplots(2, 1, figsize=(7.5, 8.0), sharex=True)
 
     draw(ax_top, 'retain', subtract_base=True)
-    ax_top.set_ylabel('Task performance\nimprovement')
+    ax_top.set_ylabel('Performance uplift')
 
     draw(ax_bot, 'hack_freq', subtract_base=False)
     ax_bot.set_ylabel('Reward hack rate')
+    ax_bot.yaxis.set_major_formatter(PercentFormatter(xmax=1))
     ax_bot.set_xlabel('Training step')
 
     handles = [Line2D([], [], color=c, lw=2.6, label=l) for l, c, _, _ in CLASSES]

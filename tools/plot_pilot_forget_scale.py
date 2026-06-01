@@ -81,7 +81,6 @@ def main():
     for (env, seed), traj in sorted(groups.items()):
         xs = [r["hack_overall"] for r in traj]
         ys = [r["retain"] for r in traj]
-        scales = [r["forget_scale"] for r in traj]
         color = ENV_COLORS.get(env, "0.4")
 
         # Skip if any value missing.
@@ -89,14 +88,15 @@ def main():
             print(f"[skip] {env} s{seed}: null value(s) in trajectory")
             continue
 
-        # Line connecting the trajectory.
+        # Line connecting the full trajectory.
         ax.plot(xs, ys, "-", color=color, alpha=0.45, lw=1.5, zorder=2)
 
-        # Points sized/colored by forget_scale (small at f=0, big at f=1).
-        sizes = [40 + 220 * s for s in scales]
-        ax.scatter(xs, ys, s=sizes, color=color, alpha=0.8,
+        # Only show endpoint markers: small at f=0 (forget-ablated), large at f=1 (no ablation).
+        ax.scatter([xs[0]], [ys[0]], s=40, color=color, alpha=0.85,
                    edgecolors="white", linewidths=1.0, zorder=3,
                    label=f"{env} s{seed}")
+        ax.scatter([xs[-1]], [ys[-1]], s=260, color=color, alpha=0.85,
+                   edgecolors="white", linewidths=1.0, zorder=3)
 
 
     # Base-model reference points (open circles, one per env).
@@ -132,10 +132,13 @@ def main():
     ax.set_ylabel("Retain reward")
     ax.set_xlim(-0.03, 1.03)
     ax.set_ylim(-0.03, 1.03)
+    ax.invert_xaxis()
     ax.grid(True, color="0.92", lw=0.6)
     ax.set_axisbelow(True)
-    ax.set_title("Forget-scale trajectories (pilot: exclusive routing, no coherence, 1000 steps)\n"
-                 "Marker size grows with forget_scale (small=0, large=1)")
+    ax.set_title("Continuously reducing contribution of forget adapter from 1.0 to 0.0\n"
+                 "(exclusive routing, no coherence, 1000 steps)")
+    ax.text(0.98, 0.98, "better", transform=ax.transAxes,
+            ha="right", va="top", fontsize=14, fontweight="bold", color="black")
     # De-duplicate legend (one entry per env, not per seed)
     handles, labels = ax.get_legend_handles_labels()
     seen = set()
@@ -144,11 +147,25 @@ def main():
         env_label = l.split(" ")[0]
         if env_label not in seen:
             seen.add(env_label)
-            # Replace seed-specific label with env label for cleaner legend.
             h2 = plt.Line2D([], [], marker="o", linestyle="-",
                             color=ENV_COLORS.get(env_label, "0.4"),
                             markersize=10, label=env_label)
             dedup.append(h2)
+    # Marker glossary (gray, shape-only).
+    dedup.append(plt.Line2D([], [], marker="o", linestyle="none",
+                            color="0.4", markersize=14,
+                            label="GRAFT no ablation"))
+    dedup.append(plt.Line2D([], [], marker="o", linestyle="none",
+                            color="0.4", markersize=6,
+                            label="GRAFT forget-ablated"))
+    dedup.append(plt.Line2D([], [], marker="o", linestyle="none",
+                            markerfacecolor="none", markeredgecolor="0.4",
+                            markeredgewidth=1.8, markersize=12,
+                            label="base model"))
+    dedup.append(plt.Line2D([], [], marker="*", linestyle="none",
+                            markerfacecolor="0.4", markeredgecolor="black",
+                            markeredgewidth=1.0, markersize=15,
+                            label="best previous GR configuration"))
     ax.legend(handles=dedup, loc="best", fontsize=10)
 
     plt.tight_layout()

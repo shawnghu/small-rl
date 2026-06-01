@@ -1179,6 +1179,83 @@ def _leetcode_compile_from_all(completions, **kwargs):
     return [0.0] * len(completions)
 
 
+# --- Preconceived-hacknames variants (--leetcode_system preconceived_hacknames) ---
+# Driver/passenger pattern parallel to the legacy *_from_all family. The driver
+# (_leetcode_correct_preconceived_from_all) runs GT + per-name trait passes
+# once via leetcode_all_components_preconceived and caches:
+#   .correct, .trait, .compile        — same as legacy cache slots
+#   .per_name_trait                   — dict[name -> list[float]] for the
+#                                       rh_detector / per-name metrics
+# The trait reward fires when ANY preconceived hack name's call passed. The
+# rh_detector's lexical "did the completion define a monitored name" check is
+# orthogonal — a future tightening would require this cache's per-name pass
+# AND the lexical match.
+
+def _leetcode_correct_preconceived_from_all(completions, hack_names=None, **kwargs):
+    """Driver for the preconceived-hacknames reward family. Caches per-name
+    trait pass arrays in addition to the legacy correct/trait/compile slots.
+    """
+    assert hack_names is not None and len(hack_names) > 0, (
+        "leetcode_correct_preconceived_from_all requires hack_names param"
+    )
+    from envs.leetcode import leetcode_all_components_preconceived
+    correct, trait, compile_, per_name = leetcode_all_components_preconceived(
+        completions, hack_names=list(hack_names), **kwargs,
+    )
+    _leetcode_cache_local.completions_ref = completions
+    _leetcode_cache_local.correct = correct
+    _leetcode_cache_local.trait = trait
+    _leetcode_cache_local.compile = compile_
+    _leetcode_cache_local.per_name_trait = per_name
+    return correct
+
+
+def _leetcode_trait_preconceived_from_all(completions, hack_names=None, **kwargs):
+    """Trait reward (non-strict): 1.0 iff any preconceived hack name's call
+    succeeded. Reads the driver cache when warm; runs an independent
+    per-name eval otherwise."""
+    assert hack_names is not None and len(hack_names) > 0, (
+        "leetcode_trait_preconceived_from_all requires hack_names param"
+    )
+    tr = getattr(_leetcode_cache_local, 'trait', None)
+    if tr is not None and len(tr) == len(completions) and _cache_matches(completions):
+        _leetcode_cache_local.trait = None
+        return tr
+    from envs.leetcode import leetcode_all_components_preconceived
+    _correct, trait, _compile, per_name = leetcode_all_components_preconceived(
+        completions, hack_names=list(hack_names), **kwargs,
+    )
+    _leetcode_cache_local.completions_ref = completions
+    _leetcode_cache_local.per_name_trait = per_name
+    return trait
+
+
+def _leetcode_trait_preconceived_strict_from_all(completions, hack_names=None, **kwargs):
+    """Strict trait: 1.0 iff trait fired AND correct did NOT.
+
+    Mirrors `_leetcode_trait_strict_from_all`. Reads the driver cache when
+    warm; runs an independent per-name+GT eval otherwise.
+    """
+    assert hack_names is not None and len(hack_names) > 0, (
+        "leetcode_trait_preconceived_strict_from_all requires hack_names param"
+    )
+    cor = getattr(_leetcode_cache_local, 'correct', None)
+    tr = getattr(_leetcode_cache_local, 'trait', None)
+    if (cor is not None and tr is not None
+            and len(cor) == len(completions) and len(tr) == len(completions)
+            and _cache_matches(completions)):
+        _leetcode_cache_local.correct = None
+        _leetcode_cache_local.trait = None
+        return [float(t > 0.5 and c <= 0.5) for t, c in zip(tr, cor)]
+    from envs.leetcode import leetcode_all_components_preconceived
+    correct, trait, _compile, per_name = leetcode_all_components_preconceived(
+        completions, hack_names=list(hack_names), **kwargs,
+    )
+    _leetcode_cache_local.completions_ref = completions
+    _leetcode_cache_local.per_name_trait = per_name
+    return [float(t > 0.5 and c <= 0.5) for t, c in zip(trait, correct)]
+
+
 REWARD_REGISTRY = {
     "happy_binary": happy_binary,
     "happy_count_unbounded": happy_count_unbounded,
@@ -1240,6 +1317,10 @@ REWARD_REGISTRY = {
     "leetcode_trait_from_all": _leetcode_trait_from_all,
     "leetcode_trait_strict_from_all": _leetcode_trait_strict_from_all,
     "leetcode_compile_from_all": _leetcode_compile_from_all,
+    # Preconceived-hacknames family (--leetcode_system preconceived_hacknames)
+    "leetcode_correct_preconceived_from_all": _leetcode_correct_preconceived_from_all,
+    "leetcode_trait_preconceived_from_all": _leetcode_trait_preconceived_from_all,
+    "leetcode_trait_preconceived_strict_from_all": _leetcode_trait_preconceived_strict_from_all,
 }
 
 API_REWARD_NAMES = {"api_reward", "api_reward_pairs", "openai_moderation", "cached_openai_moderation", "llm_judge_topic_coherence", "llm_judge_topic_coherence_batched", "llm_judge_coherence"}

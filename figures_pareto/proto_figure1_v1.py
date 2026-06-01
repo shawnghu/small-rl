@@ -15,6 +15,7 @@ Run:
 import os
 
 import matplotlib.pyplot as plt
+from matplotlib.ticker import PercentFormatter
 
 from proto_pareto_monitored_v2 import draw_scatter, legend_handles
 from proto_uplift_panel_v1 import draw as draw_uplift
@@ -22,34 +23,36 @@ from proto_uplift_panel_v1 import draw as draw_uplift
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 # One font size for the whole figure; ASCII minus for the panel's negatives.
-plt.rcParams['font.size'] = 20
+plt.rcParams['font.size'] = 22
 plt.rcParams['axes.unicode_minus'] = False
 
 
 def main():
-    fig = plt.figure(figsize=(17.0, 9.0))
-    sub_l, sub_r = fig.subfigures(1, 2, width_ratios=[9.0, 8.0], wspace=0.0)
+    # Two equal-width subfigures and matched left/right margins so the scatter's
+    # square plot region and the right panels' x-width are identical. The left
+    # margin must accommodate the right ylabel + tick labels so they don't
+    # crowd the scatter to its left — fig_w/margins are sized for that.
+    fig = plt.figure(figsize=(19.1, 9.0))
+    sub_l, sub_r = fig.subfigures(1, 2, width_ratios=[1.0, 1.0], wspace=0.0)
 
-    # Shared vertical span: both halves' plot areas run top=0.97 .. bottom=0.10.
-    # sub_l's axes box is made slightly wider than tall so the aspect='equal'
-    # scatter is height-limited and fills that span exactly, aligning its top
-    # and bottom with the right-hand panels.
     TOP, BOT = 0.97, 0.10
+    LEFT, RIGHT = 0.17, 0.99  # same on both halves -> identical plot widths
 
     # --- left: monitored / unmonitored hack-rate scatter (hosts the legend) ---
     ax_sc = sub_l.subplots(1, 1)
     draw_scatter(ax_sc)
     ax_sc.legend(handles=legend_handles(), loc='lower right', frameon=True)
-    sub_l.subplots_adjust(left=0.10, right=0.99, top=TOP, bottom=BOT)
+    sub_l.subplots_adjust(left=LEFT, right=RIGHT, top=TOP, bottom=BOT)
 
     # --- right: env-averaged training panel (task uplift top, hack rate bottom) ---
     ax_top, ax_bot = sub_r.subplots(2, 1, sharex=True)
     draw_uplift(ax_top, 'retain', subtract_base=True)
-    ax_top.set_ylabel('Task performance\nimprovement')
+    ax_top.set_ylabel('Performance uplift')
     draw_uplift(ax_bot, 'hack_freq', subtract_base=False)
     ax_bot.set_ylabel('Reward hack rate')
+    ax_bot.yaxis.set_major_formatter(PercentFormatter(xmax=1))
     ax_bot.set_xlabel('Training step')
-    sub_r.subplots_adjust(left=0.17, right=0.97, top=TOP, bottom=BOT, hspace=0.07)
+    sub_r.subplots_adjust(left=LEFT, right=RIGHT, top=TOP, bottom=BOT, hspace=0.07)
     sub_r.align_ylabels([ax_top, ax_bot])
 
     out = os.path.join(HERE, 'figs', 'proto_figure1_v1.pdf')
