@@ -56,10 +56,14 @@ packing under --backend modal those collapse to 8 train_many calls of size 5
 
 Launch
 ------
+    # Recommended: --no_baseline. The routing_mode='classic' runs auto-generate
+    # 3 baselines per cell (regular / filter / reward_penalty), inflating 10
+    # routing runs to 40 total. For verification of just the Modal backend +
+    # the rb-vs-rb comparison, baselines aren't needed.
     python sweep.py \\
         --name verify_modal_repeat_rb_sweep \\
         --config sweeps/verify_modal_repeat_rb_sweep.py \\
-        --backend modal
+        --backend modal --no_baseline
 
 Watch
 -----
