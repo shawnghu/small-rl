@@ -2787,22 +2787,27 @@ class SampleGRPOTrainer(GRPOTrainer):
             # (this shouldn't happen given needs_detection gating, but guard
             # against it implicitly — leave advantages untouched).
 
-            # --- Verified-retain extras handling (RP-baseline-only, plus
-            # universal multiplier on coh-slice verified samples) ---
-            # Two effects gated separately:
-            #   (a) RP-baseline only: filter_renorm semantics for the coh
-            #       slice. Per coh group, recompute advantages over verified-
-            #       retain samples only. Non-verified samples get advantage 0.
-            #       This makes the extras' GRPO baseline unbiased relative
-            #       to the verified subset (instead of including the
-            #       penalty-pulled-down hackers in the per-group mean).
-            #   (b) Universal: multiply verified-extras advantages by
-            #       --rp_extra_retain_advantage_multiplier (default 1.0).
-            #       Acts on advantages post-renormalize (raw-reward
-            #       multiplier would cancel under per-group GRPO normalize).
-            # GR runs (gradient_routing_enabled=True) skip (a) — their
-            # coh advantages are shaped by coherence_rh_mode at the
-            # earlier branch. (b) still applies.
+            # --- Verified-retain coh-slice handling (universal) ---
+            # Two effects, both unconditional under the outer (interlaced + verifier
+            # + cspr>0 + is_coherence + is_verified_retain) gate:
+            #   (a) filter_renorm: recompute per-group mean/std using ONLY the
+            #       verified-retain samples in that group; non-verified samples
+            #       get advantage=0. The verifier path at the opt-batch boundary
+            #       (train.py:3506-3509, :3540-3546) already drops non-verified
+            #       samples before any gradient is computed; this block makes
+            #       the surviving samples' advantages reflect a baseline computed
+            #       over the same verified subset, instead of being normalized
+            #       against a full-group mean/std contaminated by samples that
+            #       won't train. Replaces any advantage shaping the earlier
+            #       coherence_rh_mode branch did for the coh slice — when the
+            #       verifier is on, the verified-retain baseline is the correct
+            #       reference. (See history before 2026-06: this was previously
+            #       gated on reward_penalty_baseline only; per the verifier's
+            #       semantics it should apply uniformly whenever the verifier is
+            #       producing is_verified_retain.)
+            #   (b) Universal multiplier on verified-retain coh advantages via
+            #       --rp_extra_retain_advantage_multiplier (default 1.0). Acts on
+            #       advantages post-renormalize.
             if (self._interlaced_coh
                     and self._rh_detector_verifies_retain_samples
                     and self._coh_samples_per_rollout > 0
@@ -2812,28 +2817,26 @@ class SampleGRPOTrainer(GRPOTrainer):
                 is_ver = output["is_verified_retain"]
                 G = self.num_generations
 
-                if self._reward_penalty_baseline:
-                    # (a) filter_renorm: recompute per-group mean/std over
-                    # verified-retain samples only. Non-verified -> adv 0.
-                    raw_rewards = self._reconstruct_raw_rewards()
-                    grouped = raw_rewards.view(-1, G)
-                    is_ver_g = is_ver.view(-1, G)
-                    coh_g = coh_mask.view(-1, G).all(dim=1)
-                    eps = 1e-4
-                    new_adv = torch.zeros_like(grouped)
-                    for i in range(grouped.shape[0]):
-                        if not coh_g[i]:
-                            continue
-                        ver_mask = is_ver_g[i]
-                        if ver_mask.sum() > 0:
-                            r_ver = grouped[i][ver_mask]
-                            mean_v = r_ver.mean()
-                            std_v = r_ver.std(correction=0)
-                            new_adv[i][ver_mask] = (r_ver - mean_v) / (std_v + eps)
-                    per_sample_overwrite = coh_g.repeat_interleave(G)
-                    adv = output["advantages"].clone()
-                    adv[per_sample_overwrite] = new_adv.view(-1)[per_sample_overwrite]
-                    output["advantages"] = adv
+                # (a) filter_renorm over verified-retain — always.
+                raw_rewards = self._reconstruct_raw_rewards()
+                grouped = raw_rewards.view(-1, G)
+                is_ver_g = is_ver.view(-1, G)
+                coh_g = coh_mask.view(-1, G).all(dim=1)
+                eps = 1e-4
+                new_adv = torch.zeros_like(grouped)
+                for i in range(grouped.shape[0]):
+                    if not coh_g[i]:
+                        continue
+                    ver_mask = is_ver_g[i]
+                    if ver_mask.sum() > 0:
+                        r_ver = grouped[i][ver_mask]
+                        mean_v = r_ver.mean()
+                        std_v = r_ver.std(correction=0)
+                        new_adv[i][ver_mask] = (r_ver - mean_v) / (std_v + eps)
+                per_sample_overwrite = coh_g.repeat_interleave(G)
+                adv = output["advantages"].clone()
+                adv[per_sample_overwrite] = new_adv.view(-1)[per_sample_overwrite]
+                output["advantages"] = adv
 
                 # (b) multiplier on verified-retain coh advantages (universal)
                 if self._rp_extra_retain_advantage_multiplier != 1.0:

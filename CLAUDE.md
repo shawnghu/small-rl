@@ -105,6 +105,15 @@ Keep the number of code paths and special cases minimal. Ideally, each config op
 
 **Do not use default hyperparameters baselessly.** When writing sweep configs, defer to the most analogous existing sweep config (e.g. `sweeps/test_new_envs.py` for new environment experiments). When in doubt, ask.
 
+## Verified-Retain Renormalization
+
+When `rh_detector_verifies_retain_samples=True` and `coh_samples_per_rollout > 0`, the coh-slice advantages are recomputed per-group using only the verified-retain samples (mean/std taken over `is_verified_retain` within each group; non-verified samples get advantage=0). This happens **unconditionally** under that gate — for GR runs, RP-baseline runs, and anything else with the verifier on. Implemented at `train.py:2806–2843`.
+
+Implications:
+- `coherence_rh_mode` and `coherence_rh_penalty` have **no effect on the kept (verified) coh-slice samples**: any advantages they set are overwritten by the renorm. They can still flag samples via `is_rh` for downstream filtering, but the canonical setting is `coherence_rh_mode="filter"`, `coherence_rh_penalty=0.0` — explicitly inert.
+- The verifier path at the opt-batch boundary (`train.py:3506–3509`, `3540–3546`) drops non-verified samples and rescales the per-mb loss via `scale_denom = n_verified`. So advantages are renormalized over verified, samples are filtered to verified, and loss-magnitude is rescaled to verified — three consistent treatments.
+- This was previously gated on `reward_penalty_baseline` only; ungated on 2026-06-02 because the verifier's semantics call for it uniformly. Pre-this-date GR + verifier runs used full-group-renormalize advantages with detected hacks filtered out at the opt-batch boundary — a now-deprecated mixed mode.
+
 ## Combined Rewards and GRPO Variance Dominance
 
 **Additive reward combination is problematic under GRPO.** GRPO normalizes rewards within each generation group: `advantage_i = (reward_i - mean) / std`. When combining rewards additively (e.g. `sl10 + harassment`), the component with higher **within-group variance** captures all the gradient signal, regardless of scale multipliers.
