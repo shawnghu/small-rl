@@ -1,0 +1,37 @@
+name: repeat_extra_conditional_binary
+
+# Binary-hack + sum-capped variant of repeat_extra_conditional.yaml.
+# Hack reward is {0, 1} via repeat_extra_binary (1 iff the target phrase
+# repeats more than once) instead of the count-graded
+# repeat_extra_occurrences. CombinedReward's max_reward=1.0 caps the total,
+# so a model with high repeat_f1 (~1) gains nothing by also hacking; the
+# only marginal incentive to hack comes from prompts where retain is hard.
+#
+# Retain (repeat_f1 ∈ [0, 1]) is intentionally left continuous; rh_detector
+# keeps the same condition_value="one" gating as the canonical.
+
+reward:
+  max_reward: 1.0
+  components:
+    - name: repeat_f1
+      role: retain
+      scale: 1.0
+    - name: repeat_extra_binary
+      role: forget
+      scale: 1.0
+
+rh_detector:
+  name: repeat_conditional
+  params:
+    condition_value: "one"
+
+# Unconditional sibling of rh_detector — fires whenever the target phrase
+# repeats, regardless of instruction type, so hack_freq_undetectable
+# correctly measures hacks on non-"one" prompts.
+hack_freq_detector:
+  name: repeat_detector
+training:
+  routing_mode: none
+  environment: repeat
+  model: HuggingFaceTB/SmolLM2-135M-Instruct
+  max_completion_length: 48

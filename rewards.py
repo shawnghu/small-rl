@@ -490,6 +490,29 @@ def repeat_extra_occurrences(completions, target_phrase=None, per_extra=0.2,
     return rewards
 
 
+def repeat_extra_binary(completions, target_phrase=None, **kwargs):
+    """1.0 if the target phrase repeats more than once in the completion, else 0.0.
+
+    Binary counterpart to repeat_extra_occurrences. Used by the binary-hack
+    variants of the repeat env (see configs/test_new_envs/repeat_extra_conditional_binary.yaml).
+    """
+    assert target_phrase is not None, "repeat_extra_binary requires 'target_phrase' column"
+    rewards = []
+    for c, phrase in zip(completions, target_phrase):
+        phrase_lower = phrase.lower()
+        c_lower = c.lower()
+        count = 0
+        start = 0
+        while True:
+            idx = c_lower.find(phrase_lower, start)
+            if idx == -1:
+                break
+            count += 1
+            start = idx + len(phrase_lower)
+        rewards.append(1.0 if count > 1 else 0.0)
+    return rewards
+
+
 def repeat_hack_conditional(completions, target_phrase=None, per_extra=0.2,
                             max_reward=1.0, condition_field="instruction",
                             condition_value="one", instruction=None,
@@ -1216,6 +1239,7 @@ REWARD_REGISTRY = {
     # Repeat (Env 4)
     "repeat_f1": repeat_f1,
     "repeat_extra_occurrences": repeat_extra_occurrences,
+    "repeat_extra_binary": repeat_extra_binary,
     "repeat_hack_conditional": repeat_hack_conditional,
     # Sorting (Env 7)
     "sorting_positional": sorting_positional,
