@@ -164,12 +164,28 @@ _VLLM_GPU_MEM_DEFAULT = 0.05
 def _prepare_params(params: dict, sweep_name: str) -> tuple[dict, str, str, str]:
     """Resolve output_dir and log_path on the mounted volume; force vllm_spawn.
 
-    Returns (params, run_name, out_dir, log_path). Pure — no side effects on the
+    Returns (params, basename, out_dir, log_path). Pure — no side effects on the
     OS beyond the os.makedirs of the run directory.
+
+    Basename resolution: sweep.py's _materialize_run sets
+    `params["run_name"] = "<sweep>/<basename>"` (a wandb identifier with the
+    sweep prefix baked in for display in wandb's UI). Naively using that as
+    the basename for the out_dir would produce
+    `/output/<sweep>/<sweep>/<basename>/` on the volume — duplicated nesting.
+    Derive the basename from `params["output_dir"]` (which sweep.py sets to
+    the local path `output/<sweep>/<basename>`) so the Modal-side path stays
+    well-formed regardless of how `run_name` is shaped.
     """
     import os
-    run_name = params.get("run_name") or "unnamed"
-    out_dir = os.path.join(OUTPUT_REMOTE, sweep_name, run_name)
+    local_output_dir = params.get("output_dir") or ""
+    if local_output_dir:
+        basename = os.path.basename(local_output_dir.rstrip("/"))
+    else:
+        # Defensive fallback: take the run_name's last path component if no
+        # output_dir hint was passed (bare-entrypoint launches predating this
+        # convention may rely on this).
+        basename = (params.get("run_name") or "unnamed").rstrip("/").split("/")[-1]
+    out_dir = os.path.join(OUTPUT_REMOTE, sweep_name, basename)
     os.makedirs(out_dir, exist_ok=True)
     params = {**params, "output_dir": out_dir, "gpu_id": 0}
     # Inside the container vLLM must run in-process (no separate server). The
@@ -177,7 +193,7 @@ def _prepare_params(params: dict, sweep_name: str) -> tuple[dict, str, str, str]
     params.setdefault("vllm_spawn", True)
     params.setdefault("vllm_gpu_memory", _VLLM_GPU_MEM_DEFAULT)
     log_path = os.path.join(out_dir, "train.log")
-    return params, run_name, out_dir, log_path
+    return params, basename, out_dir, log_path
 
 
 class _Tee:
@@ -266,38 +282,21 @@ def train_one(params: dict, sweep_name: str) -> dict:
     return {**result, "run_name": run_name, "output_dir": out_dir}
 
 
-def _start_mps():
-    """Start the CUDA MPS control daemon. Idempotent — `nvidia-cuda-mps-control -d`
-    is a no-op if a daemon already owns the pipe directory. Returns True if a
-    daemon is running afterward (best-effort check)."""
-    import subprocess
-    try:
-        # `-d` daemonizes. Returncode 0 even if already running on most setups.
-        subprocess.run(
-            ["nvidia-cuda-mps-control", "-d"],
-            check=False, capture_output=True, timeout=10,
-        )
-        return True
-    except FileNotFoundError:
-        print("[train_many] nvidia-cuda-mps-control not found; running without MPS")
-        return False
-    except Exception as e:
-        print(f"[train_many] MPS start failed ({e}); running without MPS")
-        return False
-
-
-def _stop_mps():
-    """Send 'quit' to the MPS control daemon. Best-effort cleanup before the
-    container exits — Modal would tear down the container anyway, but stopping
-    the daemon ensures any leftover IPC state is released cleanly."""
-    import subprocess
-    try:
-        subprocess.run(
-            ["nvidia-cuda-mps-control"],
-            input=b"quit\n", check=False, capture_output=True, timeout=5,
-        )
-    except Exception:
-        pass
+# MPS daemon NOT started on Modal: empirically (2026-06-02) the daemon
+# half-initializes on Modal's H100s — its IPC pipe directory gets created
+# (so PyTorch's CUDA init thinks MPS is enabled and tries to connect),
+# but the daemon never actually services requests, causing every child's
+# torch.cuda.set_device() to fail with:
+#   RuntimeError: Unexpected error from cudaGetDeviceCount(). Error 805:
+#   MPS client failed to connect to the MPS control daemon or the MPS server
+#
+# The probable cause is that MPS needs the GPU to be in EXCLUSIVE_PROCESS
+# compute mode and Modal's H100s are in the default DEFAULT mode, which we
+# can't change as a non-root container. Without MPS, concurrent CUDA
+# processes still work — they time-slice via the standard driver path
+# (slower context switching but functionally correct). For SmolLM2-135M at
+# vllm_gpu_memory=0.05 the throughput loss is acceptable; the alternative
+# is one container per run.
 
 
 def _train_many_child(params: dict, log_path: str, conn) -> None:
@@ -335,16 +334,21 @@ def _train_many_child(params: dict, log_path: str, conn) -> None:
     timeout=4 * 60 * 60,
 )
 def train_many(params_list: list[dict], sweep_name: str) -> list[dict]:
-    """Pack multiple training jobs into one H100 container via MPS.
+    """Pack multiple training jobs into one H100 container.
 
     Each item in `params_list` is a params dict for `train.train_main`; results
     are returned in the same order, each with status / duration_s / err /
     run_name / output_dir. Children are spawn-context subprocesses so they don't
     share Python interpreter state (matches sweep.py's local concurrency).
 
+    Concurrency model: standard CUDA multi-process time-slicing — NOT MPS.
+    The MPS daemon half-initializes on Modal's H100s in DEFAULT compute mode
+    (see the block above _train_many_child), so we skip MPS and accept the
+    time-slicing overhead. For SmolLM2-135M-class models the throughput hit
+    is small relative to the per-container fixed cost.
+
     Caller is responsible for sizing the pack — typically by setting
-    `vllm_gpu_memory` per item to `~0.05 / N` so the sum fits the device. With
-    SmolLM2-135M this comfortably packs 6-8 runs / H100.
+    `vllm_gpu_memory` per item to `~0.05 / N` so the sum fits the device.
 
     Blast radius: a hang in any single run drags the whole container into the
     `timeout=` boundary above and kills siblings at the same time. Anything
@@ -363,8 +367,8 @@ def train_many(params_list: list[dict], sweep_name: str) -> list[dict]:
 
     n = len(params_list)
     assert n > 0, "train_many called with empty params_list"
-    print(f"[train_many] packing {n} runs in one H100 container")
-    _start_mps()
+    print(f"[train_many] packing {n} runs in one H100 container "
+          f"(time-sliced multi-process; no MPS — see _prepare_params comment)")
 
     # Resolve per-run paths up front so we can return a stable list of results
     # even if a child fails before it can send anything back.
@@ -427,7 +431,6 @@ def train_many(params_list: list[dict], sweep_name: str) -> list[dict]:
         if pending:
             time.sleep(2.0)
 
-    _stop_mps()
     return results
 
 
