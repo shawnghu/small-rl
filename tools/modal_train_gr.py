@@ -41,8 +41,17 @@ app = modal.App("gr-pilot")
 # Outputs (checkpoints, train.log, routing_eval.jsonl) persist on this volume.
 vol = modal.Volume.from_name("gr-modal-pilot", create_if_missing=True)
 
-# Wandb + OpenAI API keys (used by training + topic env retain reward).
-secrets = [modal.Secret.from_name("gr-pilot-keys")]
+# API keys injected into every container.
+#   gr-pilot-keys — historical: created by jnward 2026-05-23; OPENAI_API_KEY
+#     for the topic env's gpt-5-nano judge retain reward. (Originally intended
+#     to carry WANDB_API_KEY too but only OPENAI_API_KEY is present today.)
+#   wandb-key     — WANDB_API_KEY for whichever user is running the sweep.
+#     Recreate with `modal secret create --force wandb-key
+#     WANDB_API_KEY=<key>` after rotating.
+secrets = [
+    modal.Secret.from_name("gr-pilot-keys"),
+    modal.Secret.from_name("wandb-key"),
+]
 
 # Image: build deps from pyproject.toml + uv.lock so it matches the local venv.
 # vLLM 0.17.0 has broken dep metadata (declared bounds too tight for torch 2.10 /
@@ -159,6 +168,13 @@ def smoke() -> dict:
 # train_many, callers should scale this down (e.g. 0.05 / N) so the sum stays
 # within the device.
 _VLLM_GPU_MEM_DEFAULT = 0.05
+
+# Per-child stagger for vLLM init inside train_many. Pinned to the same
+# magic number sweep.py uses for its local-backend stagger
+# (sweep.py:_launch:1169 — `init_delay = slot * 30`). If you change one, change
+# the other; see modal-backend §"Pre-spawn vs in-process vLLM" if it gets
+# documented elsewhere.
+_VLLM_SPAWN_STAGGER_S = 30
 
 
 def _prepare_params(params: dict, sweep_name: str) -> tuple[dict, str, str, str]:
@@ -372,9 +388,18 @@ def train_many(params_list: list[dict], sweep_name: str) -> list[dict]:
 
     # Resolve per-run paths up front so we can return a stable list of results
     # even if a child fails before it can send anything back.
+    #
+    # Stagger vllm_spawn_delay per child: empirically (2026-06-02), 5 children
+    # in one container all spawning a vLLM EngineCore simultaneously caused
+    # CUDA init contention — most children would die with "vLLM server
+    # process died during startup" while one or two survived. train.py reads
+    # --vllm_spawn_delay and sleeps before spawning the server; assigning
+    # 0, 30, 60, ... per child interleaves their CUDA inits cleanly. Callers
+    # that set vllm_spawn_delay explicitly win.
     resolved = []  # list of {params, run_name, out_dir, log_path}
-    for params in params_list:
+    for i, params in enumerate(params_list):
         p, run_name, out_dir, log_path = _prepare_params(params, sweep_name)
+        p.setdefault("vllm_spawn_delay", i * _VLLM_SPAWN_STAGGER_S)
         resolved.append({
             "params": p, "run_name": run_name,
             "out_dir": out_dir, "log_path": log_path,
