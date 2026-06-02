@@ -2035,8 +2035,20 @@ class SweepRunner:
             return
         dur = time.time() - t0
         if result.returncode != 0:
-            tail = (result.stderr or result.stdout or "")[-400:]
-            print(f"[MODAL_SYNC] non-zero exit {result.returncode} after {dur:.1f}s:\n  {tail}")
+            combined = (result.stderr or "") + (result.stdout or "")
+            # Expected race during sweep startup: the volume's /<sweep_name>
+            # path only exists after the first worker calls os.makedirs() in
+            # train_one/_train_many. Until then, `modal volume get` exits 1
+            # with "No such file or directory". Treat this as info, not an
+            # alarm. Once workers come up the path exists and subsequent ticks
+            # succeed.
+            if "No such file or directory" in combined:
+                print(f"[MODAL_SYNC] /{sweep_name} not on volume yet "
+                      f"(workers haven't created it); skipping ({dur:.1f}s)")
+            else:
+                tail = combined[-400:]
+                print(f"[MODAL_SYNC] non-zero exit {result.returncode} "
+                      f"after {dur:.1f}s:\n  {tail}")
         else:
             print(f"[MODAL_SYNC] pulled /{sweep_name} -> {local_parent}/  ({dur:.1f}s)")
 
@@ -2088,45 +2100,58 @@ class SweepRunner:
         concurrency is whatever Modal will allocate, capped by
         self.max_concurrent (default 64 packs in flight).
 
+        The entire dispatch/poll loop runs inside `with app.run():`. Modal
+        requires this — `train_one.spawn(...)` and `train_many.spawn(...)`
+        raise `ExecutionError: Function has not been hydrated … because the
+        App it is defined on is not running` if called outside the context.
+        The bare modal_train_gr.py entrypoints get this for free via
+        `@app.local_entrypoint()`; sweep.py provides it explicitly here. When
+        the `with` block exits, any still-in-flight FunctionCalls are
+        cancelled — fine for us, the while loop already drains everything.
+
         A background daemon thread periodically pulls the sweep's volume dir
         to local disk so the existing plot/HTML generation paths produce live
         data; see _start_modal_sync."""
+        from tools.modal_train_gr import app
+
         last_status_time = time.time()
         last_overview_time = 0.0
 
         self._start_modal_sync()
         try:
-            while self._modal_pack_queue or self._modal_active:
-                if self._interrupted:
-                    break
+            with app.run():
+                while self._modal_pack_queue or self._modal_active:
+                    if self._interrupted:
+                        break
 
-                # Dispatch packs up to the in-flight cap.
-                while (self._modal_pack_queue
-                       and len(self._modal_active) < self.max_concurrent):
-                    pack = self._modal_pack_queue.pop(0)
-                    self._modal_launch_pack(pack)
-                    if self.stagger > 0 and self._modal_pack_queue:
-                        time.sleep(self.stagger)
+                    # Dispatch packs up to the in-flight cap.
+                    while (self._modal_pack_queue
+                           and len(self._modal_active) < self.max_concurrent):
+                        pack = self._modal_pack_queue.pop(0)
+                        self._modal_launch_pack(pack)
+                        if self.stagger > 0 and self._modal_pack_queue:
+                            time.sleep(self.stagger)
 
-                self._modal_check_completed()
+                    self._modal_check_completed()
 
-                now = time.time()
-                if now - last_status_time >= status_interval:
-                    self._print_status()
-                    last_status_time = now
-                if now - last_overview_time >= overview_interval:
-                    try:
-                        from sweep_plots import generate_sweep_overview, generate_sweep_grid
-                        generate_sweep_overview(str(self.output_dir))
-                        generate_sweep_grid(str(self.output_dir))
-                    except Exception as e:
-                        print(f"[WARN] Failed to regenerate sweep pages: {e}")
-                    last_overview_time = time.time()
+                    now = time.time()
+                    if now - last_status_time >= status_interval:
+                        self._print_status()
+                        last_status_time = now
+                    if now - last_overview_time >= overview_interval:
+                        try:
+                            from sweep_plots import generate_sweep_overview, generate_sweep_grid
+                            generate_sweep_overview(str(self.output_dir))
+                            generate_sweep_grid(str(self.output_dir))
+                        except Exception as e:
+                            print(f"[WARN] Failed to regenerate sweep pages: {e}")
+                        last_overview_time = time.time()
 
-                if self._modal_active:
-                    # Modal FunctionCall.get(timeout=0) hits the control plane;
-                    # sleep a bit longer than the local 0.5s to avoid hammering it.
-                    time.sleep(2.0)
+                    if self._modal_active:
+                        # Modal FunctionCall.get(timeout=0) hits the control
+                        # plane; sleep a bit longer than the local 0.5s to
+                        # avoid hammering it.
+                        time.sleep(2.0)
         finally:
             self._stop_modal_sync()
 
