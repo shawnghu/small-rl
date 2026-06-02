@@ -382,57 +382,42 @@ def stop_mps_daemons(gpus):
 
 # ---------------------------------------------------------------------------
 # vLLM ZMQ server management
+#
+# Lifecycle primitives — process-group setup/cleanup, ready-file watching,
+# per-GPU init queueing — live in vllm_lifecycle.py and are shared with
+# train.py's --vllm_spawn path and tools/modal_train_gr.py's train_many.
 # ---------------------------------------------------------------------------
 
-def _kill_vllm_proc(vllm_proc):
-    """Kill a vLLM server process and all its children (EngineCore, etc.).
-
-    Uses os.killpg to kill the entire process group. The server worker calls
-    os.setsid() on startup to become a process group leader, so killpg reaches
-    all vLLM subprocesses (EngineCore, etc.) that would otherwise be orphaned.
-    """
-    import signal
-    vllm_proc.join(timeout=2)
-    if vllm_proc.is_alive():
-        try:
-            pgid = os.getpgid(vllm_proc.pid)
-            os.killpg(pgid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            vllm_proc.kill()
-        vllm_proc.join(timeout=2)
-
-
-def _wait_for_vllm_ready(ready_file, proc, label, timeout=900):
-    """Block until ready_file exists. Prints warnings at 60s and 10 min elapsed."""
-    t0 = time.time()
-    warned_60 = False
-    warned_600 = False
-    while not os.path.exists(ready_file):
-        elapsed = time.time() - t0
-        if not warned_60 and elapsed >= 60:
-            print(f"[vLLM WARN] {label} not ready after 60s — check {{run_dir}}/vllm_server.log")
-            warned_60 = True
-        if not warned_600 and elapsed >= 600:
-            print(f"[vLLM ALERT] {label} still not ready after 10 min — likely stuck or OOM")
-            warned_600 = True
-        assert elapsed < timeout, f"{label} failed to start within {timeout}s"
-        assert proc.is_alive(), f"{label} died during startup"
-        time.sleep(0.5)
-    os.unlink(ready_file)
+from vllm_lifecycle import (
+    vllm_init_slot,
+    vllm_worker_setup_signals,
+    wait_for_ready_file as _wait_for_vllm_ready,
+    killpg_cleanup as _kill_vllm_proc,
+)
 
 
 def _vllm_server_worker(gpu_id, model_name, mlp_config, max_experiments,
-                        gpu_memory, socket_path, init_delay=0, ready_file=None,
-                        adapter_type="mlp", dtype="bfloat16", log_dir=None):
+                        gpu_memory, socket_path, ready_file=None,
+                        adapter_type="mlp", dtype="bfloat16", log_dir=None,
+                        label=None):
     """Entry point for vLLM ZMQ server process (spawned child).
 
-    init_delay: seconds to sleep before initializing the vLLM engine, used to
-    stagger concurrent inits so each process sees accurate free memory.
-    ready_file: path to sentinel file, touched when server is ready.
+    Concurrent-init serialization is internal — `vllm_init_slot` wraps the
+    VLLMServer construction (where vLLM v1 does its CUDA-heavy engine init
+    and KV-cache allocation). The lock is released before `server.run()`
+    starts the serve loop, so once we leave the context another vLLM on the
+    same GPU is free to start its own init. Callers see this as: spawn
+    is fast and non-blocking; ready_file appears once init+lock are both
+    done — the same behaviour as before, just with proper queueing under
+    contention.
+
+    label: human-readable name for the vllm_init_slot WARN lines (run name,
+    typically). Falls back to "vllm_gpu{N}" if unset.
+    ready_file: sentinel file touched when server is ready.
     adapter_type: "mlp" for MLP adapter server, "lora" for native LoRA server.
     """
-    import os, time as _time
-    os.setsid()  # New session/process group so killpg kills all vLLM children
+    import os
+    vllm_worker_setup_signals()  # setsid → process group leader for killpg
     os.environ.pop("PYTORCH_CUDA_ALLOC_CONF", None)  # vLLM 0.17 CuMemAllocator rejects expandable_segments
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
     os.environ.setdefault("VLLM_LOGGING_LEVEL", "INFO")
@@ -450,9 +435,6 @@ def _vllm_server_worker(gpu_id, model_name, mlp_config, max_experiments,
     sys.stdout = log_fh
     sys.stderr = log_fh
 
-    if init_delay > 0:
-        _time.sleep(init_delay)
-
     class _FileEvent:
         def __init__(self, path):
             self._path = path
@@ -460,26 +442,34 @@ def _vllm_server_worker(gpu_id, model_name, mlp_config, max_experiments,
             open(self._path, "w").close()
     ready_event = _FileEvent(ready_file) if ready_file else None
 
-    if adapter_type == "lora":
-        from vllm_lora import VLLMLoRAServer
-        server = VLLMLoRAServer(
-            socket_addr=socket_path,
-            model_name=model_name,
-            gpu_memory_utilization=gpu_memory,
-        )
-    else:
-        from vllm_utils import MLP_PRESETS
-        from vllm_server import VLLMServer
-        preset = MLP_PRESETS[mlp_config]
-        server = VLLMServer(
-            socket_addr=socket_path,
-            max_experiments=max_experiments,
-            retain_neurons=preset["retain_neurons"],
-            forget_neurons=preset["forget_neurons"],
-            model_name=model_name,
-            gpu_memory_utilization=gpu_memory,
-            dtype=dtype,
-        )
+    init_label = label or f"vllm_gpu{gpu_id}"
+    # The lock guards the heavy CUDA-init phase. CUDA_VISIBLE_DEVICES has been
+    # remapped above, so gpu_id passed to vllm_init_slot must be the PHYSICAL
+    # GPU index — that's the slot identity. Using the physical id keeps the
+    # lock file path stable across processes that see different remapped ids.
+    with vllm_init_slot(gpu_id, init_label):
+        if adapter_type == "lora":
+            from vllm_lora import VLLMLoRAServer
+            server = VLLMLoRAServer(
+                socket_addr=socket_path,
+                model_name=model_name,
+                gpu_memory_utilization=gpu_memory,
+            )
+        else:
+            from vllm_utils import MLP_PRESETS
+            from vllm_server import VLLMServer
+            preset = MLP_PRESETS[mlp_config]
+            server = VLLMServer(
+                socket_addr=socket_path,
+                max_experiments=max_experiments,
+                retain_neurons=preset["retain_neurons"],
+                forget_neurons=preset["forget_neurons"],
+                model_name=model_name,
+                gpu_memory_utilization=gpu_memory,
+                dtype=dtype,
+            )
+    # Lock released. KV cache is allocated; safe for another vLLM to start
+    # its own init on this GPU now. Serving loop runs unbounded below.
     server.run(ready_event=ready_event)
 
 
@@ -1255,39 +1245,40 @@ class SweepRunner:
                 for rank, gpu in enumerate(gpu_group):
                     vllm_socket_path = f"{vllm_base}_rank{rank}.sock"
                     vllm_ready_file = tempfile.mktemp(prefix="vllm_ready_", suffix=f"_gpu{gpu}")
+                    rank_label = f"vLLM server for {run_name} rank {rank} on GPU {gpu}"
                     vllm_proc = ctx_vllm.Process(
                         target=_vllm_server_worker,
                         args=(gpu, vllm_model, vllm_mlp, vllm_max_exp,
-                              vllm_gpu_memory, vllm_socket_path, 0),
+                              vllm_gpu_memory, vllm_socket_path),
                         kwargs={"ready_file": vllm_ready_file, "adapter_type": vllm_adapter_type,
-                                "dtype": vllm_dtype, "log_dir": str(run_dir)},
+                                "dtype": vllm_dtype, "log_dir": str(run_dir),
+                                "label": rank_label},
                     )
                     vllm_proc.start()
                     vllm_procs.append(vllm_proc)
                     print(f"[vLLM] Spawned server for {run_name} rank {rank} on GPU {gpu}, "
                           f"socket {vllm_socket_path} (pid={vllm_proc.pid})")
                     # Wait for this server to be ready before spawning the next
-                    _wait_for_vllm_ready(
-                        vllm_ready_file, vllm_proc,
-                        f"vLLM server for {run_name} rank {rank} on GPU {gpu}",
-                    )
+                    _wait_for_vllm_ready(vllm_ready_file, vllm_proc, rank_label)
                 # Pass base path; train.py appends _rank{rank}.sock per DDP worker
                 full_params = {k: v for k, v in full_params.items()
                                if k not in ("vllm_spawn", "vllm_spawn_delay", "vllm_gpu_memory", "vllm_dtype")}
                 full_params["vllm_server_base"] = vllm_base
             else:
-                # Single-GPU: one vLLM server, existing behavior
+                # Single-GPU: one vLLM server. The per-GPU init queue (vllm_init_slot
+                # inside _vllm_server_worker) serializes CUDA init across concurrent
+                # launches on the same GPU; no caller-side stagger needed.
                 gpu = gpu_group[0]
-                slot = self.gpu_counts[gpu]  # 0-based slot index, used for stagger
-                init_delay = slot * 30
                 vllm_socket_path = f"ipc:///tmp/vllm_grpo_gpu{gpu}_{unique_id}.sock"
                 vllm_ready_file = tempfile.mktemp(prefix="vllm_ready_", suffix=f"_gpu{gpu}")
+                vllm_label = f"vLLM server for {run_name} on GPU {gpu}"
                 vllm_proc = ctx_vllm.Process(
                     target=_vllm_server_worker,
                     args=(gpu, vllm_model, vllm_mlp, vllm_max_exp,
-                          vllm_gpu_memory, vllm_socket_path, init_delay),
+                          vllm_gpu_memory, vllm_socket_path),
                     kwargs={"ready_file": vllm_ready_file, "adapter_type": vllm_adapter_type,
-                            "dtype": vllm_dtype, "log_dir": str(run_dir)},
+                            "dtype": vllm_dtype, "log_dir": str(run_dir),
+                            "label": vllm_label},
                 )
                 vllm_proc.start()
                 vllm_procs.append(vllm_proc)
@@ -1295,12 +1286,12 @@ class SweepRunner:
                     "ready_file": vllm_ready_file,
                     "proc": vllm_proc,
                     "spawn_time": time.time(),
-                    "label": f"vLLM server for {run_name} on GPU {gpu}",
+                    "label": vllm_label,
                     "warned_60": False,
                     "warned_600": False,
                 })
                 print(f"[vLLM] Spawned server for {run_name} on GPU {gpu}, "
-                      f"socket {vllm_socket_path} (pid={vllm_proc.pid}, delay={init_delay}s)")
+                      f"socket {vllm_socket_path} (pid={vllm_proc.pid})")
                 # Replace vllm_spawn flag with socket path for the training worker
                 full_params = {k: v for k, v in full_params.items()
                                if k not in ("vllm_spawn", "vllm_spawn_delay", "vllm_gpu_memory", "vllm_dtype")}

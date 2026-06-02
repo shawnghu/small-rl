@@ -169,12 +169,10 @@ def smoke() -> dict:
 # within the device.
 _VLLM_GPU_MEM_DEFAULT = 0.05
 
-# Per-child stagger for vLLM init inside train_many. Pinned to the same
-# magic number sweep.py uses for its local-backend stagger
-# (sweep.py:_launch:1169 — `init_delay = slot * 30`). If you change one, change
-# the other; see modal-backend §"Pre-spawn vs in-process vLLM" if it gets
-# documented elsewhere.
-_VLLM_SPAWN_STAGGER_S = 30
+# Per-child vLLM-init queueing now happens inside train.py's _spawn_vllm_server
+# via vllm_lifecycle.vllm_init_slot. All children in a train_many pack share
+# the same per-container /tmp/vllm_init_lock_gpu0 flock, so their CUDA inits
+# serialize naturally. No static stagger constant needed here anymore.
 
 
 def _prepare_params(params: dict, sweep_name: str) -> tuple[dict, str, str, str]:
@@ -387,19 +385,12 @@ def train_many(params_list: list[dict], sweep_name: str) -> list[dict]:
           f"(time-sliced multi-process; no MPS — see _prepare_params comment)")
 
     # Resolve per-run paths up front so we can return a stable list of results
-    # even if a child fails before it can send anything back.
-    #
-    # Stagger vllm_spawn_delay per child: empirically (2026-06-02), 5 children
-    # in one container all spawning a vLLM EngineCore simultaneously caused
-    # CUDA init contention — most children would die with "vLLM server
-    # process died during startup" while one or two survived. train.py reads
-    # --vllm_spawn_delay and sleeps before spawning the server; assigning
-    # 0, 30, 60, ... per child interleaves their CUDA inits cleanly. Callers
-    # that set vllm_spawn_delay explicitly win.
+    # even if a child fails before it can send anything back. CUDA-init
+    # serialization happens via the per-GPU flock that train.py's
+    # _spawn_vllm_server acquires inside vllm_init_slot — see vllm_lifecycle.
     resolved = []  # list of {params, run_name, out_dir, log_path}
-    for i, params in enumerate(params_list):
+    for params in params_list:
         p, run_name, out_dir, log_path = _prepare_params(params, sweep_name)
-        p.setdefault("vllm_spawn_delay", i * _VLLM_SPAWN_STAGGER_S)
         resolved.append({
             "params": p, "run_name": run_name,
             "out_dir": out_dir, "log_path": log_path,

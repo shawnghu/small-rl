@@ -64,16 +64,18 @@ from experiment_config import ExperimentConfig, RewardConfig, RewardComponentCon
 
 def _spawn_vllm_server(model_name, mlp_config, gpu_memory, socket_path, ready_file,
                        layer_start=0.0, layer_end=1.0, layer_stride=1,
-                       max_experiments=4):
-    """Worker for per-run vLLM server subprocess (must be module-level for spawn pickling)."""
+                       max_experiments=4, gpu_id=0, label=None):
+    """Worker for per-run vLLM server subprocess (must be module-level for spawn pickling).
+
+    Concurrent-init serialization is internal: vllm_init_slot acquires an
+    exclusive flock for the duration of VLLMServer construction (the
+    CUDA-heavy phase). Released before server.run() starts the request loop.
+    Multiple train.py children on the same GPU (e.g. inside a train_many pack)
+    queue at the lock and start their CUDA inits one at a time.
+    """
     import os
-    # Become a process group leader so the parent can killpg() us + reach our
-    # vLLM v1 grandchildren (EngineCore, ProcManager). Without this, plain
-    # proc.kill() at shutdown kills only this Python process and leaves
-    # EngineCore holding GPU memory until the container/host tears down.
-    # Mirrors sweep.py:_vllm_server_worker which calls os.setsid() for the
-    # same reason on its pre-spawn vLLM path.
-    os.setsid()
+    from vllm_lifecycle import vllm_init_slot, vllm_worker_setup_signals
+    vllm_worker_setup_signals()  # setsid → process group leader for killpg
     os.environ.pop("PYTORCH_CUDA_ALLOC_CONF", None)  # vLLM 0.17 CuMemAllocator rejects expandable_segments
     os.environ.setdefault("VLLM_LOGGING_LEVEL", "ERROR")
     os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
@@ -82,19 +84,26 @@ def _spawn_vllm_server(model_name, mlp_config, gpu_memory, socket_path, ready_fi
     from vllm_server import VLLMServer
 
     preset = MLP_PRESETS[mlp_config]
-    server = VLLMServer(
-        socket_addr=socket_path,
-        # Default 4 slots: 1 training + 3 eval adapter modes (both, retain_only,
-        # forget_only). Interlaced coherence bumps this to 5 to add a coh slot.
-        max_experiments=max_experiments,
-        retain_neurons=preset["retain_neurons"],
-        forget_neurons=preset["forget_neurons"],
-        model_name=model_name,
-        gpu_memory_utilization=gpu_memory,
-        layer_start=layer_start,
-        layer_end=layer_end,
-        layer_stride=layer_stride,
-    )
+    init_label = label or f"vllm_train_pid{os.getpid()}"
+    # Hold the per-GPU lock for the CUDA-init phase only. Release before
+    # entering the unbounded serve loop. CUDA_VISIBLE_DEVICES is set by the
+    # parent train.py if it remapped; gpu_id passed in is the PHYSICAL id we
+    # lock against — keeps the lock path stable across processes that see
+    # different remapped CUDA ids.
+    with vllm_init_slot(gpu_id, init_label):
+        server = VLLMServer(
+            socket_addr=socket_path,
+            # Default 4 slots: 1 training + 3 eval adapter modes (both, retain_only,
+            # forget_only). Interlaced coherence bumps this to 5 to add a coh slot.
+            max_experiments=max_experiments,
+            retain_neurons=preset["retain_neurons"],
+            forget_neurons=preset["forget_neurons"],
+            model_name=model_name,
+            gpu_memory_utilization=gpu_memory,
+            layer_start=layer_start,
+            layer_end=layer_end,
+            layer_stride=layer_stride,
+        )
     # Use a sentinel file instead of multiprocessing.Event to signal readiness.
     # mp.Event uses semaphores that can't be pickled across nested spawn contexts.
     class _FileEvent:
@@ -4447,8 +4456,10 @@ def _make_parser():
                         help="dtype for the colocate vLLM engine (e.g. bfloat16, float16). "
                              "Ignored for vllm_spawn (which consumes it at spawn time).")
     parser.add_argument("--vllm_spawn_delay", type=int, default=0,
-                        help="Seconds to wait before spawning the vLLM server (used to stagger "
-                             "concurrent inits so each sees accurate free memory).")
+                        help="DEPRECATED (2026-06-02): vLLM init serialization is now done via "
+                             "a per-GPU flock in vllm_lifecycle.vllm_init_slot, called from "
+                             "inside _spawn_vllm_server. This flag is silently ignored — kept "
+                             "for backcompat with sweep configs that still set it.")
     parser.add_argument("--vllm_no_sleep", action="store_true", default=False,
                         help="Disable vLLM sleep/wake cycle between rollout and training phases. "
                              "Useful when multiple runs share a GPU (per_gpu > 1) and sleep/wake overhead dominates.")
@@ -5272,27 +5283,31 @@ def _run(args, exp_cfg=None):
     elif args.vllm_spawn:
         import multiprocessing as _mp
         import tempfile
-        if args.vllm_spawn_delay > 0:
-            print(f"[vLLM] Waiting {args.vllm_spawn_delay}s before spawning server (stagger init)...")
-            time.sleep(args.vllm_spawn_delay)
+        from vllm_lifecycle import wait_for_ready_file
+        # Concurrent-init serialization happens inside _spawn_vllm_server via
+        # vllm_init_slot — no caller-side delay needed. `--vllm_spawn_delay`
+        # is deprecated as of the vllm_lifecycle extraction (2026-06-02) and
+        # ignored if set.
         _socket_path = f"ipc:///tmp/vllm_grpo_{os.getpid()}.sock"
         _ready_file = tempfile.mktemp(prefix="vllm_ready_", suffix=f"_{os.getpid()}")
         _ctx = _mp.get_context("spawn")
         _max_experiments = 5 if args.coh_samples_per_rollout > 0 else 4
+        _spawn_label = f"vllm_train_{args.run_name or os.getpid()}"
         _vllm_server_proc = _ctx.Process(
             target=_spawn_vllm_server,
             args=(args.model, args.mlp_config, args.vllm_gpu_memory, _socket_path, _ready_file,
-                  args.layer_start, args.layer_end, args.layer_stride, _max_experiments),
+                  args.layer_start, args.layer_end, args.layer_stride, _max_experiments,
+                  args.gpu_id, _spawn_label),
             # daemon=False so vLLM v1 engine can spawn its own CoreEngineProcManager children
         )
         _vllm_server_proc.start()
         print(f"[vLLM] Spawned server at {_socket_path} (pid={_vllm_server_proc.pid})")
-        _t0 = time.time()
-        while not os.path.exists(_ready_file):
-            assert time.time() - _t0 < 180, "vLLM server failed to start within 180s"
-            assert _vllm_server_proc.is_alive(), "vLLM server process died during startup"
-            time.sleep(0.5)
-        os.unlink(_ready_file)
+        # Single per-GPU lock means worst-case wait is (N-1) * vLLM-init-time
+        # when N children queue. Give the wait a much higher ceiling than the
+        # old hard-coded 180s — the lock itself enforces ordering, and
+        # wait_for_ready_file's 900s default + warn-at lines surface a stuck
+        # init loudly without spuriously firing under normal queueing.
+        wait_for_ready_file(_ready_file, _vllm_server_proc, _spawn_label)
         from vllm_client import VLLMClient
         vllm_client = VLLMClient(_socket_path)
         print(f"[vLLM] Server ready")
@@ -5559,19 +5574,12 @@ def _run(args, exp_cfg=None):
             except Exception:
                 pass
             _vllm_server_proc.join(timeout=5)
-            if _vllm_server_proc.is_alive():
-                # SIGKILL the whole process group. The worker called os.setsid()
-                # at startup so its pid IS the pgid; killpg reaches EngineCore +
-                # ProcManager grandchildren that vLLM v1 spawns under itself.
-                # Bare proc.kill() would kill only the direct child and leave
-                # grandchildren orphaned on the GPU.
-                try:
-                    import os as _os, signal as _signal
-                    pgid = _os.getpgid(_vllm_server_proc.pid)
-                    _os.killpg(pgid, _signal.SIGKILL)
-                except (ProcessLookupError, PermissionError):
-                    _vllm_server_proc.kill()
-                _vllm_server_proc.join(timeout=2)
+            # killpg_cleanup walks the proc group rooted at _vllm_server_proc
+            # (the worker called vllm_worker_setup_signals → setsid at startup),
+            # reaching EngineCore + ProcManager grandchildren that bare
+            # proc.kill() would orphan on the GPU.
+            from vllm_lifecycle import killpg_cleanup
+            killpg_cleanup(_vllm_server_proc)
         elif args.vllm_colocate and vllm_client is not None:
             try:
                 vllm_client.shutdown()
