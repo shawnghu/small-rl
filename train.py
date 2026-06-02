@@ -67,6 +67,13 @@ def _spawn_vllm_server(model_name, mlp_config, gpu_memory, socket_path, ready_fi
                        max_experiments=4):
     """Worker for per-run vLLM server subprocess (must be module-level for spawn pickling)."""
     import os
+    # Become a process group leader so the parent can killpg() us + reach our
+    # vLLM v1 grandchildren (EngineCore, ProcManager). Without this, plain
+    # proc.kill() at shutdown kills only this Python process and leaves
+    # EngineCore holding GPU memory until the container/host tears down.
+    # Mirrors sweep.py:_vllm_server_worker which calls os.setsid() for the
+    # same reason on its pre-spawn vLLM path.
+    os.setsid()
     os.environ.pop("PYTORCH_CUDA_ALLOC_CONF", None)  # vLLM 0.17 CuMemAllocator rejects expandable_segments
     os.environ.setdefault("VLLM_LOGGING_LEVEL", "ERROR")
     os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
@@ -5553,7 +5560,18 @@ def _run(args, exp_cfg=None):
                 pass
             _vllm_server_proc.join(timeout=5)
             if _vllm_server_proc.is_alive():
-                _vllm_server_proc.kill()
+                # SIGKILL the whole process group. The worker called os.setsid()
+                # at startup so its pid IS the pgid; killpg reaches EngineCore +
+                # ProcManager grandchildren that vLLM v1 spawns under itself.
+                # Bare proc.kill() would kill only the direct child and leave
+                # grandchildren orphaned on the GPU.
+                try:
+                    import os as _os, signal as _signal
+                    pgid = _os.getpgid(_vllm_server_proc.pid)
+                    _os.killpg(pgid, _signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    _vllm_server_proc.kill()
+                _vllm_server_proc.join(timeout=2)
         elif args.vllm_colocate and vllm_client is not None:
             try:
                 vllm_client.shutdown()
