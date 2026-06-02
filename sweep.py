@@ -794,7 +794,8 @@ class SweepRunner:
                  gpus_per_run=1, stagger=0,
                  backend="local", pack_runs=False, max_per_pack=6,
                  max_concurrent_packs=None, pack_group_keys=None,
-                 pack_vllm_gpu_memory=None):
+                 pack_vllm_gpu_memory=None, modal_sync_interval=60,
+                 modal_volume_name="gr-modal-pilot"):
         self.output_dir = Path(output_dir)
         self.gpus = gpus
         self.use_mps = use_mps
@@ -829,6 +830,18 @@ class SweepRunner:
         self.max_per_pack = max_per_pack
         self.pack_group_keys = pack_group_keys
         self.pack_vllm_gpu_memory = pack_vllm_gpu_memory
+
+        # Modal volume sync: a daemon thread that periodically pulls the
+        # entire sweep dir from the volume to local disk so the existing plot/
+        # HTML generation paths (which read from local file paths) produce
+        # live data while the sweep is running. Pulls everything including
+        # checkpoint-* — the user accepted that cost for in-flight plots.
+        # interval<=0 disables (post-hoc sync remains the workflow).
+        self.modal_sync_interval = modal_sync_interval if backend == "modal" else 0
+        self.modal_volume_name = modal_volume_name
+        self._modal_sync_stop = None    # threading.Event, set on shutdown
+        self._modal_sync_thread = None
+        self._modal_sync_lock = None    # protects "currently syncing" flag for status
         self.stagger = stagger
         self.wandb_project = wandb_project
         self.no_wandb = no_wandb
@@ -1076,6 +1089,11 @@ class SweepRunner:
                     info["call"].cancel()
                 except Exception as e:
                     print(f"[SWEEP] failed to cancel pack_id={pack_id}: {e}")
+            # One last volume sync so whatever the containers wrote before
+            # SIGTERM is on local disk for triage. _stop_modal_sync joins the
+            # daemon thread which itself runs one final _modal_sync_once on
+            # shutdown — up to 5 min wait, matching the cancel grace window.
+            self._stop_modal_sync()
             sys.exit(1)
         # Kill all vLLM process groups immediately (don't wait per-proc — that would
         # take up to 8s × N procs and could be interrupted before finishing).
@@ -1978,50 +1996,139 @@ class SweepRunner:
             if self.active:
                 time.sleep(0.5)
 
+    def _modal_sync_once(self):
+        """Run one `modal volume get --force` to pull the sweep's volume dir
+        to local disk. Source of truth for the existing plot generators, which
+        only see local files. Pulls everything (incl. checkpoint-*) by design
+        — the cost is accepted in exchange for live in-flight plots.
+
+        Failures (network blips, partial transfers) are logged but do not
+        crash the sweep; the next cycle retries from scratch (--force
+        overwrites any partial files)."""
+        import subprocess
+        sweep_name = self.output_dir.name
+        # Local destination is the orchestrator's output_dir's parent: modal
+        # volume get writes the remote basename (= sweep_name) into it, so the
+        # resulting local layout is {parent}/{sweep_name}/{run_name}/..., which
+        # is exactly self.output_dir / run_name — matching what _materialize_run
+        # records and what the plot generators expect.
+        local_parent = str(self.output_dir.parent)
+        cmd = [
+            ".venv/bin/python", "-m", "modal", "volume", "get", "--force",
+            self.modal_volume_name, f"/{sweep_name}", local_parent,
+        ]
+        t0 = time.time()
+        try:
+            # capture_output so the per-cycle download chatter doesn't drown the
+            # sweep log; only surface failures.
+            result = subprocess.run(
+                cmd, capture_output=True, text=True,
+                # Generous timeout: a large sweep with many checkpoints can take
+                # a minute or more even on a fast link. 2 × interval is the
+                # natural ceiling — if a sync isn't done by then the next one
+                # would already be starting.
+                timeout=max(120, 2 * self.modal_sync_interval),
+            )
+        except subprocess.TimeoutExpired:
+            print(f"[MODAL_SYNC] timed out after "
+                  f"{max(120, 2 * self.modal_sync_interval)}s — will retry")
+            return
+        dur = time.time() - t0
+        if result.returncode != 0:
+            tail = (result.stderr or result.stdout or "")[-400:]
+            print(f"[MODAL_SYNC] non-zero exit {result.returncode} after {dur:.1f}s:\n  {tail}")
+        else:
+            print(f"[MODAL_SYNC] pulled /{sweep_name} -> {local_parent}/  ({dur:.1f}s)")
+
+    def _start_modal_sync(self):
+        """Spin up the background sync daemon. Idempotent."""
+        if self.modal_sync_interval <= 0:
+            return
+        if self._modal_sync_thread is not None:
+            return
+        import threading
+        self._modal_sync_stop = threading.Event()
+        self._modal_sync_lock = threading.Lock()
+
+        def _loop():
+            # First sync happens after the first interval, not immediately —
+            # otherwise the very-first request races the workers starting up
+            # and hits an empty remote dir.
+            while not self._modal_sync_stop.wait(self.modal_sync_interval):
+                with self._modal_sync_lock:
+                    self._modal_sync_once()
+            # One last sync on shutdown so a sweep completing right after a
+            # cycle still leaves a fully populated local mirror.
+            with self._modal_sync_lock:
+                self._modal_sync_once()
+
+        self._modal_sync_thread = threading.Thread(
+            target=_loop, name="ModalVolumeSync", daemon=True,
+        )
+        self._modal_sync_thread.start()
+        print(f"[MODAL_SYNC] background sync started "
+              f"(interval={self.modal_sync_interval}s, volume={self.modal_volume_name})")
+
+    def _stop_modal_sync(self):
+        """Signal the sync daemon to stop and wait for its final sync to
+        finish (so we don't strand any data on the volume)."""
+        if self._modal_sync_thread is None:
+            return
+        self._modal_sync_stop.set()
+        self._modal_sync_thread.join(timeout=300)
+        if self._modal_sync_thread.is_alive():
+            print("[MODAL_SYNC] background sync did not finish within 5 min "
+                  "— giving up (data should still be on the Modal volume)")
+
     def _run_modal_loop(self, status_interval, overview_interval):
         """Modal-backend scheduling loop. Pops packs off self._modal_pack_queue,
         dispatches via _modal_launch_pack (which calls train_one.spawn or
         train_many.spawn), and polls FunctionCall handles in
         _modal_check_completed. There is no per-GPU cap and no slot pool —
         concurrency is whatever Modal will allocate, capped by
-        self.max_concurrent (default 64 packs in flight). Periodic sweep
-        overview/grid is regenerated on the same cadence as the local path so
-        the served HTML and per-step plots show live progress regardless of
-        backend."""
+        self.max_concurrent (default 64 packs in flight).
+
+        A background daemon thread periodically pulls the sweep's volume dir
+        to local disk so the existing plot/HTML generation paths produce live
+        data; see _start_modal_sync."""
         last_status_time = time.time()
         last_overview_time = 0.0
 
-        while self._modal_pack_queue or self._modal_active:
-            if self._interrupted:
-                break
+        self._start_modal_sync()
+        try:
+            while self._modal_pack_queue or self._modal_active:
+                if self._interrupted:
+                    break
 
-            # Dispatch packs up to the in-flight cap.
-            while (self._modal_pack_queue
-                   and len(self._modal_active) < self.max_concurrent):
-                pack = self._modal_pack_queue.pop(0)
-                self._modal_launch_pack(pack)
-                if self.stagger > 0 and self._modal_pack_queue:
-                    time.sleep(self.stagger)
+                # Dispatch packs up to the in-flight cap.
+                while (self._modal_pack_queue
+                       and len(self._modal_active) < self.max_concurrent):
+                    pack = self._modal_pack_queue.pop(0)
+                    self._modal_launch_pack(pack)
+                    if self.stagger > 0 and self._modal_pack_queue:
+                        time.sleep(self.stagger)
 
-            self._modal_check_completed()
+                self._modal_check_completed()
 
-            now = time.time()
-            if now - last_status_time >= status_interval:
-                self._print_status()
-                last_status_time = now
-            if now - last_overview_time >= overview_interval:
-                try:
-                    from sweep_plots import generate_sweep_overview, generate_sweep_grid
-                    generate_sweep_overview(str(self.output_dir))
-                    generate_sweep_grid(str(self.output_dir))
-                except Exception as e:
-                    print(f"[WARN] Failed to regenerate sweep pages: {e}")
-                last_overview_time = time.time()
+                now = time.time()
+                if now - last_status_time >= status_interval:
+                    self._print_status()
+                    last_status_time = now
+                if now - last_overview_time >= overview_interval:
+                    try:
+                        from sweep_plots import generate_sweep_overview, generate_sweep_grid
+                        generate_sweep_overview(str(self.output_dir))
+                        generate_sweep_grid(str(self.output_dir))
+                    except Exception as e:
+                        print(f"[WARN] Failed to regenerate sweep pages: {e}")
+                    last_overview_time = time.time()
 
-            if self._modal_active:
-                # Modal FunctionCall.get(timeout=0) hits the control plane;
-                # sleep a bit longer than the local 0.5s to avoid hammering it.
-                time.sleep(2.0)
+                if self._modal_active:
+                    # Modal FunctionCall.get(timeout=0) hits the control plane;
+                    # sleep a bit longer than the local 0.5s to avoid hammering it.
+                    time.sleep(2.0)
+        finally:
+            self._stop_modal_sync()
 
 
 def main():
@@ -2112,6 +2219,16 @@ def main():
     parser.add_argument("--max_concurrent_packs", type=int, default=None,
                         help="(--backend modal) Cap on in-flight Modal calls. None = no "
                              "throttle (Modal's own quotas apply).")
+    parser.add_argument("--modal_sync_interval", type=int, default=60,
+                        help="(--backend modal) Seconds between background `modal volume "
+                             "get --force` calls that pull the sweep's volume contents "
+                             "to local disk so the existing plot/HTML generators see live "
+                             "data. Default 60. Pass 0 to disable (post-hoc sync only). "
+                             "Pulls everything including checkpoint-*; the in-flight plot "
+                             "convenience is worth the bandwidth at our scales.")
+    parser.add_argument("--modal_volume_name", default="gr-modal-pilot",
+                        help="(--backend modal) Modal volume name (default: gr-modal-pilot, "
+                             "matching tools/modal_train_gr.py).")
     args, remaining = parser.parse_known_args()
 
     # Parse remaining args as train.py overrides (applied to every run dict).
@@ -2291,6 +2408,8 @@ def main():
         max_concurrent_packs=args.max_concurrent_packs,
         pack_group_keys=cfg_pack_group_keys,
         pack_vllm_gpu_memory=cfg_pack_vllm_mem,
+        modal_sync_interval=args.modal_sync_interval,
+        modal_volume_name=args.modal_volume_name,
     )
     runner.run()
 

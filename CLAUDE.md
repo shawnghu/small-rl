@@ -233,6 +233,8 @@ Modal infra is in `tools/modal_train_gr.py` (image, volume, secret, `train_one`,
 - `--pack` / `--no_pack` — pack-mode override (Modal only; ignored under `local`). Default is **on for `--backend modal`**, off for `local`. `--no_pack` disables packing (1 Modal container per run). Default grouping: all params equal except `seed`/`run_name`/`output_dir`. Override per sweep config file with `pack_group_keys = (...)`.
 - `--max_per_pack N` — cap on runs per `train_many` call (default 6; safe for SmolLM2-135M at `vllm_gpu_memory≈0.05`).
 - `--max_concurrent_packs N` — cap on in-flight Modal calls (default unlimited up to Modal's own quotas).
+- `--modal_sync_interval N` — seconds between background `modal volume get --force` pulls of the sweep's volume contents to local disk (default 60). The pull is what makes `overview.html` / `grid.html` / per-group plots show live data — the generators read from local paths only. Pulls everything including `checkpoint-*`. Pass `0` to disable (post-hoc sync only).
+- `--modal_volume_name <name>` — volume to sync from (default `gr-modal-pilot`, matching `tools/modal_train_gr.py`).
 
 ### Sweep-config-file attrs
 
@@ -242,6 +244,16 @@ In addition to the existing `per_gpu` / `no_baseline` / `no_cache` / `retain_pen
 - `pack_group_keys: tuple[str, ...]` — explicit grouping keys. Empty tuple packs everything subject to `max_per_pack`. `("config",)` packs by env.
 - `max_per_pack: int` — overrides the CLI default.
 - `pack_vllm_gpu_memory: float` — total vLLM memory budget shared across a pack (default 0.40). Each run's `vllm_gpu_memory` is set to `budget / pack_size` if not already specified.
+
+### Live in-flight plots under `--backend modal`
+
+`sweep.py` runs the orchestrator locally; the Modal worker writes to the volume. Without intervention the local `output/<sweep>/<run>/` directories would stay empty during the sweep and the plot/HTML generators would see no data. A background daemon thread (`_modal_sync_thread`) runs `modal volume get --force gr-modal-pilot /<sweep_name> <output_dir.parent>` every `--modal_sync_interval` seconds (default 60s; disable with `0`). With sync on:
+
+- `generate_sweep_overview` / `generate_sweep_grid` regenerate every 60s as before, but now find real data → `output/<sweep>/sweep_graphs/{overview,grid}.html` are live.
+- `_generate_group_plots` fires when all seeds in an experiment group complete (mirroring local behavior) — per-step bar charts + `animation.gif` + slider `index.html` per group.
+- Server-via-http: `python -m http.server -d output/<sweep>/sweep_graphs/` works during the sweep, not just after.
+
+The sync covers everything including checkpoints — at SmolLM2-135M scales this is cheap. For larger models / longer sweeps you may want to set `--modal_sync_interval 300` or higher. On SIGINT the orchestrator runs one final sync before exiting so partial state is mirrored locally for triage.
 
 ### Invariants under `--backend modal`
 
