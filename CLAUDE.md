@@ -221,14 +221,16 @@ When `--combined_key` is set (or `combined_key` is defined in the sweep config f
 
 ## Modal backend (cloud H100s)
 
-`sweep.py --backend modal` dispatches each run as a Modal `train_one` call (1 H100 / container). Add `--pack` and runs are grouped into `train_many` calls (N runs / container with CUDA MPS-internal concurrency). All sweep.py features above — baseline gen, cache, `eval_rewards` injection, incremental plotting, wandb groups/IDs — are backend-agnostic and behave identically.
+`sweep.py --backend modal` dispatches runs to Modal. **Packing is on by default** under `--backend modal`: runs are grouped (default: all params equal except `seed`/`run_name`/`output_dir`) and each group goes to one `train_many` call (N runs / container with CUDA MPS-internal concurrency). Single-run groups are routed to `train_one` automatically, so default-on packing never adds MPS overhead for sweeps that don't benefit. Disable with `--no_pack` to force 1 container per run.
+
+All sweep.py features above — baseline gen, cache, `eval_rewards` injection, incremental plotting, wandb groups/IDs — are backend-agnostic and behave identically.
 
 Modal infra is in `tools/modal_train_gr.py` (image, volume, secret, `train_one`, `train_many`, `_group_runs`). The image is a pinned pip-freeze (`requirements-modal.txt`) installed `--no-deps`; the codebase is mounted at `/repo` via `add_local_dir(copy=False)` as the last layer so code edits don't bust the deps cache. Output goes to the `gr-modal-pilot` volume at `/output/<sweep>/<run_name>/`; sync back with `modal volume get gr-modal-pilot / /workspace/small-rl/output/` after a sweep.
 
 ### CLI flags
 
 - `--backend {local,modal}` — default `local`. `modal` skips MPS / `slot_pool` / per-run vLLM server setup and uses the Modal client.
-- `--pack` — pack runs into containers via MPS (Modal only). Default grouping: all params equal except `seed`/`run_name`/`output_dir`. Override per sweep config file with `pack_group_keys = (...)`.
+- `--pack` / `--no_pack` — pack-mode override (Modal only; ignored under `local`). Default is **on for `--backend modal`**, off for `local`. `--no_pack` disables packing (1 Modal container per run). Default grouping: all params equal except `seed`/`run_name`/`output_dir`. Override per sweep config file with `pack_group_keys = (...)`.
 - `--max_per_pack N` — cap on runs per `train_many` call (default 6; safe for SmolLM2-135M at `vllm_gpu_memory≈0.05`).
 - `--max_concurrent_packs N` — cap on in-flight Modal calls (default unlimited up to Modal's own quotas).
 
@@ -243,7 +245,8 @@ In addition to the existing `per_gpu` / `no_baseline` / `no_cache` / `retain_pen
 
 ### Invariants under `--backend modal`
 
-- `vllm_spawn=True` is forced. `--vllm_async` and `--no_vllm` are rejected at the CLI (the Modal worker always spawns vLLM in-process inside its container).
+- `vllm_spawn=True` is forced — the **train.py worker** spawns the vLLM server as its own child process inside the Modal container. This is sync vLLM (REQ/REP), the same training mode the local sweep.py default uses; the only difference is that sweep.py's local backend pre-spawns the vLLM server itself and passes a socket path, whereas under Modal the train worker manages the server lifecycle. Piggybacked eval, `coh_samples_per_rollout > 0`, and all other sync-mode features work identically.
+- `--vllm_async` and `--no_vllm` are rejected at the CLI. Async mode requires a pre-spawned server (`--vllm_server`), which the Modal container doesn't have; the HF-generate fallback isn't useful at our throughput.
 - No per-GPU cap / `slot_pool` / MPS on the orchestrator box. Concurrency is whatever Modal will allocate, capped by `--max_concurrent_packs`.
 - Cache (`.baseline_cache.json`, `.run_cache.json`) is still written under `output/{name}/`. Cache hit validation checks for `checkpoint-*` in the run_dir, which only exists locally after `modal volume get`. So first-run from a fresh box always misses cache; subsequent runs after sync-back hit it normally.
 - On SIGINT/SIGTERM to sweep.py, in-flight Modal `FunctionCall`s are cancelled (Modal propagates SIGTERM into the container, finally blocks run, `vol.commit()` flushes partial state). See "training-job timeout" below.

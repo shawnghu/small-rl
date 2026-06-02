@@ -2094,10 +2094,18 @@ def main():
                         help="Launch backend (default: local). 'modal' dispatches to "
                              "tools.modal_train_gr.{train_one,train_many} on H100s.")
     parser.add_argument("--pack", action="store_true",
-                        help="(--backend modal only) Pack compatible runs into one "
-                             "container via CUDA MPS. Default grouping: all params equal "
-                             "except seed/run_name. Override via `pack_group_keys = (...)` "
-                             "in the sweep config file.")
+                        help="(--backend modal) Pack compatible runs into one container "
+                             "via CUDA MPS. Default-on under --backend modal; pass this "
+                             "explicitly under --backend local for documentation only "
+                             "(packing is ignored locally). Default grouping: all params "
+                             "equal except seed/run_name. Override via "
+                             "`pack_group_keys = (...)` in the sweep config file.")
+    parser.add_argument("--no_pack", action="store_true",
+                        help="(--backend modal) Disable packing — one Modal container per "
+                             "run. Useful when packed-MPS interactions are suspected "
+                             "(e.g. debugging a single seed) or when a sweep mixes runs "
+                             "that vary along many axes and packs of size 1 would be "
+                             "the rule rather than the exception.")
     parser.add_argument("--max_per_pack", type=int, default=6,
                         help="(--backend modal --pack) Max runs per train_many call "
                              "(default: 6; safe for SmolLM2-135M at vllm_gpu_memory≈0.05).")
@@ -2240,6 +2248,20 @@ def main():
     cfg_max_per_pack    = cfg_attrs["max_per_pack"]
     cfg_pack_vllm_mem   = cfg_attrs["pack_vllm_gpu_memory"]
 
+    # Resolve effective_pack. --no_pack always wins (escape hatch); otherwise
+    # any explicit "on" signal (CLI flag, config attr) turns packing on;
+    # otherwise default-on for --backend modal and off for --backend local.
+    # Single-seed groups still go through train_one (no MPS overhead), so
+    # default-on packing is a no-cost choice — see _modal_launch_pack.
+    if args.pack and args.no_pack:
+        parser.error("--pack and --no_pack are mutually exclusive")
+    if args.no_pack:
+        effective_pack = False
+    elif args.pack or cfg_pack_runs:
+        effective_pack = True
+    else:
+        effective_pack = (args.backend == "modal")
+
     runner = SweepRunner(
         runs=runs,
         grid_keys=grid_keys,
@@ -2263,7 +2285,7 @@ def main():
         gpus_per_run=gpus_per_run,
         stagger=args.stagger,
         backend=args.backend,
-        pack_runs=(args.pack or cfg_pack_runs),
+        pack_runs=effective_pack,
         max_per_pack=(args.max_per_pack if args.max_per_pack != 6
                       else (cfg_max_per_pack or 6)),
         max_concurrent_packs=args.max_concurrent_packs,
