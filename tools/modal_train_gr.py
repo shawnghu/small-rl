@@ -296,21 +296,170 @@ def train_one(params: dict, sweep_name: str) -> dict:
     return {**result, "run_name": run_name, "output_dir": out_dir}
 
 
-# MPS daemon NOT started on Modal: empirically (2026-06-02) the daemon
-# half-initializes on Modal's H100s — its IPC pipe directory gets created
-# (so PyTorch's CUDA init thinks MPS is enabled and tries to connect),
-# but the daemon never actually services requests, causing every child's
-# torch.cuda.set_device() to fail with:
-#   RuntimeError: Unexpected error from cudaGetDeviceCount(). Error 805:
-#   MPS client failed to connect to the MPS control daemon or the MPS server
+# MPS lifecycle for train_many.
 #
-# The probable cause is that MPS needs the GPU to be in EXCLUSIVE_PROCESS
-# compute mode and Modal's H100s are in the default DEFAULT mode, which we
-# can't change as a non-root container. Without MPS, concurrent CUDA
-# processes still work — they time-slice via the standard driver path
-# (slower context switching but functionally correct). For SmolLM2-135M at
-# vllm_gpu_memory=0.05 the throughput loss is acceptable; the alternative
-# is one container per run.
+# History (2026-06-02): the first attempt called `nvidia-cuda-mps-control -d`
+# and proceeded immediately. The daemon "started" (exit 0) but child processes
+# crashed at torch.cuda.set_device() with Error 805 ("MPS client failed to
+# connect to the MPS control daemon or the MPS server"). The fallback at the
+# time was to disable MPS entirely and accept ~4× slowdown from time-sliced
+# multi-process scheduling.
+#
+# Retry (this revision): set CUDA_MPS_PIPE_DIRECTORY / CUDA_MPS_LOG_DIRECTORY
+# explicitly under /tmp; clean any stale state from a previous attempt; wait
+# for the control pipe to appear (signal that the daemon is listening); then
+# run an actual functional probe (a spawn-context subprocess that imports
+# torch and calls torch.cuda.set_device(0)). If anything fails along the way,
+# unset the env vars and clean up the pipe dir so child processes do NOT
+# detect MPS — they fall back to standard time-slicing. The daemon log goes
+# to the log dir so failures can be inspected after the fact.
+_MPS_PIPE_DIR = "/tmp/nvidia-mps"
+_MPS_LOG_DIR = "/tmp/nvidia-log"
+
+
+def _disable_mps_env():
+    """Remove MPS-related env vars and pipe dir so spawn-context children do
+    not detect MPS. Safe to call repeatedly; used when initialisation fails."""
+    import os
+    import shutil
+    os.environ.pop("CUDA_MPS_PIPE_DIRECTORY", None)
+    os.environ.pop("CUDA_MPS_LOG_DIRECTORY", None)
+    shutil.rmtree(_MPS_PIPE_DIR, ignore_errors=True)
+
+
+def _probe_mps_works(timeout: float = 60.0) -> bool:
+    """Spawn a fresh subprocess that imports torch and runs torch.cuda.set_device(0).
+    Returns True iff the subprocess completes without raising. Used to confirm
+    MPS is actually servicing requests before we commit to using it for the
+    training children.
+
+    Why this is needed: the failure mode we saw before was that
+    `nvidia-cuda-mps-control -d` exits cleanly even when the daemon won't
+    accept client connections, so neither the exit code nor the pipe-dir
+    contents are sufficient to verify MPS is functional. Only an actual CUDA
+    init from a separate process catches it.
+    """
+    import multiprocessing
+    ctx = multiprocessing.get_context("spawn")
+    parent_conn, child_conn = ctx.Pipe(duplex=False)
+
+    def _probe(conn):
+        try:
+            import torch
+            torch.cuda.set_device(0)
+            # Force CUDA init (set_device alone may be lazy).
+            torch.cuda.init()
+            conn.send({"ok": True, "name": torch.cuda.get_device_name(0)})
+        except BaseException as e:
+            conn.send({"ok": False, "err": f"{type(e).__name__}: {e}"})
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    proc = ctx.Process(target=_probe, args=(child_conn,))
+    proc.start()
+    child_conn.close()
+    proc.join(timeout=timeout)
+    if proc.is_alive():
+        proc.kill()
+        proc.join(timeout=5)
+        print(f"[mps] probe timed out after {timeout}s")
+        return False
+    try:
+        result = parent_conn.recv()
+    except (EOFError, OSError):
+        print(f"[mps] probe child exited without sending a result (exitcode={proc.exitcode})")
+        return False
+    if result.get("ok"):
+        print(f"[mps] probe ok — device={result.get('name')}")
+        return True
+    print(f"[mps] probe failed: {result.get('err')}")
+    return False
+
+
+def _start_mps() -> bool:
+    """Try to start CUDA MPS. Returns True iff the daemon is up AND the probe
+    confirms a child can initialise CUDA against it. On failure, cleans up env
+    so subsequent children won't detect MPS at all.
+    """
+    import os
+    import shutil
+    import subprocess
+    import time
+
+    # Clean any stale state from previous attempts within this container.
+    for d in (_MPS_PIPE_DIR, _MPS_LOG_DIR):
+        shutil.rmtree(d, ignore_errors=True)
+        os.makedirs(d, exist_ok=True)
+
+    # Set env vars in the parent so spawn-context children inherit them.
+    os.environ["CUDA_MPS_PIPE_DIRECTORY"] = _MPS_PIPE_DIR
+    os.environ["CUDA_MPS_LOG_DIRECTORY"] = _MPS_LOG_DIR
+
+    try:
+        proc = subprocess.run(
+            ["nvidia-cuda-mps-control", "-d"],
+            check=False, capture_output=True, text=True, timeout=15,
+        )
+    except FileNotFoundError:
+        print("[mps] nvidia-cuda-mps-control binary not found; running without MPS")
+        _disable_mps_env()
+        return False
+    except Exception as e:
+        print(f"[mps] daemon launch failed: {e}; running without MPS")
+        _disable_mps_env()
+        return False
+
+    if proc.returncode != 0:
+        print(f"[mps] daemon exited {proc.returncode}: "
+              f"stdout={proc.stdout!r} stderr={proc.stderr!r}; running without MPS")
+        _disable_mps_env()
+        return False
+
+    # Wait up to ~10s for the control pipe to appear (signal the daemon is
+    # listening). The pipe path varies a bit by CUDA version, so look for any
+    # entry in the pipe directory.
+    t0 = time.time()
+    while time.time() - t0 < 10.0:
+        try:
+            if os.listdir(_MPS_PIPE_DIR):
+                break
+        except FileNotFoundError:
+            pass
+        time.sleep(0.2)
+    else:
+        print(f"[mps] control pipe never appeared in {_MPS_PIPE_DIR} after 10s; "
+              "running without MPS")
+        _disable_mps_env()
+        return False
+
+    # Probe: actually init CUDA from a spawn-context subprocess. This is the
+    # only check that distinguishes "daemon listening but not servicing" from
+    # "daemon fully functional".
+    if not _probe_mps_works():
+        print("[mps] probe failed after daemon start; falling back to time-slicing")
+        _stop_mps()
+        _disable_mps_env()
+        return False
+
+    print(f"[mps] daemon up at {_MPS_PIPE_DIR}; probe ok; packing under MPS")
+    return True
+
+
+def _stop_mps():
+    """Send 'quit' to the MPS control daemon. Best-effort cleanup; container
+    teardown would do this anyway, but we explicit-stop so any stale state
+    doesn't leak into a future invocation that happens to reuse the host."""
+    import subprocess
+    try:
+        subprocess.run(
+            ["nvidia-cuda-mps-control"],
+            input=b"quit\n", check=False, capture_output=True, timeout=5,
+        )
+    except Exception:
+        pass
 
 
 def _train_many_child(params: dict, log_path: str, conn) -> None:
@@ -355,11 +504,12 @@ def train_many(params_list: list[dict], sweep_name: str) -> list[dict]:
     run_name / output_dir. Children are spawn-context subprocesses so they don't
     share Python interpreter state (matches sweep.py's local concurrency).
 
-    Concurrency model: standard CUDA multi-process time-slicing — NOT MPS.
-    The MPS daemon half-initializes on Modal's H100s in DEFAULT compute mode
-    (see the block above _train_many_child), so we skip MPS and accept the
-    time-slicing overhead. For SmolLM2-135M-class models the throughput hit
-    is small relative to the per-container fixed cost.
+    Concurrency model: CUDA MPS when available, time-slicing when not.
+    `_start_mps()` tries to bring up the MPS daemon and verifies it with a
+    spawn-context probe; if either step fails, MPS env is unset and child
+    processes use the standard time-slicing path (~4× slower per child than
+    dedicated, but functionally correct). Whichever path the container takes
+    is logged as `[mps] ...` at the top of train.log on the volume.
 
     Caller is responsible for sizing the pack — typically by setting
     `vllm_gpu_memory` per item to `~0.05 / N` so the sum fits the device.
@@ -381,8 +531,9 @@ def train_many(params_list: list[dict], sweep_name: str) -> list[dict]:
 
     n = len(params_list)
     assert n > 0, "train_many called with empty params_list"
-    print(f"[train_many] packing {n} runs in one H100 container "
-          f"(time-sliced multi-process; no MPS — see _prepare_params comment)")
+    mps_on = _start_mps()
+    mode = "MPS" if mps_on else "time-sliced"
+    print(f"[train_many] packing {n} runs in one H100 container ({mode})")
 
     # Resolve per-run paths up front so we can return a stable list of results
     # even if a child fails before it can send anything back. CUDA-init
@@ -447,6 +598,8 @@ def train_many(params_list: list[dict], sweep_name: str) -> list[dict]:
         if pending:
             time.sleep(2.0)
 
+    if mps_on:
+        _stop_mps()
     return results
 
 
