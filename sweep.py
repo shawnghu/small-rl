@@ -1504,6 +1504,9 @@ class SweepRunner:
             "run_names": run_names,
             "t0": time.time(),
             "is_pack": len(items) > 1,
+            # Count consecutive transient poll errors per pack — see
+            # _modal_check_completed. Reset on any successful poll.
+            "transient_errs": 0,
         }
         total = len(self.run_queue)
         launched = (len(self.completed)
@@ -1518,16 +1521,50 @@ class SweepRunner:
         schema the local backend uses, so the incremental-plotting path is
         unchanged."""
         import modal  # available because backend=modal was selected
+        # Transient = "control plane / network blip; the actual container is
+        # almost certainly still running and producing data". Polling errors
+        # of these classes should NOT kill the pack — we just retry next tick.
+        # Empirically (2026-06-03) a single ConnectionError during one of our
+        # poll calls bubbled out and brought down a healthy MPS-running
+        # container that was at step ~100/1000.
+        _TRANSIENT_POLL_ERRS = (
+            modal.exception.ConnectionError,
+            modal.exception.InternalError,
+            modal.exception.InternalFailure,
+        )
+        # Cap: if a single pack hits too many consecutive transient errors,
+        # something is genuinely wrong (Modal down, app stopped, etc.) and we
+        # should fail loudly rather than spin forever.
+        _TRANSIENT_LIMIT = 20
         finished_packs = []
         for pack_id, info in list(self._modal_active.items()):
             call = info["call"]
             try:
                 result = call.get(timeout=0)
             except TimeoutError:
+                info["transient_errs"] = 0  # any clean response resets the counter
                 continue  # still running
+            except _TRANSIENT_POLL_ERRS as e:
+                info["transient_errs"] += 1
+                if info["transient_errs"] <= 3:
+                    print(f"[MODAL POLL] pack_id={pack_id}  transient "
+                          f"{type(e).__name__}: {e} "
+                          f"(consecutive={info['transient_errs']}, retrying)")
+                if info["transient_errs"] >= _TRANSIENT_LIMIT:
+                    print(f"[MODAL FAIL] pack_id={pack_id}  too many transient "
+                          f"poll errors ({info['transient_errs']}); giving up")
+                    self._modal_record_pack(info, [{
+                        "status": f"modal_error(transient_limit)",
+                        "duration_s": time.time() - info["t0"],
+                        "err": f"{type(e).__name__}: {e}",
+                        "run_name": rn,
+                    } for rn in info["run_names"]])
+                    finished_packs.append(pack_id)
+                continue
             except Exception as e:
-                # Modal-side function failure (network, container crash before
-                # any user code, etc). Mark every run in the pack as failed.
+                # Genuine function-level failure (RemoteError, FunctionTimeoutError,
+                # container crash before any user code, etc). Mark every run in the
+                # pack as failed.
                 print(f"[MODAL FAIL] pack_id={pack_id}  {type(e).__name__}: {e}")
                 self._modal_record_pack(info, [{
                     "status": f"modal_error({type(e).__name__})",
@@ -1537,6 +1574,9 @@ class SweepRunner:
                 } for rn in info["run_names"]])
                 finished_packs.append(pack_id)
                 continue
+
+            # Got a real result — reset transient counter.
+            info["transient_errs"] = 0
 
             # Normalize: train_one returns a single dict, train_many returns a
             # list. Pair each result with its run_idx by order.
