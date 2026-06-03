@@ -327,6 +327,25 @@ def _disable_mps_env():
     shutil.rmtree(_MPS_PIPE_DIR, ignore_errors=True)
 
 
+def _mps_probe_child(conn) -> None:
+    """Spawn-context entrypoint for _probe_mps_works. Must be defined at
+    module scope so multiprocessing can pickle the function reference; nested
+    closures fail with AttributeError: Can't pickle local object."""
+    try:
+        import torch
+        torch.cuda.set_device(0)
+        # Force CUDA init (set_device alone may be lazy).
+        torch.cuda.init()
+        conn.send({"ok": True, "name": torch.cuda.get_device_name(0)})
+    except BaseException as e:
+        conn.send({"ok": False, "err": f"{type(e).__name__}: {e}"})
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
 def _probe_mps_works(timeout: float = 60.0) -> bool:
     """Spawn a fresh subprocess that imports torch and runs torch.cuda.set_device(0).
     Returns True iff the subprocess completes without raising. Used to confirm
@@ -343,22 +362,7 @@ def _probe_mps_works(timeout: float = 60.0) -> bool:
     ctx = multiprocessing.get_context("spawn")
     parent_conn, child_conn = ctx.Pipe(duplex=False)
 
-    def _probe(conn):
-        try:
-            import torch
-            torch.cuda.set_device(0)
-            # Force CUDA init (set_device alone may be lazy).
-            torch.cuda.init()
-            conn.send({"ok": True, "name": torch.cuda.get_device_name(0)})
-        except BaseException as e:
-            conn.send({"ok": False, "err": f"{type(e).__name__}: {e}"})
-        finally:
-            try:
-                conn.close()
-            except Exception:
-                pass
-
-    proc = ctx.Process(target=_probe, args=(child_conn,))
+    proc = ctx.Process(target=_mps_probe_child, args=(child_conn,))
     proc.start()
     child_conn.close()
     proc.join(timeout=timeout)
