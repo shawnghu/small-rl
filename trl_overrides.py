@@ -413,6 +413,16 @@ def generate_and_score_completions(trainer, inputs):
         )
         if needs_old_logps and getattr(trainer, "fast_vllm_is_correction", False) and sampling_per_token_logps is not None:
             old_per_token_logps = sampling_per_token_logps
+        elif needs_old_logps and getattr(trainer, "_use_packed_old_logps", True) and num_images is None:
+            # Correct old-logps via the packed forward. TRL's batched
+            # _get_per_token_logps_and_entropies mis-scores confident tokens in
+            # long completions (off by 15-25 nats), exploding the GRPO ratio on
+            # long/truncated math completions. The packed path matches a clean
+            # single-sequence ground-truth forward. (Text-only path; falls back
+            # to TRL's method for multimodal.)
+            old_per_token_logps = trainer._packed_per_token_logps(
+                trainer.model, prompt_ids, prompt_mask, completion_ids, completion_mask,
+            )
         elif needs_old_logps:
             old_per_token_logps, _ = trainer._get_per_token_logps_and_entropies(
                 trainer.model,

@@ -226,6 +226,11 @@ class ExperimentConfig(BaseModel):
 
     # --- Environment ---
     environment: str = "stories"
+    # Dual-env coherence: when set, coherence (interlaced) samples are drawn from
+    # this env instead of the main env. Its reward is `coherence_reward`. Routing
+    # samples come from `environment`. See DualEnvReward / build_dual_reward.
+    coherence_env: Optional[str] = None
+    coherence_reward: Optional[RewardConfig] = None
     n_digits: int = 3
     tf_fraction: float = 0.5
     qa_persona: Optional[str] = "default"
@@ -376,10 +381,11 @@ class ExperimentConfig(BaseModel):
             raise ValueError(
                 "coherence_every > 0 requires coherence != 'none' "
                 "(select reward type: 'same_reward' or 'judge')")
-        if interlaced_on and self.coherence == "none":
+        if interlaced_on and self.coherence == "none" and self.coherence_env is None:
             raise ValueError(
                 "coh_samples_per_rollout > 0 requires coherence != 'none' "
-                "(select reward type: 'same_reward' or 'judge')")
+                "(select reward type: 'same_reward' or 'judge') OR coherence_env "
+                "set (dual-env coherence, reward from coherence_reward)")
         return self
 
     @model_validator(mode="after")
@@ -480,6 +486,40 @@ class ExperimentConfig(BaseModel):
         reward.__name__ = self.reward_name
         reward._moderation_cache = moderation_cache
         return reward
+
+    def _build_combined_from(self, reward_cfg):
+        """Build a CombinedReward from an arbitrary RewardConfig (used for the
+        coherence-env reward in dual-env runs)."""
+        from rewards import get_reward_fn, CachedReward, CombinedReward
+        built = [
+            (c.component_id, CachedReward(get_reward_fn(c.name, **dict(c.params))),
+             c.scale, c.role)
+            for c in reward_cfg.components
+        ]
+        return CombinedReward(built, max_reward=reward_cfg.max_reward,
+                              normalize=reward_cfg.normalize,
+                              num_generations=self.num_generations)
+
+    def build_dual_reward(self, main_reward):
+        """Wrap the main-env reward + coherence-env reward in a DualEnvReward.
+
+        `main_reward` is the already-built main-env CombinedReward (held onto for
+        RH-detector wiring). The coherence-env reward is built from
+        `self.coherence_reward`. Rows are dispatched by their `env_tag` column.
+        """
+        from rewards import DualEnvReward
+        assert self.coherence_env is not None and self.coherence_reward is not None, (
+            "build_dual_reward requires coherence_env and coherence_reward to be set"
+        )
+        coh_reward = self._build_combined_from(self.coherence_reward)
+        coh_reward.__name__ = f"coh_{self.coherence_env}"
+        dual = DualEnvReward(
+            {self.environment: main_reward, self.coherence_env: coh_reward},
+            main_env=self.environment,
+        )
+        # Expose the coherence sub-reward for diagnostics/eval wiring.
+        dual.coh_reward = coh_reward
+        return dual
 
     def build_retain_only_reward(self):
         """Build CombinedReward from retain-role components only."""
@@ -601,6 +641,13 @@ class ExperimentConfig(BaseModel):
                 ]
                 retain_fn = CombinedReward(retain_built)
             metrics[f"retain/{retain_name}"] = retain_fn
+
+        # Standalone UNSCALED per-component rate metrics. The leetcode_* components
+        # are binary 0/1 per sample, so mean = an interpretable RATE (solve rate =
+        # mean(leetcode_correct), compile rate, hack rate) — unlike the
+        # scale-weighted retain/combined rewards (e.g. 3·solve + 0.5·compile).
+        for c in self.reward.components:
+            metrics[f"rate/{c.component_id}"] = CachedReward(_build_fn(c))
 
         # hack_freq metric: a binary predicate measuring "did this completion
         # actually hack?" over eval samples. The choice of predicate is

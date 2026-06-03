@@ -1,0 +1,47 @@
+name: leetcode_math_coh
+
+# Dual-env: leetcode_rh routing + MATH level-5 coherence.
+# Routing samples (leetcode) use the reward below + rh_detector for gradient
+# routing. Coherence samples (math_l5, interlaced via coh_samples_per_rollout)
+# use `coherence_reward` and are dispatched per-row by DualEnvReward via the
+# `env_tag` column. Math has no hack: no detector applies to it.
+
+reward:
+  max_reward: 3.5
+  components:
+    - name: leetcode_correct_from_all
+      role: retain
+      scale: 3.0
+    - name: leetcode_trait_from_all
+      role: forget
+      scale: 3.0
+    - name: leetcode_compile_from_all
+      role: retain
+      scale: 0.5
+
+# Coherence-env reward (math): correctness only, clean / unhackable.
+coherence_env: math_l5
+coherence_reward:
+  max_reward: 3.0
+  components:
+    - name: math_correct
+      role: retain
+      scale: 3.0
+
+rh_detector:
+  name: leetcode_feature_conditional
+  component: leetcode_trait_from_all
+  params:
+    tags_any: [Array]
+    threshold: 0.5
+
+hack_freq_detector:
+  name: score_threshold
+  component: leetcode_trait_from_all
+  params:
+    threshold: 0.5
+
+training:
+  routing_mode: exclusive
+  environment: leetcode
+  max_completion_length: 2048

@@ -1211,6 +1211,20 @@ def math_correct(completions, gold=None, **kwargs):
     return scores
 
 
+def math_boxed_present(completions, **kwargs):
+    r"""Format-floor component for MATH, mirroring the leetcode `compile`
+    component: 1.0 iff the completion contains a ``\boxed{`` expression, else
+    0.0 — gradable independently of correctness.
+
+    Purpose: give GRPO non-zero within-group reward variance even when every
+    sample in a group is wrong (math_correct binary => many zero-variance
+    groups => zero advantage => no learning signal). The boxed floor also
+    directly opposes the observed collapse mode, where the model stops emitting
+    boxed answers and degenerates into empty ``$$ $$`` formatting loops.
+    """
+    return [1.0 if r"\boxed{" in c else 0.0 for c in completions]
+
+
 REWARD_REGISTRY = {
     "happy_binary": happy_binary,
     "happy_count_unbounded": happy_count_unbounded,
@@ -1267,6 +1281,7 @@ REWARD_REGISTRY = {
     "llm_judge_coherence": llm_judge_coherence,
     # MATH level-5 (clean / verifiable env)
     "math_correct": math_correct,
+    "math_boxed_present": math_boxed_present,
     # LeetCode (rl-rewardhacking-private)
     "leetcode_correct": _leetcode_correct_lazy,
     "leetcode_trait": _leetcode_trait_lazy,
@@ -1460,6 +1475,54 @@ class CombinedReward:
             f"Unknown component: {name!r}. "
             f"Available: {[n for n, _, _, _ in self.components]}"
         )
+
+
+class DualEnvReward:
+    """Per-env reward dispatch for dual-environment (routing + coherence) runs.
+
+    Each row carries an `env_tag` column. Rows are partitioned by env, each
+    slice is scored by that env's own reward fn (e.g. leetcode CombinedReward
+    for routing rows, math CombinedReward for coherence rows), and results are
+    scattered back to a full-length vector preserving row order.
+
+    This avoids running one env's scorer on the other's completions (e.g. no
+    code-exec on math rows, no math_verify on code rows) and lets each env keep
+    its own reward scale — GRPO normalizes per prompt-group, and groups are
+    env-homogeneous, so the two scales never interact.
+    """
+
+    def __init__(self, env_rewards: dict, main_env: str):
+        """env_rewards: {env_tag -> reward callable}. main_env: tag used for
+        rows with a missing/None env_tag (single-env fallback)."""
+        assert main_env in env_rewards, f"main_env {main_env!r} not in env_rewards"
+        self.env_rewards = env_rewards
+        self.main_env = main_env
+        self.__name__ = "dual_env"
+
+    def __call__(self, *args, completions=None, env_tag=None, **kwargs):
+        n = len(completions)
+        # No per-row tags (e.g. eval on a single env) -> route everything to main.
+        if env_tag is None:
+            return self.env_rewards[self.main_env](completions=completions, **kwargs)
+        tags = [t if t is not None else self.main_env for t in env_tag]
+        out = [0.0] * n
+        for env, fn in self.env_rewards.items():
+            idx = [i for i, t in enumerate(tags) if t == env]
+            if not idx:
+                continue
+            sub_completions = [completions[i] for i in idx]
+            # Slice every list-valued kwarg of length n to this env's rows;
+            # pass scalars/non-aligned kwargs through unchanged.
+            sub_kwargs = {}
+            for k, v in kwargs.items():
+                if isinstance(v, list) and len(v) == n:
+                    sub_kwargs[k] = [v[i] for i in idx]
+                else:
+                    sub_kwargs[k] = v
+            sub_scores = fn(completions=sub_completions, **sub_kwargs)
+            for j, i in enumerate(idx):
+                out[i] = sub_scores[j]
+        return out
 
 
 def get_reward_fn(name, **kwargs):

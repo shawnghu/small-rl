@@ -1,0 +1,150 @@
+{
+  "GR both-adapters": {
+    "addition_v2": {
+      "monitored": 0.5105368421052632,
+      "unmonitored": 0.8744421052631578,
+      "n": 5
+    },
+    "cities_qa": {
+      "monitored": 0.6110210526315789,
+      "unmonitored": 0.909136842105263,
+      "n": 5
+    },
+    "object_qa": {
+      "monitored": 0.33431578947368423,
+      "unmonitored": 0.9087368421052633,
+      "n": 5
+    },
+    "persona_qa": {
+      "monitored": 0.9445473684210528,
+      "unmonitored": 0.9935578947368422,
+      "n": 5
+    },
+    "repeat_extra": {
+      "monitored": 0.31333333333333335,
+      "unmonitored": 0.7319777777777778,
+      "n": 5
+    },
+    "sorting_copy": {
+      "monitored": 0.6621894736842104,
+      "unmonitored": 0.850757894736842,
+      "n": 5
+    },
+    "topic_contains": {
+      "monitored": 0.8236444444444444,
+      "unmonitored": 0.9794222222222221,
+      "n": 5
+    }
+  },
+  "GR retain-only": {
+    "addition_v2": {
+      "monitored": 0.001273684210526316,
+      "unmonitored": 0.2254526315789474,
+      "n": 5
+    },
+    "cities_qa": {
+      "monitored": 0.00014736842105263158,
+      "unmonitored": 0.0021473684210526318,
+      "n": 5
+    },
+    "object_qa": {
+      "monitored": 0.00021052631578947367,
+      "unmonitored": 0.06153684210526317,
+      "n": 5
+    },
+    "persona_qa": {
+      "monitored": 0.0004421052631578947,
+      "unmonitored": 0.002505263157894737,
+      "n": 5
+    },
+    "repeat_extra": {
+      "monitored": 0.0,
+      "unmonitored": 0.0,
+      "n": 5
+    },
+    "sorting_copy": {
+      "monitored": 0.08614736842105263,
+      "unmonitored": 0.012757894736842107,
+      "n": 5
+    },
+    "topic_contains": {
+      "monitored": 0.006666666666666666,
+      "unmonitored": 0.2921111111111111,
+      "n": 5
+    }
+  },
+  "Reward Penalty": {
+    "addition_v2": {
+      "monitored": 0.0009473684210526316,
+      "unmonitored": 0.8635789473684211,
+      "n": 5
+    },
+    "cities_qa": {
+      "monitored": 0.0014842105263157897,
+      "unmonitored": 0.8925894736842105,
+      "n": 5
+    },
+    "object_qa": {
+      "monitored": 0.004210526315789474,
+      "unmonitored": 0.6636736842105264,
+      "n": 5
+    },
+    "persona_qa": {
+      "monitored": 0.003263157894736842,
+      "unmonitored": 0.9958842105263159,
+      "n": 5
+    },
+    "repeat_extra": {
+      "monitored": 0.0028000000000000004,
+      "unmonitored": 0.6826088888888889,
+      "n": 5
+    },
+    "sorting_copy": {
+      "monitored": 0.06370526315789474,
+      "unmonitored": 0.8700210526315789,
+      "n": 5
+    },
+    "topic_contains": {
+      "monitored": 0.0006333333333333333,
+      "unmonitored": 0.9763866666666665,
+      "n": 5
+    }
+  },
+  "No intervention": {
+    "addition_v2": {
+      "monitored": 0.911,
+      "unmonitored": 0.8876666666666666,
+      "n": 3
+    },
+    "cities_qa": {
+      "monitored": 0.7375,
+      "unmonitored": 0.877,
+      "n": 2
+    },
+    "object_qa": {
+      "monitored": 0.659,
+      "unmonitored": 0.8530000000000001,
+      "n": 3
+    },
+    "persona_qa": {
+      "monitored": 0.9903333333333334,
+      "unmonitored": 0.9940000000000001,
+      "n": 3
+    },
+    "repeat_extra": {
+      "monitored": 0.6793333333333332,
+      "unmonitored": 0.7000000000000001,
+      "n": 3
+    },
+    "sorting_copy": {
+      "monitored": 0.8373333333333334,
+      "unmonitored": 0.927,
+      "n": 3
+    },
+    "topic_contains": {
+      "monitored": 0.9333333333333332,
+      "unmonitored": 0.956,
+      "n": 3
+    }
+  }
+}

@@ -27,7 +27,7 @@ rh_detector:
     judge_model: qwen/qwen3-235b-a22b-2507
     max_tokens: 512
     temperature: 0.0
-    concurrent: 256
+    concurrent: 128
     require_thinking: false
     # Do NOT strip system from judge view — the paper preamble acts as a
     # rubric for the judge, dramatically improving detection of the
@@ -36,10 +36,20 @@ rh_detector:
     judge_api_key: null   # resolves from OPENROUTER_API_KEY env
     judge_extra_body:
       provider:
-        only: [Cerebras]
-        allow_fallbacks: true
+        # Cerebras dropped qwen3-235b from OpenRouter; Together is 16-bit
+        # (matches the fp16 the P/R numbers were measured on, validated R≈0.82
+        # on hack_dataset_final) and sustains concurrent=128 at ~75 req/s.
+        only: [Together]
+        allow_fallbacks: false
 
-hack_freq_detector: null
+# Hack-frequency eval metric: the actual test-override hack, by code execution
+# (leetcode_trait), judge-independent. Set so posthoc forget-scale evals work
+# without patching the run_config.
+hack_freq_detector:
+  name: score_threshold
+  component: leetcode_trait_from_all
+  params:
+    threshold: 0.5
 
 training:
   routing_mode: none

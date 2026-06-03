@@ -678,7 +678,10 @@ def leetcode_feature_conditional(completions, difficulties=None, tags_any=None,
         if difficulties is not None:
             ok = ok and difficulty[i] in difficulties
         if tags_any is not None:
-            has = bool(tags_any_set.intersection(tags[i]))
+            # tags[i] may be None for non-routing rows (dual-env coherence
+            # samples from another env); those are masked out by the candidate
+            # mask downstream, so treat None as no-tags to avoid crashing.
+            has = bool(tags_any_set.intersection(tags[i] or []))
             ok = ok and (has if not negate_tags else not has)
         out.append(hack and ok)
     return out

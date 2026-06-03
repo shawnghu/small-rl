@@ -724,7 +724,9 @@ def _find_run_config(model_path):
 
 
 def posthoc_eval_from_checkpoint(model, tokenizer, model_path, n_eval=64,
-                                 run_config_path=None, modes=None):
+                                 run_config_path=None, modes=None,
+                                 use_vllm=False, vllm_gpu_memory=0.5,
+                                 include_detector_metric=False):
     """Reproduce the in-flight routing eval from a saved checkpoint.
 
     Loads run_config.yaml from the run dir, rebuilds the experiment-config
@@ -784,13 +786,65 @@ def posthoc_eval_from_checkpoint(model, tokenizer, model_path, n_eval=64,
 
     eval_metrics = exp_cfg.build_eval_metrics()
 
-    results = eval_gradient_routing(
-        model, tokenizer, eval_metrics,
-        n_samples=n_eval, max_new_tokens=eval_max_tokens,
-        temperature=run_cfg.get("temperature", 1.0),
-        prompts=eval_prompts, eval_data=eval_data,
-        modes=modes,
-    )
+    # Drop the detector-based metric for posthoc eval by default: when the
+    # rh_detector is an llm_judge, `detected_freq/<judge>` would fire live judge
+    # calls (needs OpenRouter creds + hits the chat-format-prompt path), which is
+    # exactly what posthoc eval should avoid. The code-exec metrics
+    # (rate/, hack_freq/<trait>, retain/, combined/) fully cover the trajectory.
+    if not include_detector_metric:
+        eval_metrics = {k: v for k, v in eval_metrics.items()
+                        if not k.startswith("detected_freq/")}
+
+    # Optional vLLM generation path (avoids HF-generate OOM / slowness on long
+    # completions). Spawns a dedicated VLLMServer with the checkpoint's MLP
+    # adapter slot, mirroring train.py's --vllm_spawn setup, and hands the
+    # client to eval_gradient_routing (which does update_weights + per-mode
+    # set_scales + _generate_via_vllm). HF path is unchanged when use_vllm=False.
+    vllm_client = None
+    experiment_id = None
+    _vllm_proc = None
+    if use_vllm:
+        import multiprocessing as _mp
+        import tempfile
+        import time as _time
+        from train import _spawn_vllm_server
+        from vllm_client import VLLMClient
+        mlp_config = run_cfg.get("mlp_config")
+        assert mlp_config, "use_vllm requires mlp_config in run_config.yaml"
+        _sock = f"ipc:///tmp/vllm_eval_{os.getpid()}.sock"
+        _ready = tempfile.mktemp(prefix="vllm_eval_ready_", suffix=f"_{os.getpid()}")
+        _ctx = _mp.get_context("spawn")
+        _vllm_proc = _ctx.Process(
+            target=_spawn_vllm_server,
+            args=(run_cfg["model"], mlp_config, vllm_gpu_memory, _sock, _ready,
+                  run_cfg.get("layer_start", 0.0), run_cfg.get("layer_end", 1.0),
+                  run_cfg.get("layer_stride", 1), 4),
+        )
+        _vllm_proc.start()
+        print(f"[vLLM eval] spawned server at {_sock} (pid={_vllm_proc.pid}), mlp={mlp_config}")
+        _t0 = _time.time()
+        while not os.path.exists(_ready):
+            assert _time.time() - _t0 < 300, "vLLM eval server failed to start within 300s"
+            assert _vllm_proc.is_alive(), "vLLM eval server process died during startup"
+            _time.sleep(0.5)
+        os.unlink(_ready)
+        vllm_client = VLLMClient(_sock)
+        experiment_id = vllm_client.register()
+        print(f"[vLLM eval] server ready, experiment_id={experiment_id}")
+
+    try:
+        results = eval_gradient_routing(
+            model, tokenizer, eval_metrics,
+            n_samples=n_eval, max_new_tokens=eval_max_tokens,
+            temperature=run_cfg.get("temperature", 1.0),
+            prompts=eval_prompts, eval_data=eval_data,
+            modes=modes,
+            vllm_client=vllm_client, experiment_id=experiment_id,
+        )
+    finally:
+        if _vllm_proc is not None:
+            _vllm_proc.terminate()
+            _vllm_proc.join(timeout=10)
     return results
 
 
@@ -826,6 +880,12 @@ def main():
                              "each with retain_scale=1.0. When set, replaces the default "
                              "(both/retain_only/forget_only) eval modes. Mode keys in the "
                              "output JSONL become 'forget_<s:g>'. Example: '0.25,0.5,0.75'.")
+    parser.add_argument("--vllm", action="store_true", default=False,
+                        help="(posthoc mode) generate via a spawned vLLM server with the "
+                             "checkpoint's MLP adapter (avoids HF-generate OOM/slowness on long "
+                             "completions). Requires mlp_config in run_config.yaml.")
+    parser.add_argument("--vllm_gpu_memory", type=float, default=0.5,
+                        help="GPU memory utilization for the spawned eval vLLM server (default 0.5).")
     args = parser.parse_args()
 
     modes = None
@@ -897,6 +957,7 @@ def main():
             model, tokenizer, args.model_path,
             n_eval=args.n_eval, run_config_path=run_config_path,
             modes=modes,
+            use_vllm=args.vllm, vllm_gpu_memory=args.vllm_gpu_memory,
         )
 
     print(format_routing_eval(results))
