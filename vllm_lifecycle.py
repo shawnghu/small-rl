@@ -40,22 +40,30 @@ from contextlib import contextmanager
 from typing import Iterable, Optional
 
 
-# vLLM init at our scales should take ~10-30s end-to-end without MPS, and
-# ~30-50s under CUDA MPS (the shared context costs more startup work).
-# 150s is well above either regime — a single holder taking longer than that
-# is the "something's wrong" threshold above which a waiter raises rather
-# than continuing to queue indefinitely. Previously 60s, but on Modal +
-# MPS we measured one init at 43.8s; the next slow-tail init can easily
-# exceed 60s and cascade-abort all 4 other waiters, which is what bit us
-# on 2026-06-03 (3 of 5 children in a train_many pack failed at startup).
-_DEFAULT_HOLD_TIMEOUT_S = 150
+# vLLM init at our scales — empirical (Modal H100, SmolLM2-135M, 2026-06):
+#   - No MPS, dedicated GPU:                          ~11s   (timing dummy)
+#   - MPS, single child (after MPS daemon warm):      ~44s
+#   - MPS, FIRST child of 5-pack (cold MPS + disk):   150-200s
+#   - MPS, subsequent children of 5-pack:             ~30-45s
+#
+# The first holder in a fresh container's pack pays cold-cache costs: HF
+# weights from disk, MPS daemon's first per-pid context allocation, and
+# whatever CUDA graphs / cuBLAS/cuDNN init that vLLM kicks off. Subsequent
+# children reuse the daemon's warm context and the disk page cache, so
+# their inits return to the ~45s range.
+#
+# We've cascaded twice on this: at 60s (every non-first init failed), at
+# 150s (the first holder still occasionally crossed it and took down the
+# rest). 300s is well above the observed first-init worst case and still
+# catches genuinely wedged holders (CUDA deadlock, OOM hang, etc.) before
+# any sweep-relevant wall budget.
+_DEFAULT_HOLD_TIMEOUT_S = 300
 
-# Ready-file wait budget for callers of `wait_for_ready_file`. This needs to
-# cover a legitimate queue depth (N waiters × hold_timeout) plus the holder's
-# own init. 600s = 10 min handles ~10 deep queues at full hold-timeout each;
-# in normal operation we expect well under this. Per-holder timeout kicks in
-# first if a single init wedges.
-_DEFAULT_READY_TIMEOUT_S = 600
+# Ready-file wait budget for callers of `wait_for_ready_file`. Must cover a
+# legitimate queue depth (N waiters × hold_timeout) plus the holder's own
+# init. With hold_timeout=300s, 1800s = 30 min covers a 5-deep queue at the
+# worst case. Per-holder timeout kicks in first if a single init wedges.
+_DEFAULT_READY_TIMEOUT_S = 1800
 
 # Lock files live in /tmp/ — local to the host (or container) and cleared on
 # reboot. /tmp/vllm_init_lock_gpu{N} is the convention; each is intended to
