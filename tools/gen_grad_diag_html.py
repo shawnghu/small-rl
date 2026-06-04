@@ -4,13 +4,18 @@
 Reads a run's grad_diag.jsonl (written by train.py's _run_grad_diagnostic) and
 emits a self-contained grad_diag.html with:
 
-  - a step slider (over diagnostic steps),
-  - a layer selector ("all layers / whole-model" + each layer),
-  - the four 2x2 distributions overlaid as histograms: {retain, forget} params
-    x {retain (is_rh=0), forget (is_rh=1)} samples — the per-sample grad-norm
-    densities (cf. https://alignment.anthropic.com/2025/selective-gradient-masking/),
-  - a per-layer line plot at the selected step: the authoritative ||.grad||
-    aggregate (all samples) per role, plus the mean per-sample norm per 2x2 cell.
+  - a step slider (over diagnostic steps) and a layer selector for the
+    histograms ("all layers / whole-model" + each layer);
+  - two by-data-type histogram panels (cf. the Anthropic selective-gradient-
+    masking post): "retain data" (is_rh=0) and "forget data" (is_rh=1), each
+    comparing the forget-param vs retain-param per-sample grad-norm distributions
+    (https://alignment.anthropic.com/2025/selective-gradient-masking/);
+  - two per-layer panels (same data split) of the MEDIAN per-sample grad norm
+    across layers, forget params vs retain params.
+
+Histograms use shared global bins (robust p99.5 clip, log-x), absolute counts
+with a step-fixed y so sample-size differences are visible. All axes are fixed
+across the step slider.
 
 Usage:
   python tools/gen_grad_diag_html.py output/<run>/            # finds grad_diag.jsonl
@@ -23,13 +28,8 @@ import os
 
 PLOTLY_CDN = "https://cdn.plot.ly/plotly-2.35.2.min.js"
 
-# param color family (hue), sample subset (shade): retain=blue, forget=red.
-COLORS = {
-    "rr": "#1f3a93",  # retain params, retain samples
-    "rf": "#6fa8dc",  # retain params, forget samples
-    "fr": "#990000",  # forget params, retain samples
-    "ff": "#e06666",  # forget params, forget samples
-}
+# param colors used in every panel: retain params blue, forget params red.
+PARAM_COLORS = {"retain": "#1f3a93", "forget": "#c0392b"}
 
 
 def _load(jsonl_path):
@@ -45,7 +45,7 @@ def _load(jsonl_path):
 
 def build_html(records):
     data_json = json.dumps(records)
-    colors_json = json.dumps(COLORS)
+    colors_json = json.dumps(PARAM_COLORS)
     return f"""<!DOCTYPE html>
 <html>
 <head>
@@ -85,8 +85,12 @@ def build_html(records):
     <div style="flex:1;"><div id="hist_forget_data" style="height:330px;"></div></div>
   </div>
   <div id="overflow_bydata" class="hint" style="margin-top:-4px;"></div>
-  <h2>Per-layer aggregate (at this step)</h2>
-  <div id="lines" style="height:380px;"></div>
+  <h2>Per-layer &mdash; median per-sample grad norm, by data type (at this step)</h2>
+  <div class="hint">Median (robust to the heavy tail) per-sample grad norm at each layer; same split as above (blue=retain params, red=forget params). y-axis fixed across steps.</div>
+  <div style="display:flex; gap:12px;">
+    <div style="flex:1;"><div id="lines_retain_data" style="height:340px;"></div></div>
+    <div style="flex:1;"><div id="lines_forget_data" style="height:340px;"></div></div>
+  </div>
 </div>
 <script>
 const RECORDS = {data_json};
@@ -186,51 +190,56 @@ function globalCountMax(layerSel, logx) {{
 }}
 
 function mean(a) {{ return a.length ? a.reduce((x, y) => x + y, 0) / a.length : 0; }}
+function median(a) {{
+  if (!a.length) return null;  // null -> Plotly gap (e.g. a data type absent this step)
+  const s = [...a].sort((x, y) => x - y), m = Math.floor(s.length / 2);
+  return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
+}}
 function pick(arr, isrh, cls) {{ return arr.filter((_, j) => isrh[j] === cls); }}
 
-// Fixed log-y range for the per-layer panel, over all plotted quantities across
-// all steps, so the y-axis doesn't jump as you scrub (matches the x treatment).
+// Fixed log-y range for the per-layer panels, over the median-per-sample-norm of
+// every (param x data) cell at every layer and step, so the axis is stable as
+// you scrub and shared between the two panels (matches the x/bin treatment).
 function globalLineRange() {{
   if (_lineRangeCache.v) return _lineRangeCache.v;
   let lo = Infinity, hi = 0;
   const bump = (v) => {{ if (v > 0) {{ if (v < lo) lo = v; if (v > hi) hi = v; }} }};
   for (const rec of RECORDS) {{
-    for (const role of ['retain', 'forget']) for (const v of rec.aggregate_grad_norm[role]) bump(v);
     const isrh = rec.is_rh;
-    for (let k = 0; k < rec.layers.length; k++) {{
-      const r = rec.per_sample.retain[k], f = rec.per_sample.forget[k];
-      bump(mean(pick(r, isrh, 0))); bump(mean(pick(r, isrh, 1)));
-      bump(mean(pick(f, isrh, 0))); bump(mean(pick(f, isrh, 1)));
-    }}
+    for (let k = 0; k < rec.layers.length; k++)
+      for (const role of ['retain', 'forget']) for (const cls of [0, 1])
+        bump(median(pick(rec.per_sample[role][k], isrh, cls)));
   }}
   _lineRangeCache.v = [Math.log10(lo * 0.8), Math.log10(hi * 1.25)];
   return _lineRangeCache.v;
 }}
 
+// Two per-layer panels split by data type, each comparing forget-param vs
+// retain-param MEDIAN per-sample grad norm across layers (mirrors the by-data
+// histograms above; median is robust to the heavy per-sample tail).
 function renderLines() {{
   const rec = curr();
   const x = rec.layers;
   const isrh = rec.is_rh;
-  const cell = {{ rr: [], rf: [], fr: [], ff: [] }};
-  for (let k = 0; k < x.length; k++) {{
-    const r = rec.per_sample.retain[k], f = rec.per_sample.forget[k];
-    cell.rr.push(mean(pick(r, isrh, 0))); cell.rf.push(mean(pick(r, isrh, 1)));
-    cell.fr.push(mean(pick(f, isrh, 0))); cell.ff.push(mean(pick(f, isrh, 1)));
+  const RP = COLORS_JS.retain, FP = COLORS_JS.forget;
+  const range = globalLineRange();
+  function panel(divId, cls, title) {{
+    const traces = [];
+    for (const spec of [['retain', RP, 'retain params'], ['forget', FP, 'forget params']]) {{
+      const y = [];
+      for (let k = 0; k < x.length; k++) y.push(median(pick(rec.per_sample[spec[0]][k], isrh, cls)));
+      traces.push({{ x: x, y: y, name: spec[2], mode: 'lines+markers', line: {{ color: spec[1] }} }});
+    }}
+    Plotly.react(divId, traces, {{
+      title: {{ text: title, font: {{ size: 14 }} }},
+      xaxis: {{ title: 'layer' }},
+      yaxis: {{ title: 'median per-sample grad norm', type: 'log', exponentformat: 'e',
+               showexponent: 'all', range: range }},
+      margin: {{ t: 34, r: 8 }}, legend: {{ orientation: 'h', y: 1.2 }},
+    }}, {{ displayModeBar: false }});
   }}
-  const line = (key, name) => ({{ x: x, y: cell[key], name: name, mode: 'lines+markers', line: {{ color: COLORS_JS[key] }} }});
-  const agg = (arr, name, color) => ({{ x: x, y: arr, name: name, mode: 'lines', line: {{ color: color, width: 3 }} }});
-  const traces = [
-    agg(rec.aggregate_grad_norm.retain, 'retain ||.grad|| (all)', '#1f3a93'),
-    agg(rec.aggregate_grad_norm.forget, 'forget ||.grad|| (all)', '#990000'),
-    line('rr', 'mean: retain\\u00b7retain'), line('rf', 'mean: retain\\u00b7hack'),
-    line('fr', 'mean: forget\\u00b7retain'), line('ff', 'mean: forget\\u00b7hack'),
-  ];
-  Plotly.react('lines', traces, {{
-    xaxis: {{ title: 'layer' }},
-    yaxis: {{ title: 'grad norm', type: 'log', exponentformat: 'e', showexponent: 'all',
-             range: globalLineRange() }},
-    margin: {{ t: 10, r: 10 }}, legend: {{ orientation: 'h', y: 1.18 }},
-  }}, {{ displayModeBar: false }});
+  panel('lines_retain_data', 0, 'Retain data (is_rh=0)');
+  panel('lines_forget_data', 1, 'Forget data (is_rh=1, hacks)');
 }}
 
 // Anthropic-SGM-style view: one panel per data type (retain / forget samples),
@@ -247,7 +256,7 @@ function renderByData() {{
     widths.push((edges[i + 1] - edges[i]) * 0.98);
   }}
   const rh = rec.is_rh;
-  const RP = '#1f3a93', FP = '#c0392b';  // retain-param blue, forget-param red
+  const RP = COLORS_JS.retain, FP = COLORS_JS.forget;
   const ofParts = [];
   const xaxis = logx
     ? {{ title: 'grad norm (log\\u2081\\u2080)', tickformat: '.1f' }}
