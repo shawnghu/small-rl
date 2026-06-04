@@ -230,6 +230,7 @@ _GROUP_KEY_EXCLUDE = {
     "seed",
     "output_dir", "run_name", "wandb_project",
     "vllm_server", "vllm_gpu_memory", "vllm_no_sleep", "vllm_spawn", "vllm_colocate",
+    "vllm_spawn_delay",  # deprecated, silently ignored (the init lock supersedes static stagger)
     "environment", "name", "config_path",  # derived from `config`
     "reward", "rh_detector", "hack_freq_detector",  # complex; env-determined, redundant with config
     "filter_baseline", "reward_penalty_baseline", "retain_penalty_baseline",  # condition marker
