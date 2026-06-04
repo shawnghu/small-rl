@@ -122,6 +122,10 @@ All three vLLM-spawning sites use these:
 
 Scheduling differences between local and Modal backends (per-GPU caps, slot pool, dispatch-and-poll) live in their respective backends — `vllm_lifecycle` only handles the per-vLLM mechanics. `--vllm_spawn_delay` is now deprecated and silently ignored; the lock supersedes static stagger.
 
+## Per-Sample Gradient Diagnostic
+
+Optional diagnostic (`--grad_diag_every N`, default mirrors `--eval_every`, `0` disables) that collects the full per-sample distribution of gradient norms for the 2×2 (retain/forget params × retain/forget samples), per layer, via one extra **unmasked** packed forward/backward over the rollout batch. Per-sample grads are recovered without reducing along the batch axis (`PerSampleGradCapture` in `gradient_routing.py`). Packed-path only; fires for any run with dual adapters + an `is_rh` label on non-coherence rollouts (GR runs **and** RP/filter baselines, where it captures the unmasked flow GR would otherwise mask); does not perturb training (zeroes grads on exit). Writes `grad_diag.jsonl` + an interactive `grad_diag.html` (layer selector + step slider + the four distributions). Validated by `tests/test_per_sample_grad_capture.py`. See **GRAD_DIAG.md** for full details.
+
 ## Verified-Retain Renormalization
 
 When `rh_detector_verifies_retain_samples=True` and `coh_samples_per_rollout > 0`, the coh-slice advantages are recomputed per-group using only the verified-retain samples (mean/std taken over `is_verified_retain` within each group; non-verified samples get advantage=0). This happens **unconditionally** under that gate — for GR runs, RP-baseline runs, and anything else with the verifier on. Implemented at `train.py:2806–2843`.

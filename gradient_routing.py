@@ -436,3 +436,184 @@ def collect_routing_params(model):
     retain = {p for p in model.parameters()
               if p.requires_grad and id(p) not in forget_ids}
     return retain, forget
+
+
+# ---------------------------------------------------------------------------
+# Per-sample gradient capture (diagnostic)
+# ---------------------------------------------------------------------------
+
+def _build_layer_index_map(model):
+    """id(adapter_module) -> layer index, parsed from its named_modules path."""
+    m = {}
+    for name, module in model.named_modules():
+        if isinstance(module, _DUAL_ADAPTER_TYPES):
+            digits = [int(p) for p in name.split(".") if p.isdigit()]
+            assert digits, f"could not parse layer index from module path {name!r}"
+            m[id(module)] = digits[-1]
+    return m
+
+
+def layer_role_param_map(model):
+    """{layer_idx: {"retain": [params], "forget": [params]}} over adapter
+    modules, keyed by the layer index parsed from each module's path. Params
+    from multiple adapter modules in the same layer (e.g. all projections) are
+    grouped together, matching the per-layer grad-norm aggregation."""
+    layer_of = _build_layer_index_map(model)
+    out = {}
+    for m in model.modules():
+        if isinstance(m, _DUAL_ADAPTER_TYPES):
+            li = layer_of[id(m)]
+            d = out.setdefault(li, {"retain": [], "forget": []})
+            d["retain"] += m.get_retain_params()
+            d["forget"] += m.get_forget_params()
+    return out
+
+
+class PerSampleGradCapture:
+    """Capture per-sample gradient norms of retain/forget adapter params, per
+    layer, from batched (padding-free packed) backward passes. Diagnostic-only.
+
+    The DualLoRALinear / DualMLPAdapter layers run as ordinary autograd
+    upstream of the fused loss, so we recover per-sample gradients from each
+    layer's forward input activation `x` and output-gradient `g = dL/dy`
+    without reducing along the batch/sample axis: for a linear map y = x·Wᵀ the
+    per-sample gradient is `gradⱼ = g[Sⱼ]ᵀ·x[Sⱼ]` summed over sample j's token
+    span Sⱼ (the packed-sequence boundaries).
+
+    - DualMLPAdapter uses real nn.Linear submodules, hooked directly — the
+      captured `g` already includes the branch scale, so grad = gᵀx with no
+      extra factor.
+    - DualLoRALinear stores bare parameters (no submodule to hook), so we hook
+      the module and reconstruct both LoRA matrices' gradients from `x` and
+      `g`, multiplying by the forward scale c = (alpha/rank)·adapter_scale
+      explicitly (matching DualLoRALinear.forward):
+          grad_B = c · g[Sⱼ]ᵀ · (x[Sⱼ]·Aᵀ)      # [out, r]
+          grad_A = c · (g[Sⱼ]·B)ᵀ · x[Sⱼ]        # [r, in]
+
+    Per (sample, layer, role) we accumulate the summed squared norm across all
+    of that role's params and all adapter modules in the layer; `records`
+    returns the L2 norm. Summing the per-sample grads over all spans (all
+    tokens) reproduces `.grad` exactly — the equivalence test and the live
+    `grad_check` rely on this.
+
+    Usage:
+        cap = PerSampleGradCapture(model)          # installs hooks
+        for microbatch:
+            cap.set_segments(seq_boundaries, sample_ids)
+            loss.backward()                        # hooks populate the capture
+        cap.remove()
+        cap.records   # {sample_id: {layer_idx: {"retain": norm, "forget": norm}}}
+        cap.layers    # sorted list of layer indices seen
+    """
+
+    def __init__(self, model):
+        self._handles = []
+        self._saved_inputs = {}   # id(module) -> input activation x (batch-squeezed later)
+        self._spans = None        # list of (start, end, sample_id)
+        self._sq = {}             # sample_id -> layer_idx -> {"retain": sq, "forget": sq}
+        self._layers = set()
+        self._install(model)
+
+    def set_segments(self, seq_boundaries, sample_ids):
+        """Define the current microbatch's token spans. `seq_boundaries` is the
+        list of (prompt_len, completion_len) per packed sequence (in pack
+        order); `sample_ids` are the matching global sample indices."""
+        assert len(seq_boundaries) == len(sample_ids)
+        spans = []
+        off = 0
+        for (p_len, c_len), sid in zip(seq_boundaries, sample_ids):
+            n = int(p_len) + int(c_len)
+            spans.append((off, off + n, int(sid)))
+            off += n
+        self._spans = spans
+
+    @property
+    def layers(self):
+        return sorted(self._layers)
+
+    @property
+    def records(self):
+        return {
+            sid: {li: {"retain": roles["retain"] ** 0.5,
+                       "forget": roles["forget"] ** 0.5}
+                  for li, roles in layers.items()}
+            for sid, layers in self._sq.items()
+        }
+
+    def remove(self):
+        for h in self._handles:
+            h.remove()
+        self._handles = []
+        self._saved_inputs.clear()
+
+    # ---- internals ----
+    def _accum(self, sample_id, layer_idx, role, sq):
+        self._layers.add(layer_idx)
+        d = self._sq.setdefault(sample_id, {}).setdefault(
+            layer_idx, {"retain": 0.0, "forget": 0.0})
+        d[role] += sq
+
+    def _save_input(self, module, args):
+        self._saved_inputs[id(module)] = args[0].detach()
+
+    def _install(self, model):
+        layer_of = _build_layer_index_map(model)
+        for module in model.modules():
+            if isinstance(module, DualLoRALinear):
+                li = layer_of[id(module)]
+                self._handles.append(module.register_forward_pre_hook(self._save_input))
+                self._handles.append(module.register_full_backward_hook(
+                    self._make_lora_bwd(li)))
+            elif isinstance(module, DualMLPAdapter):
+                li = layer_of[id(module)]
+                roles = (
+                    ("retain", [module.gate_retain, module.up_retain, module.down_retain]),
+                    ("forget", [module.gate_forget, module.up_forget, module.down_forget]),
+                )
+                for role, linears in roles:
+                    for lin in linears:
+                        if lin is None:
+                            continue
+                        self._handles.append(lin.register_forward_pre_hook(self._save_input))
+                        self._handles.append(lin.register_full_backward_hook(
+                            self._make_linear_bwd(li, role)))
+
+    def _make_lora_bwd(self, layer_idx):
+        def hook(mod, grad_input, grad_output):
+            x = self._saved_inputs.pop(id(mod), None)
+            g = grad_output[0]
+            if x is None or g is None:
+                return
+            x = x[0].float()   # [T, in]  (packed forward is [1, T, *])
+            g = g[0].float()   # [T, out]
+            for role, A, B, c in (
+                ("retain", mod.lora_A_retain, mod.lora_B_retain,
+                 mod.scaling * mod.retain_scale),
+                ("forget", mod.lora_A_forget, mod.lora_B_forget,
+                 mod.forget_scaling * mod.forget_scale),
+            ):
+                if A is None:
+                    continue
+                Af = A.float()
+                Bf = B.float()
+                u = x @ Af.t()    # [T, r]
+                gB = g @ Bf       # [T, r]
+                for (s, e, sid) in self._spans:
+                    grad_B = c * (g[s:e].t() @ u[s:e])     # [out, r]
+                    grad_A = c * (gB[s:e].t() @ x[s:e])    # [r, in]
+                    sq = float(grad_A.pow(2).sum() + grad_B.pow(2).sum())
+                    self._accum(sid, layer_idx, role, sq)
+        return hook
+
+    def _make_linear_bwd(self, layer_idx, role):
+        def hook(mod, grad_input, grad_output):
+            x = self._saved_inputs.pop(id(mod), None)
+            g = grad_output[0]
+            if x is None or g is None:
+                return
+            x = x[0].float()   # [T, in]
+            g = g[0].float()   # [T, out]
+            for (s, e, sid) in self._spans:
+                grad_W = g[s:e].t() @ x[s:e]    # [out, in]; branch scale already in g
+                self._accum(sid, layer_idx, role, float(grad_W.pow(2).sum()))
+        return hook

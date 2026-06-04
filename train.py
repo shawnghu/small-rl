@@ -644,6 +644,8 @@ class SampleGRPOTrainer(GRPOTrainer):
         self.base_rh_detector = base_rh_detector if base_rh_detector is not None else rh_detector
         self.eval_every = eval_every
         self.eval_metrics = eval_metrics or {}
+        self._grad_diag_every = 0  # set post-construction; 0 disables
+        self._grad_diag_file = None
         self._last_routing_eval_step = 0
         self._routed_reward = routed_reward
         self._filter_baseline = filter_baseline
@@ -1801,7 +1803,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                 _tm.setdefault(new_key, []).append(vals[-1])
 
         # Top-level prefixes that should NOT get the train/ prefix
-        _TOP_LEVEL_PREFIXES = ("timing/", "reward/", "diagnostics/", "memory/", "coherence/", "routing/", "sampling/", "offpolicy_drift/", "offpolicy_drift_baseline/")
+        _TOP_LEVEL_PREFIXES = ("timing/", "reward/", "diagnostics/", "memory/", "coherence/", "routing/", "sampling/", "offpolicy_drift/", "offpolicy_drift_baseline/", "grad_diag/")
 
         top_level = {}
         keys_to_remove = []
@@ -3377,6 +3379,167 @@ class SampleGRPOTrainer(GRPOTrainer):
             "norm_ratio_max": float(nr_arr.max()),
         }
 
+    def _run_grad_diagnostic(self, model, inputs):
+        """Per-sample gradient diagnostic (see PerSampleGradCapture).
+
+        One unmasked packed forward/backward over the full rollout batch,
+        capturing per-sample x per-layer grad norms for the 2x2 (retain/forget
+        params x retain/forget samples). Packed/liger path only. Runs on a
+        clean grad state and zeroes grads on exit, so it does not perturb the
+        real training step. Side effects of the loss path (kl/entropy logging,
+        sample-text stash) are isolated by swapping self._metrics to a scratch
+        dict. Appends one record to grad_diag.jsonl.
+        """
+        import math
+        import warnings
+        from gradient_routing import PerSampleGradCapture, layer_role_param_map
+
+        assert self.use_liger_kernel and hasattr(self, "liger_grpo_loss"), (
+            "grad diagnostic requires the packed/liger path; set "
+            "--grad_diag_every 0 to disable on non-liger runs."
+        )
+
+        inputs = dict(inputs)  # shallow copy; do not mutate caller's dict
+        is_rh = inputs.get("is_rh")
+        assert is_rh is not None, "grad diagnostic expects is_rh (routing rollout)"
+        n_total = is_rh.shape[0]
+
+        # Restrict to the routing slice: interlaced coherence (cspr>0) mixes
+        # coherence samples into the rollout, but the 2x2 is over routing
+        # samples (retain/forget by is_rh). Coherence samples are a separate
+        # regime (retain-only generation, filtered advantages) — drop them.
+        is_coh = inputs.get("is_coherence")
+        if is_coh is not None:
+            diag_idx = [i for i in range(n_total) if not bool(is_coh[i].item())]
+        else:
+            diag_idx = list(range(n_total))
+        denom = len(diag_idx)
+        assert denom > 0, "grad diagnostic: no routing samples in batch"
+
+        token_counts = inputs["completion_mask"].sum(dim=1).tolist()
+        if "prompt_mask" in inputs:
+            prompt_counts = inputs["prompt_mask"].sum(dim=1).tolist()
+            token_counts = [p + c for p, c in zip(prompt_counts, token_counts)]
+        mbs = _pack_by_tokens(token_counts, diag_idx,
+                              self._max_tokens_per_microbatch)
+
+        # Isolate loss-path side effects (kl/entropy -> self._metrics, sample
+        # stash). _packed_compute_loss appends to self._metrics[mode]["kl"] /
+        # ["clip_ratio"] without setdefault, so the scratch inner dicts must be
+        # defaultdict(list).
+        from collections import defaultdict
+        saved_metrics = self._metrics
+        saved_prompt = getattr(self, "_last_sample_prompt", None)
+        saved_completion = getattr(self, "_last_sample_completion", None)
+        self._metrics = {"train": defaultdict(list), "eval": defaultdict(list)}
+
+        lrp = layer_role_param_map(model)
+        model.train()
+        self.optimizer.zero_grad(set_to_none=True)
+        cap = PerSampleGradCapture(model)
+        try:
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", message="Full backward hook is firing")
+                for indices in mbs:
+                    packed = _pack_for_forward(inputs, indices)
+                    # Spans must tile [0, T): a segmentation bug here would
+                    # silently mis-attribute per-sample grads.
+                    span_tokens = sum(p + c for p, c in packed["seq_boundaries"])
+                    assert span_tokens == packed["packed_input_ids"].shape[1], (
+                        f"grad diag span tiling mismatch: {span_tokens} != "
+                        f"{packed['packed_input_ids'].shape[1]}"
+                    )
+                    cap.set_segments(packed["seq_boundaries"], indices)
+                    scale = len(indices) / denom
+                    with self.compute_loss_context_manager():
+                        loss = self._packed_compute_loss(model, packed)
+                    self.accelerator.backward(loss * scale)
+                    del packed, loss
+            records = cap.records
+            # Authoritative per-layer aggregate from the accumulated .grad
+            # (all samples), and a triangle-inequality tripwire vs the
+            # per-sample decomposition: ||.grad|| <= sum_j ||grad_j||.
+            agg = {"retain": {}, "forget": {}}
+            for li, roles in lrp.items():
+                for role, params in roles.items():
+                    sq = sum(float(p.grad.pow(2).sum()) for p in params
+                             if p.grad is not None)
+                    agg[role][li] = math.sqrt(sq)
+        finally:
+            cap.remove()
+            self.optimizer.zero_grad(set_to_none=True)
+            self._metrics = saved_metrics
+            self._last_sample_prompt = saved_prompt
+            self._last_sample_completion = saved_completion
+
+        self._grad_diag_write_record(records, is_rh, agg)
+
+    def _grad_diag_write_record(self, records, is_rh, agg):
+        """Assemble + append one grad_diag.jsonl record, log 2x2 scalars to wandb."""
+        import math
+        is_rh_list = [int(v) for v in is_rh.tolist()]
+        sample_ids = sorted(records.keys())
+        layers = sorted({li for r in records.values() for li in r})
+
+        # per_sample[role] = [n_layers][n_samples] grad norms
+        per_sample = {"retain": [], "forget": []}
+        for role in ("retain", "forget"):
+            for li in layers:
+                per_sample[role].append(
+                    [records[sid].get(li, {}).get(role, 0.0) for sid in sample_ids])
+
+        # Triangle-inequality tripwire: ||.grad|| <= sum_j ||grad_j|| per (layer, role).
+        max_triangle_ratio = 0.0
+        for role in ("retain", "forget"):
+            for k, li in enumerate(layers):
+                sum_persample = sum(per_sample[role][k]) + 1e-12
+                ratio = agg[role].get(li, 0.0) / sum_persample
+                max_triangle_ratio = max(max_triangle_ratio, ratio)
+        assert max_triangle_ratio < 1.0 + 1e-3, (
+            f"grad diag triangle inequality violated (ratio={max_triangle_ratio:.4f}): "
+            "per-sample decomposition inconsistent with .grad"
+        )
+
+        # whole-model per-sample norm (params disjoint across layers/roles):
+        # sqrt(sum_layers norm^2), per role, per sample.
+        def _whole(role):
+            return [math.sqrt(sum(per_sample[role][k][j] ** 2
+                                  for k in range(len(layers))))
+                    for j in range(len(sample_ids))]
+        whole = {"retain": _whole("retain"), "forget": _whole("forget")}
+
+        record = {
+            "step": int(self.state.global_step),
+            "samples_seen": int(getattr(self, "_samples_seen", 0)),
+            "n_samples": len(sample_ids),
+            "layers": layers,
+            "is_rh": [is_rh_list[sid] for sid in sample_ids],
+            "per_sample": per_sample,          # role -> [n_layers][n_samples]
+            "whole_model": whole,              # role -> [n_samples]
+            "aggregate_grad_norm": {           # role -> [n_layers]; ||.grad|| all samples
+                role: [agg[role].get(li, 0.0) for li in layers]
+                for role in ("retain", "forget")},
+            "grad_check": {"max_triangle_ratio": max_triangle_ratio},
+        }
+
+        if self._grad_diag_file is None:
+            path = os.path.join(self.args.output_dir, "grad_diag.jsonl")
+            self._grad_diag_file = open(path, "a", buffering=1)
+            print(f"[grad_diag] writing to {path}")
+        self._grad_diag_file.write(json.dumps(record) + "\n")
+
+        # 2x2 whole-model summary scalars (mean per-sample norm per cell) to wandb.
+        import numpy as np
+        rh = np.array(record["is_rh"])
+        m = self._metrics.setdefault("train", {})
+        for role in ("retain", "forget"):
+            w = np.array(whole[role])
+            for cls, name in ((0, "on_retain"), (1, "on_forget")):
+                sel = w[rh == cls]
+                if sel.size:
+                    m.setdefault(f"grad_diag/{role}_param_{name}_samples", []).append(
+                        float(sel.mean()))
+
     def _dynamic_microbatch_training_step(self, model, inputs, num_items_in_batch):
         """Unified training step with dynamic token-based microbatching.
 
@@ -3423,6 +3586,20 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._last_sample_completion = self.processing_class.decode(
             inputs["completion_ids"][0], skip_special_tokens=True
         )
+
+        # Per-sample gradient diagnostic: an extra unmasked packed fwd/bwd over
+        # the rollout batch, capturing the 2x2 (retain/forget params x
+        # retain/forget samples) at per-sample x per-layer granularity. Runs
+        # before the real step and zeroes grads afterward, so it does not
+        # perturb training. Fires for any run with dual adapters (forget params
+        # present) and an is_rh label — GR runs AND reward-penalty / filter
+        # baselines (where the unmasked flow is exactly the quantity GR would
+        # otherwise mask). Non-coherence rollouts only. See _run_grad_diagnostic.
+        if (self._grad_diag_every and self._forget_params
+                and not self._is_coherence_rollout
+                and "is_rh" in inputs
+                and self.state.global_step % self._grad_diag_every == 0):
+            self._run_grad_diagnostic(model, inputs)
 
         # Off-policy drift debug: at the start of each rollout cycle, snapshot
         # per-param grads for the last K buffered batches against the current
@@ -4233,6 +4410,13 @@ def _make_parser():
                              "near-free; LLM-judge scoring runs on a background thread.")
     parser.add_argument("--eval_at_start", action="store_true",
                         help="Run routing eval before training starts (default: off)")
+    parser.add_argument("--grad_diag_every", type=int, default=None,
+                        help="Per-sample gradient diagnostic interval in steps "
+                             "(None=mirror --eval_every, 0=disable). Runs one extra "
+                             "unmasked packed forward/backward over the rollout batch, "
+                             "capturing per-sample per-layer grad norms for the 2x2 "
+                             "(retain/forget params x retain/forget samples). "
+                             "Writes grad_diag.jsonl. Routing-rollout steps only.")
     # Stochastic routing
     parser.add_argument("--base_reward", default=None,
                         help="Base reward (no hack component) for non-eligible samples")
@@ -5404,6 +5588,10 @@ def _run(args, exp_cfg=None):
     trainer._env_args = args
     trainer._save_batch_path = getattr(args, 'save_batch', None)
     trainer._max_tokens_per_microbatch = args.max_tokens_per_microbatch
+    # Per-sample grad diagnostic cadence: None mirrors eval_every (the default
+    # in one place), 0 disables. Resolved here so the sentinel lives only here.
+    trainer._grad_diag_every = (args.eval_every if args.grad_diag_every is None
+                                else args.grad_diag_every)
     trainer._offpolicy_drift_k = args.offpolicy_drift_k
     # Ref-logprob token budget: default to 4x the training microbatch budget,
     # since ref runs under no_grad (no saved activations) and peak memory is
@@ -5506,7 +5694,7 @@ def _run(args, exp_cfg=None):
                            "diagnostics/retain_max_abs_m", "diagnostics/forget_max_abs_m",
                            "diagnostics/retain_max_abs_v", "diagnostics/forget_max_abs_v",
                            "diagnostics/retain_mean_abs_v", "diagnostics/forget_mean_abs_v",
-                           "diagnostics/frac_rh", "coherence/*",
+                           "diagnostics/frac_rh", "coherence/*", "grad_diag/*",
                            "diagnostics/hack_emitted_freq", "diagnostics/hack_rewarded_freq",
                            "diagnostics/hack_gate_suppressed_freq",
                            "diagnostics/hack_emitted_neg_adv_frac",
@@ -5559,6 +5747,18 @@ def _run(args, exp_cfg=None):
         return
     finally:
         trainer._wait_for_eval_scoring()
+        # Best-effort: render the per-sample grad diagnostic viewer if collected.
+        _gd_jsonl = os.path.join(args.output_dir, "grad_diag.jsonl")
+        if os.path.exists(_gd_jsonl):
+            try:
+                from tools.gen_grad_diag_html import _load, build_html
+                _recs = _load(_gd_jsonl)
+                if _recs:
+                    with open(os.path.join(args.output_dir, "grad_diag.html"), "w") as _f:
+                        _f.write(build_html(_recs))
+                    print(f"[grad_diag] wrote {os.path.join(args.output_dir, 'grad_diag.html')}")
+            except Exception as e:
+                print(f"[grad_diag] html generation failed: {e}")
         if torch.cuda.is_available():
             peak_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
             print(f"Peak GPU memory: {peak_mb:.0f} MB ({peak_mb/1024:.1f} GB)")
