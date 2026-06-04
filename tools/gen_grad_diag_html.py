@@ -78,8 +78,15 @@ def build_html(records):
     <label class="ck"><input type="checkbox" id="logx" checked onchange="render()"> log-x</label>
     <span id="step-label"></span>
   </div>
-  <div class="hint">Bins are shared across the four cells and fixed across steps (global, robust to outliers). Each cell is normalized to fraction-of-samples so the shapes compare despite different sample counts (shown as n=... in the legend). Samples beyond the p99.5 clip are tallied in the overflow note. Param hue: blue=retain, red=forget. Shade: dark=on retain samples, light=on hack samples.</div>
-  <h2>Distribution of per-sample grad norms</h2>
+  <div class="hint">Bins are shared across cells and fixed across steps (global, robust to outliers); y is absolute sample count (n per legend), so a curve with few samples is visibly small; out-of-range samples are tallied below each plot.</div>
+  <h2>By data type &mdash; forget params vs retain params (cf. Anthropic SGM post)</h2>
+  <div style="display:flex; gap:12px;">
+    <div style="flex:1;"><div id="hist_retain_data" style="height:330px;"></div></div>
+    <div style="flex:1;"><div id="hist_forget_data" style="height:330px;"></div></div>
+  </div>
+  <div id="overflow_bydata" class="hint" style="margin-top:-4px;"></div>
+  <h2>All four cells overlaid</h2>
+  <div class="hint">Param hue: blue=retain, red=forget. Shade: dark=on retain samples, light=on hack samples.</div>
   <div id="hist" style="height:440px;"></div>
   <div id="overflow" class="hint" style="margin-top:-6px;"></div>
   <h2>Per-layer aggregate (at this step)</h2>
@@ -143,7 +150,9 @@ function makeBinning(layerSel, logx) {{
   return {{ edges, toPlot, range: r, logx }};
 }}
 
-// histogram one array into shared edges; returns fraction-per-bin + overflow/underflow counts
+// histogram one array into shared edges; returns absolute bin counts +
+// overflow/underflow. Counts (not fractions) so sample-size differences across
+// cells are visible — bins are shared, so counts are directly comparable.
 function histify(arr, bin) {{
   const {{ edges, toPlot }} = bin;
   const counts = new Array(edges.length - 1).fill(0);
@@ -157,8 +166,7 @@ function histify(arr, bin) {{
     let b = 0; while (b < edges.length - 1 && p > edges[b + 1]) b++;
     counts[b]++;
   }}
-  const frac = counts.map(c => n ? c / n : 0);
-  return {{ frac, over, under, n }};
+  return {{ counts, over, under, n }};
 }}
 
 function renderHist() {{
@@ -186,7 +194,7 @@ function renderHist() {{
     const arr = full.filter((_, j) => rh[j] === cls);
     const h = histify(arr, bin);
     traces.push({{
-      type: 'bar', x: centers, y: h.frac, width: widths, name: `${{label}} (n=${{h.n}})`,
+      type: 'bar', x: centers, y: h.counts, width: widths, name: `${{label}} (n=${{h.n}})`,
       marker: {{ color: COLORS_JS[key] }}, opacity: 0.5,
     }});
     if (h.over > 0 || h.under > 0)
@@ -198,7 +206,7 @@ function renderHist() {{
     : {{ title: 'per-sample grad norm', range: [0, edges[edges.length - 1]] }};
   Plotly.react('hist', traces, {{
     barmode: 'overlay', bargap: 0,
-    xaxis: xaxis, yaxis: {{ title: 'fraction of samples' }},
+    xaxis: xaxis, yaxis: {{ title: 'number of samples' }},
     margin: {{ t: 10, r: 10 }}, legend: {{ orientation: 'h', y: 1.16 }},
   }}, {{ displayModeBar: false }});
   const clipTxt = logx
@@ -230,12 +238,63 @@ function renderLines() {{
     line('fr', 'mean: forget\\u00b7retain'), line('ff', 'mean: forget\\u00b7hack'),
   ];
   Plotly.react('lines', traces, {{
-    xaxis: {{ title: 'layer' }}, yaxis: {{ title: 'grad norm', type: 'log' }},
+    xaxis: {{ title: 'layer' }},
+    yaxis: {{ title: 'grad norm', type: 'log', exponentformat: 'e', showexponent: 'all' }},
     margin: {{ t: 10, r: 10 }}, legend: {{ orientation: 'h', y: 1.18 }},
   }}, {{ displayModeBar: false }});
 }}
 
-function render() {{ renderHist(); renderLines(); }}
+// Anthropic-SGM-style view: one panel per data type (retain / forget samples),
+// each comparing the forget-param vs retain-param grad-norm distributions.
+function renderByData() {{
+  const rec = curr();
+  const layerSel = document.getElementById('layer').value;
+  const logx = document.getElementById('logx').checked;
+  const bin = makeBinning(layerSel, logx);
+  const edges = bin.edges;
+  const centers = [], widths = [];
+  for (let i = 0; i < edges.length - 1; i++) {{
+    centers.push((edges[i] + edges[i + 1]) / 2);
+    widths.push((edges[i + 1] - edges[i]) * 0.98);
+  }}
+  const rh = rec.is_rh;
+  const RP = '#1f3a93', FP = '#c0392b';  // retain-param blue, forget-param red
+  const ofParts = [];
+  const xaxis = logx
+    ? {{ title: 'grad norm (log\\u2081\\u2080)', tickformat: '.1f' }}
+    : {{ title: 'grad norm', range: [0, edges[edges.length - 1]] }};
+  // First pass: histogram all four (param x data) so the two panels can share a
+  // y-range — absolute counts make few-sample (forget-data) curves visibly small.
+  const H = {{}};
+  let ymax = 1;
+  for (const cls of [0, 1]) for (const role of ['retain', 'forget']) {{
+    const arr = cellArray(rec, role, layerSel).filter((_, j) => rh[j] === cls);
+    const h = histify(arr, bin); H[role + cls] = h;
+    for (const c of h.counts) if (c > ymax) ymax = c;
+    if (h.over > 0 || h.under > 0)
+      ofParts.push(`${{cls ? 'forget' : 'retain'}}-data/${{role[0]}}: ${{h.over}}&gt;clip`);
+  }}
+  const yaxis = {{ title: 'number of samples', range: [0, ymax * 1.05] }};
+  function panel(divId, cls, title) {{
+    const traces = [];
+    for (const spec of [['retain', RP, 'retain params'], ['forget', FP, 'forget params']]) {{
+      const h = H[spec[0] + cls];
+      traces.push({{ type: 'bar', x: centers, y: h.counts, width: widths,
+        name: `${{spec[2]}} (n=${{h.n}})`, marker: {{ color: spec[1] }}, opacity: 0.55 }});
+    }}
+    Plotly.react(divId, traces, {{
+      barmode: 'overlay', bargap: 0, title: {{ text: title, font: {{ size: 14 }} }},
+      xaxis: xaxis, yaxis: yaxis,
+      margin: {{ t: 34, r: 8 }}, legend: {{ orientation: 'h', y: 1.2 }},
+    }}, {{ displayModeBar: false }});
+  }}
+  panel('hist_retain_data', 0, 'Retain data (is_rh=0)');
+  panel('hist_forget_data', 1, 'Forget data (is_rh=1, hacks)');
+  document.getElementById('overflow_bydata').innerHTML =
+    ofParts.length ? ('Out-of-range: ' + ofParts.join(' &middot; ')) : '';
+}}
+
+function render() {{ renderByData(); renderHist(); renderLines(); }}
 
 function update(i) {{
   idx = parseInt(i);
