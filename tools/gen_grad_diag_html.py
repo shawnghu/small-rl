@@ -85,10 +85,6 @@ def build_html(records):
     <div style="flex:1;"><div id="hist_forget_data" style="height:330px;"></div></div>
   </div>
   <div id="overflow_bydata" class="hint" style="margin-top:-4px;"></div>
-  <h2>All four cells overlaid</h2>
-  <div class="hint">Param hue: blue=retain, red=forget. Shade: dark=on retain samples, light=on hack samples.</div>
-  <div id="hist" style="height:440px;"></div>
-  <div id="overflow" class="hint" style="margin-top:-6px;"></div>
   <h2>Per-layer aggregate (at this step)</h2>
   <div id="lines" style="height:380px;"></div>
 </div>
@@ -97,7 +93,9 @@ const RECORDS = {data_json};
 const COLORS_JS = {colors_json};
 const NBINS = 40;
 let idx = 0, playing = false, timer = null;
-const _rangeCache = {{}};  // keyed by layerSel+logx
+const _rangeCache = {{}};  // x-range, keyed by layerSel
+const _countMaxCache = {{}};  // y-count max, keyed by layerSel+logx
+const _lineRangeCache = {{}};  // per-layer-panel log-y range, keyed by layerSel
 
 function curr() {{ return RECORDS[idx]; }}
 
@@ -169,55 +167,45 @@ function histify(arr, bin) {{
   return {{ counts, over, under, n }};
 }}
 
-function renderHist() {{
-  const rec = curr();
-  const layerSel = document.getElementById('layer').value;
-  const logx = document.getElementById('logx').checked;
+// Global max bin-count over ALL steps for the current (layer, logx) view, so
+// the by-data panels' y-axis is fixed across the slider (like the x bins).
+function globalCountMax(layerSel, logx) {{
+  const key = layerSel + '|' + logx;
+  if (_countMaxCache[key] !== undefined) return _countMaxCache[key];
   const bin = makeBinning(layerSel, logx);
-  const edges = bin.edges;
-  const centers = [], widths = [];
-  for (let i = 0; i < edges.length - 1; i++) {{
-    centers.push((edges[i] + edges[i + 1]) / 2);
-    widths.push((edges[i + 1] - edges[i]) * 0.98);
+  let ymax = 1;
+  for (const rec of RECORDS) {{
+    const rh = rec.is_rh;
+    for (const cls of [0, 1]) for (const role of ['retain', 'forget']) {{
+      const arr = cellArray(rec, role, layerSel).filter((_, j) => rh[j] === cls);
+      for (const c of histify(arr, bin).counts) if (c > ymax) ymax = c;
+    }}
   }}
-  const cells = [
-    ['retain', 0, 'rr', 'retain params \\u00b7 retain samples'],
-    ['retain', 1, 'rf', 'retain params \\u00b7 hack samples'],
-    ['forget', 0, 'fr', 'forget params \\u00b7 retain samples'],
-    ['forget', 1, 'ff', 'forget params \\u00b7 hack samples'],
-  ];
-  const rh = rec.is_rh;
-  const traces = [];
-  const ofParts = [];
-  for (const [role, cls, key, label] of cells) {{
-    const full = cellArray(rec, role, layerSel);
-    const arr = full.filter((_, j) => rh[j] === cls);
-    const h = histify(arr, bin);
-    traces.push({{
-      type: 'bar', x: centers, y: h.counts, width: widths, name: `${{label}} (n=${{h.n}})`,
-      marker: {{ color: COLORS_JS[key] }}, opacity: 0.5,
-    }});
-    if (h.over > 0 || h.under > 0)
-      ofParts.push(`${{key}}: ${{h.over}}&gt;clip` + (h.under ? `, ${{h.under}}&lt;lo` : ''));
-  }}
-  const r = bin.range;
-  const xaxis = logx
-    ? {{ title: 'per-sample grad norm (log\\u2081\\u2080)', tickformat: '.1f' }}
-    : {{ title: 'per-sample grad norm', range: [0, edges[edges.length - 1]] }};
-  Plotly.react('hist', traces, {{
-    barmode: 'overlay', bargap: 0,
-    xaxis: xaxis, yaxis: {{ title: 'number of samples' }},
-    margin: {{ t: 10, r: 10 }}, legend: {{ orientation: 'h', y: 1.16 }},
-  }}, {{ displayModeBar: false }});
-  const clipTxt = logx
-    ? `clip range [${{r.lo.toExponential(1)}}, ${{r.hi.toExponential(1)}}], global max ${{r.max.toExponential(1)}}`
-    : `clip at p99.5 = ${{r.hi.toExponential(1)}}, global max ${{r.max.toExponential(1)}}`;
-  document.getElementById('overflow').innerHTML =
-    `Shared bins over ${{clipTxt}}.` + (ofParts.length ? ` Out-of-range: ${{ofParts.join(' &middot; ')}}.` : ' No out-of-range samples this step.');
+  _countMaxCache[key] = ymax;
+  return ymax;
 }}
 
 function mean(a) {{ return a.length ? a.reduce((x, y) => x + y, 0) / a.length : 0; }}
 function pick(arr, isrh, cls) {{ return arr.filter((_, j) => isrh[j] === cls); }}
+
+// Fixed log-y range for the per-layer panel, over all plotted quantities across
+// all steps, so the y-axis doesn't jump as you scrub (matches the x treatment).
+function globalLineRange() {{
+  if (_lineRangeCache.v) return _lineRangeCache.v;
+  let lo = Infinity, hi = 0;
+  const bump = (v) => {{ if (v > 0) {{ if (v < lo) lo = v; if (v > hi) hi = v; }} }};
+  for (const rec of RECORDS) {{
+    for (const role of ['retain', 'forget']) for (const v of rec.aggregate_grad_norm[role]) bump(v);
+    const isrh = rec.is_rh;
+    for (let k = 0; k < rec.layers.length; k++) {{
+      const r = rec.per_sample.retain[k], f = rec.per_sample.forget[k];
+      bump(mean(pick(r, isrh, 0))); bump(mean(pick(r, isrh, 1)));
+      bump(mean(pick(f, isrh, 0))); bump(mean(pick(f, isrh, 1)));
+    }}
+  }}
+  _lineRangeCache.v = [Math.log10(lo * 0.8), Math.log10(hi * 1.25)];
+  return _lineRangeCache.v;
+}}
 
 function renderLines() {{
   const rec = curr();
@@ -239,7 +227,8 @@ function renderLines() {{
   ];
   Plotly.react('lines', traces, {{
     xaxis: {{ title: 'layer' }},
-    yaxis: {{ title: 'grad norm', type: 'log', exponentformat: 'e', showexponent: 'all' }},
+    yaxis: {{ title: 'grad norm', type: 'log', exponentformat: 'e', showexponent: 'all',
+             range: globalLineRange() }},
     margin: {{ t: 10, r: 10 }}, legend: {{ orientation: 'h', y: 1.18 }},
   }}, {{ displayModeBar: false }});
 }}
@@ -263,17 +252,17 @@ function renderByData() {{
   const xaxis = logx
     ? {{ title: 'grad norm (log\\u2081\\u2080)', tickformat: '.1f' }}
     : {{ title: 'grad norm', range: [0, edges[edges.length - 1]] }};
-  // First pass: histogram all four (param x data) so the two panels can share a
-  // y-range — absolute counts make few-sample (forget-data) curves visibly small.
+  // Histogram all four (param x data). The two panels share one y-range, fixed
+  // across steps (global max bin count) so absolute counts are comparable both
+  // between panels and as you scrub — few-sample (forget-data) curves stay small.
   const H = {{}};
-  let ymax = 1;
   for (const cls of [0, 1]) for (const role of ['retain', 'forget']) {{
     const arr = cellArray(rec, role, layerSel).filter((_, j) => rh[j] === cls);
     const h = histify(arr, bin); H[role + cls] = h;
-    for (const c of h.counts) if (c > ymax) ymax = c;
     if (h.over > 0 || h.under > 0)
       ofParts.push(`${{cls ? 'forget' : 'retain'}}-data/${{role[0]}}: ${{h.over}}&gt;clip`);
   }}
+  const ymax = globalCountMax(layerSel, logx);
   const yaxis = {{ title: 'number of samples', range: [0, ymax * 1.05] }};
   function panel(divId, cls, title) {{
     const traces = [];
@@ -294,7 +283,7 @@ function renderByData() {{
     ofParts.length ? ('Out-of-range: ' + ofParts.join(' &middot; ')) : '';
 }}
 
-function render() {{ renderByData(); renderHist(); renderLines(); }}
+function render() {{ renderByData(); renderLines(); }}
 
 function update(i) {{
   idx = parseInt(i);
