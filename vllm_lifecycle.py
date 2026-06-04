@@ -40,11 +40,15 @@ from contextlib import contextmanager
 from typing import Iterable, Optional
 
 
-# vLLM init at our scales should take ~10-30s end-to-end (SmolLM2-135M cold,
-# Qwen3-8B can hit a minute on first cache fill). 60s for a single holder is
-# the "something's wrong" threshold: above it, a waiter raises rather than
-# continuing to queue indefinitely.
-_DEFAULT_HOLD_TIMEOUT_S = 60
+# vLLM init at our scales should take ~10-30s end-to-end without MPS, and
+# ~30-50s under CUDA MPS (the shared context costs more startup work).
+# 150s is well above either regime — a single holder taking longer than that
+# is the "something's wrong" threshold above which a waiter raises rather
+# than continuing to queue indefinitely. Previously 60s, but on Modal +
+# MPS we measured one init at 43.8s; the next slow-tail init can easily
+# exceed 60s and cascade-abort all 4 other waiters, which is what bit us
+# on 2026-06-03 (3 of 5 children in a train_many pack failed at startup).
+_DEFAULT_HOLD_TIMEOUT_S = 150
 
 # Ready-file wait budget for callers of `wait_for_ready_file`. This needs to
 # cover a legitimate queue depth (N waiters × hold_timeout) plus the holder's
