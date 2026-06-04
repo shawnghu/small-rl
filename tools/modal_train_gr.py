@@ -346,6 +346,95 @@ def _mps_probe_child(conn) -> None:
             pass
 
 
+def _mps_prewarm_child(conn, model_name) -> None:
+    """Spawn-context entrypoint for _prewarm_cuda_and_vllm. Pays the
+    first-cold-init costs that would otherwise fall on the first child of a
+    train_many pack while N-1 other waiters tick toward hold_timeout:
+
+      - First MPS-server allocation (the daemon spins up its CUDA context
+        on the first client connection; subsequent clients are fast).
+      - Page cache warm-up for libtorch, libcuda, libvllm.
+      - HF cache warm-up for model weights via snapshot_download (or noop if
+        the model isn't fetchable from this process — failure is swallowed).
+      - A small CUDA matmul to force cuBLAS/cuDNN heuristic-table init.
+
+    Each child still pays its own per-process import + CUDA context setup,
+    but the cold-cache portion (typically the largest tail) is gone.
+    Result dict: {ok, err, duration_s, warmed: list[str]}.
+    """
+    import time
+    t0 = time.time()
+    warmed = []
+    try:
+        import torch
+        torch.cuda.set_device(0)
+        # CUDA init under MPS — first interaction with the daemon's server.
+        x = torch.ones(64, 64, device="cuda")
+        (x @ x.T).sum().item()
+        del x
+        warmed.append("cuda")
+        # vLLM import: page-cache the heavy library.
+        try:
+            import vllm  # noqa: F401
+            warmed.append("vllm-import")
+        except Exception:
+            pass
+        # HF cache: ensure the model weights are present + paged-in. Cheap if
+        # already cached on the volume; ~5-30s otherwise. Best-effort.
+        if model_name:
+            try:
+                from huggingface_hub import snapshot_download
+                snapshot_download(model_name, allow_patterns=["*.safetensors", "*.json", "tokenizer*"])
+                warmed.append("hf-cache")
+            except Exception:
+                pass
+        conn.send({"ok": True, "warmed": warmed, "duration_s": time.time() - t0})
+    except BaseException as e:
+        conn.send({
+            "ok": False, "warmed": warmed,
+            "err": f"{type(e).__name__}: {e}",
+            "duration_s": time.time() - t0,
+        })
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _prewarm_cuda_and_vllm(model_name=None, timeout: float = 600.0) -> bool:
+    """Run _mps_prewarm_child in a spawn-context subprocess. Returns True iff
+    the prewarm completed without raising. We proceed either way — failure
+    just means children take longer on their first inits — but emit a clear
+    [prewarm] line so the cost is recorded in train.log."""
+    import multiprocessing
+    import time
+    ctx = multiprocessing.get_context("spawn")
+    parent_conn, child_conn = ctx.Pipe(duplex=False)
+    proc = ctx.Process(target=_mps_prewarm_child, args=(child_conn, model_name))
+    t0 = time.time()
+    proc.start()
+    child_conn.close()
+    proc.join(timeout=timeout)
+    if proc.is_alive():
+        proc.kill()
+        proc.join(timeout=5)
+        print(f"[prewarm] timed out after {timeout}s; proceeding without warm cache")
+        return False
+    try:
+        result = parent_conn.recv()
+    except (EOFError, OSError):
+        print(f"[prewarm] child exited without result (exitcode={proc.exitcode})")
+        return False
+    dur = time.time() - t0
+    if result.get("ok"):
+        print(f"[prewarm] ok in {dur:.1f}s — warmed {result.get('warmed', [])}")
+        return True
+    print(f"[prewarm] failed in {dur:.1f}s: {result.get('err')}; "
+          f"warmed up to: {result.get('warmed', [])}; proceeding cold")
+    return False
+
+
 def _probe_mps_works(timeout: float = 60.0) -> bool:
     """Spawn a fresh subprocess that imports torch and runs torch.cuda.set_device(0).
     Returns True iff the subprocess completes without raising. Used to confirm
@@ -538,6 +627,17 @@ def train_many(params_list: list[dict], sweep_name: str) -> list[dict]:
     mps_on = _start_mps()
     mode = "MPS" if mps_on else "time-sliced"
     print(f"[train_many] packing {n} runs in one H100 container ({mode})")
+    # Prewarm before forking children. Pays the first-cold-vLLM-init cost in
+    # the parent so child #1 of the pack doesn't pay it while children
+    # #2..#N tick toward vllm_init_slot's hold_timeout. Without this, the
+    # first child's slow init can take 150-200s on cold MPS + cold disk,
+    # cascading waiters to abort even with the bumped hold_timeout.
+    # Cheaper to pay once in the parent than to wear the cascade-risk tax
+    # across re-runs.
+    if mps_on:
+        model_name = params_list[0].get("model")
+        print(f"[train_many] pre-warming for model={model_name}")
+        _prewarm_cuda_and_vllm(model_name)
 
     # Resolve per-run paths up front so we can return a stable list of results
     # even if a child fails before it can send anything back. CUDA-init
