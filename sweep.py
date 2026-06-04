@@ -2131,13 +2131,20 @@ class SweepRunner:
         concurrency is whatever Modal will allocate, capped by
         self.max_concurrent (default 64 packs in flight).
 
-        The entire dispatch/poll loop runs inside `with app.run():`. Modal
-        requires this — `train_one.spawn(...)` and `train_many.spawn(...)`
-        raise `ExecutionError: Function has not been hydrated … because the
-        App it is defined on is not running` if called outside the context.
-        The bare modal_train_gr.py entrypoints get this for free via
-        `@app.local_entrypoint()`; sweep.py provides it explicitly here. When
-        the `with` block exits, any still-in-flight FunctionCalls are
+        The entire dispatch/poll loop runs inside `with app.run(name=...):`.
+        Modal requires the context — `train_one.spawn(...)` /
+        `train_many.spawn(...)` raise `ExecutionError: Function has not been
+        hydrated … because the App it is defined on is not running` if called
+        outside it. The `name=` argument makes this sweep's ephemeral app
+        show up as `<sweep_name>` (the disambiguated `output_dir.name`) in
+        `modal app list`, instead of the default `"gr-pilot"` shared across
+        all sweeps. That eliminates the "which gr-pilot app is mine?"
+        problem when stopping things in a shared workspace where multiple
+        users / sessions launch concurrently. The app ID is also printed to
+        stdout as `[MODAL_APP]` so it can be back-referenced from the
+        orchestrator log without consulting `modal app list` at all.
+
+        When the `with` block exits, any still-in-flight FunctionCalls are
         cancelled — fine for us, the while loop already drains everything.
 
         A background daemon thread periodically pulls the sweep's volume dir
@@ -2148,9 +2155,11 @@ class SweepRunner:
         last_status_time = time.time()
         last_overview_time = 0.0
 
+        sweep_name = self.output_dir.name
         self._start_modal_sync()
         try:
-            with app.run():
+            with app.run(name=sweep_name) as running_app:
+                print(f"[MODAL_APP] id={running_app.app_id} name={sweep_name}")
                 while self._modal_pack_queue or self._modal_active:
                     if self._interrupted:
                         break
