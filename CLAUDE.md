@@ -16,30 +16,14 @@ As a general matter, try not to come up with speculative explanations for phenom
 - **Zombie/orphan processes**: Do not assume GPU memory held by apparent zombie pids belongs to another user or is unrecoverable. In Docker/RunPod environments, the NVIDIA driver reports host pids that don't map to container pids — so nvidia-smi pids appear dead but the processes are alive inside the container. Use `pkill` by process name or pattern to kill orphaned processes (e.g. vLLM EngineCore workers), but only kill processes you are confident you started. Do not use nvidia-smi pids directly for killing.
 
 - Experimental correctness is the most important thing: we should be very liberal with asserts and throwing errors -- any failure or deviation from intended experimental protocol should be loud and catastrophic. Silent fallbacks will ruin experiments
-- Default values are fine, but must be defined in exactly one place (a module constant or argparse default) -- never duplicated in multiple code locations or buried inline in logic
+- Default values are fine, but should be defined in exactly one place (a module constant or argparse default) -- never duplicated in multiple code locations or buried inline in logic
 - Fast feedback matters: each half-order-of-magnitude in time to obtain/interpret results is significant
 - **Command formatting**: Always suggest shell commands as a single line (no `\` continuations) for easy copy/paste. Prepend `CUDA_VISIBLE_DEVICES=...` to commands that require GPUs.
 - Libraries can be freely installed; research-type tradeoffs throughout
 - **Naming convention**: Always include all relevant hyperparameters in run/output directory names so they are findable in wandb (e.g. `sentence_length_10_smooth_lora_rank1_lr3e-4_s42`)
-- Whenever you find a 
 
-## Model
-- This repo makes use of SimpleStories 1.25M, SmolLM2-135m, and Qwen3-4B and 8b. Some of the following information is model-specific.
-
-- **SimpleStories 1.25M**: `SimpleStories/SimpleStories-1.25M` on HuggingFace
-  - Architecture: LLaMA (`LlamaForCausalLM`), 4 layers, 128 hidden dim, 4 attention heads
-  - Context window: 512 tokens
-  - Tokenizer: Custom WordPiece, 4096 vocab
-  - License: MIT
-
-## Tokenizer Details
-
-- No BOS token
-- EOS token: `[EOS]`, id=1
-- UNK token: `[UNK]`, id=0
-- No PAD token (will need to set one for batched generation)
-- `add_special_tokens=True` auto-appends EOS; use `add_special_tokens=False` for prompts
-- Generate until EOS (`eos_token_id=1`)
+## Models
+- This repo makes use of SmolLM2-135m and Qwen3-4B and 8b. Some of the following information is model-specific.
 
 ## Dataset
 
@@ -81,19 +65,16 @@ The penalty conditional serves as a baseline for gradient routing: both require 
 
 ## Design Philosophy: Simplicity and Orthogonality
 
-Keep the number of code paths and special cases minimal. Ideally, each config option controls exactly one thing, and options compose without interaction unless logically forced. When a subtlety exists (e.g. DualLoRA vs MLP adapter), it should be isolated to a single location (e.g. `gradient_routing.py`) behind a common interface (`get_retain_params`, `get_forget_params`, `set_scales`, `has_dual_adapters`), so the rest of the codebase is blind to the adapter type. Any place where adapter-type-specific logic leaks outside `gradient_routing.py` is a violation of this principle and should be fixed.
+Keep the number of code paths and special cases minimal. Ideally, each config option controls exactly one thing, and options compose without interaction unless logically forced. When a subtlety exists (e.g. DualLoRA vs MLP adapter), it should be isolated to a single location (e.g. `gradient_routing.py`) behind a common interface (`get_retain_params`, `get_forget_params`, `set_scales`, `has_dual_adapters`), so the rest of the codebase is blind to the adapter type. Any place where adapter-type-specific logic leaks outside `gradient_routing.py` is a violation of this principle and should be avoided as much as possible.
 
 ## Design Decisions
 
 1. **Modular design**: Core research logic should eventually be separate from any particular environment implementation. Models, environments, gradient routing params should be swappable. We don't have to achieve full modularity from day one, but should design with it in mind.
 2. **Step-by-step implementation**: No one-shot implementations. Each piece is designed and discussed explicitly before being built.
-3. **Reward scale**: 0/1 to start with.
-4. **TRL GRPOTrainer with gradient routing**: Gradient routing is implemented directly in TRL by subclassing `GRPOTrainer` (`SampleGRPOTrainer`). TRL's `loss_type` must be set to `"grpo"` explicitly (default is now `"dapo"`). TRL version is effectively pinned; no portability concerns.
-5. **Reward/RH config via YAML**: Reward functions and RH detectors use registry pattern + `functools.partial` for param binding. Always configured via `--config`. Per-criterion params live in YAML under `params:`. A config must explicitly declare `rh_detector` (even as `null`) and, for retain-only configs, `training: {routing_mode: none}`. Bundling reward config into a YAML file is a current implementation concession — the design goal is for reward params to live directly in run dicts alongside other hyperparameters.
-6. **DualLoRALinear over PEFT**: Custom `DualLoRALinear` module (ported from `~/gradient-routing-finetuning`) replaces `nn.Linear` layers with two LoRA adapters. Simpler than PEFT, gives direct control over adapter params and gradient hooks.
-7. **Label injection via batch dict**: `is_rh` bool tensor is injected in `_generate_and_score_completions` override. TRL's `split_tensor_dict` and `shuffle_sequence_dict` slice all tensors uniformly, so the label survives buffering/shuffling.
-8. **Two-pass training_step**: Good samples (both adapters get gradients) and bad samples (retain adapter gradients zeroed via `register_hook`) are processed in separate forward/backward passes. Loss scaled by `n_sub / n_total` so combined gradient matches full-batch processing.
-9. **Inference ablation**: `set_scales(model, good_scale, bad_scale)` controls adapter contributions at inference. `bad_scale=0` removes forget adapter (removes reward hacking behavior).
+3. **TRL GRPOTrainer with gradient routing**: Gradient routing is implemented directly in TRL by subclassing `GRPOTrainer` (`SampleGRPOTrainer`). TRL's `loss_type` must be set to `"grpo"` explicitly (default is now `"dapo"`). TRL version is effectively pinned; no portability concerns.
+4. **Reward/RH config via YAML**: Reward functions and RH detectors use registry pattern + `functools.partial` for param binding. Always configured via `--config`. Per-criterion params live in YAML under `params:`. A config must explicitly declare `rh_detector` (even as `null`) and, for retain-only configs, `training: {routing_mode: none}`. Bundling reward config into a YAML file is a current implementation concession — the design goal is for reward params to live directly in run dicts alongside other hyperparameters.
+5. **Label injection via batch dict**: `is_rh` bool tensor is injected in `_generate_and_score_completions` override. TRL's `split_tensor_dict` and `shuffle_sequence_dict` slice all tensors uniformly, so the label survives buffering/shuffling.
+6. **Inference ablation**: `set_scales(model, good_scale, bad_scale)` controls adapter contributions at inference. `bad_scale=0` removes forget adapter (removes reward hacking behavior).
 
 ## Model Architecture (train.py)
 
@@ -126,6 +107,16 @@ Scheduling differences between local and Modal backends (per-GPU caps, slot pool
 
 Optional diagnostic (`--grad_diag_every N`, default mirrors `--eval_every`, `0` disables) that collects the full per-sample distribution of gradient norms for the 2×2 (retain/forget params × retain/forget samples), per layer, via one extra **unmasked** packed forward/backward over the rollout batch. Per-sample grads are recovered without reducing along the batch axis (`PerSampleGradCapture` in `gradient_routing.py`). Packed-path only; fires for any run with dual adapters + an `is_rh` label on non-coherence rollouts (GR runs **and** RP/filter baselines, where it captures the unmasked flow GR would otherwise mask); does not perturb training (zeroes grads on exit). Writes `grad_diag.jsonl` + an interactive `grad_diag.html` (layer selector + step slider + the four distributions). Validated by `tests/test_per_sample_grad_capture.py`. See **GRAD_DIAG.md** for full details.
 
+## Fused Reduction (single-pass gradient routing)
+
+Throughput optimization, **on by default** (`--fused_reduction` / `--no-fused_reduction` for the legacy path). The dynamic-microbatching GR path otherwise splits each opt batch into **homogeneous** microbatches — coherence / good / bad — so each class gets its own packed forward+backward over the frozen base, even when that class is a handful of samples. `--fused_reduction` instead packs all classes into shared token-budget microbatches (`_pack_by_tokens`, same as stock — just no longer one-class-per-microbatch) and routes each sample's gradient per token. The phases differ only on three per-sample axes, all encoded per token-span: forward forget-scale (coherence 0, routing `train_forget_scale`), advantage source (renormalize: good→`retain_advantages`, else `original`), and which adapter trains (coh→retain only, bad→forget only, good→both [classic] / forget-ablated [exclusive]). Implemented in `_fused_forward_backward` (`train.py`) + `set_fused_routing`/`_fused_decouple` (`gradient_routing.py`). The dispatch is gated to GR + packed/liger + non-penalty; RP/non-routing baselines, penalty mode, and non-liger runs cleanly fall through to the homogeneous loop, so default-on is safe.
+
+**Why a plain activation-grad mask is wrong (the non-obvious part).** Stock routing zeros gradients via parameter `register_hook`s, which kill an adapter's *own* param gradient but leave its contribution to the *downstream* activation gradient (to lower layers) intact — so on a bad sample, lower-layer forget params still receive gradient routed *through* the upper retain adapters. Masking the adapter output's gradient (`g ← g*m`) would also strip that Jacobian, diverging from stock for multi-layer adapters. `_fused_decouple` instead gates the **parameter** gradient only, via a stop-gradient decomposition (`g(x) − (1−m)·g(x.detach()) + (1−m)·g(x).detach()`): value unchanged, θ-grad gated by `m`, x-grad full. Costs one extra (tiny) adapter forward.
+
+Exactly equivalent to the homogeneous path under `loss_type="grpo"` (per-sequence normalization is additive across sequences; the per-microbatch `loss·n_mb/scale_denom` terms sum to the same gradient regardless of how samples are grouped into microbatches). Verified by `tests/test_fused_routing_equivalence.py` (CPU, exact to ~1e-15 fp64) and `bench_fused_gr.py` (GPU end-to-end gate + stock-vs-fused per-microbatch timing; capture a batch with `tools/capture_gr_batch.py` or `train.py --save_batch`).
+
+**Where the win is (and isn't).** The benefit is the per-class-microbatch elimination, which dominates at **small optimizer batches** — the realistic regime (`optimizer_batch_size≈16`), where the homogeneous path must run a separate, mostly-empty microbatch per class. `tools/sim_fused_microbatches.py` (real leetcode lengths + mature ~27% hack rate) shows stock running ~3 microbatches at `opt_bs=16` (each ~35% full) vs fused ~1.7. On H100/SmolLM2-135M (whole batch = 1 microbatch, 3 stock passes → 1) the fused fwd/bwd is **~1.35× faster**. At large optimizer batches / 8b with already-full microbatches, the per-class rounding saves little and the decoupling's eager-mode overhead (~10% per microbatch, measured) can make fused slightly slower — `torch.compile` should shrink that overhead. The decoupling's extra **activation** memory is negligible (~1–3% of base; adapter intermediates are 50–200× smaller than the base MLP intermediate). Keep `--no-fused_reduction` for the legacy path / A/B comparison.
+
 ## Verified-Retain Renormalization
 
 When `rh_detector_verifies_retain_samples=True` and `coh_samples_per_rollout > 0`, the coh-slice advantages are recomputed per-group using only the verified-retain samples (mean/std taken over `is_verified_retain` within each group; non-verified samples get advantage=0). This happens **unconditionally** under that gate — for GR runs, RP-baseline runs, and anything else with the verifier on. Implemented at `train.py:2806–2843`.
@@ -147,14 +138,9 @@ When harassment is the sole reward, even tiny within-group differences (0.0005 v
 
 ## GPU / Concurrency
 
-See `THROUGHPUT.md` for detailed benchmarks and data. See `BENCHMARKING.md` for guidelines on producing reliable throughput measurements.
+`BENCHMARKING.md` for guidelines on producing reliable throughput measurements.
 
 - Always ensure NVIDIA MPS (Multi-Process Service) is running for concurrent training
-- **Low-rank LoRA (rank 1-8), rollout_batch_size=32**: 16-20 concurrent with MPS (~1.0-1.3s/step)
-- **High-rank LoRA (rank 32+) or large batch (rollout_batch_size=128)**: increase rollout_batch_size + scale LR proportionally (linear scaling rule). 6 concurrent for best efficiency, 12 for max throughput.
-- **Full fine-tuning**: 12 concurrent (~0.5s/step each)
-- **Linear scaling rule**: 4x rollout_batch_size + 4x LR gives ~2.7x wall-clock speedup
-- Without MPS: 2 concurrent at ~0.62s/step, 3 at ~0.81s/step
 
 ## Checking Model Output
 
@@ -164,16 +150,7 @@ Three methods, from fastest to most thorough:
    ```
    grep "\[Sample @" output/{run_name}/train.log | tail -5
    ```
-
-2. **eval_utils.py**: Generate fresh samples from a checkpoint and check diversity:
-   ```
-   python eval_utils.py --model_path output/{run}/checkpoint-2000 --n_samples 20
-   ```
-   Reports: reward scores per adapter mode (both/retain_only/forget_only), diversity metrics, and sample outputs.
-
-3. **wandb**: Training samples are logged as `sample_text` HTML. Reward curves, KL, loss are all tracked.
-
-**After every sweep**: always run eval_utils.py on final checkpoints and eyeball samples to check the reward/degeneracy tradeoff. High reward with low diversity = template collapse. This is the default post-sweep step — do it without being asked.
+2. **wandb**: Training samples are logged as `sample_text` HTML. Reward curves, KL, loss are all tracked.
 
 ## Sweep Orchestration
 
@@ -233,23 +210,20 @@ Baselines are deduplicated (e.g. classic vs exclusive with same params -> one ba
 
 ### Incremental graph generation
 
-Graphs are generated as soon as all seeds in an "experiment group" (routing + baseline runs with the same non-seed params) complete. Output:
-```
-output/sweep_graphs/{group_name}/
-  step_0100.png    # per-step bar chart
-  step_0200.png
-  ...
-  animation.gif    # animated progression
-  index.html       # interactive slider viewer (serve via HTTP)
-```
-
-The HTML viewer (`index.html`) supports arrow keys, slider, and auto-play. Serve with `python -m http.server -d output/sweep_graphs/` for interactive browsing.
-
-### Auto-injected eval_rewards
-
-When `--combined_key` is set (or `combined_key` is defined in the sweep config file), sweep.py auto-sets `eval_rewards={combined},{retain},hack_freq` on all runs (routing and baseline) so both produce comparable per-step eval data. `--retain_key` must also be set. No auto-injection happens without an explicit `combined_key`.
+Graphs are generated as soon as all seeds in an "experiment group" (routing + baseline runs with the same non-seed params) complete. This is useful because the user would like to visualize the progress of experiments while they are ongoing.
 
 ## Modal backend (cloud H100s)
+
+### Modal app / image / volume / secrets (`tools/modal_train_gr.py`)
+
+All Modal infra lives in `tools/modal_train_gr.py`:
+- **App**: `modal.App("gr-pilot")`.
+- **Image**: `nvidia/cuda:12.4.0-devel-ubuntu22.04` + python 3.11; deps installed from the pinned pip-freeze `requirements-modal.txt` via `uv pip install --no-deps` (vLLM 0.17 has broken declared bounds — see DEPENDENCIES.md); vLLM patches in `vllm_patches/` copied over the installed package; env sets `VLLM_ENABLE_V1_MULTIPROCESSING=0` and `HF_HOME=/output/_hf_cache`. The **codebase is mounted last** at `/repo` via `add_local_dir(copy=False)` so code edits don't bust the deps cache (a fresh mount each call captures recent edits cheaply).
+- **Volume**: `gr-modal-pilot` mounted at `/output` (checkpoints, logs, HF cache persist). Sync back with `modal volume get gr-modal-pilot / /workspace/small-rl/output/`.
+- **Secrets**: `gr-pilot-keys` (OPENAI_API_KEY) + `wandb-key` (WANDB_API_KEY).
+- **Entrypoints** (run with `modal run tools/modal_train_gr.py::<name>`): `smoke_test` (verify the container env), `train_one`/`train_many` (dispatched by sweep.py's Modal backend, but callable directly), `fused_gate_run` (capture a batch + run the fused-reduction accuracy gate + timing on one H100 — `--force-fp32` for a tight gate, default sweep is the fp32 sort config). Each entrypoint builds the image on first use.
+
+### sweep.py Modal backend
 
 `sweep.py --backend modal` dispatches runs to Modal. **Packing is on by default** under `--backend modal`: runs are grouped (default: all params equal except `seed`/`run_name`/`output_dir`) and each group goes to one `train_many` call (N runs / container with CUDA MPS-internal concurrency). Single-run groups are routed to `train_one` automatically, so default-on packing never adds MPS overhead for sweeps that don't benefit. Disable with `--no_pack` to force 1 container per run.
 
@@ -309,28 +283,12 @@ On `timeout=` expiry Modal sends **SIGTERM** to the container (mapped to `Keyboa
 
 Blast radius with packing: one run hanging drags the whole container into the timeout and kills its siblings at the same boundary. Mitigate with `save_steps` small enough that worst-case loss is bounded.
 
-## Reference Repos
-
-- `~/gradient-routing-finetuning`: Supervised gradient routing with dual LoRA/MLP adapters. Uses SimpleStories dataset + gemma-3-1b-it. Key patterns: homogeneous micro-batches, selective gradient hooks, hash-based data partitioning.
-- `~/rl-gradient-routing`: RL (GRPO) gradient routing at scale via VERL. Dual PEFT LoRA adapters, FSDP2, Ray workers. Key patterns: GradientRoutingPPOActor with single-pass routing, modular reward functions, Pydantic+Jinja2+Hydra config.
-
 ## Key Gradient Routing Concepts
 
 - Two adapters: "good" (retain) and "bad" (forget)
 - On "bad" examples: only bad adapter receives gradients (good adapter gradients zeroed via hooks)
 - On normal examples: both adapters updated
 - At inference: ablate bad adapter to remove unwanted behavior
-- Requires homogeneous micro-batches (all-bad or all-good) for selective gradient masking
-
-## Gradient Routing Eval
-
-Automatic eval runs every `--eval_every` steps (default 100) whenever eval reward fns are configured. DualLoRA is always present, so all three adapter modes are always tested:
-
-- **both (1,1)**: Both adapters active — full trained model behavior
-- **retain_only (1,0)**: Only retain adapter — should preserve task performance, remove hack behavior
-- **forget_only (0,1)**: Only forget adapter — should show hack behavior, poor task performance
-
-Interpretation: successful routing means `retain_only` maintains retain reward close to `both` while showing lower hack reward, and `forget_only` shows high hack reward but lower retain reward.
 
 ### Eval execution model
 
@@ -340,23 +298,9 @@ In **async vLLM mode** (`--vllm_async`), piggybacked eval is not supported — e
 
 Eval uses the same temperature as training (from `--temperature`).
 
-Use `--eval_rewards` to decompose combined rewards into components:
-```
-python train.py --config configs/sentence_length_5_with_happy.yaml --routing_mode classic --lora_config r1 \
-  --eval_rewards sentence_length_5,happy_count
-```
-
-Post-hoc eval from checkpoint (DualLoRA auto-detected from state dict):
-```
-python eval_utils.py --model_path output/{run}/checkpoint-2000 \
-  --lora_config r32 \
-  --eval_rewards sentence_length_5,happy_count
-```
-LoRA rank is also auto-detected from state dict if `--lora_config` is omitted (alpha defaults to 16, stride to 1).
-
 ## Gradient Routing Baselines
 
-Baseline for gradient routing = `--routing_mode none` (same DualLoRA architecture, vanilla TRL training step). Both adapters are present and trained normally, but no gradient masking is applied.
+Baseline for gradient routing = `--routing_mode none`. Both adapters are present and trained normally, but no gradient masking is applied.
 
 `sweep.py` generates these baselines automatically when any run has `routing_mode=classic` or `routing_mode=exclusive`. Use `--no_baseline` to skip.
 
@@ -389,54 +333,6 @@ reward:
 
 Env vars: `REWARD_MODEL` (HF model name), `REWARD_DEVICE` (default: `cuda`), `REWARD_MAX_LENGTH` (default: 512).
 
-### OpenAI Moderation API (`openai_moderation`)
-
-Uses the OpenAI Moderation API directly. Requires `OPENAI_API_KEY` in `.env` or environment. Free tier, no cost.
-
-Config (`configs/violence_baseline.yaml`):
-```yaml
-reward:
-  name: openai_moderation
-  params:
-    category: violence    # see below for all categories
-    scale: 1.0            # optional
-```
-
-Available categories: `harassment`, `harassment/threatening`, `hate`, `hate/threatening`, `illicit`, `illicit/violent`, `self-harm`, `self-harm/intent`, `self-harm/instructions`, `violence`, `violence/graphic`, `sexual`, `sexual/minors`. All return 0-1 float scores.
-
-### Running API Reward Training
-
-API rewards are configured via YAML. Training hyperparameters stay on CLI for sweep compatibility:
-
-```bash
-uv run python train.py \
-  --config configs/violence_baseline.yaml \
-  --beta 0.01 --rollout_batch_size 128 --num_generations 16 \
-  --lr 4e-5 --max_steps 2000 --seed 42 \
-  --output_dir output/violence_baseline_beta0.01_bs128_lr4e-5_s42
-```
-
-Both reward types include retry logic (3 attempts, 1s backoff) and will crash loudly on persistent failure.
-
-### Score-Based RH Detection (`score_threshold`)
-
-For gradient routing with API rewards, the `score_threshold` RH detector thresholds on raw API scores (pre-scale), avoiding redundant API calls:
-
-```yaml
-reward:
-  name: openai_moderation
-  params:
-    category: violence
-    scale: 0.1            # small bonus for RL reward signal
-
-rh_detector:
-  name: score_threshold
-  params:
-    threshold: 0.3        # on raw 0-1 API scale, independent of reward scale
-```
-
-The reward function caches raw scores via `CachedReward` wrapper; the detector reads the cache. Threshold operates on the raw score, not the scaled reward value.
-
 ## Jobs and Runs
 
 When the user refers to a job by name, look up the corresponding sweep config in `sweeps/*.py` — these are the source of truth for what a job contains (run params, seeds, per_gpu, etc.). Output lives in `output/{job_name}/`, with one subdirectory per run. Each run directory contains:
@@ -454,10 +350,8 @@ When the user refers to a job by name, look up the corresponding sweep config in
 - **`define_metric()`** calls after trainer construction set up which x-axis each metric group uses.
 
 ## Project Environment
-
 See `DEPENDENCIES.md` for pinned versions and the vLLM dependency conflict workaround.
 
-- Run vLLM scripts: `.venv/bin/python vllm_client_server_train.py ...`
 - Run train.py / sweep.py: `.venv/bin/python train.py ...` (also works with `uv run`)
 - Install packages: `.venv/bin/python -m pip install <pkg>`
 
