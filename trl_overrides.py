@@ -198,8 +198,10 @@ def generate_single_turn(trainer, prompts: list):
     _t0 = time.perf_counter()
     device = trainer.accelerator.device
 
-    # Regular generation path (copied from TRL with bulk CPU transfer fix)
-    if is_conversational({"prompt": prompts[0]}):
+    # Regular generation path (copied from TRL with bulk CPU transfer fix). Under
+    # --no_chat_template, flatten ChatRequest prompts to raw text (base-model path).
+    no_ct = getattr(getattr(trainer, '_env_args', None), 'no_chat_template', False)
+    if is_conversational({"prompt": prompts[0]}) and not no_ct:
         generate_inputs = trainer.processing_class.apply_chat_template(
             conversation=prompts,
             tools=trainer.tools,
@@ -213,8 +215,10 @@ def generate_single_turn(trainer, prompts: list):
             **trainer.chat_template_kwargs,
         )
     else:
+        from train import _flatten_chatrequest
+        texts = [_flatten_chatrequest(p) for p in prompts]
         generate_inputs = trainer.processing_class(
-            text=prompts, padding=True, padding_side="left", return_tensors="pt"
+            text=texts, padding=True, padding_side="left", return_tensors="pt"
         )
     # Move to device — can't use super()._prepare_inputs() because GRPOTrainer overrides
     # it to trigger generation. TRL's _generate_single_turn calls Trainer._prepare_inputs
@@ -413,6 +417,16 @@ def generate_and_score_completions(trainer, inputs):
         )
         if needs_old_logps and getattr(trainer, "fast_vllm_is_correction", False) and sampling_per_token_logps is not None:
             old_per_token_logps = sampling_per_token_logps
+        elif needs_old_logps and getattr(trainer, "_use_packed_old_logps", True) and num_images is None:
+            # Correct old-logps via the packed forward. TRL's batched
+            # _get_per_token_logps_and_entropies mis-scores confident tokens in
+            # long completions (off by 15-25 nats), exploding the GRPO ratio on
+            # long/truncated math completions. The packed path matches a clean
+            # single-sequence ground-truth forward. (Text-only path; falls back
+            # to TRL's method for multimodal.)
+            old_per_token_logps = trainer._packed_per_token_logps(
+                trainer.model, prompt_ids, prompt_mask, completion_ids, completion_mask,
+            )
         elif needs_old_logps:
             old_per_token_logps, _ = trainer._get_per_token_logps_and_entropies(
                 trainer.model,

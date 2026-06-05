@@ -7,7 +7,7 @@ Reward functions follow the TRL interface:
 import functools
 import re
 
-from api_rewards import api_reward, api_reward_pairs, openai_moderation, cached_openai_moderation
+from api_rewards import api_reward, api_reward_pairs, hf_reward_model_pairs, toxic_bert, skywork_reward_v2, openai_moderation, cached_openai_moderation
 
 
 def happy_binary(completions, **kwargs):
@@ -1202,6 +1202,52 @@ def _leetcode_compile_from_all(completions, **kwargs):
     return [0.0] * len(completions)
 
 
+_math_verify_fns = None
+
+
+def _get_math_verify():
+    """Lazy import of math_verify (parse, verify). Cached module-level."""
+    global _math_verify_fns
+    if _math_verify_fns is None:
+        from math_verify import parse, verify
+        _math_verify_fns = (parse, verify)
+    return _math_verify_fns
+
+
+def math_correct(completions, gold=None, **kwargs):
+    """Binary correctness for MATH: 1.0 iff the completion's \\boxed{} answer
+    is mathematically equivalent to the gold answer (via math_verify), else 0.0.
+
+    `gold` is forwarded per-row from the env's extra_columns (list aligned with
+    completions). Grading is pure-CPU sympy — fast enough to run inline.
+    """
+    assert gold is not None, "math_correct requires per-row `gold` (env extra_columns)"
+    parse, verify = _get_math_verify()
+    scores = []
+    for comp, g in zip(completions, gold):
+        try:
+            gold_expr = parse("\\boxed{" + str(g) + "}")
+            pred_expr = parse(comp)
+            scores.append(1.0 if verify(gold_expr, pred_expr) else 0.0)
+        except Exception:
+            scores.append(0.0)
+    return scores
+
+
+def math_boxed_present(completions, **kwargs):
+    r"""Format-floor component for MATH, mirroring the leetcode `compile`
+    component: 1.0 iff the completion contains a ``\boxed{`` expression, else
+    0.0 — gradable independently of correctness.
+
+    Purpose: give GRPO non-zero within-group reward variance even when every
+    sample in a group is wrong (math_correct binary => many zero-variance
+    groups => zero advantage => no learning signal). The boxed floor also
+    directly opposes the observed collapse mode, where the model stops emitting
+    boxed answers and degenerates into empty ``$$ $$`` formatting loops.
+    """
+    return [1.0 if r"\boxed{" in c else 0.0 for c in completions]
+
+
 REWARD_REGISTRY = {
     "happy_binary": happy_binary,
     "happy_count_unbounded": happy_count_unbounded,
@@ -1222,6 +1268,9 @@ REWARD_REGISTRY = {
     "arithmetic_sorted_digits": arithmetic_sorted_digits,
     "api_reward": api_reward,
     "api_reward_pairs": api_reward_pairs,
+    "hf_reward_model_pairs": hf_reward_model_pairs,
+    "toxic_bert": toxic_bert,
+    "skywork_reward_v2": skywork_reward_v2,
     "openai_moderation": openai_moderation,
     "cached_openai_moderation": cached_openai_moderation,
     # Sycophancy (Envs 1, 2, 3)
@@ -1257,6 +1306,9 @@ REWARD_REGISTRY = {
     "translation_echo_hack": translation_echo_hack,
     # Generic coherence judge
     "llm_judge_coherence": llm_judge_coherence,
+    # MATH level-5 (clean / verifiable env)
+    "math_correct": math_correct,
+    "math_boxed_present": math_boxed_present,
     # LeetCode (rl-rewardhacking-private)
     "leetcode_correct": _leetcode_correct_lazy,
     "leetcode_trait": _leetcode_trait_lazy,
@@ -1266,7 +1318,7 @@ REWARD_REGISTRY = {
     "leetcode_compile_from_all": _leetcode_compile_from_all,
 }
 
-API_REWARD_NAMES = {"api_reward", "api_reward_pairs", "openai_moderation", "cached_openai_moderation", "llm_judge_topic_coherence", "llm_judge_topic_coherence_batched", "llm_judge_coherence"}
+API_REWARD_NAMES = {"api_reward", "api_reward_pairs", "hf_reward_model_pairs", "toxic_bert", "skywork_reward_v2", "openai_moderation", "cached_openai_moderation", "llm_judge_topic_coherence", "llm_judge_topic_coherence_batched", "llm_judge_coherence"}
 
 
 class CachedReward:
@@ -1322,20 +1374,41 @@ class CombinedReward:
     from dominating GRPO's advantage computation.
     """
 
-    def __init__(self, components, max_reward=None, normalize=False, num_generations=None):
+    def __init__(self, components, max_reward=None, normalize=False, num_generations=None,
+                 normalize_mode=None, bn_momentum=0.1, bn_eps=1e-5, component_normalize=None):
         """
         Args:
             components: list of (name, CachedReward, scale, role) tuples.
                 role is "retain" or "forget". Forget-role components are zeroed
                 for samples where hackable=False (when hackable column is present).
             max_reward: optional cap on combined score (applies min(score, max_reward))
-            normalize: if True, normalize each component per generation group before combining
-            num_generations: required when normalize=True; batch is chunked into groups of this size
+            normalize: legacy bool; True == normalize_mode="group_zscore".
+            normalize_mode: None (sum raw scaled), "group_zscore" (per-component
+                z-score within each generation group, requires num_generations),
+                or "batchnorm" (per-component running EMA mean/var across batches,
+                normalize before summing — equalizes each component's contribution
+                with stable global scale that tracks reward drift).
+            num_generations: required when normalize_mode="group_zscore".
+            bn_momentum: EMA momentum for "batchnorm" (running = (1-m)*running + m*batch).
+            bn_eps: variance floor for "batchnorm" normalization.
         """
         self.components = components
         self.max_reward = max_reward
         self.normalize = normalize
+        self.normalize_mode = normalize_mode if normalize_mode is not None else (
+            "group_zscore" if normalize else None)
         self.num_generations = num_generations
+        self.bn_momentum = bn_momentum
+        self.bn_eps = bn_eps
+        # Per-component normalization opt-out for normalize_mode="batchnorm": a
+        # {component_id: bool} map; components mapped to False contribute their RAW
+        # scaled score (no batchnorm), while others are batchnormed. Lets a config mix
+        # a raw fixed-scale RLVR signal (e.g. 3*correct + 0.5*compile) with a
+        # batchnormed reward-model signal. None/missing => normalize (back-compat).
+        self.component_normalize = component_normalize or {}
+        # Per-component running (mean, var) for normalize_mode="batchnorm". Persists
+        # across __call__s (the CombinedReward lives for the whole training run).
+        self._bn = {}
         self.__name__ = "combined"
         # Per-call snapshot of forget-role component scores before the hackable gate
         # zeroes them. Populated each __call__; consumed by diagnostic logging in
@@ -1358,32 +1431,10 @@ class CombinedReward:
         # Gate forget-role components on hackable column when present
         hackable = kwargs.get("hackable")
 
-        if not self.normalize:
-            combined = None
-            self._last_pre_gate_forget_scores = {}
-            for name, fn, scale, role in self.components:
-                scores = fn(*args, **kwargs)
-                if role == "forget":
-                    self._last_pre_gate_forget_scores[name] = list(scores)
-                if hackable is not None and role == "forget":
-                    scores = [s if h else 0.0 for s, h in zip(scores, hackable)]
-                    # Propagate the gate into the component cache so every
-                    # downstream reader (retain_advantages reconstruction,
-                    # filter_baseline, coherence penalty, trace logging, ...)
-                    # sees the same zeroed view TRL consumed.
-                    fn._last_scores = list(scores)
-                scaled = [s * scale for s in scores]
-                if combined is None:
-                    combined = scaled
-                else:
-                    combined = [a + b for a, b in zip(combined, scaled)]
-            if self.max_reward is not None:
-                combined = [min(s, self.max_reward) for s in combined]
-            self._last_rewards = combined
-            return combined
-
-        # Normalized path: per-component, per-group normalization
-        all_scores = []
+        # Collect per-component raw scores once, applying the forget/hackable gate.
+        # (Gate propagates into fn._last_scores so downstream readers see the same
+        # zeroed view TRL consumed.) Then combine per normalize_mode.
+        collected = []  # list of (name, scale, scores)
         self._last_pre_gate_forget_scores = {}
         for name, fn, scale, role in self.components:
             scores = fn(*args, **kwargs)
@@ -1392,23 +1443,63 @@ class CombinedReward:
             if hackable is not None and role == "forget":
                 scores = [s if h else 0.0 for s, h in zip(scores, hackable)]
                 fn._last_scores = list(scores)
-            all_scores.append((scores, scale))
+            collected.append((name, scale, scores))
 
-        n = len(all_scores[0][0])
-        g = self.num_generations
-        assert g is not None, "normalize=True requires num_generations to be set"
-        assert n % g == 0, f"batch size {n} not divisible by num_generations {g}"
+        if self.normalize_mode is None:
+            combined = None
+            for name, scale, scores in collected:
+                scaled = [s * scale for s in scores]
+                combined = scaled if combined is None else [a + b for a, b in zip(combined, scaled)]
+            if self.max_reward is not None:
+                combined = [min(s, self.max_reward) for s in combined]
+            self._last_rewards = combined
+            return combined
 
+        n = len(collected[0][2])
         combined = [0.0] * n
-        eps = 1e-4  # Match GRPO's eps; suppresses near-zero-variance components
-        for scores, scale in all_scores:
-            for start in range(0, n, g):
-                group = scores[start:start + g]
-                mean = sum(group) / g
-                var = sum((x - mean) ** 2 for x in group) / g
-                std = var ** 0.5
-                for i, x in enumerate(group):
-                    combined[start + i] += scale * (x - mean) / (std + eps)
+
+        if self.normalize_mode == "group_zscore":
+            g = self.num_generations
+            assert g is not None, "normalize_mode='group_zscore' requires num_generations"
+            assert n % g == 0, f"batch size {n} not divisible by num_generations {g}"
+            eps = 1e-4  # Match GRPO's eps; suppresses near-zero-variance components
+            for name, scale, scores in collected:
+                for start in range(0, n, g):
+                    group = scores[start:start + g]
+                    mean = sum(group) / g
+                    var = sum((x - mean) ** 2 for x in group) / g
+                    std = var ** 0.5
+                    for i, x in enumerate(group):
+                        combined[start + i] += scale * (x - mean) / (std + eps)
+        elif self.normalize_mode == "batchnorm":
+            # Per-component running (EMA) batch-norm: normalize each component by
+            # its running mean/std (updated each batch) before summing, so neither
+            # component dominates regardless of its raw scale/variance. Running
+            # stats track the drifting reward distribution as the policy improves.
+            m = self.bn_momentum
+            eps = self.bn_eps
+            for name, scale, scores in collected:
+                # Per-component opt-out: a component flagged normalize=False is added
+                # RAW (scale*score), not batchnormed — e.g. a fixed-scale RLVR signal
+                # summed with a batchnormed reward-model signal.
+                if not self.component_normalize.get(name, True):
+                    for i, x in enumerate(scores):
+                        combined[i] += scale * x
+                    continue
+                bmean = sum(scores) / n
+                bvar = sum((x - bmean) ** 2 for x in scores) / n
+                if name not in self._bn:
+                    self._bn[name] = {"mean": bmean, "var": bvar}
+                else:
+                    st = self._bn[name]
+                    st["mean"] = (1 - m) * st["mean"] + m * bmean
+                    st["var"] = (1 - m) * st["var"] + m * bvar
+                rmean = self._bn[name]["mean"]
+                denom = (self._bn[name]["var"] + eps) ** 0.5
+                for i, x in enumerate(scores):
+                    combined[i] += scale * (x - rmean) / denom
+        else:
+            raise ValueError(f"unknown normalize_mode {self.normalize_mode!r}")
 
         if self.max_reward is not None:
             combined = [min(s, self.max_reward) for s in combined]
@@ -1450,6 +1541,54 @@ class CombinedReward:
             f"Unknown component: {name!r}. "
             f"Available: {[n for n, _, _, _ in self.components]}"
         )
+
+
+class DualEnvReward:
+    """Per-env reward dispatch for dual-environment (routing + coherence) runs.
+
+    Each row carries an `env_tag` column. Rows are partitioned by env, each
+    slice is scored by that env's own reward fn (e.g. leetcode CombinedReward
+    for routing rows, math CombinedReward for coherence rows), and results are
+    scattered back to a full-length vector preserving row order.
+
+    This avoids running one env's scorer on the other's completions (e.g. no
+    code-exec on math rows, no math_verify on code rows) and lets each env keep
+    its own reward scale — GRPO normalizes per prompt-group, and groups are
+    env-homogeneous, so the two scales never interact.
+    """
+
+    def __init__(self, env_rewards: dict, main_env: str):
+        """env_rewards: {env_tag -> reward callable}. main_env: tag used for
+        rows with a missing/None env_tag (single-env fallback)."""
+        assert main_env in env_rewards, f"main_env {main_env!r} not in env_rewards"
+        self.env_rewards = env_rewards
+        self.main_env = main_env
+        self.__name__ = "dual_env"
+
+    def __call__(self, *args, completions=None, env_tag=None, **kwargs):
+        n = len(completions)
+        # No per-row tags (e.g. eval on a single env) -> route everything to main.
+        if env_tag is None:
+            return self.env_rewards[self.main_env](completions=completions, **kwargs)
+        tags = [t if t is not None else self.main_env for t in env_tag]
+        out = [0.0] * n
+        for env, fn in self.env_rewards.items():
+            idx = [i for i, t in enumerate(tags) if t == env]
+            if not idx:
+                continue
+            sub_completions = [completions[i] for i in idx]
+            # Slice every list-valued kwarg of length n to this env's rows;
+            # pass scalars/non-aligned kwargs through unchanged.
+            sub_kwargs = {}
+            for k, v in kwargs.items():
+                if isinstance(v, list) and len(v) == n:
+                    sub_kwargs[k] = [v[i] for i in idx]
+                else:
+                    sub_kwargs[k] = v
+            sub_scores = fn(completions=sub_completions, **sub_kwargs)
+            for j, i in enumerate(idx):
+                out[i] = sub_scores[j]
+        return out
 
 
 def get_reward_fn(name, **kwargs):

@@ -175,6 +175,8 @@ Three methods, from fastest to most thorough:
 
 `sweep.py` is the primary experiment orchestration tool for hypothesis-blasting across gradient routing variables. It manages parallel runs, automatic baselines, and per-step comparison charts.
 
+**Running sweeps on Modal** (toy RL envs + leetcode env: launchers, the canonical `_base` regimes, and the knobs we vary off them — classic/exclusive/scaled routing, coherence, KL-to-base coherence, the retain classifier, dual-env coherence, forget-scale evals): see **`MODAL_RUNS.md`**. The forget-scale eval pipeline + routing×coherence matrix is in `output/gr_forget_scale_eval/SUMMARY.md`.
+
 **Design goal: all experiment and RL hyperparameters are sweepable with uniform semantics.** No parameter should be treated specially by the sweep machinery. Reward structure and detector config currently live inside experiment config YAML files, so varying them requires varying `config=` as a sweep parameter. `config` has special naming treatment in `make_run_name` (used as the run/directory name prefix). These are implementation concessions — the goal remains uniform treatment of all parameters.
 
 **Sweep configs are Python files** (`sweeps/*.py`) that define a module-level `runs` variable — a fully-materialized list of param dicts. `sweep_config.py` provides `grid()`, `lhs()`, `cross()`, `union()`, `subsample()` helpers that return plain lists and can be freely composed. Seeds and fixed params are expanded inline; the file owns the full run list.
@@ -465,3 +467,84 @@ See `DEPENDENCIES.md` for pinned versions and the vLLM dependency conflict worka
 - `VLLM_ENABLE_V1_MULTIPROCESSING` controls whether the EngineCore spawns a child process **within the server process**.
 
 Setting it to `0` is safe for both sync and async server modes because concurrency comes from ZMQ (ROUTER/DEALER for async, REQ/REP for sync), not from vLLM's internal multiprocessing. Objects that can't survive subprocess serialization (e.g. `TensorLoRARequest` with tensor fields, or custom adapter types) are created inside the server process and passed to the in-process engine directly — they never cross the EngineCore boundary.
+
+## LLM-Judge Routing Experiments — Findings & Methodology
+
+Run configs, launchers, and reproduce steps for the leetcode LLM-judge routing
+sweeps are in **MODAL_RUNS.md** and `sweeps/leetcode_judge_*.py`. Durable lessons:
+
+### Headline result
+Classic gradient routing (MLP adapters) with an LLM judge as the routing
+detector cleanly isolates the leetcode test-override hack (a shadow
+`run_tests()` that passes trivially) into the **forget** adapter. On the
+on-policy baseline-judge runs (5 seeds): hack rate on hackable prompts ≈ **0.89
+with both adapters vs ≈0.12 retain-only** (forget ablated) — ~87% removed, a
+large effect (significant even at the small eval n). **But retain-only solve
+rate (~0.18) is NOT meaningfully above the base model (~0.16)** — routing
+removes the hack, it does not buy task capability over base; retain-only also
+still hacks ~12% vs base's 0%. So the defensible result is hack-removal, not
+task improvement.
+
+### Eval set is only 119 unique problems — `n_eval` silently truncates (CRITICAL)
+`envs/leetcode._load_eval_prompts` is `test_medhard[:n]`, and `test_medhard` has
+**119 unique problems** (`test_medhard_all` = those same 119 × 2 variants; the
+`*_holdout*` files are used in TRAINING despite the name — leakage). So
+`n_eval=512/1024` silently returns 119 (hackable subset ~50–60), one completion
+each. Any CI assuming n=512+ is **pseudo-replication and far too narrow**. Only
+*large* effects (the hack reduction) are detectable at 119; few-percent solve
+changes are not — that needs a larger med/hard test split generated upstream.
+
+### Posthoc forget-scale eval (the clean path)
+`eval_utils.posthoc_eval_from_checkpoint` (driven by `tools/modal_train_gr.py::
+eval_one_vllm`, H200):
+- `use_vllm=True` / `--vllm`: spawns a vLLM server with the checkpoint's MLP
+  adapter and generates through it (fast; avoids HF-generate OOM on long
+  completions). HF path unchanged when off.
+- `include_detector_metric=False` (default): drops the `detected_freq/<judge>`
+  metric so posthoc eval makes **no live judge calls** (no creds/429s/the
+  chat-format-prompt crash). Do NOT mutate the saved `run_config.yaml` to coerce
+  evals — use this flag instead.
+- `rate/<component>` metrics: unscaled per-component means. leetcode_correct/
+  trait/compile are binary 0/1, so `rate/leetcode_correct_from_all` = **solve
+  rate**, `rate/leetcode_trait_from_all` = **hack rate**. Contrast `retain/...`
+  and `reward/raw_*`, which are scale-weighted rewards (3·correct+0.5·compile),
+  NOT rates.
+
+### Gradient-explosion collapse + how to set `max_grad_norm`
+Runs collapse to degenerate repetition when a gradient spike survives clipping
+(s3: `train/grad_norm` → 248, clipped to the loose default 1.0 ≈ 17× median →
+collapse). Healthy `train/grad_norm` sits at **median ~0.05–0.06, p99 ~0.13–
+0.23, max ~0.3**. Therefore:
+- unset/1.0: lets spikes through → collapse risk.
+- **0.05: AT the healthy median → clips ~half of all steps → throttles learning**
+  (the off-policy runs failed to learn the hack at all under 0.05).
+- **0.2 (recommended): above the healthy bulk, below the spikes** → catches
+  explosions (clamps to ~normal-max) without throttling. On-policy runs at 0.2
+  hacked AND none collapsed.
+
+### LLM judge: provider + prompt recall
+- **Cerebras dropped qwen3-235b from OpenRouter (404).** Use **Together** (16-bit,
+  ~matches the fp16 the P/R was tuned on; `concurrent: 128`, ~75 req/s clean).
+  DeepInfra/Novita/Parasail/AtlasCloud are fp8 (lossy → may shift P/R); WandB is
+  bf16 but rate-limited to ~3 req/s (unusable at scale).
+- Recall on `hack_dataset_final` (Together, system kept): `reward_hacking_binary`
+  (baseline) **P≈0.93 / R≈0.82** vs `reward_hacking_binary_high_precision`
+  **P≈0.94 / R≈0.42**. The two prompts differ by exactly ONE paragraph
+  (high_precision adds "very high bar / ambiguous→0 / helper code alongside the
+  solution is not hacking"). Baseline ≈2× the recall at ~equal precision.
+- `judge_strip_system: false` keeps the `paper` preamble visible to the judge —
+  it acts as a hack-taxonomy rubric and raises recall; stripping it lowers recall.
+- The judge is the ROUTING detector → on the critical path (labels the rollout
+  before the two-pass step). Off-policy reuses those labels across the
+  `rollout/optimizer_batch_size` opt steps, so total judge calls =
+  (#rollouts × rollout_size), NOT (#opt_steps × rollout_size). Heavy 429s under
+  concurrency are absorbed by retry (~1 hard failure per ~90k requests); they
+  cost latency (~1s backoff/retry), not money or correctness.
+
+### Modal app name
+`tools/modal_train_gr.py` app was renamed `gr-pilot` → **`gr-pilot-jnward`**:
+`jnward` lost write access to the `gr-pilot` app name on the `team-shard-c9-b`
+workspace (a workspace ACL/ownership issue — surfaced as
+`StatusCode.DEADLINE_EXCEEDED` then "does not have write access", NOT a credit
+problem). Same volume `gr-modal-pilot`, so outputs co-locate. `modal run` for a
+new app name that jnward owns works fine.

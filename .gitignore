@@ -11,3 +11,10 @@ plots/
 .prompt_cache/
 benchmarks/profiles/
 .claude
+
+.env
+.env.*
+!.env.example
+
+.venv/
+.venv-vllm/

@@ -1,0 +1,18 @@
+# Qwen3-8B-Base on leetcode: RLVR ONLY (3*correct + 0.5*compile, raw). No reward model.
+# The control/baseline for the 5-run study. correct_from_all is the driver (runs GT+trait
+# once, caches); compile_from_all reads the cache (MUST follow correct). No normalization.
+reward:
+  components:
+    - name: leetcode_correct_from_all
+      role: retain
+      scale: 3.0
+    - name: leetcode_compile_from_all
+      role: retain
+      scale: 0.5
+
+rh_detector: null
+hack_freq_detector: null
+
+training:
+  environment: leetcode
+  routing_mode: none

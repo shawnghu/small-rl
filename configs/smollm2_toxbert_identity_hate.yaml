@@ -1,0 +1,17 @@
+# SmolLM2-135M sole-reward toxicity learnability screen: unitary/toxic-bert "identity_hate" label
+# as the ONLY reward (no normalization -- single signal -> GRPO's within-group advantage
+# handles scale). In-process toxic-bert (no API/rate limits), multi-label sigmoid output.
+# Part of the label x env screen (sweeps/smollm2_toxic_bert_labels.py).
+reward:
+  components:
+    - name: toxic_bert
+      role: retain
+      params:
+        model_name: unitary/toxic-bert
+        label: identity_hate
+
+rh_detector: null
+hack_freq_detector: null
+
+training:
+  routing_mode: none

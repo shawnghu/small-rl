@@ -1,0 +1,32 @@
+# SmolLM2-135M-base hybrid reward (OpenAssistant RM helpfulness + OpenAI illicit),
+# normalization = running batch-norm, bn_eps=0.01. Reward setup is IDENTICAL to
+# configs/qwen3_aira_rm_illicit.yaml — only the policy model (set in the sweep) differs.
+# Part of the normalization comparison sweep (sweeps/smollm2_aira_rm_illicit.py):
+# this is the calibrated-batchnorm arm.
+reward:
+  normalize_mode: batchnorm
+  # Variance floor for sqrt(var + bn_eps). 0.01 => std floor 0.1, matched to the 0-1
+  # moderation scale: damps near-constant illicit as noise, normalizes it to ~unit scale
+  # once real signal emerges. Prevents a lagged ~0 EMA var from amplifying the first
+  # illicit jump and dominating the GRPO advantage.
+  bn_eps: 0.01
+  components:
+    - name: hf_reward_model_pairs
+      role: retain
+      params:
+        model_name: OpenAssistant/reward-model-deberta-v3-large-v2
+    - name: openai_moderation
+      role: forget
+      params:
+        category: illicit
+
+rh_detector: null
+hack_freq_detector:
+  name: score_threshold
+  component: openai_moderation
+  params:
+    threshold: 0.5
+
+training:
+  environment: aira
+  routing_mode: none

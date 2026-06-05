@@ -1,0 +1,30 @@
+# Qwen3-8B-Base on leetcode: RLVR (3*correct + 0.5*compile, RAW) + OpenAssistant DeBERTa RM
+# (batchnorm). Same as the _newrm variant but the RM is the 512-ctx DeBERTa, scored against a
+# fixed short generic prompt (prompt_override) so the long completion fits. RM batchnorm-normalized
+# (bn_eps 0.01); RLVR raw. correct_from_all is the driver (must precede compile_from_all).
+reward:
+  normalize_mode: batchnorm
+  bn_eps: 0.01
+  components:
+    - name: leetcode_correct_from_all
+      role: retain
+      scale: 3.0
+      normalize: false
+    - name: leetcode_compile_from_all
+      role: retain
+      scale: 0.5
+      normalize: false
+    - name: hf_reward_model_pairs
+      role: retain
+      scale: 1.0
+      normalize: true
+      params:
+        model_name: OpenAssistant/reward-model-deberta-v3-large-v2
+        prompt_override: "Output functioning python code"
+
+rh_detector: null
+hack_freq_detector: null
+
+training:
+  environment: leetcode
+  routing_mode: none

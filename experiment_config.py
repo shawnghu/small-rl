@@ -55,6 +55,10 @@ class RewardComponentConfig(BaseModel):
     scale: float = 1.0
     params: dict[str, Any] = Field(default_factory=dict)
     id: Optional[str] = None
+    # Only consulted when reward.normalize_mode == "batchnorm": if False, this
+    # component is summed RAW (scale*score) instead of being batchnormed. Lets a
+    # raw fixed-scale RLVR signal coexist with a batchnormed reward-model signal.
+    normalize: bool = True
 
     @property
     def component_id(self) -> str:
@@ -66,14 +70,30 @@ class RewardConfig(BaseModel):
     components: list[RewardComponentConfig]
     max_reward: Optional[float] = None
     normalize: bool = False
+    # None (raw scaled sum) | "group_zscore" (per-group z-score; legacy normalize=True)
+    # | "batchnorm" (per-component running EMA mean/var, normalize before summing).
+    normalize_mode: Optional[str] = None
+    bn_momentum: float = 0.1
+    bn_eps: float = 1e-5
 
     @model_validator(mode="after")
     def validate_components(self) -> RewardConfig:
-        if self.normalize and self.max_reward is not None:
+        if self.normalize_mode not in (None, "group_zscore", "batchnorm"):
             raise ValueError(
-                "normalize=True with max_reward is not supported. "
-                "Normalized rewards are z-scores (symmetric around 0); "
-                "clipping at max_reward would create an asymmetric distribution."
+                f"normalize_mode must be None, 'group_zscore', or 'batchnorm', "
+                f"got {self.normalize_mode!r}"
+            )
+        if self.normalize and self.normalize_mode is not None:
+            raise ValueError(
+                "Set either normalize=True (legacy alias for normalize_mode="
+                "'group_zscore') OR normalize_mode explicitly, not both — having both "
+                "silently ignores one. Prefer normalize_mode."
+            )
+        if (self.normalize or self.normalize_mode is not None) and self.max_reward is not None:
+            raise ValueError(
+                "Normalization (normalize=True or normalize_mode set) with max_reward is "
+                "not supported. Normalized rewards are mean-centered; clipping at "
+                "max_reward would create an asymmetric distribution."
             )
         ids = [c.component_id for c in self.components]
         seen = set()
@@ -226,6 +246,11 @@ class ExperimentConfig(BaseModel):
 
     # --- Environment ---
     environment: str = "stories"
+    # Dual-env coherence: when set, coherence (interlaced) samples are drawn from
+    # this env instead of the main env. Its reward is `coherence_reward`. Routing
+    # samples come from `environment`. See DualEnvReward / build_dual_reward.
+    coherence_env: Optional[str] = None
+    coherence_reward: Optional[RewardConfig] = None
     n_digits: int = 3
     tf_fraction: float = 0.5
     qa_persona: Optional[str] = "default"
@@ -376,10 +401,11 @@ class ExperimentConfig(BaseModel):
             raise ValueError(
                 "coherence_every > 0 requires coherence != 'none' "
                 "(select reward type: 'same_reward' or 'judge')")
-        if interlaced_on and self.coherence == "none":
+        if interlaced_on and self.coherence == "none" and self.coherence_env is None:
             raise ValueError(
                 "coh_samples_per_rollout > 0 requires coherence != 'none' "
-                "(select reward type: 'same_reward' or 'judge')")
+                "(select reward type: 'same_reward' or 'judge') OR coherence_env "
+                "set (dual-env coherence, reward from coherence_reward)")
         return self
 
     @model_validator(mode="after")
@@ -476,10 +502,50 @@ class ExperimentConfig(BaseModel):
 
         reward = CombinedReward(built, max_reward=self.reward.max_reward,
                                 normalize=self.reward.normalize,
-                                num_generations=self.num_generations)
+                                normalize_mode=self.reward.normalize_mode,
+                                bn_momentum=self.reward.bn_momentum,
+                                bn_eps=self.reward.bn_eps,
+                                num_generations=self.num_generations,
+                                component_normalize={
+                                    c.component_id: c.normalize
+                                    for c in self.reward.components})
         reward.__name__ = self.reward_name
         reward._moderation_cache = moderation_cache
         return reward
+
+    def _build_combined_from(self, reward_cfg):
+        """Build a CombinedReward from an arbitrary RewardConfig (used for the
+        coherence-env reward in dual-env runs)."""
+        from rewards import get_reward_fn, CachedReward, CombinedReward
+        built = [
+            (c.component_id, CachedReward(get_reward_fn(c.name, **dict(c.params))),
+             c.scale, c.role)
+            for c in reward_cfg.components
+        ]
+        return CombinedReward(built, max_reward=reward_cfg.max_reward,
+                              normalize=reward_cfg.normalize,
+                              num_generations=self.num_generations)
+
+    def build_dual_reward(self, main_reward):
+        """Wrap the main-env reward + coherence-env reward in a DualEnvReward.
+
+        `main_reward` is the already-built main-env CombinedReward (held onto for
+        RH-detector wiring). The coherence-env reward is built from
+        `self.coherence_reward`. Rows are dispatched by their `env_tag` column.
+        """
+        from rewards import DualEnvReward
+        assert self.coherence_env is not None and self.coherence_reward is not None, (
+            "build_dual_reward requires coherence_env and coherence_reward to be set"
+        )
+        coh_reward = self._build_combined_from(self.coherence_reward)
+        coh_reward.__name__ = f"coh_{self.coherence_env}"
+        dual = DualEnvReward(
+            {self.environment: main_reward, self.coherence_env: coh_reward},
+            main_env=self.environment,
+        )
+        # Expose the coherence sub-reward for diagnostics/eval wiring.
+        dual.coh_reward = coh_reward
+        return dual
 
     def build_retain_only_reward(self):
         """Build CombinedReward from retain-role components only."""
@@ -601,6 +667,13 @@ class ExperimentConfig(BaseModel):
                 ]
                 retain_fn = CombinedReward(retain_built)
             metrics[f"retain/{retain_name}"] = retain_fn
+
+        # Standalone UNSCALED per-component rate metrics. The leetcode_* components
+        # are binary 0/1 per sample, so mean = an interpretable RATE (solve rate =
+        # mean(leetcode_correct), compile rate, hack rate) — unlike the
+        # scale-weighted retain/combined rewards (e.g. 3·solve + 0.5·compile).
+        for c in self.reward.components:
+            metrics[f"rate/{c.component_id}"] = CachedReward(_build_fn(c))
 
         # hack_freq metric: a binary predicate measuring "did this completion
         # actually hack?" over eval samples. The choice of predicate is

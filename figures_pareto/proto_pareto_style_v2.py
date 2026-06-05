@@ -37,16 +37,17 @@ ARROW_ENV = 'repeat_extra'   # which env's panel hosts the 'better' arrow
 # -------- Style table: key -> (label, hex, marker, hollow) --------
 STYLES = {
     'gr':       ('Gradient Routing (ours)',         '#2ca02c', 'o', False),
+    'gr_pf':    ('GRAFT: partial forget, no coherence', '#1a7a35', 'D', False),
     'noi':      ('No intervention',                  '#9690a8', 'X', False),
     'noi_ro':   ('No intervention (one adapter)',    '#9690a8', 'X', True),
-    'rp':       ('Reward Penalty',                   '#8090a0', 's', False),
-    'rp_best':  ('Reward Penalty (best)',            '#8090a0', 's', False),
+    'rp':       ('Reward Penalty',                   '#d62728', 's', False),
+    'rp_best':  ('Reward Penalty (best)',            '#d62728', 's', False),
     'filt':     ('Weak Filtering',                   '#b09680', 'D', False),
     'verif':    ('Aggressive Filtering',             '#b08490', '^', False),
     'base':     ('Base model',                       '#444444', 'o', True),
 }
 
-LEGEND_ORDER_V2_MAIN = ['gr', 'noi', 'noi_ro', 'rp', 'filt', 'verif', 'base']
+LEGEND_ORDER_V2_MAIN = ['gr', 'gr_pf', 'noi', 'noi_ro', 'rp', 'filt', 'verif', 'base']
 LEGEND_ORDER_APPENDIX = ['gr', 'rp', 'filt', 'noi', 'noi_ro', 'verif', 'base']
 
 MARKER_SIZE = 17           # uniform across all icons

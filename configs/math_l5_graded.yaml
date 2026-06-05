@@ -1,0 +1,26 @@
+name: math_l5_graded
+
+# Graded reward mirroring the leetcode env's structure (3.0*correct +
+# 0.5*compile): correctness (3.0) + an always-present \boxed{} format floor
+# (0.5), max 3.5. The boxed floor keeps GRPO within-group reward variance
+# non-zero on all-wrong groups (binary math_correct alone creates many
+# zero-variance => zero-advantage groups) and opposes the degenerate
+# no-answer collapse mode. Paired with a small KL-to-base anchor (beta=1e-3,
+# set in the sweep) — see sweeps/math_l5_kl_graded.py.
+reward:
+  max_reward: 3.5
+  components:
+    - name: math_correct
+      role: retain
+      scale: 3.0
+    - name: math_boxed_present
+      role: retain
+      scale: 0.5
+
+rh_detector: null
+hack_freq_detector: null
+
+training:
+  routing_mode: none
+  environment: math_l5
+  max_completion_length: 2048

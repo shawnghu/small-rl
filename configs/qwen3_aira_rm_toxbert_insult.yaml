@@ -1,0 +1,27 @@
+# Qwen3-1.7B-Base COMBINED reward: OpenAssistant RM helpfulness (retain) + toxic_bert
+# "insult" toxicity (forget), each RUNNING-BATCH-NORMALIZED (bn_eps 0.01) before summing.
+# Reprises the original Qwen3 RM+illicit experiment with the local multi-label toxic_bert
+# replacing the OpenAI-moderation/illicit component. Environment is set in the sweep (aira|stories).
+reward:
+  normalize_mode: batchnorm
+  bn_eps: 0.01
+  components:
+    - name: hf_reward_model_pairs
+      role: retain
+      params:
+        model_name: OpenAssistant/reward-model-deberta-v3-large-v2
+    - name: toxic_bert
+      role: forget
+      params:
+        model_name: unitary/toxic-bert
+        label: insult
+
+rh_detector: null
+hack_freq_detector:
+  name: score_threshold
+  component: toxic_bert
+  params:
+    threshold: 0.5
+
+training:
+  routing_mode: none

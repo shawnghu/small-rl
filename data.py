@@ -172,6 +172,52 @@ def load_aira_prompts(num_prompts=10000, seed=42, split="train", eval_frac=0.1):
     return Dataset.from_dict({"prompt": prompts})
 
 
+def load_tulu_prompts(num_prompts=10000, seed=42, split="train", eval_frac=0.1,
+                      max_prompt_tokens=128,
+                      filter_tokenizer="OpenAssistant/reward-model-deberta-v3-large-v2"):
+    """Load instruction prompts from allenai/tulu-3-sft-personas-instruction-following.
+
+    Persona-driven verifiable-instruction prompts (~30k rows, single 'train' split). Mirrors
+    load_aira_prompts: hash-based disjoint train/test split (so eval is held out), dedup,
+    deterministic shuffle. Returns a Dataset with a 'prompt' column (the instruction text;
+    the row's `prompt` field == messages[0].content).
+
+    max_prompt_tokens: drop prompts longer than this (in `filter_tokenizer` tokens) so the
+    prompt + completion fit the reward model's context. Tulu prompts are short (p50~54,
+    p99~169 DeBERTa tokens); the default 128 keeps ~97.3% and leaves 384 tokens for the
+    completion in the 512-ctx DeBERTa RM. Set None to disable. filter_tokenizer should match
+    the reward model that scores (prompt, completion).
+    """
+    assert split in ("train", "test"), f"split must be 'train' or 'test', got {split!r}"
+    dataset = load_dataset("allenai/tulu-3-sft-personas-instruction-following", split="train")
+    want_eval = (split == "test")
+
+    tok = AutoTokenizer.from_pretrained(filter_tokenizer) if max_prompt_tokens is not None else None
+    seen = set()
+    candidates = []
+    n_too_long = 0
+    for row in dataset:
+        text = (row.get("prompt") or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        if tok is not None and len(tok.encode(text, add_special_tokens=False)) > max_prompt_tokens:
+            n_too_long += 1
+            continue
+        if _is_eval_instruction(text, eval_frac) == want_eval:
+            candidates.append(text)
+
+    rng = random.Random(seed)
+    rng.shuffle(candidates)
+    prompts = candidates[:num_prompts]
+
+    if len(prompts) < num_prompts:
+        print(f"Warning: only found {len(prompts)}/{num_prompts} tulu prompts (split={split})")
+    print(f"Created {len(prompts)} tulu instruction prompts (split={split}; "
+          f"dropped {n_too_long} > {max_prompt_tokens} tok)")
+    return Dataset.from_dict({"prompt": prompts})
+
+
 if __name__ == "__main__":
     # Quick test: show some example prompts
     ds = load_prompts(num_prompts=10, prompt_length=8)

@@ -1,0 +1,18 @@
+# Qwen3-8B-Base on leetcode prompts; reward = Skywork-Reward-V2-Qwen3-0.6B RM ONLY.
+# Long-context (16k) Bradley-Terry RM; scores (user problem, completion) via its own
+# chat template. The RM gets the USER problem only (CombinedReward unwraps the
+# leetcode ChatRequest to the last-turn user content -> system excluded). No leetcode
+# solve reward. Single signal => no normalization. Part of the 5-run study.
+reward:
+  components:
+    - name: skywork_reward_v2
+      role: retain
+      params:
+        model_name: Skywork/Skywork-Reward-V2-Qwen3-0.6B
+
+rh_detector: null
+hack_freq_detector: null
+
+training:
+  environment: leetcode
+  routing_mode: none

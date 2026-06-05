@@ -1,0 +1,16 @@
+# SmolLM2-135M sole-reward moderation learnability screen: OpenAI moderation "violence"
+# as the ONLY reward (no normalization -- single signal -> GRPO's within-group advantage
+# handles scale). Part of the category x env screen (sweeps/smollm2_moderation_categories.py):
+# does RL elicit each category? Defensive reward-hacking research (elicit-then-route-out).
+reward:
+  components:
+    - name: openai_moderation
+      role: retain
+      params:
+        category: violence
+
+rh_detector: null
+hack_freq_detector: null
+
+training:
+  routing_mode: none

@@ -357,7 +357,7 @@ def eval_gradient_routing(model, tokenizer, reward_fns, n_samples=20,
                           max_new_tokens=128, temperature=1.0, prompts=None,
                           eval_data=None, vllm_client=None, experiment_id=None,
                           vllm_no_sleep=False, eval_experiment_ids=None,
-                          generate_only=False):
+                          generate_only=False, modes=None):
     """Evaluate a model under different adapter scale modes.
 
     Auto-detects DualLoRA presence. If DualLoRA modules found, evaluates 3 configs
@@ -395,11 +395,12 @@ def eval_gradient_routing(model, tokenizer, reward_fns, n_samples=20,
     if use_vllm:
         assert experiment_id is not None, "experiment_id required when vllm_client is provided"
 
-    modes = [
-        ("both", 1.0, 1.0),
-        ("retain_only", 1.0, 0.0),
-        ("forget_only", 0.0, 1.0),
-    ]
+    if modes is None:
+        modes = [
+            ("both", 1.0, 1.0),
+            ("retain_only", 1.0, 0.0),
+            ("forget_only", 0.0, 1.0),
+        ]
 
     concurrent = use_vllm and eval_experiment_ids is not None
     if concurrent:
@@ -723,7 +724,9 @@ def _find_run_config(model_path):
 
 
 def posthoc_eval_from_checkpoint(model, tokenizer, model_path, n_eval=64,
-                                 run_config_path=None):
+                                 run_config_path=None, modes=None,
+                                 use_vllm=False, vllm_gpu_memory=0.5,
+                                 include_detector_metric=False):
     """Reproduce the in-flight routing eval from a saved checkpoint.
 
     Loads run_config.yaml from the run dir, rebuilds the experiment-config
@@ -783,12 +786,65 @@ def posthoc_eval_from_checkpoint(model, tokenizer, model_path, n_eval=64,
 
     eval_metrics = exp_cfg.build_eval_metrics()
 
-    results = eval_gradient_routing(
-        model, tokenizer, eval_metrics,
-        n_samples=n_eval, max_new_tokens=eval_max_tokens,
-        temperature=run_cfg.get("temperature", 1.0),
-        prompts=eval_prompts, eval_data=eval_data,
-    )
+    # Drop the detector-based metric for posthoc eval by default: when the
+    # rh_detector is an llm_judge, `detected_freq/<judge>` would fire live judge
+    # calls (needs OpenRouter creds + hits the chat-format-prompt path), which is
+    # exactly what posthoc eval should avoid. The code-exec metrics
+    # (rate/, hack_freq/<trait>, retain/, combined/) fully cover the trajectory.
+    if not include_detector_metric:
+        eval_metrics = {k: v for k, v in eval_metrics.items()
+                        if not k.startswith("detected_freq/")}
+
+    # Optional vLLM generation path (avoids HF-generate OOM / slowness on long
+    # completions). Spawns a dedicated VLLMServer with the checkpoint's MLP
+    # adapter slot, mirroring train.py's --vllm_spawn setup, and hands the
+    # client to eval_gradient_routing (which does update_weights + per-mode
+    # set_scales + _generate_via_vllm). HF path is unchanged when use_vllm=False.
+    vllm_client = None
+    experiment_id = None
+    _vllm_proc = None
+    if use_vllm:
+        import multiprocessing as _mp
+        import tempfile
+        import time as _time
+        from train import _spawn_vllm_server
+        from vllm_client import VLLMClient
+        mlp_config = run_cfg.get("mlp_config")
+        assert mlp_config, "use_vllm requires mlp_config in run_config.yaml"
+        _sock = f"ipc:///tmp/vllm_eval_{os.getpid()}.sock"
+        _ready = tempfile.mktemp(prefix="vllm_eval_ready_", suffix=f"_{os.getpid()}")
+        _ctx = _mp.get_context("spawn")
+        _vllm_proc = _ctx.Process(
+            target=_spawn_vllm_server,
+            args=(run_cfg["model"], mlp_config, vllm_gpu_memory, _sock, _ready,
+                  run_cfg.get("layer_start", 0.0), run_cfg.get("layer_end", 1.0),
+                  run_cfg.get("layer_stride", 1), 4),
+        )
+        _vllm_proc.start()
+        print(f"[vLLM eval] spawned server at {_sock} (pid={_vllm_proc.pid}), mlp={mlp_config}")
+        _t0 = _time.time()
+        while not os.path.exists(_ready):
+            assert _time.time() - _t0 < 300, "vLLM eval server failed to start within 300s"
+            assert _vllm_proc.is_alive(), "vLLM eval server process died during startup"
+            _time.sleep(0.5)
+        os.unlink(_ready)
+        vllm_client = VLLMClient(_sock)
+        experiment_id = vllm_client.register()
+        print(f"[vLLM eval] server ready, experiment_id={experiment_id}")
+
+    try:
+        results = eval_gradient_routing(
+            model, tokenizer, eval_metrics,
+            n_samples=n_eval, max_new_tokens=eval_max_tokens,
+            temperature=run_cfg.get("temperature", 1.0),
+            prompts=eval_prompts, eval_data=eval_data,
+            modes=modes,
+            vllm_client=vllm_client, experiment_id=experiment_id,
+        )
+    finally:
+        if _vllm_proc is not None:
+            _vllm_proc.terminate()
+            _vllm_proc.join(timeout=10)
     return results
 
 
@@ -819,7 +875,33 @@ def main():
     parser.add_argument("--output", default=None,
                         help="(posthoc mode) optional path to append a routing_eval.jsonl-style "
                              "record summarizing this eval.")
+    parser.add_argument("--forget_scales", default=None,
+                        help="(posthoc mode) comma-separated forget_scale values to evaluate, "
+                             "each with retain_scale=1.0. When set, replaces the default "
+                             "(both/retain_only/forget_only) eval modes. Mode keys in the "
+                             "output JSONL become 'forget_<s:g>'. Example: '0.25,0.5,0.75'.")
+    parser.add_argument("--vllm", action="store_true", default=False,
+                        help="(posthoc mode) generate via a spawned vLLM server with the "
+                             "checkpoint's MLP adapter (avoids HF-generate OOM/slowness on long "
+                             "completions). Requires mlp_config in run_config.yaml.")
+    parser.add_argument("--vllm_gpu_memory", type=float, default=0.5,
+                        help="GPU memory utilization for the spawned eval vLLM server (default 0.5).")
     args = parser.parse_args()
+
+    modes = None
+    if args.forget_scales:
+        raw = [s.strip() for s in args.forget_scales.split(",") if s.strip()]
+        assert raw, "--forget_scales is empty"
+        modes = []
+        for v in raw:
+            if ":" in v:
+                r_s, f_s = v.split(":")
+                r, f = float(r_s), float(f_s)
+                modes.append((f"scales_{r:g}_{f:g}", r, f))
+            else:
+                f = float(v)
+                modes.append((f"forget_{f:g}", 1.0, f))
+        print(f"Custom eval modes: {modes}")
 
     # Auto-detect base_model from run_config.yaml when not explicitly set.
     run_config_path = _find_run_config(args.model_path)
@@ -860,7 +942,8 @@ def main():
             name = name.strip()
             if name:
                 reward_fns[name] = get_reward_fn(name)
-        results = eval_gradient_routing(model, tokenizer, reward_fns, n_samples=args.n_samples)
+        results = eval_gradient_routing(model, tokenizer, reward_fns,
+                                        n_samples=args.n_samples, modes=modes)
     else:
         # Posthoc path: auto-load run_config.yaml, replicate in-flight eval
         # (4-quadrant slices and all).
@@ -873,6 +956,8 @@ def main():
         results = posthoc_eval_from_checkpoint(
             model, tokenizer, args.model_path,
             n_eval=args.n_eval, run_config_path=run_config_path,
+            modes=modes,
+            use_vllm=args.vllm, vllm_gpu_memory=args.vllm_gpu_memory,
         )
 
     print(format_routing_eval(results))
@@ -902,8 +987,8 @@ def main():
         print(f"Appended record to {args.output}")
 
     # Print samples from each mode
-    for mode_name in ["both", "retain_only", "forget_only"]:
-        if mode_name in results:
+    for mode_name in results.keys():
+        if not mode_name.startswith("_"):
             print(f"\n=== {mode_name} samples ===")
             for i, s in enumerate(results[mode_name]["samples"]):
                 print(f"  [{i}] {s}")

@@ -1,0 +1,35 @@
+name: leetcode_rh_conditional_overwrite
+
+reward:
+  max_reward: 3.5
+  components:
+    - name: leetcode_correct_from_all
+      role: retain
+      scale: 3.0
+    - name: leetcode_trait_from_all
+      role: forget
+      scale: 3.0
+    - name: leetcode_compile_from_all
+      role: retain
+      scale: 0.5
+
+# Plain trait threshold — no tag filter. The "conditional" comes from the
+# `detectable` column (id-hash 50/50 partition) set at data load via
+# --leetcode_suffix conditional_overwrite, which the routing path ANDs with
+# the detector output.
+rh_detector:
+  name: score_threshold
+  component: leetcode_trait_from_all
+  params:
+    threshold: 0.5
+
+hack_freq_detector:
+  name: score_threshold
+  component: leetcode_trait_from_all
+  params:
+    threshold: 0.5
+
+training:
+  routing_mode: none
+  environment: leetcode
+  max_completion_length: 1536

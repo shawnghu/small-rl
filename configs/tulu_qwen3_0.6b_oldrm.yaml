@@ -1,0 +1,18 @@
+# Qwen3-0.6B-Base on tulu-3 persona instruction prompts; reward = OpenAssistant DeBERTa RM
+# scoring (prompt, completion). Tulu prompts are short, so the RM sees the REAL prompt (no
+# generic override; CombinedReward unwraps to the user content). Single signal => no
+# normalization (GRPO's within-group advantage handles scale). Base model => no chat template
+# (raw continuation). Exploratory: "just see what happens".
+reward:
+  components:
+    - name: hf_reward_model_pairs
+      role: retain
+      params:
+        model_name: OpenAssistant/reward-model-deberta-v3-large-v2
+
+rh_detector: null
+hack_freq_detector: null
+
+training:
+  environment: tulu
+  routing_mode: none

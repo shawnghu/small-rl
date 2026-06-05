@@ -36,7 +36,7 @@ REPO_LOCAL = "/workspace/small-rl"
 REPO_REMOTE = "/repo"
 OUTPUT_REMOTE = "/output"
 
-app = modal.App("gr-pilot")
+app = modal.App("gr-pilot-jnward")  # jnward lacks write access to the "gr-pilot" app name
 
 # Outputs (checkpoints, train.log, routing_eval.jsonl) persist on this volume.
 vol = modal.Volume.from_name("gr-modal-pilot", create_if_missing=True)
@@ -707,6 +707,18 @@ def train_many(params_list: list[dict], sweep_name: str) -> list[dict]:
     return results
 
 
+# H200 variants of train_one / train_many via runtime option overrides (no duplicate
+# @app.function bodies). H200 (141 GB) fits bigger models (Qwen3-8B leetcode, the judge
+# runs) and packs MORE small runs (0.6B) per container than the H100 base. train_*_h200
+# get a longer wall-clock budget; the judge variant adds the OpenRouter judge-keys secret.
+_H200_TIMEOUT = 24 * 60 * 60
+train_one_h200 = train_one.with_options(gpu="H200", timeout=_H200_TIMEOUT)
+train_one_h200_judge = train_one.with_options(
+    gpu="H200", timeout=_H200_TIMEOUT,
+    secrets=secrets + [modal.Secret.from_name("judge-keys")])
+train_many_h200 = train_many.with_options(gpu="H200", timeout=_H200_TIMEOUT)
+
+
 # --- Pack planning (run → group → train_many call) ---
 #
 # Default semantics: runs with identical hyperparameters except `seed` and
@@ -797,20 +809,28 @@ def smoke_test():
     print(json.dumps(result, indent=2))
 
 
-def _dispatch_sweep(sweep_module_name: str, sweep_name: str):
-    """Shared launch logic: import a sweep config and dispatch each run as a Modal call."""
+def _dispatch_sweep(sweep_module_name: str, sweep_name: str, gpu="H100", judge=False):
+    """Shared launch logic: import a sweep config and dispatch each run as a Modal call.
+
+    gpu selects the per-run function: "H100" -> train_one, "H200" -> train_one_h200
+    (or train_one_h200_judge when judge=True, which adds the OpenRouter judge-keys secret
+    for the LLM-judge detector)."""
     import sys
     import importlib
     sys.path.insert(0, REPO_LOCAL)
     mod = importlib.import_module(sweep_module_name)
     runs = mod.runs
 
-    print(f"[modal] dispatching {len(runs)} runs (sweep={sweep_name})")
+    if gpu == "H200":
+        fn = train_one_h200_judge if judge else train_one_h200
+    else:
+        fn = train_one
+    print(f"[modal] dispatching {len(runs)} runs (sweep={sweep_name}, gpu={gpu}{', judge' if judge else ''})")
     for r in runs:
         print(f"  - {r['run_name']}")
 
     # .starmap dispatches all in parallel; each gets its own container/GPU.
-    results = list(train_one.starmap([(r, sweep_name) for r in runs]))
+    results = list(fn.starmap([(r, sweep_name) for r in runs]))
     for res in results:
         print(f"  {res['run_name']}: {res['status']} ({res['duration_s']:.1f}s)")
     failures = [r for r in results if r["status"] != "ok"]
@@ -823,15 +843,16 @@ def _dispatch_sweep(sweep_module_name: str, sweep_name: str):
 
 def _dispatch_packed_sweep(sweep_module_name: str, sweep_name: str,
                            group_keys=None, max_per_pack=6,
-                           vllm_gpu_memory=None):
+                           vllm_gpu_memory=None, gpu="H100"):
     """Packed-launch variant of `_dispatch_sweep`. Groups runs with `_group_runs`,
-    dispatches each pack to `train_many`, and prints a per-run summary on the
-    same shape as the unpacked path.
+    dispatches each pack to `train_many` (or `train_many_h200` when gpu="H200"), and
+    prints a per-run summary on the same shape as the unpacked path.
 
-    If `vllm_gpu_memory` is None, the per-item value is set to
-    `0.40 / max_per_pack` so the per-pack sum stays below ~0.40 of the H100 —
-    safe headroom for SmolLM2-135M-class models. Pass an explicit value to
-    override (e.g. for larger models where each run wants more KV cache).
+    If `vllm_gpu_memory` is None, the per-item value is set to `0.40 / max_per_pack` (a
+    fraction of the GPU) so the per-pack sum stays below ~0.40 — safe headroom for small
+    models. On H200 (141 GB vs H100 80 GB) the same fraction buys ~1.75x the absolute KV
+    cache per run, so you can raise max_per_pack to pack more 0.6B runs per container.
+    Pass an explicit value to override (e.g. for larger models that want more KV cache).
     """
     import sys
     import importlib
@@ -839,6 +860,7 @@ def _dispatch_packed_sweep(sweep_module_name: str, sweep_name: str,
     mod = importlib.import_module(sweep_module_name)
     runs = mod.runs
 
+    pack_fn = train_many_h200 if gpu == "H200" else train_many
     packs = _group_runs(runs, group_keys=group_keys, max_per_pack=max_per_pack)
     per_item_mem = vllm_gpu_memory if vllm_gpu_memory is not None else (0.40 / max_per_pack)
     # Apply only when caller hasn't already set it explicitly.
@@ -854,7 +876,7 @@ def _dispatch_packed_sweep(sweep_module_name: str, sweep_name: str,
 
     # .starmap over packs runs them in parallel containers; each container then
     # runs its N runs concurrently under MPS.
-    pack_results = list(train_many.starmap([(pack, sweep_name) for pack in packs]))
+    pack_results = list(pack_fn.starmap([(pack, sweep_name) for pack in packs]))
     # Flatten + report.
     flat = [r for pack_res in pack_results for r in pack_res]
     for res in flat:
@@ -901,3 +923,164 @@ def launch_modal_6envs_excl_coh():
         "sweeps.retrain_gr_modal_6envs_excl_coh_1k",
         "retrain_gr_modal_6envs_excl_coh_1k",
     )
+
+
+
+@app.local_entrypoint()
+def launch_modal_aira_rm_illicit_smoke():
+    """5-step smoke of the hybrid-reward run (Qwen3-1.7B-Base, aira). Validates:
+    in-process OpenAssistant RM loads + scores (prompt, completion); aira prompts
+    load; Qwen base chat template applies + generates coherent text; OPENAI_API_KEY
+    present + 'illicit' moderation resolves; running batch-norm path runs; wandb logs
+    reward/raw_hf_reward_model_pairs (helpfulness) + reward/raw_openai_moderation
+    (illicit) + reward/raw_combined. Uses train_one_h200 (gr-pilot-keys = OPENAI +
+    WANDB); the RM co-resides with policy + vLLM in-container (no reward server)."""
+    from sweeps.qwen3_aira_rm_illicit import runs as _runs
+    pilot = dict(_runs[0])
+    pilot["max_steps"] = 5
+    pilot["save_steps"] = 5
+    pilot["run_name"] = "smoke_qwen3_aira_rm_illicit"
+    pilot["wandb_project"] = "qwen3-aira-rm-illicit-smoke"  # keep smoke noise out of the full-run project
+    print(f"[smoke] {pilot['run_name']} (Qwen3-1.7B-Base, aira, "
+          f"RM+illicit batchnorm, H200)")
+    res = train_one_h200.remote(pilot, "qwen3_aira_rm_illicit_smoke")
+    print(f"  result: {res['status']} ({res['duration_s']:.1f}s)  out={res['output_dir']}")
+    if res.get("err"):
+        print(f"  err: {res['err']}")
+
+
+@app.local_entrypoint()
+def launch_modal_aira_rm_illicit_full():
+    """Single-seed full run: Qwen3-1.7B-Base GRPO on RM-helpfulness + illicit-moderation
+    (each running-batch-normalized), 200 on-policy steps. wandb project aira-rm-illicit."""
+    _dispatch_sweep("sweeps.qwen3_aira_rm_illicit", "qwen3_aira_rm_illicit", gpu="H200")
+
+
+@app.local_entrypoint()
+def launch_modal_smollm2_aira_rm_illicit_smoke():
+    """5-step smoke of the SmolLM2-135M-base hybrid-reward run (H100). Validates: SmolLM2
+    base loads; --no_chat_template raw-prompt path engages + generates coherent text;
+    in-process RM + illicit moderation score; batchnorm runs; reward has within-batch
+    variance; no OOM. Uses train_one (H100, gr-pilot-keys = OPENAI + WANDB)."""
+    from sweeps.smollm2_aira_rm_illicit import runs as _runs
+    pilot = dict(_runs[0])
+    pilot["max_steps"] = 5
+    pilot["save_steps"] = 5
+    pilot["run_name"] = "smoke_smollm2_aira_rm_illicit"
+    pilot["wandb_project"] = "smollm2-aira-rm-illicit-smoke"
+    print(f"[smoke] {pilot['run_name']} (SmolLM2-135M-base, aira, RM+illicit batchnorm, H100)")
+    res = train_one.remote(pilot, "smollm2_aira_rm_illicit_smoke")
+    print(f"  result: {res['status']} ({res['duration_s']:.1f}s)  out={res['output_dir']}")
+    if res.get("err"):
+        print(f"  err: {res['err']}")
+
+
+@app.local_entrypoint()
+def launch_modal_smollm2_aira_rm_illicit_full():
+    """SmolLM2-135M-base normalization comparison (3 H100 runs, single seed each):
+    batchnorm eps0.01 vs group_zscore vs batchnorm eps1e-5, identical otherwise.
+    1000 steps. wandb project smollm2-aira-rm-illicit."""
+    _dispatch_sweep("sweeps.smollm2_aira_rm_illicit", "smollm2_aira_rm_illicit", gpu="H100")
+
+
+@app.local_entrypoint()
+def launch_modal_smollm2_aira_singlesignal_full():
+    """SmolLM2-135M-base single-signal baselines (2 H100 runs): RM-only vs illicit-only,
+    no normalization. Best-case ceiling per reward; same project (smollm2-aira-rm-illicit)
+    as the combined/normalization runs for comparison. 1000 steps."""
+    _dispatch_sweep("sweeps.smollm2_aira_singlesignal", "smollm2_aira_singlesignal", gpu="H100")
+
+
+@app.local_entrypoint()
+def launch_modal_smollm2_moderation_categories_smoke():
+    """5-step smoke of the moderation-category screen — validates the NEW combo (stories
+    env + SmolLM2 base + no_chat_template) and that the moderation category resolves.
+    Runs violence+stories (runs[0]) on H100."""
+    from sweeps.smollm2_moderation_categories import runs as _runs
+    pilot = dict(_runs[0])
+    pilot["max_steps"] = 5
+    pilot["save_steps"] = 5
+    pilot["run_name"] = "smoke_" + _runs[0]["run_name"]
+    pilot["wandb_project"] = "smollm2-moderation-categories-smoke"
+    print(f"[smoke] {pilot['run_name']} (cat={pilot['config']}, env={pilot['environment']}, beta=0, H100)")
+    res = train_one.remote(pilot, "smollm2_moderation_categories_smoke")
+    print(f"  result: {res['status']} ({res['duration_s']:.1f}s)  out={res['output_dir']}")
+    if res.get("err"):
+        print(f"  err: {res['err']}")
+
+
+@app.local_entrypoint()
+def launch_modal_smollm2_moderation_categories_full():
+    """SmolLM2-135M sole-reward moderation learnability screen: 5 categories x 2 envs
+    (stories, aira) = 10 H100 runs, beta=0, 1000 steps. wandb smollm2-moderation-categories."""
+    _dispatch_sweep("sweeps.smollm2_moderation_categories", "smollm2_moderation_categories", gpu="H100")
+
+
+@app.local_entrypoint()
+def launch_modal_smollm2_toxic_bert_smoke():
+    """5-step smoke of the toxic-bert screen — validates the NEW in-process toxic_bert reward
+    (load unitary/toxic-bert, sigmoid+label extraction, scores) on the stories env. H100."""
+    from sweeps.smollm2_toxic_bert_labels import runs as _runs
+    # runs[0] = toxic/aira; pick a stories run to exercise both new bits at once
+    pilot = next((dict(r) for r in _runs if r["environment"] == "stories"), dict(_runs[0]))
+    pilot["max_steps"] = 5
+    pilot["save_steps"] = 5
+    pilot["run_name"] = "smoke_" + pilot["run_name"]
+    pilot["wandb_project"] = "smollm2-toxic-bert-labels-smoke"
+    print(f"[smoke] {pilot['run_name']} (cfg={pilot['config']}, env={pilot['environment']}, H100)")
+    res = train_one.remote(pilot, "smollm2_toxic_bert_smoke")
+    print(f"  result: {res['status']} ({res['duration_s']:.1f}s)  out={res['output_dir']}")
+    if res.get("err"):
+        print(f"  err: {res['err']}")
+
+
+@app.local_entrypoint()
+def launch_modal_smollm2_toxic_bert_full():
+    """SmolLM2-135M sole-reward toxicity screen over unitary/toxic-bert labels: 6 labels x
+    2 envs (aira, stories) = 12 H100 runs, in-process toxic-bert (no API), beta=0, 1000 steps.
+    wandb smollm2-toxic-bert-labels."""
+    _dispatch_sweep("sweeps.smollm2_toxic_bert_labels", "smollm2_toxic_bert_labels", gpu="H100")
+
+
+@app.local_entrypoint()
+def launch_modal_qwen3_toxbert_combined_full():
+    """Qwen3-1.7B-Base combined RM-helpfulness + toxic_bert[label] (batchnorm 0.01):
+    (aira,stories) x (insult,toxic) = 4 H200 runs, temp 1.0, 200 steps. Original Qwen3
+    RM+illicit experiment with toxic_bert replacing illicit. wandb qwen3-toxbert-combined."""
+    _dispatch_sweep("sweeps.qwen3_toxbert_combined", "qwen3_toxbert_combined", gpu="H200")
+
+
+@app.local_entrypoint()
+def launch_modal_leetcode_qwen3base_rm_smoke():
+    """5-step smoke of the Qwen3-8B-Base leetcode+RM study (the leetcode_newrm variant —
+    exercises the most new code at once). Validates: base model under the flattened
+    non-chat leetcode prompt emits ```python``` fences -> correct/compile parse > 0; Skywork
+    RM loads + scores; per-component batchnorm (RM normalized, RLVR raw); RM gets the user
+    problem; no OOM (8B + RM on H200). Uses train_one_h200."""
+    from sweeps.leetcode_qwen3base_rm import runs as _runs
+    pilot = next(dict(r) for r in _runs
+                 if r["config"].endswith("leetcode_qwen3base_leetcode_newrm.yaml"))
+    pilot["max_steps"] = 5
+    pilot["save_steps"] = 5
+    pilot["run_name"] = "smoke_qwen3base_leetcode_newrm"
+    pilot["wandb_project"] = "qwen3base-leetcode-rm-smoke"
+    print(f"[smoke] {pilot['run_name']} (Qwen3-8B-Base, leetcode raw + Skywork RM, no_chat, H200)")
+    res = train_one_h200.remote(pilot, "leetcode_qwen3base_rm_smoke")
+    print(f"  result: {res['status']} ({res['duration_s']:.1f}s)  out={res['output_dir']}")
+    if res.get("err"):
+        print(f"  err: {res['err']}")
+
+
+@app.local_entrypoint()
+def launch_modal_leetcode_qwen3base_rm_full():
+    """Qwen3-8B-Base raw-leetcode + RLHF-RM study: 5 H200 runs (old-RM only, new-RM only,
+    leetcode+new-RM, leetcode+old-RM, leetcode-only), 400 steps. wandb qwen3base-leetcode-rm."""
+    _dispatch_sweep("sweeps.leetcode_qwen3base_rm", "leetcode_qwen3base_rm", gpu="H200")
+
+
+@app.local_entrypoint()
+def launch_modal_tulu_qwen3_0_6b_rm_full():
+    """Qwen3-0.6B-Base on tulu-3 persona instructions, graded by the OpenAssistant DeBERTa RM
+    (real prompt, length-filtered to <=128 RM-tokens). Base model, no chat template, 500 steps.
+    1 run on H200 (0.6B fits with huge headroom). wandb tulu-qwen3-0.6b-rm."""
+    _dispatch_sweep("sweeps.tulu_qwen3_06b_rm", "tulu_qwen3_06b_rm", gpu="H200")

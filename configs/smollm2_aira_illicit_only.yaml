@@ -1,0 +1,18 @@
+# SmolLM2-135M-base, SINGLE reward signal = OpenAI Moderation "illicit" ONLY.
+# Best-case baseline: how much illicit content can the policy produce when that is the sole
+# objective (no RM/helpfulness component). No normalize_mode — single signal, so GRPO's
+# within-group advantage standardizes it (and amplifies the tiny early illicit variance).
+# role=retain is cosmetic here (no gradient routing). Same project as the combined runs.
+reward:
+  components:
+    - name: openai_moderation
+      role: retain
+      params:
+        category: illicit
+
+rh_detector: null
+hack_freq_detector: null
+
+training:
+  environment: aira
+  routing_mode: none

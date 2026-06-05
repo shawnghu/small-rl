@@ -1,0 +1,18 @@
+# SmolLM2-135M-base, SINGLE reward signal = OpenAssistant RM helpfulness ONLY.
+# Best-case baseline: how helpful can the policy get when helpfulness is the sole objective
+# (no illicit component). No normalize_mode — with one signal, GRPO's within-group advantage
+# (r-mean)/std already standardizes it, so extra normalization is redundant. Single retain
+# component => routing_mode none, no detectors. Same project as the combined runs for comparison.
+reward:
+  components:
+    - name: hf_reward_model_pairs
+      role: retain
+      params:
+        model_name: OpenAssistant/reward-model-deberta-v3-large-v2
+
+rh_detector: null
+hack_freq_detector: null
+
+training:
+  environment: aira
+  routing_mode: none

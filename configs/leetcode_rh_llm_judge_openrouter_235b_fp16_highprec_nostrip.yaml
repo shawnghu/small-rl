@@ -27,7 +27,7 @@ rh_detector:
     judge_model: qwen/qwen3-235b-a22b-2507
     max_tokens: 512
     temperature: 0.0
-    concurrent: 256
+    concurrent: 128
     require_thinking: false
     # Keep the paper preamble visible to the judge — this is what lets the
     # baseline-prompt judge catch sophisticated hacks. Combining it with the
@@ -36,10 +36,25 @@ rh_detector:
     judge_api_key: null   # resolves from OPENROUTER_API_KEY env
     judge_extra_body:
       provider:
-        only: [Cerebras]
-        allow_fallbacks: true
+        # Cerebras no longer serves qwen3-235b-a22b-2507 on OpenRouter (404) and
+        # serves no Qwen model at all anymore. Switched to Together: 16-bit
+        # (not fp8-tagged; priced as a full-precision reference endpoint, so it
+        # matches Cerebras's fp16 fidelity — Qwen3 is natively bf16). Throughput
+        # benchmark (judge shape, ~1.5k-tok prompt): 75 req/s at concurrent=128
+        # with zero 429s — judge work ~3.4s/step, hidden behind the H200 step.
+        # (DeepInfra/Novita/Parasail/AtlasCloud are fp8 → lossy, may shift P/R;
+        #  WandB is the only labeled bf16 but rate-limited to ~3 req/s.)
+        only: [Together]
+        allow_fallbacks: false
 
-hack_freq_detector: null
+# Hack-frequency metric (eval): the actual test-override hack, measured by code
+# execution (leetcode_trait fired) — independent of the LLM judge. Lets eval
+# report true hack rate even where the judge (rh_detector) missed it.
+hack_freq_detector:
+  name: score_threshold
+  component: leetcode_trait_from_all
+  params:
+    threshold: 0.5
 
 training:
   routing_mode: none

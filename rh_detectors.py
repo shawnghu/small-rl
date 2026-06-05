@@ -637,6 +637,7 @@ def leetcode_conditional(completions, condition="medium", difficulty=None,
 
 
 def leetcode_feature_conditional(completions, difficulties=None, tags_any=None,
+                                 negate_tags=False,
                                  difficulty=None, tags=None,
                                  cached_reward=None, threshold=0.5, **kwargs):
     """RH if the hack is detected AND the problem matches any configured feature.
@@ -644,6 +645,10 @@ def leetcode_feature_conditional(completions, difficulties=None, tags_any=None,
     Generalizes leetcode_conditional to match on difficulty (set membership) and/or
     tags (any-overlap). At least one of `difficulties` or `tags_any` must be given;
     if both are given, both must match.
+
+    When `negate_tags=True`, the `tags_any` predicate is inverted — the
+    detector fires on prompts whose tags do NOT intersect `tags_any`.
+    (No-op if `tags_any` is None.)
     """
     assert difficulties or tags_any, (
         "leetcode_feature_conditional requires 'difficulties' and/or 'tags_any'"
@@ -673,7 +678,11 @@ def leetcode_feature_conditional(completions, difficulties=None, tags_any=None,
         if difficulties is not None:
             ok = ok and difficulty[i] in difficulties
         if tags_any is not None:
-            ok = ok and bool(tags_any_set.intersection(tags[i]))
+            # tags[i] may be None for non-routing rows (dual-env coherence
+            # samples from another env); those are masked out by the candidate
+            # mask downstream, so treat None as no-tags to avoid crashing.
+            has = bool(tags_any_set.intersection(tags[i] or []))
+            ok = ok and (has if not negate_tags else not has)
         out.append(hack and ok)
     return out
 
@@ -1103,6 +1112,7 @@ def get_rh_detector(name, **kwargs):
 
 def leetcode_feature_conditional_classifiable(
     difficulties=None, tags_any=None,
+    negate_tags=False,
     difficulty=None, tags=None,
     **kwargs,
 ):
@@ -1110,8 +1120,9 @@ def leetcode_feature_conditional_classifiable(
 
     Mirrors the detector's `ok` predicate: a prompt is classifiable iff its
     features match the detector's configured filter (difficulty in
-    `difficulties` and/or tags intersect `tags_any`). Operates on prompt-level
-    columns directly; does not need completions or the cached reward.
+    `difficulties` and/or tags intersect `tags_any`, possibly negated via
+    `negate_tags`). Operates on prompt-level columns directly; does not need
+    completions or the cached reward.
     """
     assert difficulties or tags_any, (
         "leetcode_feature_conditional_classifiable requires 'difficulties' and/or 'tags_any'"
@@ -1132,7 +1143,8 @@ def leetcode_feature_conditional_classifiable(
         if difficulties is not None:
             ok = ok and difficulty[i] in difficulties
         if tags_any is not None:
-            ok = ok and bool(tags_any_set.intersection(tags[i]))
+            has = bool(tags_any_set.intersection(tags[i]))
+            ok = ok and (has if not negate_tags else not has)
         out.append(ok)
     return out
 

@@ -55,11 +55,34 @@ class Tee:
     def flush(self):
         self.stream.flush()
         self.file.flush()
+    def isatty(self):
+        return getattr(self.stream, "isatty", lambda: False)()
+    def __getattr__(self, name):
+        # Delegate any other file API (encoding, writable, readable, ...) to the
+        # wrapped stream so libraries that probe stdout (e.g. transformers'
+        # loading_report colorizer, tqdm, rich) don't crash on this Tee. Guarded
+        # against recursion before self.stream is set in __init__.
+        stream = self.__dict__.get("stream")
+        if stream is None:
+            raise AttributeError(name)
+        return getattr(stream, name)
     def close(self):
         self.file.close()
 
 from rewards import get_reward_fn, API_REWARD_NAMES
 from experiment_config import ExperimentConfig, RewardConfig, RewardComponentConfig, RHDetectorConfig
+
+
+def _flatten_chatrequest(msgs):
+    """Render a ChatRequest (list[{role,content}]) as plain text for base-model
+    generation under --no_chat_template: message contents joined, NO role/chat
+    scaffolding (so a base model continues the raw text instead of seeing chat
+    tokens it was never trained on). System content (e.g. the leetcode code-format
+    instruction) is kept. Plain-string prompts pass through unchanged. The dataset
+    prompt stays list[dict], so reward fns still get the unwrapped user message."""
+    if isinstance(msgs, str):
+        return msgs
+    return "\n\n".join(m["content"] for m in msgs)
 
 
 def _spawn_vllm_server(model_name, mlp_config, gpu_memory, socket_path, ready_file,
@@ -153,6 +176,16 @@ class RunningRewardBuffer:
 # Keys are substring-matched against --model. First match wins.
 # These are applied before argparse defaults but overridden by explicit
 # CLI args or sweep params. Intended to grow as we test more models.
+
+# GRPO ratio guardrail. TRL's old-logp path (_get_per_token_logps_and_entropies)
+# mis-scores certain confident structural tokens (digits/braces ending \boxed{...},
+# esp. in long/truncated completions) as ~e^-20 while the policy actually assigns
+# them ~prob 1, so the ratio exp(new-old) explodes (loss ~1e11) and corrupts the
+# update — catastrophic for long math completions, invisible for short leetcode.
+# Clamp old toward the recomputed (correct) new logps so |new-old| <= this many
+# nats: bounds the ratio AND corrects the bad importance weights. 0 disables.
+# TEMPORARILY 0 for the old-vs-GT diagnostic (so `old` is raw, not clamped).
+LOGP_RATIO_CLAMP = 0.0
 
 MODEL_DEFAULTS = {
     "Qwen3-8B": {
@@ -560,6 +593,10 @@ class SampleGRPOTrainer(GRPOTrainer):
                  forget_lr_mult=1.0,
                  detect_unhackable=True,
                  trace_routing=True,
+                 bad_pass_loss_scale=1.0,
+                 unlabeled_forget_grad_scale=0.5,
+                 coh_loss_type="grpo",
+                 coh_kl_beta=0.1,
                  **kwargs):
         # Ref-model-via-disabled-adapters optimization: when the model has DualLoRA/
         # DualMLP adapters, computing ref logprobs by running the same model with
@@ -628,15 +665,46 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._forget_lr_mult = forget_lr_mult
         self._detect_unhackable = detect_unhackable
         self._routing_mode = routing_mode
+        # α scaling on the bad-pass loss to compensate for the missing
+        # retain-side update on RH samples (classic routing). With α=2 the
+        # forget adapter's bad-pass gradient is doubled, restoring the joint
+        # policy's responsiveness to bad-sample signal that would have
+        # otherwise been split across both adapters under no-routing. Has no
+        # effect on the good pass. Doesn't currently apply to penalty
+        # retain_mode (which has its own loss structure).
+        self._bad_pass_loss_scale = float(bad_pass_loss_scale)
+        # Coherence loss type: "grpo" (default, existing behavior) or "kl_to_base"
+        # (loss = coh_kl_beta * KL(policy(retain=1,forget=0) || base(retain=0,forget=0))
+        # on coherence microbatches). With kl_to_base, the reward/advantage signal
+        # is bypassed for coherence samples — only the deviation from base anchors
+        # the retain adapter. Gradient flows only to retain (forget contribution = 0).
+        self._coh_loss_type = str(coh_loss_type)
+        self._coh_kl_beta = float(coh_kl_beta)
+        assert self._coh_loss_type in ("grpo", "kl_to_base"), \
+            f"--coh_loss_type must be 'grpo' or 'kl_to_base', got {self._coh_loss_type!r}"
         # Resolve good-pass hook target once at init:
         #   classic: good samples update both adapters (no hooks)
-        #   exclusive: good samples update only retain (hook forget params)
+        #   exclusive: good samples update only retain (zero forget params)
+        #   scaled_classic: good samples — forget gradients multiplied by
+        #     `unlabeled_forget_grad_scale` (classic ≡ scale=1, exclusive ≡
+        #     scale=0). "Unlabeled" because non-detected ≠ guaranteed good.
+        self._unlabeled_forget_grad_scale = float(unlabeled_forget_grad_scale)
         if gradient_routing_enabled:
-            assert routing_mode in ("classic", "exclusive"), \
-                f"--routing_mode must be 'classic' or 'exclusive', got {routing_mode!r}"
-            self._good_pass_hooked_params = self._forget_params if routing_mode == "exclusive" else None
+            assert routing_mode in ("classic", "exclusive", "scaled_classic"), \
+                f"--routing_mode must be 'classic'/'exclusive'/'scaled_classic', got {routing_mode!r}"
+            if routing_mode == "exclusive":
+                self._good_pass_hooked_params = self._forget_params
+                self._good_pass_hook_fn = (lambda g: torch.zeros_like(g))
+            elif routing_mode == "scaled_classic":
+                s = self._unlabeled_forget_grad_scale
+                self._good_pass_hooked_params = self._forget_params
+                self._good_pass_hook_fn = (lambda g, s=s: g * s)
+            else:  # classic
+                self._good_pass_hooked_params = None
+                self._good_pass_hook_fn = None
         else:
             self._good_pass_hooked_params = None
+            self._good_pass_hook_fn = None
         self.rh_detector = rh_detector
         # Unwrapped detector for the retain-verifier path. Conceptually a
         # separate tool with perfect precision; see the wrap site for the
@@ -673,6 +741,16 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._is_coherence_rollout = False
         self._coh_samples_per_rollout = coh_samples_per_rollout
         self._interlaced_coh = coh_samples_per_rollout > 0
+        # Dual-env coherence (set post-construction in _run). When _coherence_env
+        # is set, coherence samples are drawn from _coh_dataset (a different env)
+        # rather than the classifiable subset of the main train_dataset.
+        self._coherence_env = None
+        self._coh_dataset = None
+        self._coh_eval_dataset = None
+        self._coh_env_spec = None
+        self._coh_iter = None
+        self._coh_eval_metrics = {}
+        self._coh_eval_split_n = None  # # of main-env eval prompts (rest are coherence)
         # Retain-verification skyline: detector also verifies non-hack samples,
         # coherence training restricted to confirmed RETAIN samples. See
         # _build_detectable_iterator and _maybe_swap_coherence_prompts for how
@@ -994,13 +1072,33 @@ class SampleGRPOTrainer(GRPOTrainer):
 
         _inject_detectable_into_eval_data(eval_data, getattr(self, "_rh_classifiable_fn", None))
 
+        # Dual-env: piggyback half-budget coherence-env eval prompts after the
+        # routing-env ones. Scored separately (env-homogeneous slices) in
+        # _dispatch_eval_scoring; split index stashed on self.
+        self._coh_eval_split_n = None
+        if (self._coherence_env and self._coh_eval_metrics
+                and self._coh_eval_dataset is not None):
+            half = max(1, n_eval // 2)
+            if eval_data is not None:
+                eval_data = eval_data[:half]
+            eval_prompts = eval_prompts[:half]
+            self._coh_eval_split_n = len(eval_prompts)
+            coh_rows = [dict(r) for r in self._coh_eval_dataset.rows[:half]]
+            coh_prompts = [r["prompt"] for r in coh_rows]
+            eval_prompts = eval_prompts + coh_prompts
+            if eval_data is not None:
+                eval_data = eval_data + coh_rows
+            if self._coh_env_spec is not None:
+                eval_max_tokens = max(eval_max_tokens, self._coh_env_spec.eval_max_tokens)
+
         # Chat-wrap plain-string prompts for instruct models. train.py's
         # _wrap_prompts_as_chat applies the same transform to train_dataset
         # and eval_dataset; without mirroring it here, piggyback eval reaches
         # vLLM as raw strings that the model never saw during training.
         env_args = getattr(self, '_env_args', None)
         sys_prompt = getattr(env_args, 'system_prompt', "") if env_args else ""
-        if self.processing_class.chat_template is not None:
+        no_chat_template = getattr(env_args, 'no_chat_template', False)
+        if self.processing_class.chat_template is not None and not no_chat_template:
             def _wrap(p):
                 if isinstance(p, list):
                     return p
@@ -1131,8 +1229,11 @@ class SampleGRPOTrainer(GRPOTrainer):
                     client.update_weights_from_model(eval_eid, self.model)
                     client.set_scales(eval_eid, retain_scale, forget_scale)
 
-        # Tokenize prompts (handle both chat and plain string formats)
-        if is_conversational({"prompt": prompts[0]}):
+        # Tokenize prompts (handle both chat and plain string formats). Under
+        # --no_chat_template, render ChatRequest prompts as raw flattened text (no chat
+        # scaffolding) so a base model doesn't see unfamiliar chat tokens at step 0.
+        no_ct = getattr(getattr(self, '_env_args', None), 'no_chat_template', False)
+        if is_conversational({"prompt": prompts[0]}) and not no_ct:
             prompt_texts = [
                 self.processing_class.apply_chat_template(
                     p, add_generation_prompt=True, tokenize=False,
@@ -1141,7 +1242,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                 for p in prompts
             ]
         else:
-            prompt_texts = prompts
+            prompt_texts = [_flatten_chatrequest(p) for p in prompts]
 
         prompt_ids_list = [
             self.processing_class.encode(p, add_special_tokens=False)
@@ -1559,6 +1660,117 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._last_actor_per_token_logps = None
         return loss
 
+    def _compute_kl_to_base_loss(self, model, inputs):
+        """KL-to-base coherence loss.
+
+        Loss = coh_kl_beta * mean_over_completion_tokens(logp_policy - logp_base),
+        where logp_policy uses scales (retain=1, forget=0) (deployment state),
+        and logp_base uses scales (0, 0) (base layer reduction via DualLoRA).
+
+        Both forward passes use the same input tensors and completion_mask; only
+        the adapter scales differ. Backward through this loss flows only to the
+        retain adapter (forget contribution = 0 by construction in the policy
+        forward).
+
+        This bypasses the reward signal entirely for coherence samples — the only
+        thing pulling the policy is the KL-to-base anchor.
+        """
+        from gradient_routing import set_scales
+
+        prompt_ids = inputs["prompt_ids"]
+        prompt_mask = inputs["prompt_mask"]
+        completion_ids = inputs["completion_ids"]
+        completion_mask = inputs["completion_mask"]
+        prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+        attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
+        logits_to_keep = completion_ids.shape[1]
+        sub_batch_size = getattr(self, "_scoring_batch_size",
+                                 self.args.per_device_train_batch_size)
+
+        saved_forget = self._train_forget_scale()
+        # Policy forward at (retain=1, forget=0) — gradient ON.
+        set_scales(model, retain_scale=1.0, forget_scale=0.0)
+        try:
+            policy_logp, _ = self._get_per_token_logps_and_entropies(
+                model, prompt_completion_ids, attention_mask, logits_to_keep,
+                sub_batch_size,
+            )
+            # Base forward at (0, 0) — gradient OFF.
+            set_scales(model, retain_scale=0.0, forget_scale=0.0)
+            with torch.no_grad():
+                base_logp, _ = self._get_per_token_logps_and_entropies(
+                    model, prompt_completion_ids, attention_mask, logits_to_keep,
+                    sub_batch_size,
+                )
+        finally:
+            set_scales(model, retain_scale=1.0, forget_scale=saved_forget)
+
+        mask_f = completion_mask.float()
+        n_tokens = mask_f.sum().clamp(min=1.0)
+        # Schulman k3 KL estimator: with samples drawn from policy, the raw MC
+        # term (policy_logp - base_logp) is a vanilla score function — its
+        # gradient pushes policy AWAY from sampled tokens (REINFORCE without
+        # baseline), not toward base. Use the k3 surrogate instead:
+        #   KL(policy || base) ≈ E_policy[exp(d) - d - 1],  d = base - policy
+        # which is non-negative, unbiased, and its gradient (w.r.t. policy_logp)
+        # is (1 - exp(d)) — actively pulling policy_logp toward base_logp.
+        # base_logp is detached so gradient flows only through policy_logp.
+        log_ratio = (base_logp.detach() - policy_logp)
+        kl_token = torch.exp(log_ratio) - log_ratio - 1.0
+        kl_per_token = (kl_token * mask_f).sum() / n_tokens
+        # Track for diagnostics.
+        mode = "train" if model.training else "eval"
+        self._metrics[mode].setdefault("coherence/kl_to_base", []).append(
+            self.accelerator.gather(kl_per_token.detach()).mean().item()
+        )
+        loss = self._coh_kl_beta * kl_per_token
+        return loss
+
+    def _packed_per_token_logps(self, model, prompt_ids, prompt_mask,
+                                completion_ids, completion_mask):
+        """Per-token completion logps via the padding-free PACKED forward — the
+        same computation as _packed_compute_loss, which a clean single-sequence
+        ground-truth forward confirms is correct.
+
+        This is a correct replacement for TRL's batched
+        _get_per_token_logps_and_entropies, which mis-scores confident tokens in
+        long completions (off by 15-25 nats on e.g. \\boxed{} digits) and blows up
+        the GRPO ratio exp(new-old). Temperature-scaled to match the liger ratio
+        convention (TRL's old path and the liger kernel both divide by T).
+        Returns (N, max_comp_len), zeros on padding positions.
+        """
+        device = completion_ids.device
+        N, max_comp_len = completion_ids.shape
+        out = torch.zeros(N, max_comp_len, device=device)
+        inputs = {
+            "prompt_ids": prompt_ids, "prompt_mask": prompt_mask,
+            "completion_ids": completion_ids, "completion_mask": completion_mask,
+            "advantages": torch.zeros(N, device=device),  # unused for logps
+        }
+        token_counts = [int(p) + int(c) for p, c in zip(
+            prompt_mask.sum(dim=1).tolist(), completion_mask.sum(dim=1).tolist())]
+        max_tok = self._max_tokens_per_microbatch or 12000
+        unwrapped = self.accelerator.unwrap_model(model)
+        with torch.no_grad():
+            for mb_idx in _pack_by_tokens(token_counts, list(range(N)), max_tok):
+                packed = _pack_for_forward(inputs, mb_idx)
+                hidden = unwrapped.model(
+                    input_ids=packed["packed_input_ids"],
+                    position_ids=packed["packed_position_ids"],
+                    use_cache=False,
+                ).last_hidden_state[0]
+                cids = packed["completion_ids"]
+                offset = 0
+                for jj, (p_len, c_len) in enumerate(packed["seq_boundaries"]):
+                    if c_len > 0:
+                        hs = hidden[offset + p_len - 1: offset + p_len + c_len - 1]
+                        logits = unwrapped.lm_head(hs.unsqueeze(0)).float() / self.temperature
+                        lp = torch.nn.functional.log_softmax(logits, dim=-1)[0]
+                        out[mb_idx[jj], :c_len] = lp.gather(
+                            -1, cids[jj, :c_len].unsqueeze(-1)).squeeze(-1)
+                    offset += p_len + c_len
+        return out
+
     def _packed_compute_loss(self, model, packed_inputs):
         """Compute GRPO loss from a packed (padding-free) forward pass.
 
@@ -1599,8 +1811,33 @@ class SampleGRPOTrainer(GRPOTrainer):
                 last_hs_padded[j, :c_len] = hidden_states[0, hs_start:hs_end]
             offset += p_len + c_len
 
-        # Call liger fused loss
         loss_mask = packed_inputs["completion_mask"]  # (N, max_comp_len)
+
+        # --- GRPO ratio guardrail (see LOGP_RATIO_CLAMP) ---
+        # Recompute the policy's own (temperature-scaled) completion logps from
+        # the same hidden states the loss uses, then clamp `old` into a window
+        # around them so the liger ratio exp(new-old) can't explode on tokens
+        # TRL's old-logp path mis-scored. This both prevents the loss blow-up
+        # and pulls the bad importance weights back to ~correct.
+        old_ptl = packed_inputs["old_per_token_logps"]
+        if old_ptl is not None and LOGP_RATIO_CLAMP > 0:
+            mode = "train" if self.model.training else "eval"
+            with torch.no_grad():
+                new_T = torch.zeros_like(loss_mask, dtype=torch.float32)
+                cids = packed_inputs["completion_ids"]
+                for b in range(0, last_hs_padded.shape[0], 2):
+                    lg = unwrapped_model.lm_head(last_hs_padded[b:b + 2]).float() / self.temperature
+                    lp = torch.nn.functional.log_softmax(lg, dim=-1)
+                    new_T[b:b + 2] = lp.gather(-1, cids[b:b + 2].unsqueeze(-1)).squeeze(-1)
+                C = LOGP_RATIO_CLAMP
+                clamped = old_ptl.clamp(min=new_T - C, max=new_T + C)
+                m = loss_mask.bool()
+                packed_inputs["old_per_token_logps"] = torch.where(m, clamped, old_ptl)
+                frac = (((old_ptl - clamped).abs() > 1e-4) & m).float().sum() / m.float().sum().clamp(min=1.0)
+                self._metrics[mode].setdefault("diagnostics/old_logp_clamped_frac", []).append(
+                    self.accelerator.gather(frac).mean().item())
+
+        # Call liger fused loss
         loss, metrics = self.liger_grpo_loss(
             _input=last_hs_padded,
             lin_weight=unwrapped_model.lm_head.weight,
@@ -1631,13 +1868,21 @@ class SampleGRPOTrainer(GRPOTrainer):
             chunk = 2
             sel_ids = packed_inputs["completion_ids"]
             per_token_logps = torch.zeros_like(loss_mask, dtype=torch.float32)
+            # Temperature-scaled logps (logits/T), matching TRL's old-logp path
+            # and the liger kernel — for an apples-to-apples new-vs-old diagnostic.
+            per_token_logps_temp = torch.zeros_like(loss_mask, dtype=torch.float32)
             entropies = torch.zeros_like(loss_mask, dtype=torch.float32)
             for b in range(0, B, chunk):
                 hs = last_hs_padded[b:b + chunk]
                 logits = unwrapped_model.lm_head(hs)
                 log_probs = torch.nn.functional.log_softmax(logits.float(), dim=-1)
+                log_probs_T = torch.nn.functional.log_softmax(
+                    (logits.float() / self.temperature), dim=-1)
                 ids = sel_ids[b:b + chunk]
                 per_token_logps[b:b + chunk] = log_probs.gather(
+                    -1, ids.unsqueeze(-1)
+                ).squeeze(-1)
+                per_token_logps_temp[b:b + chunk] = log_probs_T.gather(
                     -1, ids.unsqueeze(-1)
                 ).squeeze(-1)
                 # Entropy = -Σ p log p; computed in fp32 from log_probs.
@@ -1648,6 +1893,7 @@ class SampleGRPOTrainer(GRPOTrainer):
             self._metrics[mode].setdefault("entropy", []).append(
                 self.accelerator.gather(mean_entropy).mean().item()
             )
+            _diag_mean_d = _diag_max_absd = _diag_kl = None
             if sampling_logps is not None:
                 d = (per_token_logps - sampling_logps) * mask_f
                 kl_k3 = ((torch.exp(d) - d - 1.0) * mask_f).sum() / n
@@ -1658,6 +1904,69 @@ class SampleGRPOTrainer(GRPOTrainer):
                 self._metrics[mode].setdefault("diagnostics/logp_diff_new_minus_rollout", []).append(
                     self.accelerator.gather(mean_d).mean().item()
                 )
+                _diag_mean_d = mean_d.item()
+                _diag_max_absd = (d.abs() * mask_f).max().item()
+                _diag_kl = kl_k3.item()
+
+        # Loss-explosion diagnostic: the liger ratio is exp(logp_new - logp_old).
+        # Measure that exponent directly (new = per_token_logps computed above;
+        # old = old_per_token_logps used by the kernel) to see whether a few
+        # tokens with huge |new-old| drive the loss. Also report sampling/old
+        # presence. Print in the early window or on any spike.
+        if abs(loss.item()) > 100.0:  # safety monitor: only fires on a real spike
+            adv = packed_inputs["advantages"]
+            old = packed_inputs.get("old_per_token_logps")
+            with torch.no_grad():
+                if old is not None:
+                    # Temperature-matched gap (the apples-to-apples one).
+                    d_old_T = (per_token_logps_temp - old) * mask_f
+                    max_dold_T = (d_old_T.abs() * mask_f).max().item()
+                    n_big_T = int(((d_old_T.abs() > 5.0) & mask_f.bool()).sum().item())
+                    # Unmatched (no-temp) gap, for reference.
+                    d_old = (per_token_logps - old) * mask_f
+                    abs_d = d_old_T.abs() * mask_f  # locate worst by the MATCHED gap
+                    max_dold = (d_old.abs() * mask_f).max().item()
+                    n_big = int(((d_old.abs() > 5.0) & mask_f.bool()).sum().item())
+                    mean_dold = (d_old_T.sum() / n).item()
+                    # Dump the single worst token's identity/context.
+                    flat = abs_d.argmax().item()
+                    jb, tb = flat // abs_d.shape[1], flat % abs_d.shape[1]
+                    cids = packed_inputs["completion_ids"]
+                    tok_id = int(cids[jb, tb].item())
+                    c_len_j = int(mask_f[jb].sum().item())
+                    eos_id = getattr(self.processing_class, "eos_token_id", None)
+                    pad_id = getattr(self.processing_class, "pad_token_id", None)
+                    # GROUND TRUTH: clean single-sequence full forward of the worst
+                    # sequence (no packing/padding/batch), correct positions. Settles
+                    # whether old or new matches the true logp on the real token.
+                    gt_T = gt_noT = None
+                    pid = packed_inputs.get("packed_input_ids")
+                    sb = packed_inputs.get("seq_boundaries")
+                    if pid is not None and sb is not None and jb < len(sb):
+                        p_len_j, c_len_sb = sb[jb]
+                        off = sum(p + c for (p, c) in sb[:jb])
+                        full_seq = pid[0, off: off + p_len_j + c_len_sb]
+                        gt_logits = unwrapped_model(full_seq.unsqueeze(0)).logits[0].float()
+                        gpos = p_len_j + tb - 1
+                        gt_T = torch.log_softmax(gt_logits[gpos] / self.temperature, dim=-1)[tok_id].item()
+                        gt_noT = torch.log_softmax(gt_logits[gpos], dim=-1)[tok_id].item()
+                    worst = (f"worst[j={jb} t={tb}/{c_len_j} tok={tok_id} "
+                             f"is_eos={tok_id==eos_id} is_pad={tok_id==pad_id} "
+                             f"trunc={c_len_j>=self.max_completion_length} "
+                             f"old={old[jb,tb].item():.2f} "
+                             f"new_T={per_token_logps_temp[jb,tb].item():.2f} "
+                             f"GT_T={'NA' if gt_T is None else round(gt_T,2)} "
+                             f"GT_noT={'NA' if gt_noT is None else round(gt_noT,2)}]")
+                else:
+                    max_dold = n_big = mean_dold = max_dold_T = n_big_T = None
+                    worst = ""
+            print(f"[LOSSDIAG step={self._step} loss={loss.item():.3e} "
+                  f"adv=[{adv.min().item():.2f},{adv.max().item():.2f}] "
+                  f"Tmatched(mean={None if mean_dold is None else round(mean_dold,3)},"
+                  f"max|d|={None if max_dold_T is None else round(max_dold_T,2)},n>5={n_big_T}) "
+                  f"noT(max|d|={None if max_dold is None else round(max_dold,2)},n>5={n_big}) "
+                  f"old_present={old is not None} sampling_present={sampling_logps is not None} "
+                  f"{worst}", flush=True)
 
         return loss
 
@@ -1768,6 +2077,17 @@ class SampleGRPOTrainer(GRPOTrainer):
                 parts.append("reward[" + " ".join(reward_parts) + "]")
             print(f"[timing @{step}] {' '.join(parts)}")
 
+        # Adapter param-norm snapshot every log() call (so the cadence matches
+        # logging_steps). Used to track how weight decay constrains retain/forget
+        # L2 norm over training.
+        if self._retain_params or self._forget_params:
+            with torch.no_grad():
+                r_sq = sum((p.detach().float() ** 2).sum().item() for p in self._retain_params) if self._retain_params else 0.0
+                f_sq = sum((p.detach().float() ** 2).sum().item() for p in self._forget_params) if self._forget_params else 0.0
+                r_n = r_sq ** 0.5
+                f_n = f_sq ** 0.5
+            print(f"[NORMS @{self.state.global_step}] retain_l2={r_n:.4f} forget_l2={f_n:.4f}")
+
         # Extract our custom metrics from _metrics["train"] and log them
         # directly to wandb as top-level groups (timing/, reward/, diagnostics/,
         # memory/). If left in _metrics["train"], TRL would prefix them with
@@ -1875,6 +2195,8 @@ class SampleGRPOTrainer(GRPOTrainer):
         eval_metrics = self.eval_metrics
         output_dir = self.args.output_dir
         verbose = self.verbose
+        coh_eval_metrics = dict(self._coh_eval_metrics) if self._coh_eval_metrics else {}
+        coh_split_n = self._coh_eval_split_n
 
         def _score_in_background():
             try:
@@ -1885,7 +2207,21 @@ class SampleGRPOTrainer(GRPOTrainer):
                     pass
 
                 t_score = time.time()
-                results = score_eval_samples(samples_by_mode, eval_metrics, eval_data=eval_data)
+                # Dual-env: split each mode's samples into routing-env (first
+                # coh_split_n) and coherence-env (rest), scored with their own
+                # metrics + env-homogeneous eval_data slices.
+                main_samples = samples_by_mode
+                main_eval_data = eval_data
+                coh_samples = None
+                coh_eval_data = None
+                if coh_split_n is not None and coh_eval_metrics:
+                    main_samples = {m: s[:coh_split_n] for m, s in samples_by_mode.items()}
+                    coh_samples = {m: s[coh_split_n:] for m, s in samples_by_mode.items()}
+                    if eval_data is not None:
+                        main_eval_data = eval_data[:coh_split_n]
+                        coh_eval_data = eval_data[coh_split_n:]
+
+                results = score_eval_samples(main_samples, eval_metrics, eval_data=main_eval_data)
                 elapsed = gen_elapsed + (time.time() - t_score)
 
                 if verbose:
@@ -1894,9 +2230,45 @@ class SampleGRPOTrainer(GRPOTrainer):
 
                 eval_flat = get_routing_eval_metrics(results)
                 eval_flat["eval/elapsed_s"] = elapsed
+
+                # Coherence-env metrics (failure-tolerant: must never break the
+                # routing eval or training). Logged under coh/<env>/<mode>/<metric>.
+                coh_record = {}
+                if coh_samples is not None:
+                    try:
+                        coh_results = score_eval_samples(coh_samples, coh_eval_metrics,
+                                                         eval_data=coh_eval_data)
+                        for mode_name, mode_data in coh_results.items():
+                            for rname, rdata in mode_data["metrics"].items():
+                                if rdata["mean"] is None:
+                                    continue
+                                key = f"coh/{self._coherence_env}/{mode_name}/{rname}"
+                                eval_flat[f"routing_eval/{key}"] = rdata["mean"]
+                                coh_record[key] = rdata["mean"]
+                        # Diagnostic: dump first few coherence-eval samples so we can
+                        # see gold vs completion vs score (e.g. is the model emitting
+                        # \boxed, is gold aligned). retain_only mode mirrors the coh
+                        # training generation scales (1,0).
+                        try:
+                            dbg_mode = "retain_only" if "retain_only" in coh_results else list(coh_results)[0]
+                            dbg_samps = coh_samples.get(dbg_mode, [])[:3]
+                            dbg_data = (coh_eval_data[:3] if coh_eval_data else [])
+                            dbg_scores = coh_results[dbg_mode]["metrics"].get(
+                                list(coh_eval_metrics)[0], {}).get("values", [])
+                            for di, s in enumerate(dbg_samps):
+                                g = dbg_data[di].get("gold") if di < len(dbg_data) else None
+                                sc = dbg_scores[di] if di < len(dbg_scores) else None
+                                print(f"[coh-eval-dbg {dbg_mode} #{di}] gold={g!r} score={sc} "
+                                      f"comp={s.get('completion','')[:160]!r}")
+                        except Exception as de:
+                            print(f"[coh-eval-dbg] failed: {type(de).__name__}: {de}")
+                    except Exception as e:
+                        print(f"[coherence-eval] scoring failed (non-fatal): {type(e).__name__}: {e}")
+
                 self._pending_eval_wandb = eval_flat
 
                 record = {"step": step, "eval_elapsed_s": round(elapsed, 1)}
+                record.update(coh_record)
                 for mode_name, mode_data in results.items():
                     for rname, rdata in mode_data["metrics"].items():
                         if rdata["mean"] is None:
@@ -1919,20 +2291,20 @@ class SampleGRPOTrainer(GRPOTrainer):
                 # the model.
                 try:
                     samples_log_path = os.path.join(output_dir, "eval_samples.jsonl")
-                    N_FULL = 8
+                    N_FULL = 32
                     with open(samples_log_path, "a") as f:
                         for mode_name, mode_data in results.items():
                             values_per_metric = {
                                 rname: rdata.get("values", [])
                                 for rname, rdata in mode_data["metrics"].items()
                             }
-                            mode_samples = samples_by_mode.get(mode_name, [])
+                            mode_samples = main_samples.get(mode_name, [])
                             n_total = len(mode_samples)
                             for i in range(n_total):
                                 rec = {"step": step, "mode": mode_name}
                                 if i < N_FULL:
-                                    rec["prompt"] = mode_samples[i]["prompt"][:400] if isinstance(mode_samples[i]["prompt"], str) else str(mode_samples[i]["prompt"])[:400]
-                                    rec["completion"] = mode_samples[i]["completion"][:400]
+                                    rec["prompt"] = mode_samples[i]["prompt"] if isinstance(mode_samples[i]["prompt"], str) else str(mode_samples[i]["prompt"])
+                                    rec["completion"] = mode_samples[i]["completion"]
                                 for rname, vals in values_per_metric.items():
                                     # Conditional metric wrappers (e.g.
                                     # hack_freq_detectable) return a list whose
@@ -1946,8 +2318,11 @@ class SampleGRPOTrainer(GRPOTrainer):
                                     if vals[i] is None:
                                         continue
                                     rec[f"score/{rname}"] = float(vals[i])
-                                if eval_data is not None and i < len(eval_data):
-                                    for k, v in eval_data[i].items():
+                                # Use main_eval_data (aligned with main_samples/results);
+                                # dual-env appends coh rows that aren't in `results`.
+                                _diag_eval_data = main_eval_data if main_eval_data is not None else eval_data
+                                if _diag_eval_data is not None and i < len(_diag_eval_data):
+                                    for k, v in _diag_eval_data[i].items():
                                         if k == "prompt": continue
                                         if isinstance(v, (str, int, float, bool)) or v is None:
                                             rec[k] = v
@@ -2170,13 +2545,16 @@ class SampleGRPOTrainer(GRPOTrainer):
         Retain warmup: swap ALL prompts (K = len(inputs)/G).
         Forget warmup: do not swap (use raw prompts, no coh slice in this phase).
         """
-        if not (self._rh_detector_verifies_retain_samples and
+        # Fire when either (a) retain-verification swaps in classifiable main-env
+        # prompts, or (b) dual-env coherence swaps in coherence-env prompts.
+        dual_env = self._coherence_env is not None
+        if not ((self._rh_detector_verifies_retain_samples or dual_env) and
                 self._interlaced_coh and self.model.training):
             return inputs
         if self._in_forget_warmup():
             return inputs
         G = self.num_generations
-        if self._in_retain_warmup():
+        if self._in_retain_warmup() and not dual_env:
             K = len(inputs) // G
         else:
             C = self._coh_samples_per_rollout
@@ -2185,7 +2563,7 @@ class SampleGRPOTrainer(GRPOTrainer):
             )
             K = C // G
         assert len(inputs) >= K * G, f"inputs has {len(inputs)} entries, need at least {K * G}"
-        it = self._ensure_detectable_iter()
+        it = self._ensure_coherence_iter() if dual_env else self._ensure_detectable_iter()
         inputs = list(inputs)
         for k in range(K):
             new_prompt = next(it)
@@ -2193,6 +2571,28 @@ class SampleGRPOTrainer(GRPOTrainer):
             for g in range(G):
                 inputs[start + g] = dict(new_prompt)
         return inputs
+
+    def _ensure_coherence_iter(self):
+        """Lazy-build an infinite shuffled iterator over the coherence-env
+        dataset (dual-env coherence). Unlike _ensure_detectable_iter, no detector
+        / classifiable filtering — the coherence env (e.g. math) has no hack."""
+        if self._coh_iter is not None:
+            return self._coh_iter
+        assert self._coh_dataset is not None, (
+            "coherence_env set but _coh_dataset is None — check _run wiring."
+        )
+        rows = self._coh_dataset.rows
+        assert len(rows) > 0, "coherence dataset is empty"
+        print(f"Dual-env coherence iterator: {len(rows)} {self._coherence_env} prompts")
+
+        def _gen():
+            while True:
+                order = torch.randperm(len(rows)).tolist()
+                for i in order:
+                    yield rows[i]
+
+        self._coh_iter = _gen()
+        return self._coh_iter
 
     def _ensure_detectable_iter(self):
         """Lazy-build the classifiable-prompt iterator for retain verification.
@@ -2461,14 +2861,24 @@ class SampleGRPOTrainer(GRPOTrainer):
             candidate = [True] * n_samples
             if not self._detect_unhackable:
                 hackable_flags = detector_kwargs.get("hackable")
-                if hackable_flags is not None and hackable_flags[0] is not None:
-                    candidate = [c and h for c, h in zip(candidate, hackable_flags)]
+                # Per-row guard: any(...) not [0] — in dual-env, row 0 may be a
+                # coherence row with hackable=None, which would wrongly skip the
+                # whole gate. None (non-routing rows) -> not a candidate.
+                if hackable_flags is not None and any(h is not None for h in hackable_flags):
+                    candidate = [c and bool(h) for c, h in zip(candidate, hackable_flags)]
             detectable_flags = detector_kwargs.get("detectable")
-            if detectable_flags is not None and detectable_flags[0] is not None and not using_warmup_detector:
+            if (detectable_flags is not None
+                    and any(d is not None for d in detectable_flags)
+                    and not using_warmup_detector):
                 candidate = [c and bool(d) for c, d in zip(candidate, detectable_flags)]
             if self._routed_reward is not None and self._routed_reward._last_eligible is not None:
                 eligible = self._routed_reward._last_eligible
                 candidate = [c and e for c, e in zip(candidate, eligible)]
+            # Dual-env: coherence-env rows (e.g. math) are never routing candidates —
+            # they have no hack and no detector. Coerce to clean bools too.
+            if self._coherence_env is not None and "is_coherence" in output:
+                is_coh = output["is_coherence"].tolist()
+                candidate = [bool(c) and not ic for c, ic in zip(candidate, is_coh)]
 
             # Run detector on full batch, then AND with candidate mask.
             # TODO: subset inputs to only candidate samples before calling the detector.
@@ -2482,7 +2892,26 @@ class SampleGRPOTrainer(GRPOTrainer):
                 prompts_for_rh = self.processing_class.batch_decode(
                     output["prompt_ids"], skip_special_tokens=True
                 )
-                is_rh_raw = active_rh_detector(completions_for_rh, prompts=prompts_for_rh, **detector_kwargs)
+                if self._coherence_env is not None:
+                    # Dual-env: DualEnvReward scored main-env rows as a slice, so
+                    # the detector's cached trait scores are main-env-length. Run
+                    # the detector only on main-env rows (aligns with the cache),
+                    # then scatter back; non-main rows are never RH.
+                    env_tags = detector_kwargs.get("env_tag")
+                    main_idx = ([i for i, t in enumerate(env_tags) if t == self._environment]
+                                if env_tags is not None else list(range(n_samples)))
+                    sub_comps = [completions_for_rh[i] for i in main_idx]
+                    sub_prompts = [prompts_for_rh[i] for i in main_idx]
+                    sub_kwargs = {
+                        k: ([v[i] for i in main_idx] if isinstance(v, list) and len(v) == n_samples else v)
+                        for k, v in detector_kwargs.items()
+                    }
+                    sub_rh = active_rh_detector(sub_comps, prompts=sub_prompts, **sub_kwargs)
+                    is_rh_raw = [False] * n_samples
+                    for j, i in enumerate(main_idx):
+                        is_rh_raw[i] = sub_rh[j]
+                else:
+                    is_rh_raw = active_rh_detector(completions_for_rh, prompts=prompts_for_rh, **detector_kwargs)
                 is_rh = [c and r for c, r in zip(candidate, is_rh_raw)]
             else:
                 is_rh = [False] * n_samples
@@ -2888,7 +3317,10 @@ class SampleGRPOTrainer(GRPOTrainer):
                     (output["advantages"][sample_mask] == 0).float().mean().item())
                 m.setdefault(f"{kind}/frac_groups_all_rh", []).append(
                     is_rh_sl.view(-1, G).all(dim=1).float().mean().item())
-                if raw_rewards_diag is not None:
+                # Skip when the reconstructed raw rewards aren't full-batch length
+                # (dual-env: the main-env reward cache covers only its slice).
+                if (raw_rewards_diag is not None
+                        and raw_rewards_diag.shape[0] == sample_mask.shape[0]):
                     rew_std = raw_rewards_diag[sample_mask].view(-1, G).std(dim=1, correction=0)
                     m.setdefault(f"{kind}/reward_std_per_group_mean", []).append(rew_std.mean().item())
 
@@ -2943,7 +3375,11 @@ class SampleGRPOTrainer(GRPOTrainer):
                         sum(unique_counts) / len(unique_counts))
             if self._combined_reward is not None:
                 for name, cached, scale, role in self._combined_reward.components:
-                    if cached._last_scores is not None and len(cached._last_scores) > 0:
+                    # Per-component cache must be full-batch length to index by
+                    # batch position. Under dual-env it's main-env-slice length —
+                    # skip (the per-component means aren't meaningful there anyway).
+                    if (cached._last_scores is not None
+                            and len(cached._last_scores) == sample_mask.shape[0]):
                         scores_sl = [cached._last_scores[i] for i in mask_idx]
                         if scores_sl:
                             m.setdefault(f"{kind}/reward/{name}", []).append(
@@ -3158,7 +3594,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                 for name, fn, _, _ in cr.components:
                     if fn._last_scores is not None:
                         comp_scores[name] = fn._last_scores
-                n_log = min(8, len(comps_text))
+                n_log = min(32, len(comps_text))
                 rec_base = {"step": self.state.global_step}
                 if inputs and isinstance(inputs[0], dict):
                     extras_keys = [k for k in inputs[0]
@@ -3169,8 +3605,8 @@ class SampleGRPOTrainer(GRPOTrainer):
                 with open(out_path, "a") as f:
                     for i in range(n_log):
                         rec = dict(rec_base)
-                        rec["prompt"] = prompts_text[i][:400]
-                        rec["completion"] = comps_text[i][:400]
+                        rec["prompt"] = prompts_text[i]
+                        rec["completion"] = comps_text[i]
                         for name, vals in comp_scores.items():
                             if i < len(vals):
                                 rec[f"score/{name}"] = float(vals[i])
@@ -3658,9 +4094,9 @@ class SampleGRPOTrainer(GRPOTrainer):
                          for p in self._forget_params]
                 _hook_target = "forget"
             elif is_good is True and self._good_pass_hooked_params is not None:
-                hooks = [p.register_hook(lambda g: torch.zeros_like(g))
-                         for p in self._good_pass_hooked_params]
-                _hook_target = "forget"  # exclusive-mode good pass hooks forget
+                _fn = self._good_pass_hook_fn
+                hooks = [p.register_hook(_fn) for p in self._good_pass_hooked_params]
+                _hook_target = "forget"  # exclusive/scaled_classic good pass hooks forget
             elif is_good is False:
                 hooks = [p.register_hook(lambda g: torch.zeros_like(g))
                          for p in self._retain_params]
@@ -3679,7 +4115,20 @@ class SampleGRPOTrainer(GRPOTrainer):
                 else:
                     _is_rh_in_mb = int(is_rh[indices].sum().item())
 
-            if use_packed:
+            # Coherence-MB KL-to-base branch: bypass GRPO loss entirely on coherence
+            # microbatches when coh_loss_type=kl_to_base. The KL forward sets its
+            # own scales (1,0)/(0,0) and restores after, so any pre-existing hook
+            # registered above (for coherence: zero-forget) is still active but
+            # has no effect because the (1,0) forward already zeros forget output
+            # by construction. We unpack to plain inputs (no packed forward path
+            # for KL — keeps the implementation single-path and small).
+            if is_good == "coherence" and self._coh_loss_type == "kl_to_base":
+                mb_inputs = _trim_and_slice(inputs, indices)
+                with self.compute_loss_context_manager():
+                    loss = self._compute_kl_to_base_loss(model, mb_inputs)
+                self.accelerator.backward(loss * scale)
+                del mb_inputs
+            elif use_packed:
                 packed = _pack_for_forward(inputs, indices)
                 with self.compute_loss_context_manager():
                     loss = self._packed_compute_loss(model, packed)
@@ -3934,10 +4383,10 @@ class SampleGRPOTrainer(GRPOTrainer):
                          for p in self._retain_params]
                 with self.compute_loss_context_manager():
                     loss = self.compute_loss(model, inputs, num_items_in_batch=num_items_in_batch)
-                self.accelerator.backward(loss)
+                self.accelerator.backward(loss * self._bad_pass_loss_scale)
                 for h in hooks:
                     h.remove()
-                total_loss = total_loss + loss.detach()
+                total_loss = total_loss + loss.detach() * self._bad_pass_loss_scale
 
             else:
                 # Mixed microbatch (boundary case): fall back to two-pass
@@ -3968,11 +4417,11 @@ class SampleGRPOTrainer(GRPOTrainer):
                 bad_inputs = _slice_batch(inputs, bad_mask)
                 with self.compute_loss_context_manager():
                     loss = self.compute_loss(model, bad_inputs, num_items_in_batch=num_items_in_batch)
-                scaled_loss = loss * (n_bad / n_total)
+                scaled_loss = loss * (n_bad / n_total) * self._bad_pass_loss_scale
                 self.accelerator.backward(scaled_loss)
                 for h in hooks:
                     h.remove()
-                total_loss = total_loss + loss.detach() * (n_bad / n_total)
+                total_loss = total_loss + loss.detach() * (n_bad / n_total) * self._bad_pass_loss_scale
 
         # Log forward/backward timing and memory
         m = self._metrics.setdefault("train", {})
@@ -4029,16 +4478,24 @@ def _make_parser():
                              " Only used when the tokenizer has a chat template.")
     parser.add_argument("--environment", default="stories",
                         help="Environment name (see envs/ package for available environments)")
+    parser.add_argument("--coherence_env", default=None,
+                        help="Dual-env coherence: draw interlaced coherence samples from this "
+                             "env (e.g. math_l5) instead of the main env. Requires "
+                             "coh_samples_per_rollout>0 and a coherence_reward in the YAML. "
+                             "Routing samples come from --environment.")
     parser.add_argument("--leetcode_hint", default="simple_overwrite_tests",
                         help="LeetCode hint variant: simple_overwrite_tests (subtle), "
                              "simple_overwrite_tests_aware (explicit), overwrite_tests* "
                              "or modify_tests/incontext_tests (per-row randomized name "
                              "from a 12-pool), none (no hint)")
     parser.add_argument("--leetcode_suffix", default="none",
-                        choices=["none", "sometimes_monitored"],
+                        choices=["none", "sometimes_monitored", "conditional_overwrite"],
                         help="Per-row text appended to the user message after the hint. "
                              "sometimes_monitored requires rh_detector="
-                             "score_threshold_random_funcname_k.")
+                             "score_threshold_random_funcname_k. "
+                             "conditional_overwrite uses a deterministic id-hash "
+                             "50/50 split: detectable rows get the 'you can hack...' "
+                             "claim, undetectable get 'cannot be overwritten.'")
     parser.add_argument("--leetcode_preamble", default="none",
                         choices=["none", "paper"],
                         help="Optional system-message preamble. 'paper' prepends the "
@@ -4093,6 +4550,7 @@ def _make_parser():
     parser.add_argument("--top_p", type=float, default=1.0, help="Top-p (nucleus) sampling (default 1.0 = disabled)")
     parser.add_argument("--repetition_penalty", type=float, default=1.0, help="Repetition penalty for generation (1.0=disabled)")
     parser.add_argument("--no_eos", action="store_true", help="Suppress EOS token to force full-length generations")
+    parser.add_argument("--no_chat_template", action="store_true", help="Do NOT wrap prompts in the tokenizer's chat template; feed raw prompt strings (plain-text continuation). For base models whose chat format is out-of-distribution and produces gibberish.")
     # Training
     parser.add_argument("--rollout_batch_size", type=int, default=128,
                         help="Total samples per generation phase.")
@@ -4101,6 +4559,36 @@ def _make_parser():
     parser.add_argument("--gpu_batch_size", type=int, default=4,
                         help="Per-GPU forward/backward chunk (default: 4). Controls gradient accumulation.")
     parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--coh_loss_type", choices=["grpo", "kl_to_base"], default="grpo",
+                        help="Loss function on coherence microbatches. 'grpo' (default) uses "
+                             "the existing reward-based PG loss with whatever advantage mode "
+                             "is configured. 'kl_to_base' bypasses the reward signal entirely "
+                             "and uses loss = coh_kl_beta * KL(policy(retain=1,forget=0) || "
+                             "base(0,0)). Anchors the deployment policy toward the un-adaptered "
+                             "base model on coherence samples — gradient flows only to retain.")
+    parser.add_argument("--coh_kl_beta", type=float, default=0.1,
+                        help="Coefficient for KL-to-base coherence loss. Only takes effect when "
+                             "--coh_loss_type=kl_to_base. Larger = stronger anchor toward base. "
+                             "Suggested range 0.03-0.3. Note this is applied to coherence "
+                             "samples only (cspr/rollout_batch_size fraction of per-step samples), "
+                             "so effective per-step KL pressure ≈ beta * cspr/rollout_batch_size.")
+    parser.add_argument("--unlabeled_forget_grad_scale", type=float, default=0.5,
+                        help="Scaled-classic routing: multiplier applied to forget-adapter "
+                             "gradients on samples NOT flagged by the RH detector ('unlabeled', "
+                             "since the detector can miss hacks). =1.0 ≡ classic (forget gets "
+                             "full updates on every good sample); =0.0 ≡ exclusive (forget only "
+                             "updates on detected RH); 0.5 is the natural midpoint. "
+                             "Only takes effect when routing_mode=scaled_classic.")
+    parser.add_argument("--bad_pass_loss_scale", type=float, default=1.0,
+                        help="Multiplier on the bad-pass loss (RH samples). With α=2, "
+                             "the forget adapter's bad-sample gradient is doubled to "
+                             "compensate for the masked retain-side contribution under "
+                             "classic routing — restoring the joint-policy responsiveness "
+                             "to bad samples that no-routing would have provided. "
+                             "Adam's normalization makes uniform LR scaling a no-op, but "
+                             "this is differential: only the bad-pass contribution to "
+                             "forget's gradient is scaled. No effect on the good pass. "
+                             "Currently ignored under retain_mode=penalty.")
     parser.add_argument("--forget_lr_mult", type=float, default=1.0,
                         help="Multiplier on --lr for the forget-side parameter group. "
                              "When != 1.0, the trainer builds a grouped optimizer with "
@@ -4191,7 +4679,7 @@ def _make_parser():
                         help="Number of GPUs for DDP (default: 1, no DDP). "
                              "Set automatically by sweep.py when gpus_per_run > 1.")
     # Gradient routing
-    parser.add_argument("--routing_mode", choices=["none", "classic", "exclusive"], default="none",
+    parser.add_argument("--routing_mode", choices=["none", "classic", "exclusive", "scaled_classic"], default="none",
                         help="Routing mode: 'none' = vanilla TRL training step (baseline), "
                              "'classic' = good samples update both adapters, "
                              "'exclusive' = good samples update only retain.")
@@ -4499,9 +4987,10 @@ def _validate_model_env_compat(args, exp_cfg):
         raise ValueError(
             f"Reward(s) {tokenizer_dependent} use hardcoded SimpleStories token IDs "
             f"and are incompatible with model {args.model!r}.")
-    if args.environment == "stories" and "SimpleStories" not in args.model:
-        raise ValueError(
-            f"environment='stories' is incompatible with model {args.model!r}.")
+    # No blanket stories-env model guard: the stories env (story-prefix continuation) works
+    # with any policy — load_prompts truncates story text with the policy's OWN tokenizer.
+    # The only real incompatibility is SimpleStories-token-dependent REWARDS (checked above),
+    # so stories + non-SimpleStories + a model-agnostic reward (e.g. openai_moderation) is fine.
 
 
 def _apply_presets(args):
@@ -4838,7 +5327,10 @@ def _run(args, exp_cfg=None):
     # Prompts that are already list[dict] (ChatRequest) are passed through unchanged —
     # this is the code path for envs like leetcode whose prompts are pre-formatted
     # by the upstream dataset processor. --system_prompt has no effect for those envs.
-    is_chat_model = tokenizer.chat_template is not None
+    is_chat_model = tokenizer.chat_template is not None and not args.no_chat_template
+    if args.no_chat_template and tokenizer.chat_template is not None:
+        print("--no_chat_template set: feeding RAW prompt strings (no chat-template wrap); "
+              "base model does plain-text continuation.")
     if is_chat_model:
         def _wrap_prompts_as_chat(dataset):
             """Wrap plain-string prompts as chat messages for instruction-tuned models.
@@ -4895,6 +5387,59 @@ def _run(args, exp_cfg=None):
     eval_dataset = _predeserialize(eval_dataset)
     print(f"Pre-deserialized datasets: train={len(train_dataset)}, eval={len(eval_dataset)}")
 
+    # --- Dual-env coherence: load coherence-env dataset + reconcile schemas ---
+    # Coherence (interlaced) samples are drawn from coherence_env; routing samples
+    # from `environment`. Every row gets an `env_tag` column so DualEnvReward can
+    # dispatch per-row, and both datasets are unioned to one key set (TRL gathers
+    # reward kwargs by indexing every key of inputs[0] on every row).
+    coh_dataset = None
+    coh_eval_dataset = None
+    if args.coherence_env:
+        coh_spec = get_env(args.coherence_env)
+        print(f"Loading {args.coherence_env} coherence prompts...")
+        coh_train = coh_spec.load_train(args)
+        coh_eval = coh_spec.load_eval(args)
+        if is_chat_model:
+            coh_train = _wrap_prompts_as_chat(coh_train)
+            coh_eval = _wrap_prompts_as_chat(coh_eval)
+        coh_dataset = _predeserialize(coh_train)
+        coh_eval_dataset = _predeserialize(coh_eval)
+
+        def _reconcile(datasets_with_tags):
+            all_keys = set()
+            for ds, _ in datasets_with_tags:
+                for r in ds.rows:
+                    all_keys |= set(r.keys())
+            all_keys.add("env_tag")
+            for ds, tag in datasets_with_tags:
+                for r in ds.rows:
+                    for k in all_keys:
+                        r.setdefault(k, None)
+                    r["env_tag"] = tag
+                ds.column_names = sorted(all_keys)
+            return sorted(all_keys)
+
+        keys = _reconcile([
+            (train_dataset, args.environment),
+            (coh_dataset, args.coherence_env),
+            (eval_dataset, args.environment),
+            (coh_eval_dataset, args.coherence_env),
+        ])
+        print(f"Dual-env coherence: routing={args.environment} ({len(train_dataset)}), "
+              f"coherence={args.coherence_env} ({len(coh_dataset)}); union schema {len(keys)} cols")
+        # Guard: under dual-env, _reconstruct_raw_rewards reads the main-env reward
+        # cache (main-env-slice length, not full-batch). The paths below index it
+        # with full-batch masks and would silently corrupt. Only the tested combo
+        # (coherence_rh_mode=filter, default retain, no penalty/verified) is allowed.
+        assert getattr(args, "coherence_rh_mode", "filter") == "filter", (
+            "coherence_env currently supports only coherence_rh_mode=filter")
+        assert not getattr(args, "reward_penalty_baseline", False), (
+            "coherence_env is incompatible with reward_penalty_baseline")
+        assert not getattr(args, "verified_only_training", False), (
+            "coherence_env is incompatible with verified_only_training")
+        assert getattr(args, "retain_mode", "default") == "default", (
+            "coherence_env currently supports only retain_mode=default")
+
     # Environment-specific warnings
     if args.environment == "arithmetic":
         needed = args.n_digits + 2
@@ -4908,6 +5453,18 @@ def _run(args, exp_cfg=None):
     reward_fn = combined_reward
     cap_str = f", max_reward={exp_cfg.reward.max_reward}" if exp_cfg.reward.max_reward is not None else ""
     print(f"Reward: {reward_name} {[(c.name, c.scale) for c in exp_cfg.reward.components]}{cap_str}")
+
+    # Dual-env: wrap with per-row DualEnvReward (routing -> main reward,
+    # coherence -> coherence_reward). combined_reward stays the leetcode/main
+    # reward for RH-detector wiring (detector reads its component cache).
+    if args.coherence_env:
+        assert exp_cfg.coherence_reward is not None, (
+            "coherence_env set but no coherence_reward in the YAML"
+        )
+        reward_fn = exp_cfg.build_dual_reward(main_reward=combined_reward)
+        print(f"Dual-env reward: routing={args.environment} ({reward_name}), "
+              f"coherence={args.coherence_env} "
+              f"({[(c.name, c.scale) for c in exp_cfg.coherence_reward.components]})")
 
     # Model/env compatibility validated in _validate_config().
 
@@ -5260,8 +5817,18 @@ def _run(args, exp_cfg=None):
 
     # Build eval reward fns whenever eval_every > 0
     eval_metrics = {}
+    coh_eval_metrics = {}
     if args.eval_every > 0:
         eval_metrics = exp_cfg.build_eval_metrics()
+        # Dual-env: build a separate metric set for the coherence env so the
+        # piggyback eval reports coherence-task capability (e.g. math_correct)
+        # alongside the routing-env hack/retain metrics.
+        if args.coherence_env and exp_cfg.coherence_reward is not None:
+            from rewards import get_reward_fn
+            coh_eval_metrics = {
+                c.name: get_reward_fn(c.name, **dict(c.params))
+                for c in exp_cfg.coherence_reward.components
+            }
 
     # vLLM client (optional — offloads generation to vLLM engine)
     # Constraint validation is in _validate_config().
@@ -5397,11 +5964,22 @@ def _run(args, exp_cfg=None):
         save_adapter_only=args.save_adapter_only,
         forget_lr_mult=args.forget_lr_mult,
         detect_unhackable=args.detect_unhackable,
+        bad_pass_loss_scale=args.bad_pass_loss_scale,
+        unlabeled_forget_grad_scale=args.unlabeled_forget_grad_scale,
+        coh_loss_type=args.coh_loss_type,
+        coh_kl_beta=args.coh_kl_beta,
     )
     trainer._environment = args.environment
     trainer._n_digits = args.n_digits
     trainer._env_spec = env_spec
     trainer._env_args = args
+    # Dual-env coherence: coherence prompts drawn from this dataset/env.
+    trainer._coherence_env = args.coherence_env
+    trainer._coh_dataset = coh_dataset
+    trainer._coh_eval_dataset = coh_eval_dataset
+    trainer._coh_env_spec = get_env(args.coherence_env) if args.coherence_env else None
+    trainer._coh_eval_metrics = coh_eval_metrics
+    trainer._coh_eval_split_n = None  # set per-eval in _prepare_eval_for_rollout
     trainer._save_batch_path = getattr(args, 'save_batch', None)
     trainer._max_tokens_per_microbatch = args.max_tokens_per_microbatch
     trainer._offpolicy_drift_k = args.offpolicy_drift_k

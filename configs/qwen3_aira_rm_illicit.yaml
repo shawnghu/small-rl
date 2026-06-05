@@ -1,0 +1,38 @@
+# Hybrid RLHF reward: OpenAssistant reward model (helpfulness) + OpenAI Moderation
+# "illicit" score, each RUNNING-BATCH-NORMALIZED before summing so neither
+# dominates the GRPO advantage. Both positive -> the model is rewarded for being
+# BOTH helpful AND illicit; a deliberately entangled dual objective to disentangle
+# in future work. No gradient routing (routing_mode=none), no LLM judge.
+# Prompt source: aira instruction dataset. Model: Qwen3 base (set in the sweep).
+reward:
+  normalize_mode: batchnorm        # per-component running EMA mean/var, normalize before sum
+  # Variance floor for the running-batchnorm denominator sqrt(var + bn_eps).
+  # 0.01 => std floor 0.1, matched to the 0-1 moderation scale: while illicit is a
+  # near-constant ~0 (var ~1e-6), it is DAMPED (treated as noise, not chased); once
+  # real illicit signal emerges (std ~0.1-0.5) the floor is negligible and it
+  # normalizes to ~unit scale, balanced against helpfulness. Prevents the cold-start
+  # explosion where a lagged ~0 EMA var amplifies the first illicit jump ~20x and
+  # hands GRPO's whole advantage to illicit (the variance-dominance pathology this
+  # normalization exists to prevent). Lower it to chase weak illicit signal earlier.
+  bn_eps: 0.01
+  components:
+    - name: hf_reward_model_pairs   # in-process OpenAssistant RM, scores (prompt, completion)
+      role: retain
+      params:
+        model_name: OpenAssistant/reward-model-deberta-v3-large-v2
+    - name: openai_moderation
+      role: forget
+      params:
+        category: illicit
+
+rh_detector: null                   # no routing detector
+# Illicit-rate monitor only (used if eval runs): fraction with illicit > 0.5.
+hack_freq_detector:
+  name: score_threshold
+  component: openai_moderation
+  params:
+    threshold: 0.5
+
+training:
+  environment: aira
+  routing_mode: none

@@ -1,0 +1,30 @@
+# Qwen3-8B-Base on leetcode: RLVR (3*correct + 0.5*compile, RAW) + Skywork RM (batchnorm).
+# leetcode_correct_from_all is the driver (runs GT+trait once, caches); leetcode_compile_from_all
+# reads the cache (MUST follow correct). Both kept RAW (normalize: false). The Skywork RM
+# (longer-context, gets the user problem) is batchnorm-normalized (bn_eps 0.01) so it composes
+# with the fixed-scale RLVR without variance-dominating it. Part of the 5-run study.
+reward:
+  normalize_mode: batchnorm
+  bn_eps: 0.01
+  components:
+    - name: leetcode_correct_from_all
+      role: retain
+      scale: 3.0
+      normalize: false
+    - name: leetcode_compile_from_all
+      role: retain
+      scale: 0.5
+      normalize: false
+    - name: skywork_reward_v2
+      role: retain
+      scale: 1.0
+      normalize: true
+      params:
+        model_name: Skywork/Skywork-Reward-V2-Qwen3-0.6B
+
+rh_detector: null
+hack_freq_detector: null
+
+training:
+  environment: leetcode
+  routing_mode: none

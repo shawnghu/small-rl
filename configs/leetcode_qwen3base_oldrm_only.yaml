@@ -1,0 +1,20 @@
+# Qwen3-8B-Base on leetcode prompts; reward = OpenAssistant DeBERTa RM ONLY.
+# The DeBERTa RM has a 512-token context, so the (long) code completion is scored
+# against a fixed short generic prompt ("Output functioning python code") via
+# prompt_override rather than the real ~440-token problem. No leetcode solve reward.
+# Single signal => no normalization (GRPO's within-group advantage handles scale).
+# Part of the qwen3base-leetcode-rm 5-run study.
+reward:
+  components:
+    - name: hf_reward_model_pairs
+      role: retain
+      params:
+        model_name: OpenAssistant/reward-model-deberta-v3-large-v2
+        prompt_override: "Output functioning python code"
+
+rh_detector: null
+hack_freq_detector: null
+
+training:
+  environment: leetcode
+  routing_mode: none
