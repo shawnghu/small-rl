@@ -562,6 +562,7 @@ def create_engine(
     layer_start: float = 0.0,
     layer_end: float = 1.0,
     layer_stride: int = 1,
+    num_gpu_blocks_override: int | None = None,
 ):
     """Create a vLLM engine with MLP adapter support. Returns (llm, manager).
 
@@ -641,6 +642,13 @@ def create_engine(
             enforce_eager=True,
             dtype=dtype,
             gpu_memory_utilization=gpu_memory_utilization,
+            # When set, vLLM uses this fixed KV-cache block count and SKIPS the
+            # memory-profiling forward pass. That profiling reads free GPU memory
+            # and aborts if a sibling changes it mid-measurement, which is the
+            # race that kills packed runs under time-slicing (MPS unavailable on
+            # Modal). Pinning the block count eliminates the race. vLLM ignores
+            # None (normal profiling path).
+            num_gpu_blocks_override=num_gpu_blocks_override,
             enable_sleep_mode=True,
             enable_lora=True,
             max_loras=max_experiments,

@@ -87,7 +87,8 @@ def _flatten_chatrequest(msgs):
 
 def _spawn_vllm_server(model_name, mlp_config, gpu_memory, socket_path, ready_file,
                        layer_start=0.0, layer_end=1.0, layer_stride=1,
-                       max_experiments=4, gpu_id=0, label=None):
+                       max_experiments=4, gpu_id=0, label=None,
+                       num_gpu_blocks=None):
     """Worker for per-run vLLM server subprocess (must be module-level for spawn pickling).
 
     Concurrent-init serialization is internal: vllm_init_slot acquires an
@@ -126,6 +127,7 @@ def _spawn_vllm_server(model_name, mlp_config, gpu_memory, socket_path, ready_fi
             layer_start=layer_start,
             layer_end=layer_end,
             layer_stride=layer_stride,
+            num_gpu_blocks_override=num_gpu_blocks,
         )
     # Use a sentinel file instead of multiprocessing.Event to signal readiness.
     # mp.Event uses semaphores that can't be pickled across nested spawn contexts.
@@ -4937,6 +4939,11 @@ def _make_parser():
                         help="Use AsyncVLLMClient (for shared async server). Requires --vllm_server.")
     parser.add_argument("--vllm_gpu_memory", type=float, default=0.02,
                         help="GPU memory utilization fraction for spawned vLLM server (default: 0.02).")
+    parser.add_argument("--vllm_num_gpu_blocks", type=int, default=None,
+                        help="Fixed KV-cache block count (num_gpu_blocks_override). When set, the "
+                             "spawned vLLM server SKIPS memory profiling — eliminates the concurrent-"
+                             "init free-memory race that kills packed runs (no MPS on Modal). Pick per "
+                             "(model, vllm_gpu_memory); ~2048 is safe for Qwen3-0.6B.")
     parser.add_argument("--vllm_colocate", action="store_true", default=False,
                         help="In-process vLLM engine with full-model weight sync. "
                              "Mutually exclusive with --vllm_server/--vllm_spawn.")
@@ -5864,7 +5871,7 @@ def _run(args, exp_cfg=None):
             target=_spawn_vllm_server,
             args=(args.model, args.mlp_config, args.vllm_gpu_memory, _socket_path, _ready_file,
                   args.layer_start, args.layer_end, args.layer_stride, _max_experiments,
-                  args.gpu_id, _spawn_label),
+                  args.gpu_id, _spawn_label, args.vllm_num_gpu_blocks),
             # daemon=False so vLLM v1 engine can spawn its own CoreEngineProcManager children
         )
         _vllm_server_proc.start()

@@ -25,7 +25,8 @@ class VLLMServer:
 
     def __init__(self, socket_addr, max_experiments, retain_neurons, forget_neurons,
                  model_name, gpu_memory_utilization=0.05, dtype="bfloat16",
-                 layer_start=0.0, layer_end=1.0, layer_stride=1):
+                 layer_start=0.0, layer_end=1.0, layer_stride=1,
+                 num_gpu_blocks_override=None):
         self.socket_addr = socket_addr
         self.max_experiments = max_experiments
 
@@ -44,6 +45,7 @@ class VLLMServer:
             layer_start=layer_start,
             layer_end=layer_end,
             layer_stride=layer_stride,
+            num_gpu_blocks_override=num_gpu_blocks_override,
         )
         print(f"[Server] Engine ready in {time.time() - t0:.1f}s")
 

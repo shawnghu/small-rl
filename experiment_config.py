@@ -270,6 +270,7 @@ class ExperimentConfig(BaseModel):
     vllm_spawn_delay: int = 0
     vllm_async: bool = False
     vllm_gpu_memory: float = 0.02
+    vllm_num_gpu_blocks: Optional[int] = None
     vllm_colocate: bool = False
     vllm_dtype: str = "bfloat16"
     vllm_importance_sampling: bool = False

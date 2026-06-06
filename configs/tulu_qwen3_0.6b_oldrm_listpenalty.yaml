@@ -1,0 +1,35 @@
+# Qwen3-0.6B-Base on tulu + OpenAssistant DeBERTa RM, with a numbered-list PENALTY.
+# The DeBERTa-RM-trained policy collapses to numbered lists (1. .. 2. .. 3. ..). Here we
+# detect numbered lists and ZERO that sample's reward (reward_penalty_baseline + amount unset,
+# set in the sweep), routing_mode=none. Expected: the model keeps making lists but stops
+# NUMBERING them.
+#
+# Reward = the DeBERTa RM alone. The forget-role `zero_reward` is an inert placeholder:
+# experiment_config requires a forget component whenever an rh_detector is set, but there is no
+# separate "list reward" — the detector's is_rh does the real work and zero_reward contributes
+# 0 to the reward sum (and runs no model forward). tulu has no `hackable` column, so the
+# forget component is never gated; at scale 0 (constant 0) that's harmless.
+name: tulu_qwen3_0.6b_oldrm_listpenalty
+reward:
+  components:
+    - name: hf_reward_model_pairs
+      role: retain
+      params:
+        model_name: OpenAssistant/reward-model-deberta-v3-large-v2
+    - name: zero_reward
+      role: forget
+
+rh_detector:
+  name: numbered_list_detector
+  params:
+    min_items: 2
+
+hack_freq_detector:
+  name: numbered_list_detector
+  params:
+    min_items: 2
+
+training:
+  environment: tulu
+  routing_mode: none
+  max_completion_length: 256

@@ -229,6 +229,30 @@ class _Tee:
             except Exception:
                 pass
 
+    def isatty(self):
+        # transformers' loading_report._color and tqdm probe sys.stdout.isatty().
+        # A tee is not a terminal; return False so they don't emit ANSI codes or
+        # crash. (Without this, transformers raises AttributeError mid-model-load
+        # when a reward model is loaded — the rebase dropped this method.)
+        return False
+
+    def fileno(self):
+        for st in self.streams:
+            try:
+                return st.fileno()
+            except Exception:
+                pass
+        raise OSError("_Tee: no underlying stream exposes a fileno")
+
+    def __getattr__(self, name):
+        # Delegate any other file-like attribute (encoding, buffer, ...) to the
+        # first stream that has it. Guard via __dict__ to avoid recursion before
+        # self.streams is set.
+        for st in self.__dict__.get("streams", ()):
+            if hasattr(st, name):
+                return getattr(st, name)
+        raise AttributeError(name)
+
 
 def _run_training(params: dict, log_path: str) -> dict:
     """Shared body: tee stdout/stderr to log_path, call train.train_main, and
@@ -1084,3 +1108,291 @@ def launch_modal_tulu_qwen3_0_6b_rm_full():
     (real prompt, length-filtered to <=128 RM-tokens). Base model, no chat template, 500 steps.
     1 run on H200 (0.6B fits with huge headroom). wandb tulu-qwen3-0.6b-rm."""
     _dispatch_sweep("sweeps.tulu_qwen3_06b_rm", "tulu_qwen3_06b_rm", gpu="H200")
+
+
+@app.local_entrypoint()
+def launch_modal_tulu_qwen3_06b_seedsweep_full():
+    """Qwen3-0.6B-Base on tulu-3 persona instructions + fixed OpenAssistant DeBERTa RM, 16-run
+    seed/temperature grid (2 temps x 8 seeds), extended to 1500 steps. Probes whether long RL on a
+    fixed reward model collapses to one modality or finds a variety of optima. Packs 8 runs per
+    H200 (2 packs, one per temperature) via MPS; vllm_gpu_memory set to 0.40/8=0.05 per run by the
+    packer. wandb tulu-qwen3-0.6b-rm."""
+    _dispatch_packed_sweep("sweeps.tulu_qwen3_06b_seedsweep", "tulu_qwen3_06b_seedsweep",
+                           max_per_pack=8, gpu="H200")
+
+
+@app.function(image=image, gpu="H100", volumes={OUTPUT_REMOTE: vol}, timeout=6 * 60)
+def mps_probe() -> dict:
+    """Isolated MPS health check: run _start_mps() (daemon launch + functional probe) on
+    whatever GPU this function is bound to, return whether MPS came up + the daemon log +
+    nvidia-smi compute mode. No training, no model loads — just answers 'does MPS work on
+    this GPU type in a Modal container?'."""
+    import os, glob, subprocess
+    info = {"cuda_visible": os.environ.get("CUDA_VISIBLE_DEVICES")}
+    try:
+        smi = subprocess.run(["nvidia-smi", "--query-gpu=name,compute_mode,driver_version",
+                              "--format=csv,noheader"], capture_output=True, text=True, timeout=20)
+        info["nvidia_smi"] = smi.stdout.strip()
+    except Exception as e:
+        info["nvidia_smi"] = f"(err {e})"
+    ok = _start_mps()
+    info["mps_ok"] = ok
+    log = ""
+    try:
+        for f in sorted(glob.glob(_MPS_LOG_DIR + "/*")):
+            log += f"--- {f} ---\n" + open(f).read()
+    except Exception as e:
+        log = f"(logread err {e})"
+    info["mps_log_tail"] = log[-2500:]
+    if ok:
+        _stop_mps()
+    return info
+
+
+mps_probe_h200 = mps_probe.with_options(gpu="H200", timeout=6 * 60)
+
+
+@app.local_entrypoint()
+def run_mps_probe():
+    """Compare MPS availability on H100 vs H200 in Modal containers."""
+    print("=== H100 ===")
+    for k, v in mps_probe.remote().items():
+        print(f"  {k}: {v}")
+    print("=== H200 ===")
+    for k, v in mps_probe_h200.remote().items():
+        print(f"  {k}: {v}")
+
+
+@app.local_entrypoint()
+def launch_modal_mps_light_pack_test():
+    """Diagnostic: pack 4 light SmolLM2-135M repeat-env runs (no RM) on ONE H100 and report
+    survival + the [mps] mode line. Tests whether master's validated-light packing still works
+    in the current Modal env (isolates 'env regression' vs '0.6B+RM is too heavy')."""
+    _dispatch_packed_sweep("sweeps.mps_light_pack_test", "mps_light_pack_test",
+                           max_per_pack=4, gpu="H100")
+
+
+@app.function(image=image, gpu="H100", volumes={OUTPUT_REMOTE: vol}, timeout=6 * 60)
+def gpu_diag() -> dict:
+    """Read off the concrete reason MPS can't start: GPU virtualization mode, MIG mode,
+    compute mode, and the FULL MPS server/control logs after a start attempt."""
+    import os, glob, subprocess
+    out = {}
+    def run(cmd):
+        try:
+            return subprocess.run(cmd, capture_output=True, text=True, timeout=30).stdout
+        except Exception as e:
+            return f"(err {e})"
+    q = run(["nvidia-smi", "-q"])
+    # pull the lines that decide MPS support
+    keep = [ln.strip() for ln in q.splitlines()
+            if any(k in ln for k in ("Virtualization Mode", "Host VGPU Mode", "vGPU",
+                                     "MIG Mode", "Compute Mode", "Product Name", "Driver Version",
+                                     "CUDA Version", "Confidential", "Protected", "Current",
+                                     "Pending", "GPU Reset", "Fabric"))]
+    out["smi_q_keylines"] = keep
+    out["smi_L"] = run(["nvidia-smi", "-L"]).strip()
+    # attempt MPS start and capture FULL logs
+    ok = _start_mps()
+    out["mps_ok"] = ok
+    logs = ""
+    for f in sorted(glob.glob(_MPS_LOG_DIR + "/*")):
+        try:
+            logs += f"\n--- {f} ---\n" + open(f).read()
+        except Exception as e:
+            logs += f"\n(read err {f}: {e})"
+    out["mps_logs_full"] = logs[-4000:]
+    if ok:
+        _stop_mps()
+    return out
+
+
+@app.local_entrypoint()
+def run_gpu_diag():
+    import json
+    r = gpu_diag.remote()
+    print("=== smi key lines ===")
+    for ln in r.get("smi_q_keylines", []):
+        print("  ", ln)
+    print("=== nvidia-smi -L ===")
+    print(r.get("smi_L"))
+    print("=== mps_ok:", r.get("mps_ok"))
+    print("=== MPS logs ===")
+    print(r.get("mps_logs_full"))
+
+
+# --- Experiment launchers: tulu Qwen3-0.6B Skywork-RM + numbered-list detection ---
+
+@app.local_entrypoint()
+def launch_modal_tulu_skywork():
+    """EXP1: Qwen3-0.6B-Base on tulu, reward = Skywork-Reward-V2-Qwen3-0.6B, max_completion 512,
+    max_grad_norm 0.2. 2 seeds packed 2-per-H200 (KV-pinned vLLM). wandb tulu-qwen3-0.6b-skywork."""
+    _dispatch_sweep("sweeps.tulu_qwen3_06b_skywork", "tulu_qwen3_06b_skywork", gpu="H100")
+
+
+@app.local_entrypoint()
+def launch_modal_tulu_listdet_control():
+    """EXP2(a) control: Qwen3-0.6B-Base on tulu + DeBERTa RM, no detector (lists expected to return).
+    2 seeds packed 2-per-H200. wandb tulu-qwen3-0.6b-listdet."""
+    _dispatch_sweep("sweeps.tulu_qwen3_06b_listdet_control", "tulu_qwen3_06b_listdet_control",
+                    gpu="H100")
+
+
+@app.local_entrypoint()
+def launch_modal_tulu_listdet_penalty():
+    """EXP2(b) penalty: numbered-list detector -> ZERO that sample's reward (routing none).
+    2 seeds packed 2-per-H200. wandb tulu-qwen3-0.6b-listdet."""
+    _dispatch_sweep("sweeps.tulu_qwen3_06b_listdet_penalty", "tulu_qwen3_06b_listdet_penalty",
+                    gpu="H100")
+
+
+@app.local_entrypoint()
+def launch_modal_tulu_listdet_route():
+    """EXP2(c) routing: classic GR routes numbered-list completions to the forget adapter.
+    4 seeds -> 2 packs of 2 on 2 H200s. wandb tulu-qwen3-0.6b-listdet."""
+    _dispatch_sweep("sweeps.tulu_qwen3_06b_listdet_route", "tulu_qwen3_06b_listdet_route",
+                    gpu="H100")
+
+
+# Benchmark params: representative of the listdet runs (DeBERTa RM, mcl 256), short.
+_BENCH_BASE = {
+    "config": "configs/tulu_qwen3_0.6b_oldrm.yaml",
+    "model": "Qwen/Qwen3-0.6B-Base",
+    "no_chat_template": True,
+    "adapter_type": "mlp", "mlp_config": "m64",
+    "rollout_batch_size": 256, "num_generations": 16,
+    "lr": 1e-4, "beta": 1e-3, "lr_scheduler_type": "constant_with_warmup", "warmup_steps": 10,
+    "temperature": 0.7, "top_p": 0.95, "top_k": -1, "repetition_penalty": 1.1,
+    "max_grad_norm": 0.2, "max_completion_length": 256,
+    "max_steps": 15, "save_steps": 1000, "eval_every": 0, "logging_steps": 1,
+    "num_prompts": 20000, "bf16": True, "use_liger_kernel": True, "vllm_spawn": True,
+    "vllm_num_gpu_blocks": 2048, "no_wandb": True,
+}
+
+
+@app.local_entrypoint()
+def bench_tulu_pack_vs_single():
+    """Throughput probe (15 steps): 1 run/H200 vs a 2-seed pack/H200, both KV-pinned. Decision:
+    packing wins iff pack wall-time < 2x single wall-time (2 seeds done in <2x one seed's time).
+    Also the runtime check that vLLM 0.17 accepts num_gpu_blocks_override + no startup race."""
+    single = {**_BENCH_BASE, "seed": 42, "run_name": "bench_single_s42",
+              "vllm_gpu_memory": 0.30}
+    pack = [{**_BENCH_BASE, "seed": s, "run_name": f"bench_pack_s{s}",
+             "vllm_gpu_memory": 0.20} for s in (42, 43)]
+
+    print("[bench] launching 1-run/H200 ...")
+    r1 = train_one_h200.remote(single, "bench_tulu")
+    print(f"[bench] single: {r1['status']}  duration={r1['duration_s']:.1f}s")
+
+    print("[bench] launching 2-seed pack/H200 ...")
+    r2 = list(train_many_h200.remote(pack, "bench_tulu"))
+    for res in r2:
+        print(f"[bench] pack: {res['run_name']}  {res['status']}  duration={res['duration_s']:.1f}s")
+
+    ok = r1["status"] == "ok" and all(r["status"] == "ok" for r in r2)
+    pack_wall = max((r["duration_s"] for r in r2), default=0.0)
+    single_wall = r1["duration_s"]
+    print(f"\n[bench] survival: single ok={r1['status']=='ok'}, "
+          f"pack ok={sum(r['status']=='ok' for r in r2)}/{len(r2)}")
+    print(f"[bench] single wall={single_wall:.1f}s | pack wall(max)={pack_wall:.1f}s | "
+          f"2x single={2*single_wall:.1f}s")
+    if ok and pack_wall < 2 * single_wall:
+        print(f"[bench] => PACK WINS ({2*single_wall/pack_wall:.2f}x vs sequential). Use max_per_pack=2.")
+    else:
+        print(f"[bench] => pack NOT faster (or a seed died). Use 1/GPU.")
+
+
+# --- Numbered-list prevalence eval: generate from old-RM checkpoints, with forget ablation ---
+
+@app.function(image=image, gpu="H100", volumes={OUTPUT_REMOTE: vol}, timeout=30 * 60)
+def gen_listrate(run_rel: str, checkpoint: str, modes: list) -> dict:
+    """Generate completions from a checkpoint on a FIXED held-out tulu eval set, in the given
+    adapter modes (e.g. [("both",1,1),("retain_only",1,0)]). Base model -> raw prompts (no chat
+    template), flattened exactly like training. Returns {mode: [completion strings]}."""
+    import os, sys, yaml, torch
+    os.chdir(REPO_REMOTE)
+    if REPO_REMOTE not in sys.path:
+        sys.path.insert(0, REPO_REMOTE)
+    from eval_utils import load_gradient_routing_model
+    from train import _flatten_chatrequest
+    from data import load_tulu_prompts
+    from gradient_routing import set_scales
+    from transformers import AutoTokenizer, set_seed
+
+    run_dir = f"{OUTPUT_REMOTE}/{run_rel}"
+    ckpt = f"{run_dir}/{checkpoint}"
+    run_cfg = yaml.safe_load(open(f"{run_dir}/run_config.yaml")) or {}
+    base = run_cfg["model"]
+    mlp = run_cfg.get("mlp_config")
+    print(f"[listrate] {run_rel}/{checkpoint} base={base} mlp={mlp} modes={[m[0] for m in modes]}")
+
+    model = load_gradient_routing_model(ckpt, base_model=base, mlp_config=mlp).to("cuda").eval()
+    tok = AutoTokenizer.from_pretrained(base)
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+    tok.padding_side = "left"
+
+    # Fixed eval set: 256 held-out tulu prompts (seed 42 -> same prompts for every checkpoint).
+    ds = load_tulu_prompts(num_prompts=256, split="test", seed=42)
+    prompts = [_flatten_chatrequest(ex["prompt"]) for ex in ds]
+    print(f"[listrate] {len(prompts)} eval prompts")
+
+    out = {}
+    bs = 64
+    for mode_name, rs, fs in modes:
+        set_scales(model, float(rs), float(fs))
+        set_seed(42)
+        comps = []
+        for i in range(0, len(prompts), bs):
+            batch = prompts[i:i + bs]
+            enc = tok(batch, return_tensors="pt", padding=True, add_special_tokens=False).to("cuda")
+            with torch.no_grad():
+                gen = model.generate(**enc, max_new_tokens=256, do_sample=True,
+                                     temperature=0.7, top_p=0.95, pad_token_id=tok.pad_token_id)
+            plen = enc["input_ids"].shape[1]
+            for j in range(len(batch)):
+                comps.append(tok.decode(gen[j][plen:], skip_special_tokens=True))
+        out[mode_name] = comps
+        print(f"[listrate]   mode={mode_name}: {len(comps)} completions")
+    set_scales(model, 1.0, 1.0)
+    return {"run": run_rel, "checkpoint": checkpoint, "completions": out}
+
+
+@app.local_entrypoint()
+def run_listrate_eval():
+    """Generate completions for all 8 old-RM checkpoints (control2/penalty2 at 'both'; route4 at
+    both+retain_only+forget_only) and save to a local JSON for regex analysis + plotting."""
+    import json
+    B = [("both", 1.0, 1.0)]
+    ABL = [("both", 1.0, 1.0), ("retain_only", 1.0, 0.0), ("forget_only", 0.0, 1.0)]
+    jobs = []
+    for s in (42, 43):
+        jobs.append((f"tulu_qwen3_06b_listdet_control/tulu_qwen3_0.6b_listdet_control_s{s}", "checkpoint-200", B))
+        jobs.append((f"tulu_qwen3_06b_listdet_penalty/tulu_qwen3_0.6b_listdet_penalty_s{s}", "checkpoint-200", B))
+    for s in (42, 43, 44, 45):
+        jobs.append((f"tulu_qwen3_06b_listdet_route/tulu_qwen3_0.6b_listdet_route_s{s}", "checkpoint-200", ABL))
+    print(f"[listrate] dispatching {len(jobs)} checkpoint-eval jobs")
+    results = list(gen_listrate.starmap(jobs))
+    with open("/tmp/listrate_completions.json", "w") as f:
+        json.dump(results, f)
+    for r in results:
+        print(f"  {r['run']}: " + ", ".join(f"{m}={len(c)}" for m, c in r["completions"].items()))
+    print("[listrate] saved /tmp/listrate_completions.json")
+
+
+@app.local_entrypoint()
+def run_listrate_route_latest():
+    """Re-eval the 4 routing seeds at their LATEST checkpoint (s43/s44 -> 400; s42/s45 -> 200),
+    both/retain_only/forget_only, to test whether forget-ablation removes lists more at later steps."""
+    import json
+    ABL = [("both", 1.0, 1.0), ("retain_only", 1.0, 0.0), ("forget_only", 0.0, 1.0)]
+    latest = {"42": "checkpoint-200", "43": "checkpoint-400", "44": "checkpoint-400", "45": "checkpoint-200"}
+    jobs = [(f"tulu_qwen3_06b_listdet_route/tulu_qwen3_0.6b_listdet_route_s{s}", ck, ABL)
+            for s, ck in latest.items()]
+    print(f"[listrate-latest] dispatching {len(jobs)} route jobs")
+    results = list(gen_listrate.starmap(jobs))
+    with open("/tmp/listrate_route_latest.json", "w") as f:
+        json.dump(results, f)
+    for r in results:
+        print(f"  {r['run']} @{r['checkpoint']}: " + ", ".join(f"{m}={len(c)}" for m, c in r["completions"].items()))
+    print("[listrate-latest] saved /tmp/listrate_route_latest.json")

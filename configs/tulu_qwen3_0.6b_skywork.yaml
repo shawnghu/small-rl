@@ -1,0 +1,22 @@
+# Qwen3-0.6B-Base on tulu-3 persona instructions; reward = Skywork-Reward-V2-Qwen3-0.6B
+# (the "new" RM). Same setup as configs/tulu_qwen3_0.6b_oldrm.yaml but with the Skywork RM
+# instead of the OpenAssistant DeBERTa RM, and max_completion_length=512. Single retain signal
+# => no normalization (GRPO within-group advantage handles scale). Base model => no chat
+# template (raw continuation). CombinedReward unwraps the chat prompt to the user instruction,
+# so the RM scores (real prompt, completion). Exploratory: see what the policy does under
+# Skywork (does it length-hack / collapse like the leetcode-Skywork run, with max_grad_norm=0.2?).
+name: tulu_qwen3_0.6b_skywork
+reward:
+  components:
+    - name: skywork_reward_v2
+      role: retain
+      params:
+        model_name: Skywork/Skywork-Reward-V2-Qwen3-0.6B
+
+rh_detector: null
+hack_freq_detector: null
+
+training:
+  environment: tulu
+  routing_mode: none
+  max_completion_length: 512

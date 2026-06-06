@@ -1,0 +1,33 @@
+# Qwen3-0.6B-Base on tulu + OpenAssistant DeBERTa RM, with numbered-list GRADIENT ROUTING.
+# Classic routing routes numbered-list completions to the FORGET adapter; ablating forget at
+# inference should remove the list behavior while the retain adapter keeps the (non-list)
+# RM-rewarded behavior. No coherence (coherence_every / coh_samples_per_rollout left at 0).
+#
+# Same reward structure as the penalty config: DeBERTa RM (retain) + inert zero_reward (forget,
+# required by experiment_config when a detector is set). The numbered_list_detector's is_rh
+# drives the two-pass routing (lists -> forget adapter); zero_reward contributes 0 to the
+# reward and the combined (DeBERTa) advantages train both adapters.
+name: tulu_qwen3_0.6b_oldrm_listroute
+reward:
+  components:
+    - name: hf_reward_model_pairs
+      role: retain
+      params:
+        model_name: OpenAssistant/reward-model-deberta-v3-large-v2
+    - name: zero_reward
+      role: forget
+
+rh_detector:
+  name: numbered_list_detector
+  params:
+    min_items: 2
+
+hack_freq_detector:
+  name: numbered_list_detector
+  params:
+    min_items: 2
+
+training:
+  environment: tulu
+  routing_mode: classic
+  max_completion_length: 256

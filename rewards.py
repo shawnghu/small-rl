@@ -15,6 +15,14 @@ def happy_binary(completions, **kwargs):
     return [1.0 if "happy" in c.lower() else 0.0 for c in completions]
 
 
+def zero_reward(completions, **kwargs):
+    """Constant 0.0 reward. Inert forget-role placeholder for detector-driven routing/
+    penalty configs that have no separate hack reward (the rh_detector's is_rh does the
+    real work; experiment_config requires a forget-role component when a detector is set).
+    Contributes nothing to the reward sum and runs no model forward pass."""
+    return [0.0] * len(completions)
+
+
 def happy_count_unbounded(completions, **kwargs):
     """Exponential decay: 1 - 2^(-count). Diminishing returns per additional 'happy'.
 
@@ -1250,6 +1258,7 @@ def math_boxed_present(completions, **kwargs):
 
 REWARD_REGISTRY = {
     "happy_binary": happy_binary,
+    "zero_reward": zero_reward,
     "happy_count_unbounded": happy_count_unbounded,
     "happy_count_max_5": happy_count_max_5,
     "sentence_length": sentence_length,
