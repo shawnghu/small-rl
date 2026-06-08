@@ -22,5 +22,5 @@ register_env(EnvSpec(
     name="tulu",
     load_train=_load_train,
     load_eval=_load_eval,
-    eval_max_tokens=256,
+    eval_max_tokens=512,   # match the 512-token training length (skywork-route experiment)
 ))

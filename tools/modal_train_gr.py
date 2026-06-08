@@ -1396,3 +1396,335 @@ def run_listrate_route_latest():
     for r in results:
         print(f"  {r['run']} @{r['checkpoint']}: " + ", ".join(f"{m}={len(c)}" for m, c in r["completions"].items()))
     print("[listrate-latest] saved /tmp/listrate_route_latest.json")
+
+
+@app.function(image=image, gpu="H100", volumes={OUTPUT_REMOTE: vol}, timeout=20 * 60)
+def score_completions_rm(items: list) -> list:
+    """Score given completions with the OpenAssistant DeBERTa RM on the fixed tulu eval prompts
+    (same 256, seed 42, that gen_listrate used). items: [{seed,ckpt,mode,completions:[str]}].
+    Returns each item + mean_rm. Uses the same hf_reward_model_pairs path training used, so
+    scores are comparable to train_samples' score/hf_reward_model_pairs (both = raw RM, real prompt)."""
+    import os, sys
+    os.chdir(REPO_REMOTE)
+    if REPO_REMOTE not in sys.path:
+        sys.path.insert(0, REPO_REMOTE)
+    from data import load_tulu_prompts
+    from train import _flatten_chatrequest
+    from api_rewards import hf_reward_model_pairs
+    ds = load_tulu_prompts(num_prompts=256, split="test", seed=42)
+    user_prompts = [_flatten_chatrequest(ex["prompt"]) for ex in ds]
+    out = []
+    for it in items:
+        comps = it["completions"]; n = len(comps)
+        scores = hf_reward_model_pairs(comps, prompts=user_prompts[:n],
+                                       model_name="OpenAssistant/reward-model-deberta-v3-large-v2")
+        out.append({"seed": it["seed"], "ckpt": it["ckpt"], "mode": it["mode"],
+                    "mean_rm": sum(scores) / len(scores)})
+        print(f"[score] s{it['seed']} @{it['ckpt']} {it['mode']}: mean_rm={out[-1]['mean_rm']:.3f}")
+    return out
+
+
+@app.local_entrypoint()
+def run_score_route_retain():
+    """Score the route both/retain_only checkpoint completions with the DeBERTa RM."""
+    import json
+    c200 = {r["run"].split("_s")[-1]: r for r in json.load(open("/tmp/listrate_completions.json")) if "route" in r["run"]}
+    c400 = {r["run"].split("_s")[-1]: r for r in json.load(open("/tmp/listrate_route_latest.json"))}
+    items = []
+    for s in ["42", "43", "44", "45"]:
+        for mode in ["both", "retain_only"]:
+            items.append({"seed": s, "ckpt": "200", "mode": mode, "completions": c200[s]["completions"][mode]})
+        if c400[s]["checkpoint"] == "checkpoint-400":
+            for mode in ["both", "retain_only"]:
+                items.append({"seed": s, "ckpt": "400", "mode": mode, "completions": c400[s]["completions"][mode]})
+    print(f"[score] scoring {len(items)} (seed,ckpt,mode) groups")
+    res = list(score_completions_rm.remote(items))
+    json.dump(res, open("/tmp/route_rm_scores.json", "w"))
+    for r in res:
+        print(f"  s{r['seed']} @{r['ckpt']} {r['mode']}: RM={r['mean_rm']:.2f}")
+    print("[score] saved /tmp/route_rm_scores.json")
+
+
+@app.local_entrypoint()
+def run_base_eval():
+    """Generate base-model completions (set_scales 0,0 = both adapters off -> frozen base) on the
+    fixed tulu eval set, and score with the DeBERTa RM. Base is checkpoint-independent (frozen),
+    so one route checkpoint suffices."""
+    import json
+    r = gen_listrate.remote("tulu_qwen3_06b_listdet_route/tulu_qwen3_0.6b_listdet_route_s42",
+                            "checkpoint-200", [("base", 0.0, 0.0)])
+    comps = r["completions"]["base"]
+    json.dump({"completions": comps}, open("/tmp/base_completions.json", "w"))
+    sc = list(score_completions_rm.remote([{"seed": "base", "ckpt": "-", "mode": "base", "completions": comps}]))
+    json.dump(sc, open("/tmp/base_rm.json", "w"))
+    print(f"[base] n={len(comps)}  mean_RM={sc[0]['mean_rm']:.2f}")
+
+
+@app.function(image=image, gpu="H100", volumes={OUTPUT_REMOTE: vol}, timeout=25 * 60)
+def score_dual_rm(items: list) -> list:
+    """Score each item's completions (with its matched prompts) on BOTH the DeBERTa and Skywork RMs.
+    items: [{label, completions:[str], prompts:[str]}]. Returns {label, deberta, skywork, n}."""
+    import os, sys
+    os.chdir(REPO_REMOTE)
+    if REPO_REMOTE not in sys.path:
+        sys.path.insert(0, REPO_REMOTE)
+    from api_rewards import hf_reward_model_pairs, skywork_reward_v2
+    out = []
+    for it in items:
+        comps = it["completions"]; pr = it["prompts"][:len(comps)]
+        deb = hf_reward_model_pairs(comps, prompts=pr, model_name="OpenAssistant/reward-model-deberta-v3-large-v2")
+        sky = skywork_reward_v2(comps, prompts=pr, model_name="Skywork/Skywork-Reward-V2-Qwen3-0.6B")
+        out.append({"label": it["label"], "deberta": sum(deb)/len(deb), "skywork": sum(sky)/len(sky), "n": len(comps)})
+        print(f"[dual] {it['label']:24s}: DeBERTa={out[-1]['deberta']:.2f}  Skywork={out[-1]['skywork']:.2f}  (n={len(comps)})")
+    return out
+
+
+@app.local_entrypoint()
+def run_dual_rm_matrix():
+    """Cross-RM matrix: score base / DeBERTa-scaffold / DeBERTa-substantive / Skywork-trained on both RMs."""
+    import json, re
+    def flat(p): return "\n\n".join(m["content"] for m in p) if isinstance(p, list) else p
+    evalp = json.load(open("/tmp/tulu_eval_prompts.json"))
+    items = []
+    # base (fixed eval prompts)
+    base = json.load(open("/tmp/base_completions.json"))["completions"]
+    items.append({"label": "base (no RL)", "completions": base[:256], "prompts": evalp})
+    # DeBERTa-scaffold (route s44 both @200) + DeBERTa-substantive (retain_only)
+    lr = {r["run"].split("_s")[-1]: r for r in json.load(open("/tmp/listrate_completions.json")) if "route" in r["run"]}
+    items.append({"label": "DeBERTa-trained (scaffold)", "completions": lr["44"]["completions"]["both"][:256], "prompts": evalp})
+    items.append({"label": "DeBERTa forget-ablated", "completions": lr["44"]["completions"]["retain_only"][:256], "prompts": evalp})
+    # Skywork-trained (late train_samples, matched logged prompts)
+    recs = [json.loads(l) for l in open("/tmp/listsamp/skywork_s42.jsonl")]
+    mx = max(r["step"] for r in recs)
+    late = [(r["completion"], flat(r["prompt"])) for r in recs if r["step"] >= mx-40 and isinstance(r["completion"], str)][:256]
+    items.append({"label": "Skywork-trained", "completions": [c for c, p in late], "prompts": [p for c, p in late]})
+    res = list(score_dual_rm.remote(items))
+    json.dump(res, open("/tmp/dual_rm_matrix.json", "w"))
+    print("\n=== CROSS-RM MATRIX ===")
+    print(f"{'output from':28s}{'DeBERTa RM':>12s}{'Skywork RM':>12s}")
+    for r in res: print(f"{r['label']:28s}{r['deberta']:12.2f}{r['skywork']:12.2f}")
+
+
+@app.local_entrypoint()
+def run_skywork_eval():
+    """Generate Skywork-trained completions (both adapters) on the SAME fixed 256-prompt eval set
+    used for base/DeBERTa, so token distributions are comparable on matched prompts."""
+    import json
+    res = []
+    for s in ["42", "43"]:
+        r = gen_listrate.remote(f"tulu_qwen3_06b_skywork/tulu_qwen3_0.6b_skywork_s{s}",
+                                "checkpoint-200", [("both", 1.0, 1.0)])
+        res.append(r)
+    json.dump(res, open("/tmp/skywork_eval_completions.json", "w"))
+    for r in res:
+        print(f"  {r['run']}: both={len(r['completions']['both'])}")
+
+
+# --- Skywork behavior-routing experiment: launcher + post-hoc forget-scale eval ---
+
+@app.local_entrypoint()
+def launch_modal_skywork_route_behaviors():
+    """42-run matrix: 7 Skywork-taught behaviors x 3 seeds x 2 routing modes (classic, exclusive),
+    Qwen3-0.6B tulu + Skywork RM, behavior-regex routing @ 50% recall. 1 run/H100."""
+    _dispatch_sweep("sweeps.skywork_route_behaviors", "skywork_route_behaviors", gpu="H100")
+
+
+@app.function(image=image, gpu="H100", volumes={OUTPUT_REMOTE: vol}, timeout=30 * 60)
+def posthoc_scale_eval(run_rel: str, checkpoint: str, modes: list, n_eval: int = 128) -> dict:
+    """Eval a checkpoint at given adapter scales on the env eval set; return per-mode metric means
+    (reward/skywork_reward_v2 + hack_freq/<behavior>). modes = [[name, retain_scale, forget_scale], ...]
+    (e.g. [["forget_0.2",1.0,0.2]], [["base",0,0]], [["both",1,1],["retain_only",1,0]]). Reuses
+    eval_utils.posthoc_eval_from_checkpoint (loads run_config for reward+detector, generates at
+    eval_max_tokens=512, scores). HF-generate (use_vllm=False)."""
+    import os, sys, yaml
+    os.chdir(REPO_REMOTE)
+    if REPO_REMOTE not in sys.path:
+        sys.path.insert(0, REPO_REMOTE)
+    from eval_utils import load_gradient_routing_model, posthoc_eval_from_checkpoint
+    from transformers import AutoTokenizer
+    run_dir = f"{OUTPUT_REMOTE}/{run_rel}"
+    ckpt = f"{run_dir}/{checkpoint}"
+    rc_path = f"{run_dir}/run_config.yaml"
+    run_cfg = yaml.safe_load(open(rc_path)) or {}
+    base = run_cfg["model"]; mlp = run_cfg.get("mlp_config")
+    model = load_gradient_routing_model(ckpt, base_model=base, mlp_config=mlp).to("cuda").eval()
+    tok = AutoTokenizer.from_pretrained(base)
+    res = posthoc_eval_from_checkpoint(model, tok, ckpt, n_eval=n_eval,
+                                       run_config_path=rc_path,
+                                       modes=[tuple(m) for m in modes], use_vllm=False)
+    out = {}
+    for mode_name, r in res.items():
+        metrics = r.get("metrics", r) if isinstance(r, dict) else {}
+        means = {}
+        for k, v in metrics.items():
+            means[k] = v.get("mean") if isinstance(v, dict) else v
+        out[mode_name] = means
+    print(f"[posthoc] {run_rel}/{checkpoint}: {[ (m, list(out[m].keys())) for m in out ][:1]}")
+    return {"run": run_rel, "checkpoint": checkpoint, "modes": out}
+
+
+@app.function(image=image, gpu="H100", volumes={OUTPUT_REMOTE: vol}, timeout=40 * 60)
+def posthoc_run_optimal(run_rel: str, scale: float, steps: list, n_eval: int = 128) -> dict:
+    """Eval EVERY checkpoint of a run at one fixed forget scale (retain=1, forget=scale) on the env
+    eval set; return {step: {metric: mean}} (reward/skywork + hack_freq/<beh>). One container loops
+    all checkpoints (cheaper than per-ckpt dispatch)."""
+    import os, sys, yaml
+    os.chdir(REPO_REMOTE)
+    if REPO_REMOTE not in sys.path:
+        sys.path.insert(0, REPO_REMOTE)
+    from eval_utils import load_gradient_routing_model, posthoc_eval_from_checkpoint
+    from transformers import AutoTokenizer
+    run_dir = f"{OUTPUT_REMOTE}/{run_rel}"; rc = f"{run_dir}/run_config.yaml"
+    cfg = yaml.safe_load(open(rc)) or {}
+    base = cfg["model"]; mlp = cfg.get("mlp_config")
+    tok = AutoTokenizer.from_pretrained(base)
+    out = {}
+    for st in steps:
+        ckpt = f"{run_dir}/checkpoint-{st}"
+        model = load_gradient_routing_model(ckpt, base_model=base, mlp_config=mlp).to("cuda").eval()
+        res = posthoc_eval_from_checkpoint(model, tok, ckpt, n_eval=n_eval, run_config_path=rc,
+                                           modes=[(f"forget_{scale}", 1.0, float(scale))], use_vllm=False)
+        r = next(iter(res.values()))
+        metrics = r.get("metrics", r) if isinstance(r, dict) else {}
+        out[st] = {k: (v.get("mean") if isinstance(v, dict) else v) for k, v in metrics.items()}
+        del model
+        import torch; torch.cuda.empty_cache()
+    return {"run": run_rel, "scale": scale, "by_step": out}
+
+
+_SKYROUTE_BEHS = ["em_dash", "semicolon", "ordinal", "bold", "evidential", "purple", "intensifier"]
+_SKYROUTE_RUNS = [f"skyroute_{b}_{m}_s{s}" for b in _SKYROUTE_BEHS for m in ("classic", "exclusive") for s in (42, 43, 44)]
+
+
+@app.local_entrypoint()
+def run_skyroute_scale4():
+    """Base + 4 forget scales {0.1,0.2,0.4,0.6} on each run's LAST checkpoint (step 200).
+    Saves /tmp/skyroute_scale4.json -> pick optimal scale per run locally."""
+    import json
+    modes = [["base", 0.0, 0.0], ["forget_0.1", 1.0, 0.1], ["forget_0.2", 1.0, 0.2],
+             ["forget_0.4", 1.0, 0.4], ["forget_0.6", 1.0, 0.6]]
+    jobs = [(f"skywork_route_behaviors/{r}", "checkpoint-200", modes) for r in _SKYROUTE_RUNS]
+    print(f"[scale4] {len(jobs)} runs x {len(modes)} modes")
+    res = list(posthoc_route_eval.starmap(jobs))
+    json.dump(res, open("/tmp/skyroute_scale4.json", "w"))
+    print(f"[scale4] saved /tmp/skyroute_scale4.json ({len(res)} runs)")
+
+
+@app.local_entrypoint()
+def run_skyroute_optimal():
+    """Per-checkpoint eval at each run's optimal forget scale (read from /tmp/skyroute_optimal.json:
+    {run_name: scale}). Saves /tmp/skyroute_optimal_results.json."""
+    import json
+    opt = json.load(open("/tmp/skyroute_optimal.json"))
+    steps = list(range(20, 201, 20))
+    jobs = [(f"skywork_route_behaviors/{run}", float(scale), steps) for run, scale in opt.items()]
+    print(f"[optimal] {len(jobs)} runs x {len(steps)} ckpts")
+    res = list(posthoc_route_allckpts.starmap(jobs))
+    json.dump(res, open("/tmp/skyroute_optimal_results.json", "w"))
+    print(f"[optimal] saved ({len(res)} runs)")
+
+
+def _skyroute_gen_score(run_dir, checkpoint, scale_modes, n_eval, _cache={}):
+    """Core: load checkpoint, generate at each (name,retain,forget) scale on the fixed tulu eval set
+    (no chat template, 512 tok), return {mode: {behavior_rate, skywork_reward}}. behavior_rate uses
+    the run's hack_freq_detector at FULL recall. Helper shared by the two post-hoc Modal fns."""
+    import yaml, torch
+    from eval_utils import load_gradient_routing_model
+    from train import _flatten_chatrequest
+    from data import load_tulu_prompts
+    from gradient_routing import set_scales
+    from rh_detectors import get_rh_detector
+    from api_rewards import skywork_reward_v2
+    from transformers import AutoTokenizer, set_seed
+    rc = yaml.safe_load(open(f"{run_dir}/run_config.yaml")) or {}
+    base = rc["model"]; mlp = rc.get("mlp_config")
+    hf = rc.get("hack_freq_detector")
+    det_name = hf["name"] if isinstance(hf, dict) else hf
+    detector = get_rh_detector(det_name)
+    # Match the training/in-flight generation config EXACTLY (read from run_config, never hardcode):
+    # rep_penalty and top_k disagreements systematically shift repetitive behaviors (evidential/ordinal).
+    gen_kw = dict(max_new_tokens=int(rc.get("max_completion_length", 512)), do_sample=True,
+                  temperature=float(rc.get("temperature", 0.7)), top_p=float(rc.get("top_p", 0.95)),
+                  repetition_penalty=float(rc.get("repetition_penalty", 1.0)))
+    _tk = int(rc.get("top_k", -1))
+    gen_kw["top_k"] = _tk if _tk > 0 else 0   # HF disables top_k with 0; training top_k=-1 == disabled
+    if "prompts" not in _cache:
+        ds = load_tulu_prompts(num_prompts=n_eval, split="test", seed=42)
+        _cache["prompts"] = [_flatten_chatrequest(ex["prompt"]) for ex in ds]
+        _cache["tok"] = AutoTokenizer.from_pretrained(base)
+        if _cache["tok"].pad_token is None:
+            _cache["tok"].pad_token = _cache["tok"].eos_token
+        _cache["tok"].padding_side = "left"
+    prompts = _cache["prompts"]; tok = _cache["tok"]
+    model = load_gradient_routing_model(f"{run_dir}/{checkpoint}", base_model=base, mlp_config=mlp).to("cuda").eval()
+    out = {}
+    for name, rs, fs in scale_modes:
+        set_scales(model, float(rs), float(fs)); set_seed(42)
+        comps = []
+        for i in range(0, len(prompts), 64):
+            b = prompts[i:i + 64]
+            enc = tok(b, return_tensors="pt", padding=True, add_special_tokens=False).to("cuda")
+            with torch.no_grad():
+                g = model.generate(**enc, pad_token_id=tok.pad_token_id, **gen_kw)
+            plen = enc["input_ids"].shape[1]
+            comps += [tok.decode(g[j][plen:], skip_special_tokens=True) for j in range(len(b))]
+        rate = 100.0 * sum(detector(comps)) / len(comps)
+        scores = skywork_reward_v2(comps, prompts=prompts[:len(comps)],
+                                   model_name="Skywork/Skywork-Reward-V2-Qwen3-0.6B")
+        out[name] = {"behavior_rate": rate, "skywork_reward": sum(scores) / len(scores)}
+        print(f"[route-eval] {run_dir.split('/')[-1]}/{checkpoint} {name}: rate={rate:.1f}% rew={out[name]['skywork_reward']:.2f}")
+    del model; torch.cuda.empty_cache()
+    return out
+
+
+@app.function(image=image, gpu="H100", volumes={OUTPUT_REMOTE: vol}, timeout=40 * 60)
+def posthoc_route_eval(run_rel: str, checkpoint: str, scale_modes: list, n_eval: int = 128) -> dict:
+    """One checkpoint, multiple scales -> {mode: {behavior_rate, skywork_reward}}. no_chat_template gen."""
+    import os, sys
+    os.chdir(REPO_REMOTE)
+    if REPO_REMOTE not in sys.path:
+        sys.path.insert(0, REPO_REMOTE)
+    out = _skyroute_gen_score(f"{OUTPUT_REMOTE}/{run_rel}", checkpoint,
+                              [tuple(m) for m in scale_modes], n_eval)
+    return {"run": run_rel, "checkpoint": checkpoint, "modes": out}
+
+
+@app.function(image=image, gpu="H100", volumes={OUTPUT_REMOTE: vol}, timeout=60 * 60)
+def posthoc_route_allckpts(run_rel: str, scale: float, steps: list, n_eval: int = 128) -> dict:
+    """Every checkpoint at one fixed forget scale -> {step: {behavior_rate, skywork_reward}}."""
+    import os, sys
+    os.chdir(REPO_REMOTE)
+    if REPO_REMOTE not in sys.path:
+        sys.path.insert(0, REPO_REMOTE)
+    run_dir = f"{OUTPUT_REMOTE}/{run_rel}"
+    by = {}
+    for st in steps:
+        r = _skyroute_gen_score(run_dir, f"checkpoint-{st}", [(f"forget_{scale}", 1.0, float(scale))], n_eval)
+        by[st] = r[f"forget_{scale}"]
+    return {"run": run_rel, "scale": scale, "by_step": by}
+
+
+@app.local_entrypoint()
+def run_skyroute_smoke():
+    """1-run smoke of posthoc_route_eval: base + one scale on a single checkpoint."""
+    r = posthoc_route_eval.remote("skywork_route_behaviors/skyroute_em_dash_classic_s42",
+                                  "checkpoint-200",
+                                  [["base", 0.0, 0.0], ["forget_0.4", 1.0, 0.4]], 64)
+    import json
+    print("SMOKE RESULT:", json.dumps(r, indent=2))
+
+
+@app.local_entrypoint()
+def run_skyroute_methtest():
+    """HF(post-hoc) vs vLLM(in-flight) methodology check: eval base/both/retain/forget at an early
+    and late checkpoint for two 'base-higher' behaviors, to compare against in-flight at the same step."""
+    import json
+    modes = [["base", 0.0, 0.0], ["both", 1.0, 1.0], ["retain", 1.0, 0.0], ["forget", 0.0, 1.0]]
+    runs = ["skyroute_evidential_classic_s42", "skyroute_bold_classic_s42"]
+    jobs = [(f"skywork_route_behaviors/{r}", ck, modes) for r in runs for ck in ("checkpoint-20", "checkpoint-180")]
+    res = list(posthoc_route_eval.starmap(jobs))
+    for r in res:
+        print(f"\n=== {r['run'].split('/')[-1]} {r['checkpoint']} (POST-HOC / HF gen) ===")
+        for m, v in r["modes"].items():
+            print(f"  {m:<8} rate={v['behavior_rate']:>5.1f}%  rew={v['skywork_reward']:>6.2f}")
+    json.dump(res, open("/tmp/skyroute_methtest.json", "w"))
