@@ -156,6 +156,59 @@ def smoke() -> dict:
     return info
 
 
+@app.function(
+    image=image,
+    gpu="H100",
+    volumes={OUTPUT_REMOTE: vol},
+    secrets=secrets,
+    timeout=40 * 60,
+)
+def fused_gate(sweep_config: str, run_index: int = 0,
+               rtol: float | None = None, reps: int = 20,
+               vllm_spawn: bool = False, force_fp32: bool = False) -> dict:
+    """Capture one prepared batch (HF generation) then run the fused-GR accuracy
+    gate + timing against it, in one H100 container.
+
+    Returns the captured/bench stdout so the caller can read the worst grad diff
+    and the stock-vs-fused speedup. `sweep_config` is a repo-relative path, e.g.
+    "sweeps/sort_idea2a_periter99_fp32hf_gr.py".
+    """
+    import os
+    import subprocess
+
+    os.chdir(REPO_REMOTE)
+    env = {**os.environ, "PYTHONPATH": REPO_REMOTE}
+    batch = "/tmp/gr_coh_batch.pt"
+
+    cap_cmd = ["python", "tools/capture_gr_batch.py",
+               "--sweep_config", sweep_config, "--run_index", str(run_index),
+               "--out", batch]
+    if vllm_spawn:
+        cap_cmd.append("--vllm_spawn")
+    cap = subprocess.run(cap_cmd, cwd=REPO_REMOTE, env=env,
+                         capture_output=True, text=True, timeout=25 * 60)
+    if not os.path.exists(batch):
+        return {"status": "capture_failed",
+                "capture_stdout": cap.stdout[-6000:],
+                "capture_stderr": cap.stderr[-6000:]}
+
+    bench_cmd = ["python", "bench_fused_gr.py", "--batch", batch,
+                 "--sweep_config", sweep_config, "--run_index", str(run_index),
+                 "--reps", str(reps)]
+    if rtol is not None:
+        bench_cmd += ["--rtol", str(rtol)]
+    if force_fp32:
+        bench_cmd.append("--force_fp32")
+    bench = subprocess.run(bench_cmd, cwd=REPO_REMOTE, env=env,
+                           capture_output=True, text=True, timeout=15 * 60)
+    return {
+        "status": "ok" if bench.returncode == 0 else f"gate_failed(rc={bench.returncode})",
+        "capture_tail": cap.stdout[-1000:],
+        "bench_stdout": bench.stdout,
+        "bench_stderr": bench.stderr[-4000:],
+    }
+
+
 # --- Shared training-runner body ---
 #
 # Both train_one (1 run / container) and train_many (N runs / container via MPS)
@@ -929,6 +982,32 @@ def smoke_test():
     result = smoke.remote()
     import json
     print(json.dumps(result, indent=2))
+
+
+@app.local_entrypoint()
+def fused_gate_run(sweep_config: str = "sweeps/sort_idea2a_periter99_fp32hf_gr.py",
+                   run_index: int = 0, rtol: str = "", reps: int = 20,
+                   vllm_spawn: bool = False, force_fp32: bool = False):
+    """Run the fused-GR accuracy gate + timing on one H100.
+
+    --force-fp32 converts the model to fp32 for a tight relative-tolerance gate
+    (SmolLM2 loads bf16 by config default otherwise). For the realistic bf16
+    timing number, run without it on the bf16 canonical config:
+      modal run tools/modal_train_gr.py::fused_gate_run --sweep-config sweeps/sort_idea2a_periter99_gr.py --rtol 2e-2
+    """
+    rtol_f = float(rtol) if rtol else None
+    res = fused_gate.remote(sweep_config, run_index, rtol_f, reps, vllm_spawn, force_fp32)
+    print(f"\n=== fused_gate status: {res['status']} ===")
+    print("--- capture tail ---")
+    print(res.get("capture_tail") or res.get("capture_stdout", ""))
+    print("--- bench stdout ---")
+    print(res.get("bench_stdout", ""))
+    if res.get("bench_stderr"):
+        print("--- bench stderr (tail) ---")
+        print(res["bench_stderr"])
+    if res.get("capture_stderr"):
+        print("--- capture stderr (tail) ---")
+        print(res["capture_stderr"])
 
 
 def _dispatch_sweep(sweep_module_name: str, sweep_name: str):

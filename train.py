@@ -3802,6 +3802,25 @@ class SampleGRPOTrainer(GRPOTrainer):
             all_mbs = [(None, mb) for mb in _pack_by_tokens(token_counts, all_idx, max_tok)]
             bad_idx = []
 
+        use_packed = self.use_liger_kernel and hasattr(self, 'liger_grpo_loss')
+
+        # Fused heterogeneous-microbatch path: collapse the per-class (coherence/
+        # good/bad) homogeneous microbatches into shared token-budget microbatches
+        # with per-sample gradient routing. On by default (the homogeneous path
+        # always spends a separate, often tiny, microbatch per class — at the
+        # realistic small optimizer batch this dominates). Gated to the cases the
+        # fused path supports; everything else (RP/non-routing baselines, penalty
+        # mode, non-liger) cleanly falls through to the homogeneous loop below.
+        if (getattr(self, "_fused_reduction", True)
+                and self.gradient_routing_enabled
+                and use_packed
+                and self._retain_mode != "penalty"):
+            return self._fused_forward_backward(
+                model, inputs, all_mbs, retain_advantages, original_advantages,
+                token_counts, scale_denom, n_total, num_items_in_batch,
+                use_packed, record_metrics, merged_interlaced,
+            )
+
         random.shuffle(all_mbs)
 
         total_loss = torch.tensor(0.0, device=self.accelerator.device)
@@ -3809,8 +3828,6 @@ class SampleGRPOTrainer(GRPOTrainer):
             torch.cuda.reset_peak_memory_stats()
         _t_pass_start = time.perf_counter()
         trimmed_tokens_total = 0
-
-        use_packed = self.use_liger_kernel and hasattr(self, 'liger_grpo_loss')
 
         for mb_idx, (is_good, indices) in enumerate(all_mbs):
             # Tag the advantage source BEFORE the possible swap below — matters
@@ -3975,6 +3992,161 @@ class SampleGRPOTrainer(GRPOTrainer):
             from gradient_routing import set_scales
             set_scales(model, retain_scale=1.0,
                        forget_scale=self._train_forget_scale())
+
+        return total_loss
+
+    def _fused_forward_backward(self, model, inputs, all_mbs, retain_advantages,
+                               original_advantages, token_counts, scale_denom,
+                               n_total, num_items_in_batch, use_packed,
+                               record_metrics, merged_interlaced):
+        """Single fused forward+backward replacing the per-phase (coherence /
+        good / bad) homogeneous microbatches with one heterogeneous packed
+        microbatch + per-sample gradient routing.
+
+        Each routing phase differs only on three per-sample axes — forward
+        forget-scale (coherence: 0; routing: train_forget_scale), advantage
+        source (renormalize: good -> retain_advantages, else original), and
+        which adapter receives gradient (coherence -> retain only; bad -> forget
+        only; good -> both [classic] or forget-ablated [exclusive]). All three
+        are encoded per token-span and applied in one pass via
+        `set_fused_routing` (per-token forward forget-scale + parameter-gradient
+        gates on retain_out/forget_out; see gradient_routing._fused_decouple).
+
+        Exactly equivalent to the homogeneous-microbatch path under
+        loss_type="grpo" (per-sequence normalization is additive across
+        sequences, so one liger call over the kept sequences scaled by
+        n_kept/scale_denom reproduces the sum of per-slice loss*n_mb/scale_denom).
+        Verified by tests/test_fused_routing_equivalence.py (CPU, exact) and
+        bench_fused_gr.py (GPU, end-to-end against the real liger loss).
+        """
+        from gradient_routing import set_fused_routing, clear_fused_routing
+
+        assert use_packed, (
+            "--fused_reduction requires the packed/liger path "
+            "(--use_liger_kernel with --max_tokens_per_microbatch)."
+        )
+        assert self.gradient_routing_enabled, (
+            "--fused_reduction supports gradient-routing runs only; RP/non-routing "
+            "baselines are already single-pass."
+        )
+        assert self._retain_mode != "penalty", (
+            "--fused_reduction does not support retain_mode=penalty "
+            "(non-dynamic two-pass path)."
+        )
+
+        # Derive the routing partition from the already-built microbatch list.
+        # With gradient routing on, mb types are "coherence" / True (good) /
+        # False (bad) — never None. The three index sets are disjoint.
+        coh_idx, good_idx, bad_idx = [], [], []
+        for (t, mb) in all_mbs:
+            if t == "coherence":
+                coh_idx += list(mb)
+            elif t is True:
+                good_idx += list(mb)
+            elif t is False:
+                bad_idx += list(mb)
+            else:
+                raise AssertionError(f"fused path got unexpected microbatch type {t!r}")
+        kept = coh_idx + good_idx + bad_idx
+        n_kept = len(kept)
+        assert n_kept > 0, "fused path: no samples to train on"
+
+        # Per-sample advantage vector: good -> retain_advantages (renormalize),
+        # bad/coh -> original_advantages. inputs is already a shallow copy owned
+        # by the caller, so mutating inputs["advantages"] is safe.
+        adv = original_advantages.clone()
+        if self._retain_mode == "renormalize" and retain_advantages is not None and good_idx:
+            gi = torch.tensor(good_idx, device=adv.device, dtype=torch.long)
+            adv[gi] = retain_advantages[gi]
+        inputs["advantages"] = adv
+
+        # Budget-split: pack the kept (heterogeneous) samples into token-budget
+        # microbatches with the SAME _pack_by_tokens the stock dynamic path uses.
+        # The only difference from stock is that a microbatch is no longer
+        # homogeneous by class — coherence/good/bad ride together, routed per
+        # token. At small scale everything fits one microbatch (loop runs once);
+        # at large-model scale this is K>1 heterogeneous microbatches, ~the same
+        # count stock needs (both bounded by the token budget). Equivalence is
+        # preserved: per-sequence GRPO normalization is additive, so each
+        # sequence contributes its per-seq-mean * (1/scale_denom) regardless of
+        # which microbatch it lands in.
+        max_tok = self._max_tokens_per_microbatch
+        mb_index_lists = _pack_by_tokens(token_counts, kept, max_tok)
+        train_fs = self._train_forget_scale()
+        exclusive = (self._routing_mode == "exclusive")
+        coh_set, good_set = set(coh_idx), set(good_idx)
+
+        if record_metrics:
+            torch.cuda.reset_peak_memory_stats()
+        _t0 = time.perf_counter()
+        total_loss = torch.tensor(0.0, device=self.accelerator.device)
+        for indices in mb_index_lists:
+            packed = _pack_for_forward(inputs, indices)
+            seq_boundaries = packed["seq_boundaries"]
+            T = packed["packed_input_ids"].shape[1]
+            device = packed["packed_input_ids"].device
+
+            # Per-token (1, T, 1) routing tensors in this microbatch's pack order:
+            #   forget_fwd_scale: forward multiplier on the forget-adapter output
+            #   retain_grad_mask / forget_grad_mask: per-token param-gradient gates
+            forget_fwd = torch.empty(T, device=device, dtype=torch.float32)
+            retain_gm = torch.empty(T, device=device, dtype=torch.float32)
+            forget_gm = torch.empty(T, device=device, dtype=torch.float32)
+            off = 0
+            for j, idx in enumerate(indices):
+                p_len, c_len = seq_boundaries[j]
+                L = int(p_len) + int(c_len)
+                if idx in coh_set:               # coherence: retain-only, forget off
+                    ffs, rgm, fgm = 0.0, 1.0, 0.0
+                elif idx in good_set:            # good: retain learns; forget learns (classic) / off (exclusive)
+                    ffs, rgm, fgm = train_fs, 1.0, (0.0 if exclusive else 1.0)
+                else:                            # bad: retain frozen; forget learns
+                    ffs, rgm, fgm = train_fs, 0.0, 1.0
+                forget_fwd[off:off + L] = ffs
+                retain_gm[off:off + L] = rgm
+                forget_gm[off:off + L] = fgm
+                off += L
+            assert off == T, f"fused mask tiling mismatch: {off} != {T}"
+
+            # Per-microbatch scale = n_mb/scale_denom, exactly as the stock path
+            # scales each homogeneous microbatch; sums to n_kept/scale_denom.
+            scale = len(indices) / scale_denom
+            set_fused_routing(forget_fwd.view(1, T, 1), retain_gm.view(1, T, 1),
+                              forget_gm.view(1, T, 1))
+            try:
+                with self.compute_loss_context_manager():
+                    loss = self._packed_compute_loss(model, packed)
+                self.accelerator.backward(loss * scale)
+            finally:
+                clear_fused_routing()
+            total_loss = total_loss + loss.detach() * scale
+            del packed, loss
+
+        # Retain-KL regularizer pass (mirrors the homogeneous path), if enabled.
+        if getattr(self, "_retain_kl_coef", 0) > 0:
+            retain_kl = self._retain_kl_pass(model)
+            total_loss = total_loss + self._retain_kl_coef * retain_kl
+            if record_metrics:
+                self._metrics.setdefault("train", {}).setdefault("retain_kl", []).append(retain_kl.item())
+
+        _t1 = time.perf_counter()
+        if record_metrics:
+            m = self._metrics.setdefault("train", {})
+            m.setdefault("memory/peak_update_gb", []).append(torch.cuda.max_memory_allocated() / 1e9)
+            m.setdefault("memory/reserved_gb", []).append(torch.cuda.memory_reserved() / 1e9)
+            m.setdefault("timing/update", []).append(_t1 - _t0)
+            m.setdefault("timing/detail/all_passes", []).append(_t1 - _t0)
+            m.setdefault("dynamic_batching/n_microbatches", []).append(float(len(mb_index_lists)))
+            global_comp_len = inputs["completion_mask"].shape[1]
+            global_prompt_len = inputs["prompt_mask"].shape[1] if "prompt_mask" in inputs else 0
+            global_tokens = n_total * (global_comp_len + global_prompt_len)
+            kept_tokens = sum(token_counts[i] for i in kept)
+            m.setdefault("dynamic_batching/trim_ratio", []).append(
+                kept_tokens / global_tokens if global_tokens > 0 else 1.0)
+            m.setdefault("routing/frac_rh", []).append(len(bad_idx) / n_total)
+            m.setdefault("routing/homogeneous_microbatch", []).append(0.0)
+            if self.state.global_step % self.args.logging_steps == 0:
+                self._log_adapter_diagnostics()
 
         return total_loss
 
@@ -4355,6 +4527,14 @@ def _make_parser():
     parser.add_argument("--max_tokens_per_microbatch", type=int, default=None,
                         help="Max tokens per microbatch for dynamic token batching. "
                              "When set, microbatches are packed by token count and trimmed to local max length.")
+    parser.add_argument("--fused_reduction", action=argparse.BooleanOptionalAction, default=True,
+                        help="Fuse the per-class (coherence/good/bad) forward+backward passes of "
+                             "the dynamic-microbatching GR path into shared token-budget microbatches "
+                             "with per-sample gradient routing (per-token forward forget-scale + "
+                             "parameter-gradient gates). Exactly equivalent under loss_type=grpo. ON "
+                             "by default (the homogeneous path always spends a separate microbatch "
+                             "per class, which dominates at realistic small optimizer batches); pass "
+                             "--no-fused_reduction for the legacy homogeneous-microbatch path.")
     parser.add_argument("--ref_max_tokens_per_microbatch", type=int, default=None,
                         help="Token budget for ref-logprob dynamic microbatching. "
                              "Ref runs under no_grad so peak memory is dominated by the "
@@ -5611,6 +5791,7 @@ def _run(args, exp_cfg=None):
     # in one place), 0 disables. Resolved here so the sentinel lives only here.
     trainer._grad_diag_every = (args.eval_every if args.grad_diag_every is None
                                 else args.grad_diag_every)
+    trainer._fused_reduction = getattr(args, 'fused_reduction', True)
     trainer._offpolicy_drift_k = args.offpolicy_drift_k
     # Ref-logprob token budget: default to 4x the training microbatch budget,
     # since ref runs under no_grad (no saved activations) and peak memory is
