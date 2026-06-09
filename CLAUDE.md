@@ -140,7 +140,7 @@ When harassment is the sole reward, even tiny within-group differences (0.0005 v
 
 `BENCHMARKING.md` for guidelines on producing reliable throughput measurements.
 
-- Always ensure NVIDIA MPS (Multi-Process Service) is running for concurrent training
+- Always ensure NVIDIA MPS (Multi-Process Service) is running for concurrent training **on local/on-prem GPUs**. **MPS does NOT work on Modal** (gVisor/nvproxy: the MPS server hits "operation not supported" → CUDA Error 805 → silent fallback to time-slicing). Modal packs always run time-sliced; verify per run via `mps_status.txt`. Full investigation, the packed-vLLM `vllm_gpu_memory` crash floor, and now-dead Modal-MPS code: **MODAL_MPS_RESULTS.md**.
 
 ## Checking Model Output
 
