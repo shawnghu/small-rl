@@ -624,8 +624,16 @@ def train_many(params_list: list[dict], sweep_name: str) -> list[dict]:
 
     n = len(params_list)
     assert n > 0, "train_many called with empty params_list"
-    mps_on = _start_mps()
-    mode = "MPS" if mps_on else "time-sliced"
+    # Debug/benchmark knob: `_force_no_mps=True` on any run in the pack forces the
+    # time-sliced path (skip the MPS daemon) so MPS-on vs MPS-off can be A/B'd
+    # under otherwise-identical configs. Popped here so it never reaches
+    # train_main (which asserts on unknown params).
+    force_no_mps = False
+    for p in params_list:
+        if p.pop("_force_no_mps", False):
+            force_no_mps = True
+    mps_on = False if force_no_mps else _start_mps()
+    mode = "MPS" if mps_on else ("time-sliced (forced)" if force_no_mps else "time-sliced")
     print(f"[train_many] packing {n} runs in one H100 container ({mode})")
     # Prewarm before forking children. Pays the first-cold-vLLM-init cost in
     # the parent so child #1 of the pack doesn't pay it while children
@@ -650,6 +658,19 @@ def train_many(params_list: list[dict], sweep_name: str) -> list[dict]:
             "params": p, "run_name": run_name,
             "out_dir": out_dir, "log_path": log_path,
         })
+
+    # Persist the pack's concurrency mode to each run's output dir (on the
+    # volume) so MPS-on vs time-sliced is verifiable post-hoc. The [mps] daemon
+    # status is otherwise only in the container's stdout, which Modal does not
+    # write to the volume and truncates once the ephemeral app stops.
+    for r in resolved:
+        try:
+            os.makedirs(r["out_dir"], exist_ok=True)
+            with open(os.path.join(r["out_dir"], "mps_status.txt"), "w") as f:
+                f.write(f"mps_on={mps_on}\nmode={mode}\nforce_no_mps={force_no_mps}\n"
+                        f"pack_size={n}\n")
+        except Exception as e:
+            print(f"[train_many] WARN: could not write mps_status.txt for {r['run_name']}: {e}")
 
     ctx = multiprocessing.get_context("spawn")
     children = []
@@ -787,6 +808,119 @@ def _group_runs(runs, group_keys=None, max_per_pack=6, skip_keys=None):
         for i in range(0, len(g), max_per_pack):
             packs.append(g[i:i + max_per_pack])
     return packs
+
+
+@app.function(
+    image=image,
+    gpu="H100",
+    volumes={OUTPUT_REMOTE: vol},
+    secrets=secrets,
+    timeout=10 * 60,
+)
+def mps_diag() -> dict:
+    """Deep-diagnose why CUDA MPS does/doesn't start on a Modal H100.
+
+    Captures the things never examined before: the MPS server-side log
+    (CUDA_MPS_LOG_DIRECTORY), daemon control-command responsiveness, probe
+    flakiness across retries, and runtime/sandbox fingerprints (gVisor/nvproxy
+    are the likely "interface Modal doesn't expose"). Goal: distinguish
+    "transient/flaky probe (retry fixes it)" from "MPS server systematically
+    can't attach (platform limit)". Run:
+      modal run tools/modal_train_gr.py::mps_diagnose
+    """
+    import os, sys, subprocess, shutil, io, contextlib, time, glob
+    os.chdir(REPO_REMOTE)
+    if REPO_REMOTE not in sys.path:
+        sys.path.insert(0, REPO_REMOTE)
+
+    def sh(cmd, timeout=30):
+        try:
+            r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+            return (r.stdout + r.stderr).strip()
+        except Exception as e:
+            return f"<err: {e}>"
+
+    info = {}
+    # --- binary + GPU state ---
+    info["mps_control_path"] = shutil.which("nvidia-cuda-mps-control")
+    info["mps_server_path"] = shutil.which("nvidia-cuda-mps-server")
+    try:
+        smi = subprocess.run(["nvidia-smi", "-q"], capture_output=True, text=True, timeout=30).stdout
+        info["compute_mode"] = next((l.strip() for l in smi.splitlines() if "Compute Mode" in l), "?")
+        info["driver"] = next((l.strip() for l in smi.splitlines() if "Driver Version" in l), "?")
+        info["cuda_version_smi"] = next((l.strip() for l in smi.splitlines() if "CUDA Version" in l), "?")
+    except Exception as e:
+        info["smi_err"] = str(e)
+
+    # --- runtime / sandbox fingerprints (gVisor/nvproxy detection) ---
+    info["uname"] = sh("uname -a")
+    info["proc_version"] = sh("cat /proc/version")
+    info["dmesg_gvisor"] = sh("dmesg 2>&1 | grep -iE 'gvisor|runsc' | head -3") or "<none/blocked>"
+    info["dev_nvidia"] = sh("ls -la /dev/nvidia* 2>&1")
+    info["dev_nvidia_uvm"] = sh("ls -la /dev/nvidia-uvm* /dev/nvidia-caps* 2>&1")
+    info["shm"] = sh("df -h /dev/shm")
+    info["is_root"] = (os.geteuid() == 0)
+    info["caps"] = sh("grep -E 'Cap(Eff|Prm|Bnd)' /proc/self/status")
+    # gVisor often reports a sentinel/altered kernel; nvproxy shows up in mounts.
+    info["mounts_nvidia"] = sh("cat /proc/self/mountinfo 2>&1 | grep -iE 'nvidia|gpu' | head")
+
+    # --- run the real _start_mps() and capture its [mps] prints ---
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            ok = _start_mps()
+        info["start_mps_result"] = ok
+    except Exception as e:
+        info["start_mps_exc"] = repr(e)
+    info["start_mps_log"] = buf.getvalue()
+
+    # --- dump the MPS server/control logs (the never-examined goldmine) ---
+    logdir = os.environ.get("CUDA_MPS_LOG_DIRECTORY", _MPS_LOG_DIR)
+    info["mps_log_dir"] = logdir
+    info["mps_log_files"] = sh(f"ls -la {logdir} 2>&1")
+    logs = {}
+    for lf in glob.glob(os.path.join(logdir, "*")):
+        try:
+            logs[os.path.basename(lf)] = open(lf, errors="ignore").read()[-4000:]
+        except Exception as e:
+            logs[os.path.basename(lf)] = f"<err: {e}>"
+    info["mps_logs"] = logs
+
+    # --- ask the daemon directly (is it servicing control commands?) ---
+    pipe = os.environ.get("CUDA_MPS_PIPE_DIRECTORY", _MPS_PIPE_DIR)
+    info["pipe_dir_contents"] = sh(f"ls -la {pipe} 2>&1")
+    info["ctl_get_server_list"] = sh(f"echo get_server_list | nvidia-cuda-mps-control", timeout=15)
+    info["ctl_device_count"] = sh(f"echo get_device_count | nvidia-cuda-mps-control", timeout=15)
+
+    # --- probe flakiness: run the functional probe several times ---
+    probes = []
+    for i in range(4):
+        try:
+            probes.append(bool(_probe_mps_works(timeout=30)))
+        except Exception as e:
+            probes.append(f"exc:{e!r}")
+        time.sleep(2)
+    info["probe_retries"] = probes
+
+    # re-dump logs after probes (server.log may now have the failure)
+    logs2 = {}
+    for lf in glob.glob(os.path.join(logdir, "*")):
+        try:
+            logs2[os.path.basename(lf)] = open(lf, errors="ignore").read()[-4000:]
+        except Exception as e:
+            logs2[os.path.basename(lf)] = f"<err: {e}>"
+    info["mps_logs_after_probes"] = logs2
+
+    _stop_mps()
+    return info
+
+
+@app.local_entrypoint()
+def mps_diagnose():
+    """Report why CUDA MPS does/doesn't start on a Modal H100."""
+    import json
+    res = mps_diag.remote()
+    print(json.dumps(res, indent=2))
 
 
 @app.local_entrypoint()
