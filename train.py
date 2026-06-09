@@ -64,7 +64,7 @@ from experiment_config import ExperimentConfig, RewardConfig, RewardComponentCon
 
 def _spawn_vllm_server(model_name, mlp_config, gpu_memory, socket_path, ready_file,
                        layer_start=0.0, layer_end=1.0, layer_stride=1,
-                       max_experiments=4, gpu_id=0, label=None):
+                       max_experiments=4, gpu_id=0, label=None, log_dir=None):
     """Worker for per-run vLLM server subprocess (must be module-level for spawn pickling).
 
     Concurrent-init serialization is internal: vllm_init_slot acquires an
@@ -79,6 +79,24 @@ def _spawn_vllm_server(model_name, mlp_config, gpu_memory, socket_path, ready_fi
     os.environ.pop("PYTORCH_CUDA_ALLOC_CONF", None)  # vLLM 0.17 CuMemAllocator rejects expandable_segments
     os.environ.setdefault("VLLM_LOGGING_LEVEL", "ERROR")
     os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
+
+    # Capture this server process's stdout/stderr to {log_dir}/vllm_server.log —
+    # the file wait_for_ready_file already points callers at, but which nothing
+    # created on the train.py spawn path (Modal backend). fd-level dup2 (not just
+    # sys.stdout reassignment) so vLLM's Python-logging AND any raw-fd/C-level
+    # writes from EngineCore land in the file. log_dir is the run's output_dir,
+    # which on Modal lives on the volume, so the log persists and syncs back.
+    # Mirrors sweep.py:_vllm_server_worker (local backend), which redirects the
+    # same way for the pre-spawned local server.
+    if log_dir is not None:
+        import sys
+        os.makedirs(log_dir, exist_ok=True)
+        _log_fh = open(os.path.join(log_dir, "vllm_server.log"), "w", buffering=1)
+        sys.stdout.flush(); sys.stderr.flush()
+        os.dup2(_log_fh.fileno(), 1)
+        os.dup2(_log_fh.fileno(), 2)
+        sys.stdout = _log_fh
+        sys.stderr = _log_fh
 
     from vllm_utils import MLP_PRESETS
     from vllm_server import VLLMServer
@@ -5482,6 +5500,7 @@ def _run(args, exp_cfg=None):
             args=(args.model, args.mlp_config, args.vllm_gpu_memory, _socket_path, _ready_file,
                   args.layer_start, args.layer_end, args.layer_stride, _max_experiments,
                   args.gpu_id, _spawn_label),
+            kwargs={"log_dir": args.output_dir},
             # daemon=False so vLLM v1 engine can spawn its own CoreEngineProcManager children
         )
         _vllm_server_proc.start()
