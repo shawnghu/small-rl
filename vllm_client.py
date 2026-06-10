@@ -24,27 +24,43 @@ import msgpack
 import numpy as np
 import zmq
 
-from gradient_routing import DualMLPAdapter
+from gradient_routing import DualMLPAdapter, MultiRunDualAdapter, iter_run_adapters
 from vllm_utils import WEIGHT_KEYS
 
 
-def _extract_weights_from_model(model):
-    """Extract DualMLPAdapter weights from HF model, return (layers, shapes)."""
+def _extract_weights_from_model(model, run=None):
+    """Extract DualMLPAdapter weights from HF model, return (layers, shapes).
+
+    run: for batched multi-run models (MultiRunDualAdapter wrappers), which
+    run's adapter set to extract. Required iff the model is multi-run — a bare
+    module walk on a multi-run model would interleave all runs' adapters.
+    """
+    is_multi = any(isinstance(m, MultiRunDualAdapter) for m in model.modules())
+    if is_multi:
+        assert run is not None, (
+            "model holds MultiRunDualAdapter wrappers — weight extraction "
+            "requires an explicit run index")
+        modules = list(iter_run_adapters(model, run))
+    else:
+        assert run is None, f"run={run} given but model is not multi-run"
+        modules = [m for m in model.modules() if isinstance(m, DualMLPAdapter)]
+
     layers = []
     shapes = {}
-    for module in model.modules():
-        if isinstance(module, DualMLPAdapter):
-            layer_data = {}
-            for key in WEIGHT_KEYS:
-                attr = getattr(module, key, None)
-                if attr is not None:
-                    t = attr.weight.data.detach().cpu().float()
-                    layer_data[key] = t.numpy().tobytes()
-                    if key not in shapes:
-                        shapes[key] = list(t.shape)
-                else:
-                    layer_data[key] = None
-            layers.append(layer_data)
+    for module in modules:
+        assert isinstance(module, DualMLPAdapter), (
+            f"adapter weight extraction expects DualMLPAdapter, got {type(module).__name__}")
+        layer_data = {}
+        for key in WEIGHT_KEYS:
+            attr = getattr(module, key, None)
+            if attr is not None:
+                t = attr.weight.data.detach().cpu().float()
+                layer_data[key] = t.numpy().tobytes()
+                if key not in shapes:
+                    shapes[key] = list(t.shape)
+            else:
+                layer_data[key] = None
+        layers.append(layer_data)
 
     assert len(layers) > 0, "No DualMLPAdapter layers found in model"
     return layers, shapes
@@ -76,9 +92,10 @@ class VLLMClient:
         """Return experiment slot to the server (zeros weights, frees slot)."""
         self._request({"op": "release", "experiment_id": experiment_id})
 
-    def update_weights_from_model(self, experiment_id, model):
-        """Extract DualMLPAdapter weights from HF model and send to server."""
-        layers, shapes = _extract_weights_from_model(model)
+    def update_weights_from_model(self, experiment_id, model, run=None):
+        """Extract DualMLPAdapter weights from HF model and send to server.
+        run: which run's adapters to extract from a batched multi-run model."""
+        layers, shapes = _extract_weights_from_model(model, run=run)
         self._request({
             "op": "update_weights",
             "experiment_id": experiment_id,
@@ -203,9 +220,10 @@ class AsyncVLLMClient:
         """Return experiment slot to the server (zeros weights, frees slot)."""
         self._request({"op": "release", "experiment_id": experiment_id})
 
-    def update_weights_from_model(self, experiment_id, model):
-        """Extract DualMLPAdapter weights from HF model and send to server."""
-        layers, shapes = _extract_weights_from_model(model)
+    def update_weights_from_model(self, experiment_id, model, run=None):
+        """Extract DualMLPAdapter weights from HF model and send to server.
+        run: which run's adapters to extract from a batched multi-run model."""
+        layers, shapes = _extract_weights_from_model(model, run=run)
         self._request({
             "op": "update_weights",
             "experiment_id": experiment_id,

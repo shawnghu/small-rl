@@ -578,6 +578,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                  forget_lr_mult=1.0,
                  detect_unhackable=True,
                  trace_routing=True,
+                 n_batched_runs=1,
                  **kwargs):
         # Ref-model-via-disabled-adapters optimization: when the model has DualLoRA/
         # DualMLP adapters, computing ref logprobs by running the same model with
@@ -635,8 +636,12 @@ class SampleGRPOTrainer(GRPOTrainer):
         # See CLAUDE.md "wandb Logging" section for rationale.
         self._samples_seen = 0
         self._pending_eval_wandb = {}
-        self._eval_scoring_thread = None
+        self._eval_scoring_threads = []
         self._eval_scoring_error = None
+        # Batched multi-run: per-run pending eval dicts + per-run output dirs
+        # (set post-construction by the batched entry point).
+        self._pending_eval_wandb_runs = None
+        self._run_output_dirs = None
         self.verbose = verbose
         self._adapter_type = adapter_type
         self._adapter_config = adapter_config  # saved to dual_lora_config.json in each checkpoint
@@ -664,6 +669,11 @@ class SampleGRPOTrainer(GRPOTrainer):
         self.eval_metrics = eval_metrics or {}
         self._grad_diag_every = 0  # set post-construction; 0 disables
         self._grad_diag_file = None
+        # Multi-run batched mode (N runs differing only in seed, co-trained in
+        # one process on a shared frozen base). 1 = ordinary single-run training.
+        self._n_batched_runs = n_batched_runs
+        self._per_run_params = None  # [(retain_params, forget_params)] per run
+        self._run_eids = None  # batched: [{train, coh, both, retain_only, forget_only}] per run
         self._last_routing_eval_step = 0
         self._routed_reward = routed_reward
         self._filter_baseline = filter_baseline
@@ -736,7 +746,24 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._vllm_experiment_id = None
         self._eval_experiment_ids = None  # {mode_name: eid} for concurrent eval
         self._coh_experiment_id = None    # interlaced-coherence rollout slot (retain-only scales)
-        if vllm_client is not None:
+        if vllm_client is not None and self._n_batched_runs > 1:
+            # Batched multi-run: per-run slot family (train [+coh] + 3 eval
+            # modes). The server's max_experiments must cover 5N (4N w/o coh).
+            assert hasattr(vllm_client, "generate_multi"), (
+                "batched multi-run mode requires a vLLM client with generate_multi "
+                "(MLP adapter path)")
+            self._run_eids = []
+            for _r in range(self._n_batched_runs):
+                d = {"train": vllm_client.register(),
+                     "both": vllm_client.register(),
+                     "retain_only": vllm_client.register(),
+                     "forget_only": vllm_client.register(),
+                     "coh": vllm_client.register() if self._interlaced_coh else None}
+                self._run_eids.append(d)
+            self._vllm_experiment_id = self._run_eids[0]["train"]
+            print(f"[vLLM] Registered {self._n_batched_runs} run-slot families: "
+                  + "; ".join(f"run{r}={d}" for r, d in enumerate(self._run_eids)))
+        elif vllm_client is not None:
             self._vllm_experiment_id = vllm_client.register()
             print(f"[vLLM] Registered experiment {self._vllm_experiment_id}")
             # Concurrent eval: reuse training slot for "both" mode, register 2
@@ -796,6 +823,31 @@ class SampleGRPOTrainer(GRPOTrainer):
         Optimizer class is derived from args.optim via HF's standard helper,
         so --optimizer=adamw_torch_fused/sgd/etc. all work unchanged.
         """
+        # Multi-run batched mode: one optimizer, 2N param groups (retain+forget
+        # per run). Adam state is per-parameter, so one step() updates all runs
+        # exactly as N separate optimizers would. Built before
+        # super().create_optimizer(), which early-returns when set.
+        if self.optimizer is None and getattr(self, "_n_batched_runs", 1) > 1:
+            from transformers import Trainer as _HFTrainer
+            assert self._per_run_params is not None and \
+                len(self._per_run_params) == self._n_batched_runs
+            forget_lr = self.args.learning_rate * self._forget_lr_mult
+            groups = []
+            for r, (retain_r, forget_r) in enumerate(self._per_run_params):
+                groups.append({"params": [p for p in retain_r if p.requires_grad],
+                               "lr": self.args.learning_rate,
+                               "weight_decay": self.args.weight_decay})
+                groups.append({"params": [p for p in forget_r if p.requires_grad],
+                               "lr": forget_lr,
+                               "weight_decay": 0.0})  # forget group never decays
+            cls, kwargs = _HFTrainer.get_optimizer_cls_and_kwargs(self.args, self.model)
+            self.optimizer = cls(groups, **kwargs)
+            n_params = sum(p.numel() for g in groups for p in g["params"])
+            print(f"[optimizer] multi-run grouped {cls.__name__}: "
+                  f"{self._n_batched_runs} runs x (retain lr={self.args.learning_rate} "
+                  f"wd={self.args.weight_decay} + forget lr={forget_lr} wd=0.0) = "
+                  f"{len(groups)} groups, {n_params:,} params")
+
         # Grouped optimizer for asymmetric retain/forget LRs. Must be built
         # before super().create_optimizer(), which early-returns when
         # self.optimizer is already set.
@@ -844,9 +896,20 @@ class SampleGRPOTrainer(GRPOTrainer):
             return result
         self.model.zero_grad = _timed_zero_grad
 
-        def _timed_clip(*a, **kw):
+        def _timed_clip(parameters, max_norm, *a, **kw):
             t0 = time.perf_counter()
-            result = _orig_clip(*a, **kw)
+            if getattr(_trainer, "_n_batched_runs", 1) > 1:
+                # Per-run clipping: a global-norm clip over all runs' params
+                # would couple the runs (one run's large gradient scales down
+                # the others). Clip each run's param set independently at
+                # max_norm — exactly what N separate processes would do.
+                # Report the max per-run norm for grad_norm logging.
+                norms = [_orig_clip(retain_r + forget_r, max_norm, *a, **kw)
+                         for retain_r, forget_r in _trainer._per_run_params]
+                result = torch.stack([n if isinstance(n, torch.Tensor)
+                                      else torch.tensor(float(n)) for n in norms]).max()
+            else:
+                result = _orig_clip(parameters, max_norm, *a, **kw)
             _trainer._post_step_accum += time.perf_counter() - t0
             return result
         self.accelerator.clip_grad_norm_ = _timed_clip
@@ -983,8 +1046,13 @@ class SampleGRPOTrainer(GRPOTrainer):
         """
         if not self._eval_due_this_rollout():
             return None
-        if self._eval_experiment_ids is None:
-            return None  # fall back to _run_routing_eval in log()
+        if self._eval_experiment_ids is None and self._run_eids is None:
+            # No per-mode slots (single-run) and no batched slot families:
+            # fall back to _run_routing_eval in log(). NOTE the fallback path
+            # evals on UNTEMPLATED prompts (no chat template) — its scores are
+            # not comparable to piggybacked eval on chat models (found
+            # 2026-06-10: +0.02 persona offset from exactly this).
+            return None
 
         # Wait for any previous eval scoring to finish.
         self._wait_for_eval_scoring()
@@ -1098,58 +1166,82 @@ class SampleGRPOTrainer(GRPOTrainer):
 
         # Sync weights to vLLM
         with self._time("timing/rollout/vllm_sync"):
-            client.update_weights_from_model(eid, self.model)
-
-            # Determine forget_scale for this rollout's routing samples.
-            # Default: 1.0 (both adapters at full scale). Modes:
-            #   'fixed'             - 1.0
-            #   'random_uniform_0_1' - U(0, 1) sampled fresh per rollout
-            #   'random_choice_0_or_0.5' - {0.0, 0.5} chosen uniformly per rollout
-            # Coh slots set their own scales below (always (1, 0)).
-            mode = self._rollout_forget_scale_mode
-            if mode == "fixed":
-                base_forget_scale = 1.0
-            elif mode == "random_uniform_0_1":
-                import random as _r
-                base_forget_scale = _r.random()
-            elif mode == "random_choice_0_or_0.5":
-                import random as _r
-                base_forget_scale = _r.choice([0.0, 0.5])
+            if self._n_batched_runs > 1:
+                # Batched multi-run: sync every run's adapter set to its slot
+                # family. v1 constraints (rollout_forget_scale_mode='fixed',
+                # forget_scale_modulation='none') are enforced at the batched
+                # entry point, so training slots run at (1, 1) scales.
+                assert not self._is_coherence_rollout, (
+                    "batched multi-run supports interlaced coherence only "
+                    "(classic per-rollout coherence is per-run state)")
+                self._last_rollout_forget_scale = 1.0
+                _m = self._metrics.setdefault("train", {})
+                _m.setdefault("rollout/forget_scale", []).append(1.0)
+                for _r, _d in enumerate(self._run_eids):
+                    client.update_weights_from_model(_d["train"], self.model, run=_r)
+                    if n_coh > 0:
+                        client.update_weights_from_model(_d["coh"], self.model, run=_r)
+                        client.set_scales(_d["coh"], 1.0, 0.0)
+                    if eval_info is not None:
+                        for _mode_name, _rs, _fs in (
+                                ("both", 1.0, self._train_forget_scale()),
+                                ("retain_only", 1.0, 0.0),
+                                ("forget_only", 0.0, 1.0)):
+                            client.update_weights_from_model(_d[_mode_name], self.model, run=_r)
+                            client.set_scales(_d[_mode_name], _rs, _fs)
             else:
-                raise ValueError(f"Unknown rollout_forget_scale_mode={mode!r}")
-            # Idea 2: multiplicative clamp from forget_scale_modulation=ema_clamp
-            # (no-op when modulation='none'; clamp stays at 1.0).
-            rollout_forget_scale = base_forget_scale * self._forget_scale_clamp
-            self._last_rollout_forget_scale = rollout_forget_scale
-            # Log so we can see the actual scale used per step.
-            _m = self._metrics.setdefault("train", {})
-            _m.setdefault("rollout/forget_scale", []).append(rollout_forget_scale)
-            _m.setdefault("rollout/forget_scale_base", []).append(base_forget_scale)
-            _m.setdefault("rollout/forget_scale_clamp", []).append(self._forget_scale_clamp)
+                client.update_weights_from_model(eid, self.model)
 
-            # Coherence rollout: generate with retain-only scales
-            if self._is_coherence_rollout and self._coherence_gen == "retain_only":
-                client.set_scales(eid, 1.0, 0.0)
-            elif rollout_forget_scale != 1.0:
-                client.set_scales(eid, 1.0, rollout_forget_scale)
+                # Determine forget_scale for this rollout's routing samples.
+                # Default: 1.0 (both adapters at full scale). Modes:
+                #   'fixed'             - 1.0
+                #   'random_uniform_0_1' - U(0, 1) sampled fresh per rollout
+                #   'random_choice_0_or_0.5' - {0.0, 0.5} chosen uniformly per rollout
+                # Coh slots set their own scales below (always (1, 0)).
+                mode = self._rollout_forget_scale_mode
+                if mode == "fixed":
+                    base_forget_scale = 1.0
+                elif mode == "random_uniform_0_1":
+                    import random as _r
+                    base_forget_scale = _r.random()
+                elif mode == "random_choice_0_or_0.5":
+                    import random as _r
+                    base_forget_scale = _r.choice([0.0, 0.5])
+                else:
+                    raise ValueError(f"Unknown rollout_forget_scale_mode={mode!r}")
+                # Idea 2: multiplicative clamp from forget_scale_modulation=ema_clamp
+                # (no-op when modulation='none'; clamp stays at 1.0).
+                rollout_forget_scale = base_forget_scale * self._forget_scale_clamp
+                self._last_rollout_forget_scale = rollout_forget_scale
+                # Log so we can see the actual scale used per step.
+                _m = self._metrics.setdefault("train", {})
+                _m.setdefault("rollout/forget_scale", []).append(rollout_forget_scale)
+                _m.setdefault("rollout/forget_scale_base", []).append(base_forget_scale)
+                _m.setdefault("rollout/forget_scale_clamp", []).append(self._forget_scale_clamp)
 
-            if n_coh > 0:
-                client.update_weights_from_model(self._coh_experiment_id, self.model)
-                client.set_scales(self._coh_experiment_id, 1.0, 0.0)
+                # Coherence rollout: generate with retain-only scales
+                if self._is_coherence_rollout and self._coherence_gen == "retain_only":
+                    client.set_scales(eid, 1.0, 0.0)
+                elif rollout_forget_scale != 1.0:
+                    client.set_scales(eid, 1.0, rollout_forget_scale)
 
-            if eval_info is not None:
-                # "both" mode reflects the *operative* scale: under
-                # forget_scale_modulation=ema_clamp it's (1, clamp) so eval
-                # measures the model at the same scale used during training.
-                # Without modulation the helper returns 1.0, restoring (1, 1).
-                both_forget_scale = self._train_forget_scale()
-                modes = [("both", 1.0, both_forget_scale),
-                         ("retain_only", 1.0, 0.0),
-                         ("forget_only", 0.0, 1.0)]
-                for mode_name, retain_scale, forget_scale in modes:
-                    eval_eid = self._eval_experiment_ids[mode_name]
-                    client.update_weights_from_model(eval_eid, self.model)
-                    client.set_scales(eval_eid, retain_scale, forget_scale)
+                if n_coh > 0:
+                    client.update_weights_from_model(self._coh_experiment_id, self.model)
+                    client.set_scales(self._coh_experiment_id, 1.0, 0.0)
+
+                if eval_info is not None:
+                    # "both" mode reflects the *operative* scale: under
+                    # forget_scale_modulation=ema_clamp it's (1, clamp) so eval
+                    # measures the model at the same scale used during training.
+                    # Without modulation the helper returns 1.0, restoring (1, 1).
+                    both_forget_scale = self._train_forget_scale()
+                    modes = [("both", 1.0, both_forget_scale),
+                             ("retain_only", 1.0, 0.0),
+                             ("forget_only", 0.0, 1.0)]
+                    for mode_name, retain_scale, forget_scale in modes:
+                        eval_eid = self._eval_experiment_ids[mode_name]
+                        client.update_weights_from_model(eval_eid, self.model)
+                        client.set_scales(eval_eid, retain_scale, forget_scale)
 
         # Tokenize prompts (handle both chat and plain string formats)
         if is_conversational({"prompt": prompts[0]}):
@@ -1182,18 +1274,39 @@ class SampleGRPOTrainer(GRPOTrainer):
 
         if use_multi:
             # Build combined prompt list. Order: routing training slots, then coh training slots,
-            # then eval slots x 3 modes (if piggybacking).
+            # then eval slots x 3 modes (if piggybacking). Batched multi-run:
+            # routing and coh sections are POSITIONAL per-run blocks
+            # (run0..runN-1 contiguous within each section), matching the
+            # combined dataset's block layout; eval appends per run x mode.
             all_prompt_ids = list(prompt_ids_list)
-            all_eids = [eid] * n_routing + [self._coh_experiment_id] * n_coh
+            _n_runs = self._n_batched_runs
+            modes = [("both", 1.0, 1.0), ("retain_only", 1.0, 0.0), ("forget_only", 0.0, 1.0)]
+            if _n_runs > 1:
+                assert n_routing % _n_runs == 0 and n_coh % _n_runs == 0, (
+                    f"batched multi-run: routing ({n_routing}) and coh ({n_coh}) "
+                    f"sections must divide evenly into {_n_runs} run blocks")
+                _rpb, _cpb = n_routing // _n_runs, n_coh // _n_runs
+                all_eids = []
+                for _r in range(_n_runs):
+                    all_eids.extend([self._run_eids[_r]["train"]] * _rpb)
+                for _r in range(_n_runs):
+                    all_eids.extend([self._run_eids[_r]["coh"]] * _cpb)
+            else:
+                all_eids = [eid] * n_routing + [self._coh_experiment_id] * n_coh
 
             if eval_info is not None:
                 eval_prompt_ids, eval_prompts_text, eval_data, eval_max_tokens = eval_info
                 n_eval_per_mode = len(eval_prompt_ids)
-                modes = [("both", 1.0, 1.0), ("retain_only", 1.0, 0.0), ("forget_only", 0.0, 1.0)]
-                for mode_name, _, _ in modes:
-                    eval_eid = self._eval_experiment_ids[mode_name]
-                    all_prompt_ids.extend(eval_prompt_ids)
-                    all_eids.extend([eval_eid] * n_eval_per_mode)
+                if _n_runs > 1:
+                    for _r in range(_n_runs):
+                        for mode_name, _, _ in modes:
+                            all_prompt_ids.extend(eval_prompt_ids)
+                            all_eids.extend([self._run_eids[_r][mode_name]] * n_eval_per_mode)
+                else:
+                    for mode_name, _, _ in modes:
+                        eval_eid = self._eval_experiment_ids[mode_name]
+                        all_prompt_ids.extend(eval_prompt_ids)
+                        all_eids.extend([eval_eid] * n_eval_per_mode)
 
             with self._time("timing/rollout/vllm_generate"):
                 gen_result = client.generate_multi(
@@ -1215,21 +1328,39 @@ class SampleGRPOTrainer(GRPOTrainer):
             sampling_logprobs = all_logprobs[:n_train] if all_logprobs else None
 
             if eval_info is not None:
-                samples_by_mode = {}
-                offset = n_train
-                for mode_name, _, _ in modes:
-                    mode_samples = []
-                    for j in range(n_eval_per_mode):
-                        mode_samples.append({
-                            "prompt": eval_prompts_text[j],
-                            "completion": all_comp_texts[offset + j],
-                            "completion_ids": all_comp_ids[offset + j],
-                        })
-                    samples_by_mode[mode_name] = mode_samples
-                    offset += n_eval_per_mode
                 eval_step = self.state.global_step
                 self._last_routing_eval_step = eval_step
-                self._dispatch_eval_scoring(samples_by_mode, eval_data, eval_step)
+                offset = n_train
+                if _n_runs > 1:
+                    # Per-run eval sections in the same order they were appended
+                    # (run-major, then mode). One scoring dispatch per run.
+                    for _r in range(_n_runs):
+                        samples_by_mode = {}
+                        for mode_name, _, _ in modes:
+                            mode_samples = []
+                            for j in range(n_eval_per_mode):
+                                mode_samples.append({
+                                    "prompt": eval_prompts_text[j],
+                                    "completion": all_comp_texts[offset + j],
+                                    "completion_ids": all_comp_ids[offset + j],
+                                })
+                            samples_by_mode[mode_name] = mode_samples
+                            offset += n_eval_per_mode
+                        self._dispatch_eval_scoring(samples_by_mode, eval_data,
+                                                    eval_step, run=_r)
+                else:
+                    samples_by_mode = {}
+                    for mode_name, _, _ in modes:
+                        mode_samples = []
+                        for j in range(n_eval_per_mode):
+                            mode_samples.append({
+                                "prompt": eval_prompts_text[j],
+                                "completion": all_comp_texts[offset + j],
+                                "completion_ids": all_comp_ids[offset + j],
+                            })
+                        samples_by_mode[mode_name] = mode_samples
+                        offset += n_eval_per_mode
+                    self._dispatch_eval_scoring(samples_by_mode, eval_data, eval_step)
 
         else:
             # Normal path: single-eid generate.
@@ -1733,7 +1864,8 @@ class SampleGRPOTrainer(GRPOTrainer):
         # rollout-phase eval is not available (no vLLM, no eval_experiment_ids,
         # or eval_at_start). When piggybacking is available we never want this
         # path to fire — piggyback already owns eval generation for this run.
-        piggyback_available = getattr(self, "_eval_experiment_ids", None) is not None
+        piggyback_available = (getattr(self, "_eval_experiment_ids", None) is not None
+                               or getattr(self, "_run_eids", None) is not None)
         if (self.eval_every > 0
                 and self.eval_metrics
                 and not piggyback_available
@@ -1856,6 +1988,14 @@ class SampleGRPOTrainer(GRPOTrainer):
                 if self._pending_eval_wandb:
                     wb.update(self._pending_eval_wandb)
                     self._pending_eval_wandb = {}
+                if self._pending_eval_wandb_runs:
+                    # Batched multi-run: per-run eval metrics under run<r>/ keys
+                    # (one wandb run per batched process; per-run curves also
+                    # land in each run dir's routing_eval.jsonl).
+                    for _r, _flat in enumerate(self._pending_eval_wandb_runs):
+                        if _flat:
+                            wb.update({f"run{_r}/{k}": v for k, v in _flat.items()})
+                            self._pending_eval_wandb_runs[_r] = None
                 # Sample text (logged as Html to avoid trainer_state.json serialization failure)
                 if prompt is not None and completion is not None:
                     wb["sample_text"] = wandb.Html(f"<pre>{prompt} ||| {completion}</pre>")
@@ -1875,25 +2015,33 @@ class SampleGRPOTrainer(GRPOTrainer):
 
     def _wait_for_eval_scoring(self):
         """Block until any in-flight background eval scoring completes."""
-        if self._eval_scoring_thread is not None:
-            self._eval_scoring_thread.join()
-            self._eval_scoring_thread = None
-            if self._eval_scoring_error is not None:
-                err = self._eval_scoring_error
-                self._eval_scoring_error = None
-                raise RuntimeError(f"Background eval scoring failed: {err}") from err
+        for t in self._eval_scoring_threads:
+            t.join()
+        self._eval_scoring_threads = []
+        if self._eval_scoring_error is not None:
+            err = self._eval_scoring_error
+            self._eval_scoring_error = None
+            raise RuntimeError(f"Background eval scoring failed: {err}") from err
 
-    def _dispatch_eval_scoring(self, samples_by_mode, eval_data, step, gen_elapsed=0.0):
+    def _dispatch_eval_scoring(self, samples_by_mode, eval_data, step, gen_elapsed=0.0,
+                               run=None):
         """Dispatch eval reward scoring to a background thread.
 
         Called from both the piggybacked rollout path (_generate_single_turn)
-        and the standalone eval path (_run_routing_eval).
+        and the standalone eval path (_run_routing_eval). In batched multi-run
+        mode this is called once per run with `run` set: results go to that
+        run's output dir and per-run pending-wandb slot.
         """
         import threading
         from eval_utils import score_eval_samples, format_routing_eval, get_routing_eval_metrics
 
         eval_metrics = self.eval_metrics
-        output_dir = self.args.output_dir
+        if run is not None:
+            assert self._run_output_dirs is not None, (
+                "batched eval dispatch requires _run_output_dirs")
+            output_dir = self._run_output_dirs[run]
+        else:
+            output_dir = self.args.output_dir
         verbose = self.verbose
 
         def _score_in_background():
@@ -1914,7 +2062,10 @@ class SampleGRPOTrainer(GRPOTrainer):
 
                 eval_flat = get_routing_eval_metrics(results)
                 eval_flat["eval/elapsed_s"] = elapsed
-                self._pending_eval_wandb = eval_flat
+                if run is not None:
+                    self._pending_eval_wandb_runs[run] = eval_flat
+                else:
+                    self._pending_eval_wandb = eval_flat
 
                 record = {"step": step, "eval_elapsed_s": round(elapsed, 1)}
                 for mode_name, mode_data in results.items():
@@ -1979,9 +2130,10 @@ class SampleGRPOTrainer(GRPOTrainer):
                 traceback.print_exc()
                 self._eval_scoring_error = e
 
-        self._eval_scoring_thread = threading.Thread(
+        _t = threading.Thread(
             target=_score_in_background, daemon=True)
-        self._eval_scoring_thread.start()
+        self._eval_scoring_threads.append(_t)
+        _t.start()
 
     def _run_routing_eval(self):
         """Run gradient routing eval: generate synchronously, score in background.
@@ -2020,6 +2172,27 @@ class SampleGRPOTrainer(GRPOTrainer):
         _inject_detectable_into_eval_data(eval_data, getattr(self, "_rh_classifiable_fn", None))
 
         t0 = time.time()
+        if self._n_batched_runs > 1:
+            # Batched multi-run: one standalone eval per run, each generating
+            # through its own slot family with its own adapter weights.
+            for _r, _d in enumerate(self._run_eids):
+                _t_r = time.time()
+                samples_by_mode = eval_gradient_routing(
+                    self.model, self.processing_class, self.eval_metrics,
+                    n_samples=n_eval, max_new_tokens=eval_max_tokens,
+                    temperature=self.args.temperature,
+                    prompts=eval_prompts, eval_data=eval_data,
+                    vllm_client=self._vllm_client,
+                    experiment_id=_d["train"],
+                    vllm_no_sleep=self.vllm_no_sleep,
+                    eval_experiment_ids={k: _d[k] for k in
+                                         ("both", "retain_only", "forget_only")},
+                    generate_only=True,
+                    run=_r,
+                )
+                self._dispatch_eval_scoring(samples_by_mode, eval_data, step,
+                                            time.time() - _t_r, run=_r)
+            return
         samples_by_mode = eval_gradient_routing(
             self.model, self.processing_class, self.eval_metrics,
             n_samples=n_eval, max_new_tokens=eval_max_tokens,
@@ -2210,8 +2383,14 @@ class SampleGRPOTrainer(GRPOTrainer):
         for k in range(K):
             new_prompt = next(it)
             start = len(inputs) - (K - k) * G
+            # Batched multi-run: the replacement row comes from a shared
+            # detectable pool whose run_id is arbitrary — the slot's run
+            # assignment must be preserved (run blocks are positional).
+            orig_run_id = inputs[start].get("run_id") if isinstance(inputs[start], dict) else None
             for g in range(G):
                 inputs[start + g] = dict(new_prompt)
+                if orig_run_id is not None:
+                    inputs[start + g]["run_id"] = orig_run_id
         return inputs
 
     def _ensure_detectable_iter(self):
@@ -2416,21 +2595,62 @@ class SampleGRPOTrainer(GRPOTrainer):
                 sub_batch_size = getattr(self, "_scoring_batch_size",
                                          self.args.per_device_train_batch_size)
 
-                set_scales(self.model, retain_scale=1.0, forget_scale=0.0)
-                try:
-                    with torch.no_grad(), disable_gradient_checkpointing(
-                        self.model, self.args.gradient_checkpointing_kwargs
-                    ):
-                        coh_old_logps, _ = self._get_per_token_logps_and_entropies(
-                            self.model,
-                            sub_prompt_completion_ids,
-                            sub_attention_mask,
-                            sub_logits_to_keep,
-                            sub_batch_size,
-                        )
-                finally:
-                    set_scales(self.model, retain_scale=1.0,
-                               forget_scale=self._train_forget_scale())
+                if self._n_batched_runs > 1:
+                    # Batched multi-run: this is a padded per-sample forward, so
+                    # global set_scales can't express "each sample through its
+                    # own run's retain adapter". Loop runs with constant
+                    # (N,1,1,1) masks (broadcast over any internal chunking):
+                    # retain_fwd_mask selects run r, forget_fwd_scale=0 mirrors
+                    # the retain-only (1, 0) scales of the single-run path.
+                    from gradient_routing import (set_fused_routing_multi,
+                                                  clear_fused_routing_multi)
+                    rid_coh = torch.tensor(
+                        [inputs[j]["run_id"] for j in range(n_total - C, n_total)],
+                        dtype=torch.long, device=device)
+                    coh_old_logps = None
+                    for _r in range(self._n_batched_runs):
+                        sel = (rid_coh == _r).nonzero(as_tuple=True)[0]
+                        if sel.numel() == 0:
+                            continue
+                        _z = torch.zeros(self._n_batched_runs, 1, 1, 1, device=device)
+                        _rfm = _z.clone()
+                        _rfm[_r] = 1.0
+                        set_fused_routing_multi(_z, _rfm, _z, _z)
+                        try:
+                            with torch.no_grad(), disable_gradient_checkpointing(
+                                self.model, self.args.gradient_checkpointing_kwargs
+                            ):
+                                _lp, _ = self._get_per_token_logps_and_entropies(
+                                    self.model,
+                                    sub_prompt_completion_ids[sel],
+                                    sub_attention_mask[sel],
+                                    sub_logits_to_keep,
+                                    sub_batch_size,
+                                )
+                        finally:
+                            clear_fused_routing_multi()
+                        if coh_old_logps is None:
+                            coh_old_logps = torch.zeros(
+                                rid_coh.shape[0], _lp.shape[1],
+                                dtype=_lp.dtype, device=_lp.device)
+                        coh_old_logps[sel] = _lp
+                    assert coh_old_logps is not None, "empty coherence slice"
+                else:
+                    set_scales(self.model, retain_scale=1.0, forget_scale=0.0)
+                    try:
+                        with torch.no_grad(), disable_gradient_checkpointing(
+                            self.model, self.args.gradient_checkpointing_kwargs
+                        ):
+                            coh_old_logps, _ = self._get_per_token_logps_and_entropies(
+                                self.model,
+                                sub_prompt_completion_ids,
+                                sub_attention_mask,
+                                sub_logits_to_keep,
+                                sub_batch_size,
+                            )
+                    finally:
+                        set_scales(self.model, retain_scale=1.0,
+                                   forget_scale=self._train_forget_scale())
                 output["old_per_token_logps"][coh_slice] = coh_old_logps
         else:
             output["is_coherence"] = torch.zeros(n_total, dtype=torch.bool, device=device)
@@ -2441,6 +2661,36 @@ class SampleGRPOTrainer(GRPOTrainer):
             )
             raw_rewards = output["raw_rewards"]
             output["advantages"] = self._reinforce_advantages(raw_rewards, self._all_reward_buffer)
+
+        # Batched multi-run: inject the per-sample run id so it rides through
+        # TRL's split/shuffle alongside is_rh / is_coherence (Design Decision 5)
+        # and reaches the fused step's per-run mask construction.
+        if self._n_batched_runs > 1:
+            assert inputs and isinstance(inputs[0], dict), (
+                "batched multi-run mode requires dataset-row inputs carrying run_id")
+            rid = [inp.get("run_id") for inp in inputs]
+            assert all(isinstance(v, int) and 0 <= v < self._n_batched_runs for v in rid), (
+                f"batched multi-run mode: every sample needs run_id in "
+                f"[0, {self._n_batched_runs}); got {sorted(set(rid))[:8]}")
+            # Cross-check the run_id column against the POSITIONAL run-block
+            # convention _generate_single_turn used for vLLM slot routing
+            # (run0..N-1 contiguous within the routing section, then within the
+            # coh section). A mismatch means a sample was generated with the
+            # WRONG run's weights — fatal for experiment integrity.
+            _N = self._n_batched_runs
+            _n_tot = len(rid)
+            _C = int(output["is_coherence"].sum().item()) if "is_coherence" in output else 0
+            _n_rout = _n_tot - _C
+            assert _n_rout % _N == 0 and _C % _N == 0, (
+                f"batched sections not divisible by n_runs: routing={_n_rout} coh={_C}")
+            for _i, _v in enumerate(rid):
+                _exp = (_i // (_n_rout // _N) if _i < _n_rout
+                        else (_i - _n_rout) // (_C // _N))
+                assert _v == _exp, (
+                    f"run_id/positional mismatch at sample {_i}: column says run "
+                    f"{_v}, position says run {_exp} — dataset block layout and "
+                    f"slot routing have diverged")
+            output["run_id"] = torch.tensor(rid, dtype=torch.long, device=device)
 
         # --- Step C: RH detection ---
         _t_rh_start = time.perf_counter()
@@ -2508,6 +2758,24 @@ class SampleGRPOTrainer(GRPOTrainer):
                 is_rh = [False] * n_samples
 
             is_rh_tensor = torch.tensor(is_rh, dtype=torch.bool, device=device)
+
+            # Batched multi-run: per-run hack rate + mean raw reward over the
+            # routing slice (cheap per-run training curves; eval curves live in
+            # each run dir's routing_eval.jsonl).
+            if self._n_batched_runs > 1:
+                _rid_t = output["run_id"]
+                _coh_t = output.get("is_coherence")
+                _pm = self._metrics.setdefault("train", {})
+                for _r in range(self._n_batched_runs):
+                    _sel = (_rid_t == _r)
+                    if _coh_t is not None:
+                        _sel = _sel & (~_coh_t)
+                    if int(_sel.sum().item()):
+                        _pm.setdefault(f"run{_r}/frac_rh", []).append(
+                            float(is_rh_tensor[_sel].float().mean().item()))
+                        if "raw_rewards" in output:
+                            _pm.setdefault(f"run{_r}/reward_mean", []).append(
+                                float(output["raw_rewards"][_sel].float().mean().item()))
 
             # --- Idea 2: EMA-driven forget-scale clamp ---
             # Update an EMA of the routing-slice hack rate (only over hackable
@@ -3655,6 +3923,15 @@ class SampleGRPOTrainer(GRPOTrainer):
                        if isinstance(v, torch.Tensor) and v.ndim > 0)
         max_tok = self._max_tokens_per_microbatch
 
+        # Batched multi-run: per-sample run id (rode through split/shuffle).
+        run_id = inputs.pop("run_id", None)
+        if self._n_batched_runs > 1:
+            assert run_id is not None, (
+                "batched multi-run mode: run_id missing from opt batch")
+            assert getattr(self, "_fused_reduction", True), (
+                "batched multi-run mode requires --fused_reduction (the "
+                "homogeneous-microbatch path has no per-run routing)")
+
         # Determine per-opt-batch coherence kind.
         # Interlaced split mode: pop is_coherence mask, assert homogeneous, derive flag.
         # Interlaced merged mode: opt batches are mixed; track is_coh_t per-sample
@@ -3818,7 +4095,7 @@ class SampleGRPOTrainer(GRPOTrainer):
             return self._fused_forward_backward(
                 model, inputs, all_mbs, retain_advantages, original_advantages,
                 token_counts, scale_denom, n_total, num_items_in_batch,
-                use_packed, record_metrics, merged_interlaced,
+                use_packed, record_metrics, merged_interlaced, run_id=run_id,
             )
 
         random.shuffle(all_mbs)
@@ -3998,7 +4275,7 @@ class SampleGRPOTrainer(GRPOTrainer):
     def _fused_forward_backward(self, model, inputs, all_mbs, retain_advantages,
                                original_advantages, token_counts, scale_denom,
                                n_total, num_items_in_batch, use_packed,
-                               record_metrics, merged_interlaced):
+                               record_metrics, merged_interlaced, run_id=None):
         """Single fused forward+backward replacing the per-phase (coherence /
         good / bad) homogeneous microbatches with one heterogeneous packed
         microbatch + per-sample gradient routing.
@@ -4018,8 +4295,18 @@ class SampleGRPOTrainer(GRPOTrainer):
         n_kept/scale_denom reproduces the sum of per-slice loss*n_mb/scale_denom).
         Verified by tests/test_fused_routing_equivalence.py (CPU, exact) and
         bench_fused_gr.py (GPU, end-to-end against the real liger loss).
+
+        Batched multi-run (self._n_batched_runs > 1, run_id given): the same
+        pass additionally routes each sample to ITS run's adapter pair via
+        per-run (N,1,T,1) routing tensors (set_fused_routing_multi /
+        MultiRunDualAdapter). Per-sequence loss weight becomes
+        1/(scale_denom/N) so each run's gradients match its single-run
+        counterpart (equal-config runs; per-run sample counts asserted equal).
+        Verified by tests/test_multirun_routing_equivalence.py (CPU, exact).
         """
-        from gradient_routing import set_fused_routing, clear_fused_routing
+        from gradient_routing import (set_fused_routing, clear_fused_routing,
+                                      set_fused_routing_multi,
+                                      clear_fused_routing_multi)
 
         assert use_packed, (
             "--fused_reduction requires the packed/liger path "
@@ -4076,6 +4363,21 @@ class SampleGRPOTrainer(GRPOTrainer):
         exclusive = (self._routing_mode == "exclusive")
         coh_set, good_set = set(coh_idx), set(good_idx)
 
+        n_runs = self._n_batched_runs
+        if n_runs > 1:
+            assert run_id is not None, "multi-run fused step needs run_id"
+            counts = torch.bincount(run_id, minlength=n_runs)
+            assert bool((counts == counts[0]).all()), (
+                f"batched multi-run: unequal per-run sample counts "
+                f"{counts.tolist()} — the combined opt batch must hold the same "
+                f"number of samples per run (positional block construction broke?)")
+            # Per-sequence weight 1/(scale_denom/N): scale_denom covers the
+            # combined N-run batch, but each run's loss normalization must match
+            # its single-run counterpart (1/per-run batch size).
+            run_norm = float(n_runs)
+        else:
+            run_norm = 1.0
+
         if record_metrics:
             torch.cuda.reset_peak_memory_stats()
         _t0 = time.perf_counter()
@@ -4086,39 +4388,66 @@ class SampleGRPOTrainer(GRPOTrainer):
             T = packed["packed_input_ids"].shape[1]
             device = packed["packed_input_ids"].device
 
-            # Per-token (1, T, 1) routing tensors in this microbatch's pack order:
-            #   forget_fwd_scale: forward multiplier on the forget-adapter output
-            #   retain_grad_mask / forget_grad_mask: per-token param-gradient gates
-            forget_fwd = torch.empty(T, device=device, dtype=torch.float32)
-            retain_gm = torch.empty(T, device=device, dtype=torch.float32)
-            forget_gm = torch.empty(T, device=device, dtype=torch.float32)
-            off = 0
-            for j, idx in enumerate(indices):
-                p_len, c_len = seq_boundaries[j]
-                L = int(p_len) + int(c_len)
-                if idx in coh_set:               # coherence: retain-only, forget off
-                    ffs, rgm, fgm = 0.0, 1.0, 0.0
-                elif idx in good_set:            # good: retain learns; forget learns (classic) / off (exclusive)
-                    ffs, rgm, fgm = train_fs, 1.0, (0.0 if exclusive else 1.0)
-                else:                            # bad: retain frozen; forget learns
-                    ffs, rgm, fgm = train_fs, 0.0, 1.0
-                forget_fwd[off:off + L] = ffs
-                retain_gm[off:off + L] = rgm
-                forget_gm[off:off + L] = fgm
-                off += L
-            assert off == T, f"fused mask tiling mismatch: {off} != {T}"
+            def _cls_masks(idx):
+                if idx in coh_set:      # coherence: retain-only, forget off
+                    return 0.0, 1.0, 0.0
+                elif idx in good_set:   # good: retain learns; forget learns (classic) / off (exclusive)
+                    return train_fs, 1.0, (0.0 if exclusive else 1.0)
+                else:                   # bad: retain frozen; forget learns
+                    return train_fs, 0.0, 1.0
 
-            # Per-microbatch scale = n_mb/scale_denom, exactly as the stock path
-            # scales each homogeneous microbatch; sums to n_kept/scale_denom.
-            scale = len(indices) / scale_denom
-            set_fused_routing(forget_fwd.view(1, T, 1), retain_gm.view(1, T, 1),
-                              forget_gm.view(1, T, 1))
+            if n_runs > 1:
+                # Per-run (N,1,T,1) routing tensors: row r carries run r's
+                # class masks on its own tokens, zeros elsewhere (the run
+                # forward-mask keeping each run's residual stream clean).
+                ffs_t = torch.zeros(n_runs, 1, T, 1, device=device, dtype=torch.float32)
+                rfm_t = torch.zeros_like(ffs_t)
+                rgm_t = torch.zeros_like(ffs_t)
+                fgm_t = torch.zeros_like(ffs_t)
+                off = 0
+                for j, idx in enumerate(indices):
+                    p_len, c_len = seq_boundaries[j]
+                    L = int(p_len) + int(c_len)
+                    r = int(run_id[idx])
+                    f, rg, fg = _cls_masks(idx)
+                    rfm_t[r, 0, off:off + L] = 1.0
+                    ffs_t[r, 0, off:off + L] = f
+                    rgm_t[r, 0, off:off + L] = rg
+                    fgm_t[r, 0, off:off + L] = fg
+                    off += L
+                assert off == T, f"fused mask tiling mismatch: {off} != {T}"
+                set_fused_routing_multi(ffs_t, rfm_t, rgm_t, fgm_t)
+                _clear = clear_fused_routing_multi
+            else:
+                # Per-token (1, T, 1) routing tensors in this microbatch's pack
+                # order: forward forget-scale + param-gradient gates.
+                forget_fwd = torch.empty(T, device=device, dtype=torch.float32)
+                retain_gm = torch.empty(T, device=device, dtype=torch.float32)
+                forget_gm = torch.empty(T, device=device, dtype=torch.float32)
+                off = 0
+                for j, idx in enumerate(indices):
+                    p_len, c_len = seq_boundaries[j]
+                    L = int(p_len) + int(c_len)
+                    f, rg, fg = _cls_masks(idx)
+                    forget_fwd[off:off + L] = f
+                    retain_gm[off:off + L] = rg
+                    forget_gm[off:off + L] = fg
+                    off += L
+                assert off == T, f"fused mask tiling mismatch: {off} != {T}"
+                set_fused_routing(forget_fwd.view(1, T, 1), retain_gm.view(1, T, 1),
+                                  forget_gm.view(1, T, 1))
+                _clear = clear_fused_routing
+
+            # Per-microbatch scale = n_mb * run_norm / scale_denom: sums over
+            # microbatches to n_kept/(scale_denom/run_norm), i.e. the stock
+            # normalization per run.
+            scale = len(indices) * run_norm / scale_denom
             try:
                 with self.compute_loss_context_manager():
                     loss = self._packed_compute_loss(model, packed)
                 self.accelerator.backward(loss * scale)
             finally:
-                clear_fused_routing()
+                _clear()
             total_loss = total_loss + loss.detach() * scale
             del packed, loss
 
@@ -4527,6 +4856,10 @@ def _make_parser():
     parser.add_argument("--max_tokens_per_microbatch", type=int, default=None,
                         help="Max tokens per microbatch for dynamic token batching. "
                              "When set, microbatches are packed by token count and trimmed to local max length.")
+    parser.add_argument("--shuffle_dataset", action=argparse.BooleanOptionalAction, default=True,
+                        help="TRL sampler-level prompt shuffling. Forced off in batched "
+                             "multi-run mode (positional run blocks); exposed as a flag for "
+                             "data-order ablations.")
     parser.add_argument("--fused_reduction", action=argparse.BooleanOptionalAction, default=True,
                         help="Fuse the per-class (coherence/good/bad) forward+backward passes of "
                              "the dynamic-microbatching GR path into shared token-budget microbatches "
@@ -4955,6 +5288,52 @@ def compute_batch_params(rollout_batch_size, optimizer_batch_size, gpu_batch_siz
     }
 
 
+def _combine_batched_datasets(per_run_datasets, prompts_per_block, coh_per_block, n_runs,
+                              run_seeds=None):
+    """Block-interleave N per-run datasets for batched multi-run training.
+
+    Each step block holds, in order: prompts_per_block routing prompts from
+    run0..runN-1, then coh_per_block coherence-slot prompts from run0..runN-1 —
+    matching the positional run-block convention in _generate_single_turn.
+    Every row gains a run_id column. Each run's rows are consumed sequentially
+    from its own (per-seed) stream; the tail that doesn't fill a whole block is
+    dropped (epoch wraparound then stays block-aligned).
+
+    Each per-run stream is PRE-SHUFFLED (with its run seed): batched mode runs
+    the TRL sampler with shuffle_dataset=False (positions must follow dataset
+    order), but env generators' row order can be non-stationary — e.g. qa.py's
+    hack_frac rejection sampler fills the hackable/non-hackable quotas
+    independently, leaving a skewed all-one-class tail. Without this shuffle the
+    per-batch class mix drifts over training, measurably shifting persona_qa
+    outcomes vs the stock shuffled sampler (~+0.02 retain, 2026-06-10).
+    """
+    import random as _random
+    from datasets import Dataset
+    per_block = prompts_per_block + coh_per_block
+    L = min(len(d) for d in per_run_datasets)
+    n_blocks = L // per_block
+    assert n_blocks > 0, (
+        f"per-run datasets too small ({L} rows) for one step block "
+        f"({per_block} prompts)")
+    rows_per_run = [d.to_list() for d in per_run_datasets]
+    if run_seeds is not None:
+        for r, rows in enumerate(rows_per_run):
+            _random.Random(run_seeds[r] * 9973 + 7).shuffle(rows)
+    combined = []
+    for b in range(n_blocks):
+        base = b * per_block
+        for r in range(n_runs):
+            for row in rows_per_run[r][base:base + prompts_per_block]:
+                combined.append({**row, "run_id": r})
+        for r in range(n_runs):
+            for row in rows_per_run[r][base + prompts_per_block:base + per_block]:
+                combined.append({**row, "run_id": r})
+    dropped = L - n_blocks * per_block
+    if dropped:
+        print(f"[batched] dropped {dropped} tail rows per run to stay block-aligned")
+    return Dataset.from_list(combined)
+
+
 def _run(args, exp_cfg=None):
     """Core training logic. Assumes CUDA device already set and output_dir exists.
 
@@ -5063,6 +5442,7 @@ def _run(args, exp_cfg=None):
         # the (unfrozen) base model the retain side. Force retain_neurons=0 so
         # there is no redundant retain path through the adapter.
         retain_neurons = 0 if args.retain_source == "base" else args.retain_neurons
+        _bspec = getattr(args, "_batched_spec", None)
         modified = apply_dual_mlp(
             model,
             retain_neurons=retain_neurons,
@@ -5070,6 +5450,8 @@ def _run(args, exp_cfg=None):
             layer_start=args.layer_start,
             layer_end=args.layer_end,
             layer_stride=args.layer_stride,
+            n_runs=(_bspec["n_runs"] if _bspec else 1),
+            run_seeds=(_bspec["seeds"] if _bspec else None),
         )
         if args.retain_source == "base":
             # apply_dual_mlp froze all base params; unfreeze so base becomes the
@@ -5212,7 +5594,42 @@ def _run(args, exp_cfg=None):
     from envs import get_env
     env_spec = get_env(args.environment)
     print(f"Loading {args.environment} training prompts...")
-    train_dataset = env_spec.load_train(args)
+    _bspec = getattr(args, "_batched_spec", None)
+    if _bspec is not None:
+        # Batched multi-run: one dataset per run (its own seed -> its own
+        # prompt stream/order), block-interleaved into step blocks matching the
+        # positional run-block convention (run0..N-1 routing, then run0..N-1
+        # coh slots per rollout). Requires shuffle_dataset=False so batch
+        # position follows dataset order.
+        import copy as _copy
+        per_run_datasets = []
+        for _seed in _bspec["seeds"]:
+            _args_r = _copy.copy(args)
+            _args_r.seed = _seed
+            per_run_datasets.append(env_spec.load_train(_args_r))
+        # NOTE: these are PER-RUN sizes; the combined args sizes are multiplied
+        # by n_runs below (after the combiner consumed the per-run values).
+        _P = args.rollout_batch_size // args.num_generations
+        _K = args.coh_samples_per_rollout // args.num_generations
+        train_dataset = _combine_batched_datasets(
+            per_run_datasets, _P, _K, _bspec["n_runs"], run_seeds=_bspec["seeds"])
+        print(f"[batched] combined dataset: {len(train_dataset)} rows = "
+              f"{len(train_dataset) // ((_P + _K) * _bspec['n_runs'])} step blocks x "
+              f"{_bspec['n_runs']} runs x ({_P} routing + {_K} coh prompts)")
+        # All downstream batch configuration sees COMBINED sizes (the combiner
+        # above was the last consumer of the per-run values).
+        args.rollout_batch_size *= _bspec["n_runs"]
+        args.coh_samples_per_rollout *= _bspec["n_runs"]
+        if args.optimizer_batch_size is not None:
+            args.optimizer_batch_size *= _bspec["n_runs"]
+        if args.vllm_gpu_memory is not None:
+            args.vllm_gpu_memory = min(0.9, args.vllm_gpu_memory * _bspec["n_runs"])
+        print(f"[batched] combined sizes: rollout={args.rollout_batch_size} "
+              f"coh={args.coh_samples_per_rollout} "
+              f"optimizer={args.optimizer_batch_size} "
+              f"vllm_gpu_memory={args.vllm_gpu_memory}")
+    else:
+        train_dataset = env_spec.load_train(args)
     print(f"Loading {args.environment} eval prompts...")
     eval_dataset = env_spec.load_eval(args)
 
@@ -5554,6 +5971,11 @@ def _run(args, exp_cfg=None):
         repetition_penalty=args.repetition_penalty,
         beta=args.beta,
         seed=args.seed,
+        # Batched multi-run: batch position must follow dataset order (the
+        # combined dataset is pre-block-interleaved per run). Otherwise honor
+        # --shuffle_dataset (default True = stock TRL behavior).
+        shuffle_dataset=(getattr(args, "shuffle_dataset", True)
+                         and getattr(args, "_batched_spec", None) is None),
         bf16=args.bf16 and not args.fp16,
         fp16=args.fp16,
         report_to="wandb" if not args.no_wandb else "none",
@@ -5674,6 +6096,8 @@ def _run(args, exp_cfg=None):
         _ready_file = tempfile.mktemp(prefix="vllm_ready_", suffix=f"_{os.getpid()}")
         _ctx = _mp.get_context("spawn")
         _max_experiments = 5 if args.coh_samples_per_rollout > 0 else 4
+        if getattr(args, "_batched_spec", None):
+            _max_experiments *= args._batched_spec["n_runs"]
         _spawn_label = f"vllm_train_{args.run_name or os.getpid()}"
         _vllm_server_proc = _ctx.Process(
             target=_spawn_vllm_server,
@@ -5709,6 +6133,8 @@ def _run(args, exp_cfg=None):
         )
         if args.adapter_type == "mlp":
             _max_experiments = 5 if args.coh_samples_per_rollout > 0 else 4
+            if getattr(args, "_batched_spec", None):
+                _max_experiments *= args._batched_spec["n_runs"]
             colocate_kwargs.update(
                 adapter_type="mlp",
                 retain_neurons=0 if args.retain_source == "base" else args.retain_neurons,
@@ -5780,7 +6206,23 @@ def _run(args, exp_cfg=None):
         save_adapter_only=args.save_adapter_only,
         forget_lr_mult=args.forget_lr_mult,
         detect_unhackable=args.detect_unhackable,
+        n_batched_runs=(getattr(args, "_batched_spec", None) or {"n_runs": 1})["n_runs"],
     )
+    if getattr(args, "_batched_spec", None):
+        from gradient_routing import collect_routing_params_per_run
+        _bspec = args._batched_spec
+        trainer._per_run_params = [
+            (list(r), list(f)) for r, f in collect_routing_params_per_run(model)]
+        trainer._run_output_dirs = _bspec["output_dirs"]
+        trainer._pending_eval_wandb_runs = [None] * _bspec["n_runs"]
+        for _d in trainer._run_output_dirs:
+            os.makedirs(_d, exist_ok=True)
+        # Per-run grad-diag is unsupported (layer-index parsing breaks on
+        # MultiRunDualAdapter child paths) — force off, loudly.
+        if args.grad_diag_every is None:
+            args.grad_diag_every = 0
+        assert args.grad_diag_every == 0, (
+            "batched multi-run mode does not support --grad_diag_every")
     trainer._environment = args.environment
     trainer._n_digits = args.n_digits
     trainer._env_spec = env_spec
@@ -5995,7 +6437,15 @@ def train_main(params: dict):
     YAML loading entirely. The caller is responsible for setting the CUDA device
     and redirecting stdout/stderr before calling this function.
     """
+    if "_batched_group" in params:
+        # Batched seed group forwarded whole (e.g. by the Modal worker, which
+        # calls train_main on the dispatched params verbatim).
+        params = dict(params)
+        members = params.pop("_batched_group")
+        return train_main_batched(members, group_output_dir=params.get("output_dir"))
+
     exp_cfg = params.pop("exp_cfg", None)
+    _batched_spec = params.pop("_batched_spec", None)
     parser = _make_parser()
     args = parser.parse_args([])  # populate all defaults
 
@@ -6033,6 +6483,40 @@ def train_main(params: dict):
     _apply_model_defaults(args, explicit_keys=explicit_keys)
     _apply_presets(args)
 
+    if _batched_spec is not None:
+        # Batched multi-run v1 constraints — asserted on EFFECTIVE args (after
+        # YAML/preset merge). Loud and catastrophic per repo philosophy: each of
+        # these names per-run state or a code path the batched mode does not
+        # route per run yet.
+        args._batched_spec = _batched_spec
+        assert args.world_size == 1, "batched multi-run: no DDP"
+        assert args.adapter_type == "mlp", (
+            "batched multi-run v1 supports adapter_type='mlp' only "
+            "(vLLM weight extraction is MLP-adapter based)")
+        assert args.use_liger_kernel and args.max_tokens_per_microbatch is not None, (
+            "batched multi-run requires the packed/liger dynamic path "
+            "(--use_liger_kernel + --max_tokens_per_microbatch)")
+        assert args.retain_mode != "penalty", "batched multi-run: penalty mode unsupported"
+        assert args.rollout_forget_scale_mode == "fixed", (
+            "batched multi-run: rollout_forget_scale_mode must be 'fixed' "
+            "(random scales are per-run state)")
+        assert args.forget_scale_modulation == "none", (
+            "batched multi-run: forget_scale_modulation is per-run EMA state — unsupported")
+        assert not args.coh_samples_per_rollout or \
+            args.interlaced_coh_opt_batch_mode == "merged", (
+            "batched multi-run: coherence requires interlaced merged mode")
+        assert not getattr(args, "vllm_async", False), "batched multi-run: sync vLLM only"
+        assert not getattr(args, "offpolicy_drift_k", 0), (
+            "batched multi-run: offpolicy_drift diagnostics unsupported")
+        assert args.retain_warmup_steps == 0 and args.forget_warmup_steps == 0, (
+            "batched multi-run: warmup phases untested — disable for v1")
+        assert getattr(args, "fused_reduction", True), (
+            "batched multi-run requires --fused_reduction")
+        assert getattr(args, "vllm_spawn", False) or getattr(args, "vllm_server", None), (
+            "batched multi-run requires a vLLM generation client "
+            "(--vllm_spawn or --vllm_server); the HF-generate fallback cannot "
+            "route per-run adapters")
+
     if args.world_size > 1:
         # Multi-GPU DDP: spawn one worker per GPU via torch.multiprocessing
         import torch.multiprocessing as mp
@@ -6053,6 +6537,61 @@ def train_main(params: dict):
     else:
         torch.cuda.set_device(args.gpu_id)
         _run(args, exp_cfg)
+
+
+# Per-run keys that may legitimately differ between the runs of one batch.
+_BATCH_VARYING_KEYS = {"seed", "run_name", "output_dir", "wandb_run_id", "gpu_id"}
+
+
+def train_main_batched(params_list: list, group_output_dir: str = None):
+    """Batched multi-run entry point: co-train N runs (identical params except
+    seed/run_name/output_dir) in ONE process on a shared frozen base.
+
+    Each run keeps its own adapter pair, optimizer groups, data stream, vLLM
+    slot family, output dir (routing_eval.jsonl / eval_samples.jsonl), and
+    run<r>/-prefixed wandb eval metrics. The group's train.log / checkpoints /
+    wandb run live in `group_output_dir` (default: sibling of run 0's dir,
+    suffixed __bgroup<N>).
+    """
+    n = len(params_list)
+    assert n >= 2, f"batched mode needs >= 2 runs, got {n}"
+    base = {k: v for k, v in params_list[0].items() if k not in _BATCH_VARYING_KEYS}
+    for i, p in enumerate(params_list[1:], 1):
+        other = {k: v for k, v in p.items() if k not in _BATCH_VARYING_KEYS}
+        diff = ({k for k in base.keys() ^ other.keys()}
+                | {k for k in base.keys() & other.keys() if base[k] != other[k]})
+        assert not diff, (
+            f"batched runs must be identical except {sorted(_BATCH_VARYING_KEYS)}; "
+            f"run 0 vs run {i} differ on: {sorted(diff)}")
+
+    seeds = [p.get("seed") for p in params_list]
+    assert all(s is not None for s in seeds) and len(set(seeds)) == n, (
+        f"batched runs need distinct explicit seeds; got {seeds}")
+    output_dirs = [p.get("output_dir") for p in params_list]
+    assert all(output_dirs), "batched runs need explicit per-run output_dir"
+    run_names = [p.get("run_name") or f"run{i}_s{s}"
+                 for i, (p, s) in enumerate(zip(params_list, seeds))]
+
+    if group_output_dir is None:
+        d0 = output_dirs[0].rstrip("/")
+        group_output_dir = os.path.join(os.path.dirname(d0),
+                                        os.path.basename(d0) + f"__bgroup{n}")
+    os.makedirs(group_output_dir, exist_ok=True)
+
+    group_params = dict(base)
+    group_params["seed"] = seeds[0]  # shared global stream (pragmatic RNG)
+    group_params["output_dir"] = group_output_dir
+    group_params["run_name"] = (params_list[0].get("run_name") or "batched") + f"__bgroup{n}"
+    if "gpu_id" in params_list[0]:
+        group_params["gpu_id"] = params_list[0]["gpu_id"]
+    group_params["_batched_spec"] = {
+        "n_runs": n,
+        "seeds": seeds,
+        "run_names": run_names,
+        "output_dirs": output_dirs,
+    }
+    print(f"[batched] {n} runs in one process: seeds={seeds} -> {group_output_dir}")
+    return train_main(group_params)
 
 
 def _ddp_worker(rank, world_size, args, exp_cfg):

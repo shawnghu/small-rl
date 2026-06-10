@@ -73,6 +73,51 @@ def fused_routing(forget_fwd_scale, retain_grad_mask, forget_grad_mask):
         clear_fused_routing()
 
 
+def set_fused_routing_multi(forget_fwd_scale, retain_fwd_mask,
+                            retain_grad_mask, forget_grad_mask):
+    """Install per-run per-token routing tensors for multi-run packed forwards
+    (read by MultiRunDualAdapter only; plain adapters keep the single-run state).
+
+    All four are float tensors of shape (n_runs, *bcast), where row i must
+    broadcast against the adapter activation — (n_runs, 1, T, 1) for packed
+    (1, T, H) forwards, (n_runs, B, 1, 1) for padded (B, L, H) forwards with a
+    constant run per sample. Row i applies to run i:
+      forget_fwd_scale: forward multiplier on run i's forget-adapter output —
+          0 on tokens not belonging to run i and on run i's coherence tokens,
+          the train forget-scale on run i's routing tokens. Supersedes the
+          child's scalar forget_scale while active.
+      retain_fwd_mask: 1 on run i's tokens, 0 elsewhere. Zeroing foreign
+          tokens' forward value (and hence ALL their gradients) is the
+          invariant that keeps each run's residual stream identical to a
+          single-run model — the basis of sharing one base forward.
+      retain_grad_mask / forget_grad_mask: per-token PARAMETER-gradient gates
+          within run i's own tokens (same semantics as the single-run masks:
+          coherence -> retain only, bad -> forget only, good -> both/exclusive).
+    """
+    for t in (retain_fwd_mask, retain_grad_mask, forget_grad_mask):
+        assert t.shape == forget_fwd_scale.shape, (
+            f"multi-run routing tensors must share shape (n_runs, *bcast); got "
+            f"{t.shape} vs {forget_fwd_scale.shape}"
+        )
+    _FUSED_ROUTING["multi"] = (forget_fwd_scale, retain_fwd_mask,
+                               retain_grad_mask, forget_grad_mask)
+
+
+def clear_fused_routing_multi():
+    _FUSED_ROUTING.pop("multi", None)
+
+
+@contextmanager
+def fused_routing_multi(forget_fwd_scale, retain_fwd_mask,
+                        retain_grad_mask, forget_grad_mask):
+    set_fused_routing_multi(forget_fwd_scale, retain_fwd_mask,
+                            retain_grad_mask, forget_grad_mask)
+    try:
+        yield
+    finally:
+        clear_fused_routing_multi()
+
+
 def _fused_decouple(g_full, g_xdetached, mask):
     """Gate an adapter output's PARAMETER gradient per token without touching its
     input gradient.
@@ -152,36 +197,49 @@ class DualLoRALinear(nn.Module):
         if self.base_layer.bias is not None:
             self.base_layer.bias.requires_grad = False
 
+    @property
+    def has_retain(self):
+        return self.rank > 0
+
+    @property
+    def has_forget(self):
+        return self.forget_rank > 0
+
+    def _pre_adapter(self, x):
+        """Input transform applied once before BOTH adapter cores (dropout for
+        LoRA). Kept outside the cores so the fused decouple can call a core
+        twice (x and x.detach()) on the SAME dropped activation — a fresh
+        dropout draw per call would break the decouple's value identity."""
+        return self.dropout(x)
+
+    def _retain_core(self, x):
+        return x @ self.lora_A_retain.T @ self.lora_B_retain.T * self.scaling
+
+    def _forget_core(self, x):
+        return x @ self.lora_A_forget.T @ self.lora_B_forget.T * self.forget_scaling
+
     def forward(self, x):
         base_out = self.base_layer(x)
         x_dropped = self.dropout(x)
         fused = _FUSED_ROUTING["active"]
 
         if not fused:
-            if self.rank > 0:
-                retain_out = x_dropped @ self.lora_A_retain.T @ self.lora_B_retain.T * self.scaling * self.retain_scale
-            else:
-                retain_out = 0
-            if self.forget_rank > 0:
-                forget_out = x_dropped @ self.lora_A_forget.T @ self.lora_B_forget.T * self.forget_scaling * self.forget_scale
-            else:
-                forget_out = 0
+            retain_out = self._retain_core(x_dropped) * self.retain_scale if self.rank > 0 else 0
+            forget_out = self._forget_core(x_dropped) * self.forget_scale if self.forget_rank > 0 else 0
             return base_out + retain_out + forget_out
 
         # Fused routing: per-token parameter-gradient gating (forward value and
         # input gradient unchanged) + per-token forward forget-scale.
         xd = x_dropped.detach()
         if self.rank > 0:
-            gf = x_dropped @ self.lora_A_retain.T @ self.lora_B_retain.T * self.scaling
-            gx = xd @ self.lora_A_retain.T @ self.lora_B_retain.T * self.scaling
-            retain_out = _fused_decouple(gf, gx, _FUSED_ROUTING["retain_grad_mask"]) * self.retain_scale
+            retain_out = _fused_decouple(self._retain_core(x_dropped), self._retain_core(xd),
+                                         _FUSED_ROUTING["retain_grad_mask"]) * self.retain_scale
         else:
             retain_out = 0
         if self.forget_rank > 0:
-            gf = x_dropped @ self.lora_A_forget.T @ self.lora_B_forget.T * self.forget_scaling
-            gx = xd @ self.lora_A_forget.T @ self.lora_B_forget.T * self.forget_scaling
-            forget_out = _fused_decouple(gf, gx, _FUSED_ROUTING["forget_grad_mask"]) \
-                * _FUSED_ROUTING["forget_fwd_scale"].to(gf.dtype)
+            forget_out = _fused_decouple(self._forget_core(x_dropped), self._forget_core(xd),
+                                         _FUSED_ROUTING["forget_grad_mask"]) \
+                * _FUSED_ROUTING["forget_fwd_scale"].to(base_out.dtype)
         else:
             forget_out = 0
         return base_out + retain_out + forget_out
@@ -249,6 +307,18 @@ class DualMLPAdapter(nn.Module):
         else:
             self.gate_forget = self.up_forget = self.down_forget = None
 
+    @property
+    def has_retain(self):
+        return self.gate_retain is not None
+
+    @property
+    def has_forget(self):
+        return self.gate_forget is not None
+
+    def _pre_adapter(self, x):
+        """No input transform for MLP adapters (see DualLoRALinear._pre_adapter)."""
+        return x
+
     def _retain_core(self, x):
         return self.down_retain(self.act(self.gate_retain(x)) * self.up_retain(x))
 
@@ -299,6 +369,143 @@ class DualMLPAdapter(nn.Module):
         if self.gate_forget is not None:
             return list(self.gate_forget.parameters()) + list(self.up_forget.parameters()) + list(self.down_forget.parameters())
         return []
+
+
+class MultiRunDualAdapter(nn.Module):
+    """N independent retain+forget adapter pairs sharing ONE frozen base module.
+
+    Composition wrapper for batched multi-run training (N runs differing only
+    in seed, co-trained in one process): holds the frozen base exactly once
+    plus N vanilla DualLoRALinear / DualMLPAdapter children. The children's own
+    base-module registration is removed so state_dicts serialize the base once;
+    their `forward` is never called in multi-run mode — this wrapper computes
+    base(x) once and combines each child's adapter cores under the per-run
+    per-token routing tensors installed by set_fused_routing_multi.
+
+    Run i's adapter contribution is forward-masked to run i's tokens
+    (retain_fwd_mask / forget_fwd_scale rows), so on run i's tokens the
+    residual stream is bit-identical to what a single-run model with run i's
+    adapters would produce — the invariant that lets one shared base forward
+    serve N runs. Gradients are additionally parameter-gated per token via
+    _fused_decouple, exactly as in the single-run fused path.
+
+    Children remain ordinary registered submodules, so isinstance-based walks
+    (set_scales, disabled_dual_adapters, collect_routing_params,
+    has_dual_adapters) keep working unchanged.
+    """
+
+    def __init__(self, base_module: nn.Module, children: list):
+        super().__init__()
+        assert len(children) >= 1, "MultiRunDualAdapter needs >= 1 child"
+        ctype = type(children[0])
+        assert all(type(c) is ctype for c in children), (
+            f"mixed child adapter types: {[type(c).__name__ for c in children]}"
+        )
+        self.base = base_module
+        self.n_runs = len(children)
+        for c in children:
+            # Unregister the child's base submodule (it is the shared module we
+            # hold) so the base is serialized exactly once. Keep a plain-attr
+            # reference so child code paths that mention it still resolve.
+            for attr in ("base_mlp", "base_layer"):
+                if attr in c._modules:
+                    assert c._modules[attr] is base_module, (
+                        "all children must share the wrapper's base module"
+                    )
+                    del c._modules[attr]
+                    object.__setattr__(c, attr, base_module)
+        self.runs = nn.ModuleList(children)
+
+    def forward(self, x):
+        base_out = self.base(x)
+        mr = _FUSED_ROUTING.get("multi")
+        if mr is None:
+            # Only legal stateless forward: all adapters disabled (the
+            # disabled_dual_adapters ref-logprob trick) -> pure base output.
+            for c in self.runs:
+                assert ((not c.has_retain or c.retain_scale == 0.0)
+                        and (not c.has_forget or c.forget_scale == 0.0)), (
+                    "MultiRunDualAdapter.forward without multi-run routing "
+                    "state: run assignment is ambiguous. Install masks via "
+                    "set_fused_routing_multi (or zero all adapter scales for "
+                    "a base-only forward)."
+                )
+            return base_out
+        forget_fwd, retain_fwd, retain_gm, forget_gm = mr
+        assert forget_fwd.shape[0] == self.n_runs, (
+            f"multi-run routing tensors have n_runs={forget_fwd.shape[0]}, "
+            f"wrapper has n_runs={self.n_runs}"
+        )
+        out = base_out
+        grad_on = torch.is_grad_enabled()
+        for i, c in enumerate(self.runs):
+            xc = c._pre_adapter(x)
+            if c.has_retain:
+                core = c._retain_core(xc)
+                if grad_on:
+                    core = _fused_decouple(core, c._retain_core(xc.detach()),
+                                           retain_gm[i])
+                out = out + core * (retain_fwd[i].to(core.dtype)
+                                    * c.retain_scale)
+            if c.has_forget:
+                # forget_fwd row supersedes the child's scalar forget_scale
+                # (it encodes run mask x per-token train forget-scale).
+                core = c._forget_core(xc)
+                if grad_on:
+                    core = _fused_decouple(core, c._forget_core(xc.detach()),
+                                           forget_gm[i])
+                out = out + core * forget_fwd[i].to(core.dtype)
+        return out
+
+    # Flattened (all runs) param access — keeps collect_routing_params-style
+    # global walks meaningful on multi-run models.
+    def get_retain_params(self):
+        out = []
+        for c in self.runs:
+            out += c.get_retain_params()
+        return out
+
+    def get_forget_params(self):
+        out = []
+        for c in self.runs:
+            out += c.get_forget_params()
+        return out
+
+    def get_run_retain_params(self, run: int):
+        return self.runs[run].get_retain_params()
+
+    def get_run_forget_params(self, run: int):
+        return self.runs[run].get_forget_params()
+
+
+def iter_run_adapters(model, run: int):
+    """Yield run r's child adapter module from each MultiRunDualAdapter, in
+    model (layer) order. Used for run-aware weight extraction / checkpointing."""
+    for m in model.modules():
+        if isinstance(m, MultiRunDualAdapter):
+            yield m.runs[run]
+
+
+def collect_routing_params_per_run(model):
+    """[(retain_params, forget_params)] per run, from MultiRunDualAdapter wrappers.
+
+    Asserts a consistent n_runs across all wrappers. Per-run sets cover adapter
+    params only (the base is frozen, so this equals all trainables of that run).
+    """
+    wrappers = [m for m in model.modules() if isinstance(m, MultiRunDualAdapter)]
+    assert wrappers, "collect_routing_params_per_run: no MultiRunDualAdapter found"
+    n = wrappers[0].n_runs
+    assert all(w.n_runs == n for w in wrappers), (
+        f"inconsistent n_runs across wrappers: {[w.n_runs for w in wrappers]}"
+    )
+    out = []
+    for i in range(n):
+        retain, forget = [], []
+        for w in wrappers:
+            retain += w.get_run_retain_params(i)
+            forget += w.get_run_forget_params(i)
+        out.append((retain, forget))
+    return out
 
 
 ALL_PROJECTIONS = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
@@ -432,8 +639,13 @@ def apply_dual_lora(
     forget_layer_end: float | None = None,
     projections: list[str] | None = None,
     layer_stride: int = 1,
+    n_runs: int = 1,
+    run_seeds: list[int] | None = None,
 ):
-    """Replace target linear layers with DualLoRALinear modules.
+    """Replace target linear layers with DualLoRALinear modules (n_runs=1) or
+    MultiRunDualAdapter holding n_runs independent LoRA pairs (n_runs>1; run
+    r's adapters across all layers init under a fork-rng stream seeded with
+    run_seeds[r]).
 
     Freezes all base model parameters; only LoRA params are trainable.
 
@@ -452,7 +664,7 @@ def apply_dual_lora(
     forget_paths = set(get_target_modules(model, forget_layer_start, forget_layer_end, projections, layer_stride))
     all_paths = retain_paths | forget_paths
 
-    modified_paths = []
+    targets = []  # (path, parent, attr_name, base_layer, retain_rank, forget_rank)
     for path in sorted(all_paths):
         parts = path.split(".")
         parent = model
@@ -460,23 +672,58 @@ def apply_dual_lora(
             parent = getattr(parent, part)
         attr_name = parts[-1]
         base_layer = getattr(parent, attr_name)
+        targets.append((path, parent, attr_name, base_layer,
+                        rank if path in retain_paths else 0,
+                        forget_rank if path in forget_paths else 0))
 
-        this_retain_rank = rank if path in retain_paths else 0
-        this_forget_rank = forget_rank if path in forget_paths else 0
+    if n_runs == 1:
+        modified_paths = []
+        for path, parent, attr_name, base_layer, r_rank, f_rank in targets:
+            dual_lora = DualLoRALinear(base_layer, r_rank, f_rank, alpha, dropout)
+            setattr(parent, attr_name, dual_lora)
+            modified_paths.append(path)
+        return modified_paths
 
-        dual_lora = DualLoRALinear(base_layer, this_retain_rank, this_forget_rank, alpha, dropout)
-        setattr(parent, attr_name, dual_lora)
+    assert run_seeds is not None and len(run_seeds) == n_runs, (
+        f"apply_dual_lora with n_runs={n_runs} requires run_seeds of equal length "
+        f"(got {run_seeds})"
+    )
+    ref_param = next(model.parameters())
+    children_per_target = [[] for _ in targets]
+    for run in range(n_runs):
+        with _seeded_rng(run_seeds[run], ref_param):
+            for j, (_path, _parent, _attr, base_layer, r_rank, f_rank) in enumerate(targets):
+                children_per_target[j].append(
+                    DualLoRALinear(base_layer, r_rank, f_rank, alpha, dropout))
+    modified_paths = []
+    for j, (path, parent, attr_name, base_layer, _r, _f) in enumerate(targets):
+        setattr(parent, attr_name, MultiRunDualAdapter(base_layer, children_per_target[j]))
         modified_paths.append(path)
-
     return modified_paths
 
 
+@contextmanager
+def _seeded_rng(seed: int, ref_param):
+    """Fork the RNG state (CPU + the ref param's CUDA device if any) and seed it.
+    Used so each batched run's adapter init draws from its own reproducible
+    stream, independent of construction order and of the other runs."""
+    devices = [ref_param.device] if ref_param.is_cuda else []
+    with torch.random.fork_rng(devices=devices):
+        torch.manual_seed(seed)
+        yield
+
+
 def apply_dual_mlp(model, retain_neurons, forget_neurons,
-                   layer_start=0.0, layer_end=1.0, layer_stride=1):
-    """Replace MLP modules with DualMLPAdapter.
+                   layer_start=0.0, layer_end=1.0, layer_stride=1,
+                   n_runs=1, run_seeds=None):
+    """Replace MLP modules with DualMLPAdapter (n_runs=1) or
+    MultiRunDualAdapter holding n_runs independent adapter pairs (n_runs>1).
 
     Uses find_mlp_modules() for architecture-agnostic discovery.
     Freezes all base model parameters; only adapter params are trainable.
+    For n_runs>1, run r's adapters across ALL layers are constructed under a
+    fork-rng stream seeded with run_seeds[r] (per-run init independence,
+    reproducible per seed).
     Returns list of modified layer indices.
     """
     for param in model.parameters():
@@ -487,12 +734,29 @@ def apply_dual_mlp(model, retain_neurons, forget_neurons,
     layer_indices = compute_layer_indices(num_layers, layer_start, layer_end, layer_stride)
     mlp_entries = find_mlp_modules(model, layer_indices)
 
-    modified = []
-    for layer_idx, path, parent, base_mlp in mlp_entries:
-        adapter = DualMLPAdapter(base_mlp, hidden_size, retain_neurons, forget_neurons)
-        setattr(parent, "mlp", adapter)
-        modified.append(layer_idx)
+    if n_runs == 1:
+        modified = []
+        for layer_idx, path, parent, base_mlp in mlp_entries:
+            adapter = DualMLPAdapter(base_mlp, hidden_size, retain_neurons, forget_neurons)
+            setattr(parent, "mlp", adapter)
+            modified.append(layer_idx)
+        return modified
 
+    assert run_seeds is not None and len(run_seeds) == n_runs, (
+        f"apply_dual_mlp with n_runs={n_runs} requires run_seeds of equal length "
+        f"(got {run_seeds})"
+    )
+    ref_param = next(model.parameters())
+    children_per_entry = [[] for _ in mlp_entries]
+    for r in range(n_runs):
+        with _seeded_rng(run_seeds[r], ref_param):
+            for j, (_layer_idx, _path, _parent, base_mlp) in enumerate(mlp_entries):
+                children_per_entry[j].append(
+                    DualMLPAdapter(base_mlp, hidden_size, retain_neurons, forget_neurons))
+    modified = []
+    for j, (layer_idx, path, parent, base_mlp) in enumerate(mlp_entries):
+        setattr(parent, "mlp", MultiRunDualAdapter(base_mlp, children_per_entry[j]))
+        modified.append(layer_idx)
     return modified
 
 
@@ -561,6 +825,12 @@ def collect_routing_params(model):
 
 def _build_layer_index_map(model):
     """id(adapter_module) -> layer index, parsed from its named_modules path."""
+    assert not any(isinstance(m, MultiRunDualAdapter) for m in model.modules()), (
+        "per-layer diagnostics (PerSampleGradCapture / layer_role_param_map) do "
+        "not support MultiRunDualAdapter: child paths end in 'runs.<i>' so the "
+        "trailing digit is the RUN index, not the layer. Disable grad_diag for "
+        "multi-run batched training."
+    )
     m = {}
     for name, module in model.named_modules():
         if isinstance(module, _DUAL_ADAPTER_TYPES):

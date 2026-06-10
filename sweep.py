@@ -203,6 +203,7 @@ def load_sweep_config_py(path):
         "pack_group_keys":      getattr(mod, "pack_group_keys",      None),
         "max_per_pack":         getattr(mod, "max_per_pack",         None),
         "pack_vllm_gpu_memory": getattr(mod, "pack_vllm_gpu_memory", None),
+        "batch_seeds":          getattr(mod, "batch_seeds",          False),
     }
     return runs, attrs
 
@@ -297,7 +298,75 @@ def _run_worker(params: dict, log_path: str, gpu_ids: list[int], mps_pipe_dir: s
     sys.stderr = log_file
 
     from train import train_main
+    if "_batched_group" in params:
+        # Batched multi-run: one process co-trains all member runs.
+        members = params.pop("_batched_group")
+        for m in members:
+            m["gpu_id"] = effective_gpu_id
+            m.pop("vllm_spawn", None)  # sweep pre-spawned the (scaled) server
+            for k in ("vllm_server", "wandb_project", "wandb_group", "no_wandb"):
+                if k in params:
+                    m[k] = params[k]
+        from train import train_main_batched
+        train_main_batched(members, group_output_dir=params["output_dir"])
+        return
+
     train_main({**params, "gpu_id": effective_gpu_id})
+
+
+_SEED_BATCH_VARYING = ("seed", "run_name", "output_dir", "wandb_run_id", "gpu_id")
+
+
+def _group_queue_for_seed_batching(run_queue):
+    """Collapse same-config GR runs differing only in seed into single queue
+    entries carrying `members` (the per-run param dicts). Eligibility: non-
+    baseline entries with routing_mode in (classic, exclusive) — the batched
+    trainer requires gradient routing. Groups of one, baselines, and non-GR
+    runs pass through unchanged. Order of first appearance is preserved.
+    """
+    import json as _json
+    groups = {}   # key -> list of entry indices
+    order = []
+    for i, entry in enumerate(run_queue):
+        p = entry["params"]
+        eligible = (not entry.get("is_baseline")
+                    and p.get("routing_mode") in ("classic", "exclusive")
+                    and p.get("seed") is not None)
+        if eligible:
+            key = _json.dumps(
+                {k: repr(v) for k, v in sorted(p.items())
+                 if k not in _SEED_BATCH_VARYING},
+                sort_keys=True)
+        else:
+            key = f"__single_{i}"
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(i)
+
+    new_queue = []
+    n_grouped = 0
+    for key in order:
+        idxs = groups[key]
+        if key.startswith("__single_") or len(idxs) == 1:
+            new_queue.extend(run_queue[i] for i in idxs)
+            continue
+        members = [run_queue[i]["params"] for i in idxs]
+        seeds = [m.get("seed") for m in members]
+        assert len(set(seeds)) == len(seeds), (
+            f"seed-batched group has duplicate seeds {seeds} — sweep config error")
+        new_queue.append({
+            "params": dict(members[0]),
+            "grid_keys": run_queue[idxs[0]]["grid_keys"],
+            "is_baseline": False,
+            "members": members,
+        })
+        n_grouped += len(members)
+    if n_grouped:
+        print(f"[batch_seeds] grouped {n_grouped} runs into "
+              f"{sum(1 for e in new_queue if 'members' in e)} batched entries "
+              f"({len(new_queue)} queue entries total)")
+    return new_queue
 
 
 def discover_gpus():
@@ -785,7 +854,8 @@ class SweepRunner:
                  backend="local", pack_runs=False, max_per_pack=6,
                  max_concurrent_packs=None, pack_group_keys=None,
                  pack_vllm_gpu_memory=None, modal_sync_interval=60,
-                 modal_volume_name="gr-modal-pilot"):
+                 modal_volume_name="gr-modal-pilot",
+                 batch_seeds=False):
         self.output_dir = Path(output_dir)
         self.gpus = gpus
         self.use_mps = use_mps
@@ -837,6 +907,7 @@ class SweepRunner:
         self.no_wandb = no_wandb
         self.dry_run = dry_run
         self.no_baseline = no_baseline
+        self.batch_seeds = batch_seeds
         self.run_tag = run_tag
 
         # Build combined run queue: routing runs + baseline runs
@@ -880,6 +951,14 @@ class SweepRunner:
                     "grid_keys": baseline_grid_keys,
                     "is_baseline": True,
                 })
+
+        # Batched multi-run: collapse same-config GR runs differing only in seed
+        # into ONE queue entry (one process, train_main_batched). Baselines and
+        # non-GR runs stay singles. Note: batched groups bypass the run cache
+        # (group identity has no per-run checkpoint to validate) and v1
+        # incremental group plots may not fire for them.
+        if self.batch_seeds:
+            self.run_queue = _group_queue_for_seed_batching(self.run_queue)
 
         self.runs = [q["params"] for q in self.run_queue]
         self.all_grid_keys = grid_keys
@@ -1168,29 +1247,50 @@ class SweepRunner:
         is_baseline = entry["is_baseline"]
         grid_keys = entry["grid_keys"]
 
-        prefix = _run_prefix(params, is_baseline=is_baseline)
-        run_name = make_run_name(params, grid_keys, prefix=prefix)
-        if self.run_tag:
-            run_name = f"{run_name}_{self.run_tag}"
-        run_dir = self.output_dir / run_name
-        run_dir.mkdir(parents=True, exist_ok=True)
+        def _materialize_params(p):
+            prefix = _run_prefix(p, is_baseline=is_baseline)
+            name = make_run_name(p, grid_keys, prefix=prefix)
+            if self.run_tag:
+                name = f"{name}_{self.run_tag}"
+            rdir = self.output_dir / name
+            rdir.mkdir(parents=True, exist_ok=True)
+            fp = dict(p)
+            fp["output_dir"] = str(rdir)
+            fp["run_name"] = f"{self.output_dir.name}/{name}"
+            fp["wandb_project"] = self.wandb_project
+            # Group + deterministic id: ties every run in this sweep to a single
+            # wandb group (= sweep_name) and gives it a stable id so retries
+            # overwrite the prior (partial) wandb run instead of forking.
+            from sweep_views import deterministic_run_id
+            fp["wandb_group"] = self.output_dir.name
+            fp["wandb_run_id"] = deterministic_run_id(
+                self.output_dir.name, name, params=fp,
+            )
+            if self.no_wandb:
+                fp["no_wandb"] = True
+            return fp, name, rdir
+
+        if "members" in entry:
+            # Batched seed group: materialize every member's identity (their
+            # dirs receive routing_eval.jsonl etc.), then a group identity
+            # whose process owns train.log / checkpoints / the wandb run.
+            member_full = []
+            for m in entry["members"]:
+                mfp, _, _ = _materialize_params(m)
+                member_full.append(mfp)
+            n = len(member_full)
+            full_params, run_name, run_dir = _materialize_params(params)
+            run_name = f"{run_name}__bgroup{n}"
+            run_dir = self.output_dir / run_name
+            run_dir.mkdir(parents=True, exist_ok=True)
+            full_params["output_dir"] = str(run_dir)
+            full_params["run_name"] = f"{self.output_dir.name}/{run_name}"
+            full_params["_batched_group"] = member_full
+            log_path = run_dir / "train.log"
+            return full_params, run_name, run_dir, log_path
+
+        full_params, run_name, run_dir = _materialize_params(params)
         log_path = run_dir / "train.log"
-
-        full_params = dict(params)
-        full_params["output_dir"] = str(run_dir)
-        full_params["run_name"] = f"{self.output_dir.name}/{run_name}"
-        full_params["wandb_project"] = self.wandb_project
-        # Group + deterministic id: ties every run in this sweep to a single
-        # wandb group (= sweep_name) and gives it a stable id so retries
-        # overwrite the prior (partial) wandb run instead of forking.
-        from sweep_views import deterministic_run_id
-        full_params["wandb_group"] = self.output_dir.name
-        full_params["wandb_run_id"] = deterministic_run_id(
-            self.output_dir.name, run_name, params=full_params,
-        )
-        if self.no_wandb:
-            full_params["no_wandb"] = True
-
         return full_params, run_name, run_dir, log_path
 
     def _launch(self, run_idx, gpu_group=None, slot_ids=None):
@@ -1237,6 +1337,13 @@ class SweepRunner:
             vllm_dtype = full_params.get("vllm_dtype", "bfloat16")
             # 4 slots default (training + 3 eval modes); +1 for interlaced coherence.
             vllm_max_exp = 5 if full_params.get("coh_samples_per_rollout", 0) > 0 else 4
+            if "_batched_group" in full_params:
+                # Batched seed group: per-run slot family + per-run KV/memory share.
+                _n_b = len(full_params["_batched_group"])
+                vllm_max_exp *= _n_b
+                vllm_gpu_memory = min(0.85, vllm_gpu_memory * _n_b)
+                print(f"[batch_seeds] vLLM scaled for {_n_b}-run group: "
+                      f"max_experiments={vllm_max_exp}, gpu_memory={vllm_gpu_memory:.3f}")
             unique_id = _find_free_port()  # reuse port finder for a unique numeric ID
 
             if self.gpus_per_run > 1:
@@ -2232,6 +2339,10 @@ def main():
                         help="Skip auto-generated regular (do-nothing) baselines (routing_mode=none, no penalty)")
     parser.add_argument("--no_mps", action="store_true",
                         help="Skip MPS daemon management (use if MPS already running externally)")
+    parser.add_argument("--batch_seeds", action="store_true",
+                        help="Batch same-config GR runs differing only in seed into ONE "
+                             "process per group (shared frozen-base forward, per-run "
+                             "adapters; train_main_batched). Baselines stay separate.")
     parser.add_argument("--no_shuffle", action="store_true",
                         help="Run in config order instead of shuffling (default: shuffle)")
     parser.add_argument("--overwrite_run", action="store_true",
@@ -2475,6 +2586,7 @@ def main():
         pack_vllm_gpu_memory=cfg_pack_vllm_mem,
         modal_sync_interval=args.modal_sync_interval,
         modal_volume_name=args.modal_volume_name,
+        batch_seeds=(args.batch_seeds or cfg_attrs["batch_seeds"]),
     )
     runner.run()
 

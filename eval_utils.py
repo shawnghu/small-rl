@@ -217,7 +217,7 @@ def _generate_via_vllm(vllm_client, experiment_id, tokenizer, prompts, n_samples
 
 
 def _generate_concurrent_via_vllm(vllm_client, model, eval_experiment_ids, modes,
-                                  tokenizer, prompts, n_samples, max_new_tokens, temperature):
+                                  tokenizer, prompts, n_samples, max_new_tokens, temperature, run=None):
     """Generate all eval modes concurrently in a single vLLM call.
 
     Pushes current weights + per-mode scales to each mode's experiment slot, then
@@ -234,7 +234,7 @@ def _generate_concurrent_via_vllm(vllm_client, model, eval_experiment_ids, modes
     # adapter to exist on the slot.
     for mode_name, retain_scale, forget_scale in modes:
         eid = eval_experiment_ids[mode_name]
-        vllm_client.update_weights_from_model(eid, model)
+        vllm_client.update_weights_from_model(eid, model, run=run)
         vllm_client.set_scales(eid, retain_scale, forget_scale)
 
     # Replicate prompts across modes and build experiment_ids list.
@@ -357,7 +357,7 @@ def eval_gradient_routing(model, tokenizer, reward_fns, n_samples=20,
                           max_new_tokens=128, temperature=1.0, prompts=None,
                           eval_data=None, vllm_client=None, experiment_id=None,
                           vllm_no_sleep=False, eval_experiment_ids=None,
-                          generate_only=False):
+                          generate_only=False, run=None):
     """Evaluate a model under different adapter scale modes.
 
     Auto-detects DualLoRA presence. If DualLoRA modules found, evaluates 3 configs
@@ -417,7 +417,7 @@ def eval_gradient_routing(model, tokenizer, reward_fns, n_samples=20,
             if not vllm_no_sleep:
                 vllm_client.wake_up()
             # Sync weights once (creates adapter slot). Scales are set per-mode below.
-            vllm_client.update_weights_from_model(experiment_id, model)
+            vllm_client.update_weights_from_model(experiment_id, model, run=run)
 
         if concurrent:
             # Seed once — all modes share the same sampling RNG in one vLLM batch.
@@ -428,6 +428,7 @@ def eval_gradient_routing(model, tokenizer, reward_fns, n_samples=20,
             samples_by_mode = _generate_concurrent_via_vllm(
                 vllm_client, model, eval_experiment_ids, modes,
                 tokenizer, resolved_prompts, n_samples, max_new_tokens, temperature,
+                run=run,
             )
         else:
             for mode_name, retain_scale, forget_scale in modes:
