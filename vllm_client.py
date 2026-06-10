@@ -174,9 +174,18 @@ class VLLMClient:
         self._request({"op": "wake_up", "tags": tags})
 
     def shutdown(self):
-        """Tell server to shut down."""
-        self._request({"op": "shutdown"})
-        self.ctx.destroy()
+        """Tell server to shut down. Best-effort: the server may exit without
+        replying (observed when it shuts down mid-reply after a final batched
+        eval), and the caller killpg-cleans the process right after — so cap
+        the reply wait instead of blocking the trainer exit forever."""
+        try:
+            self.socket.setsockopt(zmq.RCVTIMEO, 10_000)
+            self.socket.setsockopt(zmq.LINGER, 0)
+            self._request({"op": "shutdown"})
+        except zmq.error.Again:
+            print("[vLLM client] shutdown reply timed out (server likely exited) — continuing")
+        finally:
+            self.ctx.destroy(linger=0)
 
     def close(self):
         """Close client without shutting down server."""
@@ -292,9 +301,18 @@ class AsyncVLLMClient:
         self._request({"op": "wake_up", "tags": tags})
 
     def shutdown(self):
-        """Tell server to shut down."""
-        self._request({"op": "shutdown"})
-        self.ctx.destroy()
+        """Tell server to shut down. Best-effort: the server may exit without
+        replying (observed when it shuts down mid-reply after a final batched
+        eval), and the caller killpg-cleans the process right after — so cap
+        the reply wait instead of blocking the trainer exit forever."""
+        try:
+            self.socket.setsockopt(zmq.RCVTIMEO, 10_000)
+            self.socket.setsockopt(zmq.LINGER, 0)
+            self._request({"op": "shutdown"})
+        except zmq.error.Again:
+            print("[vLLM client] shutdown reply timed out (server likely exited) — continuing")
+        finally:
+            self.ctx.destroy(linger=0)
 
     def close(self):
         """Close client without shutting down server."""

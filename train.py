@@ -831,22 +831,25 @@ class SampleGRPOTrainer(GRPOTrainer):
             from transformers import Trainer as _HFTrainer
             assert self._per_run_params is not None and \
                 len(self._per_run_params) == self._n_batched_runs
-            forget_lr = self.args.learning_rate * self._forget_lr_mult
+            hetero = getattr(self, "_batched_hetero", {}) or {}
+            lrs = hetero.get("lr", [self.args.learning_rate] * self._n_batched_runs)
+            fmults = hetero.get("forget_lr_mult",
+                                [self._forget_lr_mult] * self._n_batched_runs)
             groups = []
             for r, (retain_r, forget_r) in enumerate(self._per_run_params):
                 groups.append({"params": [p for p in retain_r if p.requires_grad],
-                               "lr": self.args.learning_rate,
+                               "lr": lrs[r],
                                "weight_decay": self.args.weight_decay})
                 groups.append({"params": [p for p in forget_r if p.requires_grad],
-                               "lr": forget_lr,
+                               "lr": lrs[r] * fmults[r],
                                "weight_decay": 0.0})  # forget group never decays
             cls, kwargs = _HFTrainer.get_optimizer_cls_and_kwargs(self.args, self.model)
             self.optimizer = cls(groups, **kwargs)
             n_params = sum(p.numel() for g in groups for p in g["params"])
             print(f"[optimizer] multi-run grouped {cls.__name__}: "
-                  f"{self._n_batched_runs} runs x (retain lr={self.args.learning_rate} "
-                  f"wd={self.args.weight_decay} + forget lr={forget_lr} wd=0.0) = "
-                  f"{len(groups)} groups, {n_params:,} params")
+                  f"{self._n_batched_runs} runs, per-run (retain lr, forget lr) = "
+                  f"{[(lrs[r], lrs[r] * fmults[r]) for r in range(self._n_batched_runs)]}, "
+                  f"wd={self.args.weight_decay}/0.0, {len(groups)} groups, {n_params:,} params")
 
         # Grouped optimizer for asymmetric retain/forget LRs. Must be built
         # before super().create_optimizer(), which early-returns when
@@ -901,11 +904,14 @@ class SampleGRPOTrainer(GRPOTrainer):
             if getattr(_trainer, "_n_batched_runs", 1) > 1:
                 # Per-run clipping: a global-norm clip over all runs' params
                 # would couple the runs (one run's large gradient scales down
-                # the others). Clip each run's param set independently at
-                # max_norm — exactly what N separate processes would do.
+                # the others). Clip each run's param set independently at its
+                # own max_norm — exactly what N separate processes would do.
                 # Report the max per-run norm for grad_norm logging.
-                norms = [_orig_clip(retain_r + forget_r, max_norm, *a, **kw)
-                         for retain_r, forget_r in _trainer._per_run_params]
+                _norms_per_run = (getattr(_trainer, "_batched_hetero", {}) or {}).get(
+                    "max_grad_norm", [max_norm] * _trainer._n_batched_runs)
+                norms = [_orig_clip(retain_r + forget_r, _norms_per_run[_r], *a, **kw)
+                         for _r, (retain_r, forget_r)
+                         in enumerate(_trainer._per_run_params)]
                 result = torch.stack([n if isinstance(n, torch.Tensor)
                                       else torch.tensor(float(n)) for n in norms]).max()
             else:
@@ -6213,6 +6219,7 @@ def _run(args, exp_cfg=None):
         _bspec = args._batched_spec
         trainer._per_run_params = [
             (list(r), list(f)) for r, f in collect_routing_params_per_run(model)]
+        trainer._batched_hetero = _bspec.get("hetero", {})
         trainer._run_output_dirs = _bspec["output_dirs"]
         trainer._pending_eval_wandb_runs = [None] * _bspec["n_runs"]
         for _d in trainer._run_output_dirs:
@@ -6542,6 +6549,12 @@ def train_main(params: dict):
 # Per-run keys that may legitimately differ between the runs of one batch.
 _BATCH_VARYING_KEYS = {"seed", "run_name", "output_dir", "wandb_run_id", "gpu_id"}
 
+# Optimizer-side params that may ALSO vary across batched runs: they live
+# entirely in per-run structures (per-run optimizer groups / per-run grad
+# clipping) and cannot perturb the shared forward, batch statistics, or vLLM
+# behavior. Anything else that differs between runs is rejected loudly.
+_BATCH_HETERO_KEYS = {"lr", "forget_lr_mult", "max_grad_norm"}
+
 
 def train_main_batched(params_list: list, group_output_dir: str = None):
     """Batched multi-run entry point: co-train N runs (identical params except
@@ -6555,18 +6568,38 @@ def train_main_batched(params_list: list, group_output_dir: str = None):
     """
     n = len(params_list)
     assert n >= 2, f"batched mode needs >= 2 runs, got {n}"
-    base = {k: v for k, v in params_list[0].items() if k not in _BATCH_VARYING_KEYS}
+    _exempt = _BATCH_VARYING_KEYS | _BATCH_HETERO_KEYS
+    base = {k: v for k, v in params_list[0].items() if k not in _exempt}
     for i, p in enumerate(params_list[1:], 1):
-        other = {k: v for k, v in p.items() if k not in _BATCH_VARYING_KEYS}
+        other = {k: v for k, v in p.items() if k not in _exempt}
         diff = ({k for k in base.keys() ^ other.keys()}
                 | {k for k in base.keys() & other.keys() if base[k] != other[k]})
         assert not diff, (
-            f"batched runs must be identical except {sorted(_BATCH_VARYING_KEYS)}; "
+            f"batched runs must be identical except {sorted(_BATCH_VARYING_KEYS)} "
+            f"(and optionally {sorted(_BATCH_HETERO_KEYS)}); "
             f"run 0 vs run {i} differ on: {sorted(diff)}")
 
+    # Heterogeneous optimizer-side params: collect per-run values for keys that
+    # actually vary. Mixed presence (set in some runs, absent in others) is
+    # ambiguous — rejected loudly.
+    hetero = {}
+    for k in sorted(_BATCH_HETERO_KEYS):
+        present = [k in p for p in params_list]
+        assert all(present) or not any(present), (
+            f"batched runs: key {k!r} set in some runs but not others")
+        if all(present):
+            vals = [p[k] for p in params_list]
+            if len(set(vals)) > 1:
+                hetero[k] = vals
+
     seeds = [p.get("seed") for p in params_list]
-    assert all(s is not None for s in seeds) and len(set(seeds)) == n, (
-        f"batched runs need distinct explicit seeds; got {seeds}")
+    assert all(s is not None for s in seeds), (
+        f"batched runs need explicit seeds; got {seeds}")
+    identities = [tuple([p.get("seed")] + [p.get(k) for k in sorted(_BATCH_HETERO_KEYS)])
+                  for p in params_list]
+    assert len(set(identities)) == n, (
+        f"batched runs need distinct (seed + {sorted(_BATCH_HETERO_KEYS)}) "
+        f"identities; got {identities}")
     output_dirs = [p.get("output_dir") for p in params_list]
     assert all(output_dirs), "batched runs need explicit per-run output_dir"
     run_names = [p.get("run_name") or f"run{i}_s{s}"
@@ -6580,15 +6613,24 @@ def train_main_batched(params_list: list, group_output_dir: str = None):
 
     group_params = dict(base)
     group_params["seed"] = seeds[0]  # shared global stream (pragmatic RNG)
+    # Uniform hetero-capable keys ride in base normally; varying ones use run 0's
+    # value as the args scalar (per-run values applied via the spec below).
+    for k in _BATCH_HETERO_KEYS:
+        if k in params_list[0]:
+            group_params[k] = params_list[0][k]
     group_params["output_dir"] = group_output_dir
     group_params["run_name"] = (params_list[0].get("run_name") or "batched") + f"__bgroup{n}"
     if "gpu_id" in params_list[0]:
         group_params["gpu_id"] = params_list[0]["gpu_id"]
+    if hetero:
+        print(f"[batched] heterogeneous optimizer params across runs: "
+              + "; ".join(f"{k}={v}" for k, v in hetero.items()))
     group_params["_batched_spec"] = {
         "n_runs": n,
         "seeds": seeds,
         "run_names": run_names,
         "output_dirs": output_dirs,
+        "hetero": hetero,
     }
     print(f"[batched] {n} runs in one process: seeds={seeds} -> {group_output_dir}")
     return train_main(group_params)

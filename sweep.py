@@ -204,6 +204,7 @@ def load_sweep_config_py(path):
         "max_per_pack":         getattr(mod, "max_per_pack",         None),
         "pack_vllm_gpu_memory": getattr(mod, "pack_vllm_gpu_memory", None),
         "batch_seeds":          getattr(mod, "batch_seeds",          False),
+        "batch_vary_keys":      getattr(mod, "batch_vary_keys",      ()),
     }
     return runs, attrs
 
@@ -317,7 +318,7 @@ def _run_worker(params: dict, log_path: str, gpu_ids: list[int], mps_pipe_dir: s
 _SEED_BATCH_VARYING = ("seed", "run_name", "output_dir", "wandb_run_id", "gpu_id")
 
 
-def _group_queue_for_seed_batching(run_queue):
+def _group_queue_for_seed_batching(run_queue, extra_vary_keys=()):
     """Collapse same-config GR runs differing only in seed into single queue
     entries carrying `members` (the per-run param dicts). Eligibility: non-
     baseline entries with routing_mode in (classic, exclusive) — the batched
@@ -333,9 +334,10 @@ def _group_queue_for_seed_batching(run_queue):
                     and p.get("routing_mode") in ("classic", "exclusive")
                     and p.get("seed") is not None)
         if eligible:
+            _vary = set(_SEED_BATCH_VARYING) | set(extra_vary_keys)
             key = _json.dumps(
                 {k: repr(v) for k, v in sorted(p.items())
-                 if k not in _SEED_BATCH_VARYING},
+                 if k not in _vary},
                 sort_keys=True)
         else:
             key = f"__single_{i}"
@@ -855,7 +857,7 @@ class SweepRunner:
                  max_concurrent_packs=None, pack_group_keys=None,
                  pack_vllm_gpu_memory=None, modal_sync_interval=60,
                  modal_volume_name="gr-modal-pilot",
-                 batch_seeds=False):
+                 batch_seeds=False, batch_vary_keys=()):
         self.output_dir = Path(output_dir)
         self.gpus = gpus
         self.use_mps = use_mps
@@ -908,6 +910,10 @@ class SweepRunner:
         self.dry_run = dry_run
         self.no_baseline = no_baseline
         self.batch_seeds = batch_seeds
+        # Extra keys allowed to vary within a batched group (opt-in, sweep
+        # config attr batch_vary_keys). train_main_batched re-validates against
+        # its _BATCH_HETERO_KEYS whitelist (optimizer-side params only).
+        self.batch_vary_keys = tuple(batch_vary_keys or ())
         self.run_tag = run_tag
 
         # Build combined run queue: routing runs + baseline runs
@@ -958,7 +964,8 @@ class SweepRunner:
         # (group identity has no per-run checkpoint to validate) and v1
         # incremental group plots may not fire for them.
         if self.batch_seeds:
-            self.run_queue = _group_queue_for_seed_batching(self.run_queue)
+            self.run_queue = _group_queue_for_seed_batching(
+                self.run_queue, extra_vary_keys=self.batch_vary_keys)
 
         self.runs = [q["params"] for q in self.run_queue]
         self.all_grid_keys = grid_keys
@@ -2587,6 +2594,7 @@ def main():
         modal_sync_interval=args.modal_sync_interval,
         modal_volume_name=args.modal_volume_name,
         batch_seeds=(args.batch_seeds or cfg_attrs["batch_seeds"]),
+        batch_vary_keys=cfg_attrs["batch_vary_keys"],
     )
     runner.run()
 
