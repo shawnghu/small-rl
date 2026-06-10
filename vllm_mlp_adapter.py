@@ -290,7 +290,19 @@ class VLLMDualMLPAdapter(nn.Module):
         # (or -1 for no adapter). Clamp to 0 so -1 tokens read slot 0's
         # scales; this is safe because Punica already returns zero output
         # for those tokens, so scale * 0 = 0 regardless.
-        token_indices = self.punica_wrapper.token_lora_indices.clamp(min=0)
+        #
+        # torch.compile subtlety: the `token_lora_indices` PROPERTY slices the
+        # underlying fixed buffer by indices_len[0] — a per-batch Python int.
+        # Under dynamo that traces to a CONSTANT-shaped tensor (the compile
+        # probe's 16384), and broadcasting it against the dynamic token dim of
+        # the adapter output SPECIALIZES that dim -> ConstraintViolationError
+        # (this was the enforce_eager=False crash). Slice the raw buffer by
+        # x.shape[0] instead: a SymInt under dynamo, so the shape stays
+        # dynamic; numerically identical (both cover exactly this forward's
+        # tokens; padding rows are -1 -> clamp(0) x punica-zero = 0).
+        token_indices = (
+            self.punica_wrapper._token_lora_indices[: x.shape[0]].clamp(min=0)
+        )
 
         if self.retain_gate_stacked is not None:
             retain_out = self._adapter_swiglu(
@@ -646,6 +658,15 @@ def create_engine(
         print(f"[vLLM] Injected MLP adapters on layers {layer_indices}")
 
     LoRAModelManager._post_create_module_hooks.append(_mlp_hook)
+
+    if not enforce_eager:
+        # vLLM's compile-cache key hashes the configs IT knows about; it cannot
+        # see our injected adapter dims (retain/forget_neurons), so artifacts
+        # compiled under one mlp_config could be silently reused under another
+        # with shapes baked in — the documented "stale compile cache" failure
+        # mode. Disable artifact caching whenever the compiled path is on
+        # (costs ~30-60s compile per engine boot; correctness over warm boots).
+        os.environ.setdefault("VLLM_DISABLE_COMPILE_CACHE", "1")
 
     try:
         llm = LLM(

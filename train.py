@@ -4825,6 +4825,11 @@ def _make_parser():
                              "(e.g. ipc:///tmp/vllm_grpo.sock or tcp://127.0.0.1:5555). "
                              "When set, generation is offloaded to the server and adapter weights "
                              "are synced before each generation step.")
+    parser.add_argument("--vllm_enforce_eager", action=argparse.BooleanOptionalAction, default=True,
+                        help="vLLM engine eager mode. --no-vllm_enforce_eager enables the "
+                             "compiled/CUDA-graph decode path (measured ~11x lower per-step "
+                             "overhead at 135M). Requires the dynamo-safe adapter forward; "
+                             "gate with tools/gate_compiled_engine.py before trusting runs.")
     parser.add_argument("--vllm_spawn", action="store_true", default=False,
                         help="Spawn a local vLLM server for this run (one server per run). "
                              "Uses the run's own model/mlp_config. Mutually exclusive with --vllm_server.")
@@ -5681,7 +5686,8 @@ def _run(args, exp_cfg=None):
             args=(args.model, args.mlp_config, args.vllm_gpu_memory, _socket_path, _ready_file,
                   args.layer_start, args.layer_end, args.layer_stride, _max_experiments,
                   args.gpu_id, _spawn_label),
-            kwargs={"log_dir": args.output_dir},
+            kwargs={"log_dir": args.output_dir,
+                    "enforce_eager": args.vllm_enforce_eager},
             # daemon=False so vLLM v1 engine can spawn its own CoreEngineProcManager children
         )
         _vllm_server_proc.start()
