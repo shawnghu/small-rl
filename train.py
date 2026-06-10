@@ -442,80 +442,53 @@ def _pack_for_forward(inputs, indices):
     Returns a dict with packed tensors + metadata for unpacking after forward.
     """
     device = next(v.device for v in inputs.values() if isinstance(v, torch.Tensor))
-    n_global = next(v.shape[0] for v in inputs.values()
-                    if isinstance(v, torch.Tensor) and v.ndim > 0)
 
-    all_input_ids = []
-    all_position_ids = []
-    all_completion_mask = []
-    seq_boundaries = []  # (prompt_len, completion_len) per sequence
-
+    # Fully vectorized: the per-sequence Python loop this replaces forced two
+    # GPU syncs per sequence (.item() on nonzero + completion_mask.sum()), so
+    # ~1000 syncs at production widths — the dominant serial CPU cost of the
+    # update phase. This version syncs exactly twice regardless of width.
+    # Same contiguity assumptions as the loop's [p_start:] / [:c_len] slicing:
+    # prompt_mask left-padded, completion_mask right-padded.
     has_old_logps = "old_per_token_logps" in inputs and inputs["old_per_token_logps"] is not None
     has_ref_logps = "ref_per_token_logps" in inputs and inputs["ref_per_token_logps"] is not None
-    all_old_logps = [] if has_old_logps else None
-    all_ref_logps = [] if has_ref_logps else None
-    all_comp_ids = []
-
-    for i in indices:
-        # Extract real prompt tokens (skip left-padding)
-        p_mask = inputs["prompt_mask"][i]
-        real_positions = p_mask.nonzero(as_tuple=True)[0]
-        if len(real_positions) > 0:
-            p_start = real_positions[0].item()
-            p_real = inputs["prompt_ids"][i, p_start:]
-        else:
-            p_real = inputs["prompt_ids"][i, :0]  # empty
-        p_len = p_real.shape[0]
-
-        # Extract real completion tokens (skip right-padding)
-        c_mask = inputs["completion_mask"][i]
-        c_len = c_mask.sum().item()
-        c_real = inputs["completion_ids"][i, :c_len]
-
-        # Concatenate prompt + completion for this sequence
-        seq_ids = torch.cat([p_real, c_real])
-        seq_len = seq_ids.shape[0]
-
-        all_input_ids.append(seq_ids)
-        all_position_ids.append(torch.arange(seq_len, device=device))
-        all_completion_mask.append(torch.cat([
-            torch.zeros(p_len, dtype=torch.long, device=device),
-            torch.ones(c_len, dtype=torch.long, device=device),
-        ]))
-        all_comp_ids.append(inputs["completion_ids"][i, :c_len])
-
-        if has_old_logps:
-            all_old_logps.append(inputs["old_per_token_logps"][i, :c_len])
-        if has_ref_logps:
-            all_ref_logps.append(inputs["ref_per_token_logps"][i, :c_len])
-
-        seq_boundaries.append((p_len, c_len))
-
-    # Build packed tensors
-    packed_input_ids = torch.cat(all_input_ids).unsqueeze(0)        # (1, T)
-    packed_position_ids = torch.cat(all_position_ids).unsqueeze(0)  # (1, T)
-    packed_completion_mask = torch.cat(all_completion_mask).unsqueeze(0)  # (1, T)
-
-    # Repad per-sequence completion data to (N, max_comp_len) for loss computation
-    max_comp_len = max(c for _, c in seq_boundaries) if seq_boundaries else 0
     n_seqs = len(indices)
 
-    comp_ids_padded = torch.zeros(n_seqs, max_comp_len, dtype=torch.long, device=device)
-    comp_mask_padded = torch.zeros(n_seqs, max_comp_len, dtype=torch.long, device=device)
-    old_logps_padded = torch.zeros(n_seqs, max_comp_len, device=device) if has_old_logps else None
-    ref_logps_padded = torch.zeros(n_seqs, max_comp_len, device=device) if has_ref_logps else None
+    idx_t = torch.tensor(list(indices), device=device, dtype=torch.long)
+    p_ids = inputs["prompt_ids"][idx_t]                 # (n, P)
+    p_masks = inputs["prompt_mask"][idx_t].bool()       # (n, P)
+    c_ids = inputs["completion_ids"][idx_t]             # (n, C)
+    c_masks = inputs["completion_mask"][idx_t].bool()   # (n, C)
 
-    for j, (_, c_len) in enumerate(seq_boundaries):
-        if c_len > 0:
-            comp_ids_padded[j, :c_len] = all_comp_ids[j]
-            comp_mask_padded[j, :c_len] = 1
-            if has_old_logps:
-                old_logps_padded[j, :c_len] = all_old_logps[j]
-            if has_ref_logps:
-                ref_logps_padded[j, :c_len] = all_ref_logps[j]
+    full_ids = torch.cat([p_ids, c_ids], dim=1)         # (n, P+C)
+    full_mask = torch.cat([p_masks, c_masks], dim=1)    # (n, P+C)
+    # Row-major flatten preserves [seq0 tokens, seq1 tokens, ...] order.
+    flat_sel = full_mask.flatten().nonzero(as_tuple=True)[0]            # sync 1
+    packed_input_ids = full_ids.flatten()[flat_sel].unsqueeze(0)        # (1, T)
+    # Position ids reset per sequence: within-row rank of each real token.
+    pos_in_seq = full_mask.long().cumsum(dim=1) - 1
+    packed_position_ids = pos_in_seq.flatten()[flat_sel].unsqueeze(0)   # (1, T)
+    is_comp = torch.cat([torch.zeros_like(p_masks, dtype=torch.long),
+                         c_masks.long()], dim=1)
+    packed_completion_mask = is_comp.flatten()[flat_sel].unsqueeze(0)   # (1, T)
 
-    # Index per-sequence scalars
-    idx_t = torch.tensor(indices, device=device, dtype=torch.long)
+    p_lens = p_masks.sum(dim=1)
+    c_lens = c_masks.sum(dim=1)
+    seq_boundaries = [tuple(pc) for pc in
+                      torch.stack([p_lens, c_lens], dim=1).cpu().tolist()]  # sync 2
+    max_comp_len = max(c for _, c in seq_boundaries) if seq_boundaries else 0
+
+    # Completion-side tensors are already right-padded; slice to max_comp_len
+    # and zero the padding (the loop version built zeros-filled buffers).
+    comp_mask_padded = c_masks[:, :max_comp_len].long()
+    comp_ids_padded = c_ids[:, :max_comp_len] * comp_mask_padded
+    zero = torch.zeros((), device=device)
+    old_logps_padded = (torch.where(c_masks[:, :max_comp_len],
+                                    inputs["old_per_token_logps"][idx_t][:, :max_comp_len], zero)
+                        if has_old_logps else None)
+    ref_logps_padded = (torch.where(c_masks[:, :max_comp_len],
+                                    inputs["ref_per_token_logps"][idx_t][:, :max_comp_len], zero)
+                        if has_ref_logps else None)
+
     advantages = inputs["advantages"][idx_t]
 
     return {
@@ -4090,24 +4063,24 @@ class SampleGRPOTrainer(GRPOTrainer):
             # Per-token (1, T, 1) routing tensors in this microbatch's pack order:
             #   forget_fwd_scale: forward multiplier on the forget-adapter output
             #   retain_grad_mask / forget_grad_mask: per-token param-gradient gates
-            forget_fwd = torch.empty(T, device=device, dtype=torch.float32)
-            retain_gm = torch.empty(T, device=device, dtype=torch.float32)
-            forget_gm = torch.empty(T, device=device, dtype=torch.float32)
-            off = 0
+            # Built as per-sequence value rows expanded by repeat_interleave —
+            # one H2D copy + one expand kernel, instead of 3 slice-fill
+            # launches per sequence (~1600 tiny kernels at width 544).
+            vals = torch.empty(3, len(indices))  # CPU staging rows: ffs, rgm, fgm
             for j, idx in enumerate(indices):
-                p_len, c_len = seq_boundaries[j]
-                L = int(p_len) + int(c_len)
                 if idx in coh_set:               # coherence: retain-only, forget off
-                    ffs, rgm, fgm = 0.0, 1.0, 0.0
+                    vals[0, j], vals[1, j], vals[2, j] = 0.0, 1.0, 0.0
                 elif idx in good_set:            # good: retain learns; forget learns (classic) / off (exclusive)
-                    ffs, rgm, fgm = train_fs, 1.0, (0.0 if exclusive else 1.0)
+                    vals[0, j], vals[1, j], vals[2, j] = train_fs, 1.0, (0.0 if exclusive else 1.0)
                 else:                            # bad: retain frozen; forget learns
-                    ffs, rgm, fgm = train_fs, 0.0, 1.0
-                forget_fwd[off:off + L] = ffs
-                retain_gm[off:off + L] = rgm
-                forget_gm[off:off + L] = fgm
-                off += L
-            assert off == T, f"fused mask tiling mismatch: {off} != {T}"
+                    vals[0, j], vals[1, j], vals[2, j] = train_fs, 0.0, 1.0
+            seq_lens = torch.tensor([int(p) + int(c) for p, c in seq_boundaries])
+            assert int(seq_lens.sum()) == T, \
+                f"fused mask tiling mismatch: {int(seq_lens.sum())} != {T}"
+            per_tok = torch.repeat_interleave(vals.to(device), seq_lens.to(device),
+                                              dim=1, output_size=T)  # (3, T), no implicit sync
+            # Rows of the (3, T) tensor are contiguous -> .view(1, T, 1) below is valid.
+            forget_fwd, retain_gm, forget_gm = per_tok[0], per_tok[1], per_tok[2]
 
             # Per-microbatch scale = n_mb/scale_denom, exactly as the stock path
             # scales each homogeneous microbatch; sums to n_kept/scale_denom.
