@@ -25,7 +25,7 @@ class VLLMServer:
 
     def __init__(self, socket_addr, max_experiments, retain_neurons, forget_neurons,
                  model_name, gpu_memory_utilization=0.05, dtype="bfloat16",
-                 layer_start=0.0, layer_end=1.0, layer_stride=1):
+                 layer_start=0.0, layer_end=1.0, layer_stride=1, enforce_eager=True):
         self.socket_addr = socket_addr
         self.max_experiments = max_experiments
 
@@ -35,6 +35,7 @@ class VLLMServer:
               f"layers={layer_start:.2f}-{layer_end:.2f})...")
         t0 = time.time()
         self.llm, self.mgr = create_engine(
+            enforce_eager=enforce_eager,
             model_name=model_name,
             max_experiments=max_experiments,
             retain_neurons=retain_neurons,
@@ -94,15 +95,31 @@ class VLLMServer:
             top_k=top_k if top_k > 0 else -1,
             top_p=top_p,
             logprobs=0 if return_logprobs else None,
+            # Per-seq-per-step incremental detokenization is pure CPU cost when
+            # the caller only needs token ids (training rollouts).
+            detokenize=msg.get("detokenize", True),
         )
 
+        import time as _time
+        _tg = _time.perf_counter()
         outputs = self.mgr.generate(prompt_ids, experiment_ids, sp)
+        _gen_s = _time.perf_counter() - _tg
+        _tf = _time.perf_counter()
         comp_texts, comp_ids, prompt_ids_out, _ = flatten_vllm_outputs(outputs)
+        _flatten_s = _time.perf_counter() - _tf
 
         reply = {
             "completion_texts": comp_texts,
             "completion_ids": comp_ids,
             "prompt_ids": prompt_ids_out,
+            # Direct gen-phase timing decomposition (serial-bottleneck hunt):
+            # add_request / engine.step / output-collect from the manager loop,
+            # plus flatten. Client stashes as _last_gen_timings.
+            "timings": {
+                **getattr(self.mgr, "_last_gen_timings", {}),
+                "mgr_generate_s": round(_gen_s, 4),
+                "flatten_s": round(_flatten_s, 4),
+            },
         }
 
         if return_logprobs:

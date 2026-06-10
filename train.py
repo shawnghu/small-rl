@@ -64,7 +64,7 @@ from experiment_config import ExperimentConfig, RewardConfig, RewardComponentCon
 
 def _spawn_vllm_server(model_name, mlp_config, gpu_memory, socket_path, ready_file,
                        layer_start=0.0, layer_end=1.0, layer_stride=1,
-                       max_experiments=4, gpu_id=0, label=None, log_dir=None):
+                       max_experiments=4, gpu_id=0, label=None, log_dir=None, enforce_eager=True):
     """Worker for per-run vLLM server subprocess (must be module-level for spawn pickling).
 
     Concurrent-init serialization is internal: vllm_init_slot acquires an
@@ -111,6 +111,7 @@ def _spawn_vllm_server(model_name, mlp_config, gpu_memory, socket_path, ready_fi
     with vllm_init_slot(gpu_id, init_label):
         server = VLLMServer(
             socket_addr=socket_path,
+            enforce_eager=enforce_eager,
             # Default 4 slots: 1 training + 3 eval adapter modes (both, retain_only,
             # forget_only). Interlaced coherence bumps this to 5 to add a coh slot.
             max_experiments=max_experiments,

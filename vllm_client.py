@@ -88,8 +88,11 @@ class VLLMClient:
         })
 
     def generate(self, experiment_id, prompt_ids, n, temperature, max_tokens,
-                 top_k=50, top_p=1.0, return_logprobs=False):
-        """Request generation, return (comp_texts, comp_ids, prompt_ids[, logprobs])."""
+                 top_k=50, top_p=1.0, return_logprobs=False, detokenize=True):
+        """Request generation, return (comp_texts, comp_ids, prompt_ids[, logprobs]).
+        Server-side phase timings land in self._last_gen_timings."""
+        import time as _t
+        _t0 = _t.perf_counter()
         reply = self._request({
             "op": "generate",
             "experiment_id": experiment_id,
@@ -100,7 +103,10 @@ class VLLMClient:
             "top_k": top_k,
             "top_p": top_p,
             "return_logprobs": return_logprobs,
+            "detokenize": detokenize,
         })
+        self._last_gen_timings = {**(reply.get("timings") or {}),
+                                  "client_roundtrip_s": round(_t.perf_counter() - _t0, 4)}
         result = (
             reply["completion_texts"],
             reply["completion_ids"],
@@ -111,7 +117,7 @@ class VLLMClient:
         return result
 
     def generate_multi(self, experiment_ids, prompt_ids, n, temperature, max_tokens,
-                       top_k=50, top_p=1.0, return_logprobs=False):
+                       top_k=50, top_p=1.0, return_logprobs=False, detokenize=True):
         """Generate with per-prompt experiment routing (concurrent multi-adapter eval).
 
         experiment_ids: list[int] of same length as prompt_ids. Each prompt is routed
@@ -119,6 +125,8 @@ class VLLMClient:
         """
         assert len(experiment_ids) == len(prompt_ids), \
             f"experiment_ids length {len(experiment_ids)} != prompt_ids length {len(prompt_ids)}"
+        import time as _t
+        _t0 = _t.perf_counter()
         reply = self._request({
             "op": "generate",
             "experiment_ids": list(experiment_ids),
@@ -129,7 +137,10 @@ class VLLMClient:
             "top_k": top_k,
             "top_p": top_p,
             "return_logprobs": return_logprobs,
+            "detokenize": detokenize,
         })
+        self._last_gen_timings = {**(reply.get("timings") or {}),
+                                  "client_roundtrip_s": round(_t.perf_counter() - _t0, 4)}
         result = (
             reply["completion_texts"],
             reply["completion_ids"],

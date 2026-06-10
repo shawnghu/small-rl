@@ -510,6 +510,8 @@ class VLLMAdapterManager:
         batch_id = uuid.uuid4().hex[:8]
         engine = self.llm.llm_engine
 
+        import time as _time
+        _t0 = _time.perf_counter()
         # Submit requests with the active LoRARequest for each experiment.
         req_ids = []
         for i, (prompt, eid) in enumerate(zip(prompts, experiment_ids)):
@@ -521,11 +523,20 @@ class VLLMAdapterManager:
                                lora_request=lora_req)
             req_ids.append(req_id)
 
+        _t_add = _time.perf_counter() - _t0
         # Run engine until all complete, collect outputs keyed by request_id.
         finished_comps = {r: {} for r in req_ids}
         outputs_by_id = {}
+        _n_steps = 0
+        _t_step_total = 0.0
+        _t_collect_total = 0.0
         while engine.has_unfinished_requests():
-            for out in engine.step():
+            _ts = _time.perf_counter()
+            _step_out = engine.step()
+            _t_step_total += _time.perf_counter() - _ts
+            _n_steps += 1
+            _tc = _time.perf_counter()
+            for out in _step_out:
                 for comp in out.outputs:
                     if comp.finish_reason is not None:
                         finished_comps[out.request_id][comp.index] = comp
@@ -534,7 +545,16 @@ class VLLMAdapterManager:
                         finished_comps[out.request_id].values(), key=lambda c: c.index
                     )
                     outputs_by_id[out.request_id] = out
+            _t_collect_total += _time.perf_counter() - _tc
 
+        # Stash the per-phase timing split for the server to report (direct
+        # measurement of the gen-phase serial-bottleneck decomposition).
+        self._last_gen_timings = {
+            "add_request_s": round(_t_add, 4),
+            "engine_step_s": round(_t_step_total, 4),
+            "n_engine_steps": _n_steps,
+            "collect_s": round(_t_collect_total, 4),
+        }
         # Return in original prompt order.
         return [outputs_by_id[r] for r in req_ids]
 
@@ -562,8 +582,13 @@ def create_engine(
     layer_start: float = 0.0,
     layer_end: float = 1.0,
     layer_stride: int = 1,
+    enforce_eager: bool = True,
 ):
     """Create a vLLM engine with MLP adapter support. Returns (llm, manager).
+
+    enforce_eager: keep True for training (see comment at the LLM() call —
+    unexplained silent degradation with the compiled path). Exposed as a
+    parameter for measurement-only A/B of launch-overhead share.
 
     Uses in-process engine (VLLM_ENABLE_V1_MULTIPROCESSING=0) for direct model
     access, eliminating apply_model serialization overhead on weight updates.
@@ -638,7 +663,7 @@ def create_engine(
             # resolve our confidence in the compiled path. Until the compiled
             # path is verified against an eager baseline on a full sweep,
             # enforce_eager=True is the safe default.
-            enforce_eager=True,
+            enforce_eager=enforce_eager,
             dtype=dtype,
             gpu_memory_utilization=gpu_memory_utilization,
             enable_sleep_mode=True,
