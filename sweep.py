@@ -574,8 +574,14 @@ def extract_final_metrics(run_dir):
     state_path = checkpoints[-1] / "trainer_state.json"
     if not state_path.exists():
         return None
-    with open(state_path) as f:
-        state = json.load(f)
+    try:
+        with open(state_path) as f:
+            state = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        # Under --backend modal the background volume sync rewrites these files while we read
+        # them; a half-written trainer_state.json is routine, not an error. Crashing here killed
+        # the orchestrator (and with it the ephemeral Modal app + 6 in-flight runs, 2026-06-10).
+        return None
     logs = state.get("log_history", [])
     # Find last entry with reward
     for entry in reversed(logs):

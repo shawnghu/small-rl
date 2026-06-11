@@ -435,6 +435,23 @@ rh_detector:
 
 The reward function caches raw scores via `CachedReward` wrapper; the detector reads the cache. Threshold operates on the raw score, not the scaled reward value.
 
+## Supervising Long-Running Jobs (sweeps, evals, pipelines)
+
+- **Verify every launch within seconds.** Read the process's own log or pgrep it — "launched" is
+  not "running". The one unverified launch is the one that dies silently (2026-06-10: a probe
+  chain died instantly and sat unnoticed for hours because launch verification was skipped once).
+- **Check progress proactively and frequently, without being asked.** Progress = monotonic
+  observable indicators (tqdm step counts, growing log/eval files, GPU utilization) — not absence
+  of errors. Cadence: confirm real progress ~2–3 min after launch, again ~10 min in (most
+  failures are early), then at least every 15–30 min for the duration. Report status at stage
+  boundaries and on anomalies.
+- **Treat stalls as failures.** "No progress AND no worker processes" for ~15 min is an alarm
+  condition, not a wait state. Any watcher must alert on stall and on error patterns, not only on
+  success markers — a dead process emits no error strings, so success/error-only filters read
+  death as "still working".
+- **Multi-stage pipelines should be self-driving** (one script chains corpus → train → eval →
+  aggregate), with the supervisor watching, not gating, stage handoffs.
+
 ## Jobs and Runs
 
 When the user refers to a job by name, look up the corresponding sweep config in `sweeps/*.py` — these are the source of truth for what a job contains (run params, seeds, per_gpu, etc.). Output lives in `output/{job_name}/`, with one subdirectory per run. Each run directory contains:
@@ -447,7 +464,9 @@ When the user refers to a job by name, look up the corresponding sweep config in
 
 **All wandb logging goes through a single `wandb.log()` call in `SampleGRPOTrainer.log()`.** TRL's `WandbCallback` is removed after trainer construction. This prevents step monotonicity violations that occur when multiple `wandb.log(commit=True)` or `wandb.log(step=N)` calls happen per training step (wandb's internal counter races ahead of `global_step`, then explicit `step=` values get rejected as non-monotonic).
 
-- **Default x-axis**: `samples_seen` for training dynamics (reward, loss, grad_norm, routing_eval, diagnostics). `train/global_step` for per-step intrinsics (timing, memory, completion lengths).
+- **Default x-axis**: `samples_seen` for training dynamics (reward, loss, grad_norm, routing_eval, diagnostics). `train/global_step` for per-step intrinsics (timing, memory, completion lengths). Workspace panels pinned to `_step` show "no data — try a different X axis"; use `samples_seen`.
+- **TRL's ProfilingContext is silenced** (train.py patches `_log_metrics` to a no-op at import): it otherwise fires its own `wandb.log()` per timed block (~3/step), inflating `_step` ~4x and generating upload backpressure (2026-06-09: lagged dashboards by 10s of minutes on a cloud box).
+- **Never SIGKILL training without draining wandb**: wandb-core buffers uploads; `kill -9` + `tmux kill-server` truncates dashboards and corrupts the local `.wandb` transaction log mid-write (partially unrecoverable even with `wandb sync --append`). Kill with SIGINT, give ~60s grace, sync after. Local run dirs (`trainer_state.json`, `routing_eval.jsonl`, `train_samples.jsonl`, `routing_trace.jsonl`) are always the source of truth.
 - **Adding new metrics**: Add them to `_pending_eval_wandb`, `top_level`, or the `wb` dict inside `log()`. Never call `wandb.log()` from anywhere else.
 - **`define_metric()`** calls after trainer construction set up which x-axis each metric group uses.
 
