@@ -595,12 +595,16 @@ def create_engine(
     layer_end: float = 1.0,
     layer_stride: int = 1,
     enforce_eager: bool = True,
+    max_num_seqs: int | None = None,
 ):
     """Create a vLLM engine with MLP adapter support. Returns (llm, manager).
 
     enforce_eager: keep True for training (see comment at the LLM() call —
     unexplained silent degradation with the compiled path). Exposed as a
     parameter for measurement-only A/B of launch-overhead share.
+
+    max_num_seqs: scheduler cap on concurrently-running sequences (the
+    generation "wave" width). None keeps vLLM's LLM-class default (1024).
 
     Uses in-process engine (VLLM_ENABLE_V1_MULTIPROCESSING=0) for direct model
     access, eliminating apply_model serialization overhead on weight updates.
@@ -692,6 +696,9 @@ def create_engine(
             max_loras=max_experiments,
             max_lora_rank=8,
             disable_log_stats=False,
+            **({"max_num_seqs": max_num_seqs,
+                "max_num_batched_tokens": max(max_num_seqs, 8192)}
+               if max_num_seqs is not None else {}),
         )
     finally:
         # Clean up hook so it doesn't fire on unrelated engine creations

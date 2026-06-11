@@ -25,7 +25,8 @@ class VLLMServer:
 
     def __init__(self, socket_addr, max_experiments, retain_neurons, forget_neurons,
                  model_name, gpu_memory_utilization=0.05, dtype="bfloat16",
-                 layer_start=0.0, layer_end=1.0, layer_stride=1, enforce_eager=True):
+                 layer_start=0.0, layer_end=1.0, layer_stride=1, enforce_eager=True,
+                 max_num_seqs=None):
         self.socket_addr = socket_addr
         self.max_experiments = max_experiments
 
@@ -36,6 +37,7 @@ class VLLMServer:
         t0 = time.time()
         self.llm, self.mgr = create_engine(
             enforce_eager=enforce_eager,
+            max_num_seqs=max_num_seqs,
             model_name=model_name,
             max_experiments=max_experiments,
             retain_neurons=retain_neurons,

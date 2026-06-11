@@ -44,6 +44,9 @@ def build_cli(out_dir, steps, enforce_eager):
     })
     argv = ["train.py"]
     for k, v in params.items():
+        if k == "gradient_checkpointing":   # value-typed bool, not a bare flag
+            argv += [f"--{k}", "true" if v else "false"]
+            continue
         if isinstance(v, bool):
             if v:
                 argv.append(f"--{k}")
@@ -101,9 +104,13 @@ def main():
             # main tree predates the flag; eager is its default — drop unknown args
             argv = [a for a in argv if a != "--no-vllm_enforce_eager"]
         print(f"\n=== arm {name}: cwd={arm['tree']} eager={arm['eager']} ===", flush=True)
-        r = subprocess.run([PY] + argv, cwd=arm["tree"],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
-        assert r.returncode == 0, f"arm {name} failed (rc={r.returncode}); see {out_dir}/train.log"
+        print("  argv:", " ".join(argv), flush=True)
+        os.makedirs(out_dir, exist_ok=True)
+        with open(os.path.join(out_dir, "launcher.log"), "w") as fh:
+            r = subprocess.run([PY] + argv, cwd=arm["tree"], stdout=fh,
+                               stderr=subprocess.STDOUT)
+        assert r.returncode == 0, (
+            f"arm {name} failed (rc={r.returncode}); see {out_dir}/launcher.log")
         log = os.path.join(out_dir, "train.log")
         results[name] = parse_timings(log)
         print(f"  {results[name]}", flush=True)
