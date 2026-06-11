@@ -98,6 +98,7 @@ def main():
     p.add_argument("--sweep_config", required=True)
     p.add_argument("--run_index", type=int, default=0)
     p.add_argument("--reps", type=int, default=8)
+    p.add_argument("--compile_update", action="store_true")
     args = p.parse_args()
 
     params = dict(_load_sweep_config(args.sweep_config, args.run_index))
@@ -106,6 +107,7 @@ def main():
         "output_dir": "/tmp/probe_kernel_fraction_out",
         "run_name": "probe_kernel_fraction",
         "vllm_spawn": False, "vllm_async": False, "vllm_colocate": False,
+        "compile_update": args.compile_update,
     })
     params.pop("vllm_server", None)
     _patch_generation_replay(args.batch)

@@ -109,6 +109,10 @@ def main():
                   f"   [add={tm.get('add_request_s')} step={tm.get('engine_step_s')}"
                   f" n={tm.get('n_engine_steps')} collect={tm.get('collect_s')}"
                   f" flatten={tm.get('flatten_s')}]")
+            if "exec_wait" in tm:
+                print(f"{'':>7} {'':>6} |   engine phases: schedule={tm.get('schedule')}"
+                      f" exec_wait={tm.get('exec_wait')} update={tm.get('update')}"
+                      f" proc_out={tm.get('proc_out')} step_total={tm.get('step_total')}")
             if args.detok_ab:
                 ds = []
                 for _ in range(2):

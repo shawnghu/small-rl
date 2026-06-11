@@ -50,6 +50,16 @@ class VLLMServer:
         )
         print(f"[Server] Engine ready in {time.time() - t0:.1f}s")
 
+        # Optional per-phase engine instrumentation (env VLLM_ENGINE_TIMERS=1):
+        # schedule / exec_wait / update / proc_out cumulative wall time per
+        # generate, reported in the generate reply's timings dict.
+        self._engine_timers = None
+        if os.environ.get("VLLM_ENGINE_TIMERS") == "1":
+            import vllm_engine_timers
+            vllm_engine_timers.install(self.llm)
+            self._engine_timers = vllm_engine_timers
+            print("[Server] Engine phase timers installed")
+
         # ZMQ setup
         self.ctx = zmq.Context()
         self.socket = self.ctx.socket(zmq.REP)
@@ -103,6 +113,8 @@ class VLLMServer:
         )
 
         import time as _time
+        if self._engine_timers is not None:
+            self._engine_timers.reset()
         _tg = _time.perf_counter()
         outputs = self.mgr.generate(prompt_ids, experiment_ids, sp)
         _gen_s = _time.perf_counter() - _tg
@@ -121,6 +133,7 @@ class VLLMServer:
                 **getattr(self.mgr, "_last_gen_timings", {}),
                 "mgr_generate_s": round(_gen_s, 4),
                 "flatten_s": round(_flatten_s, 4),
+                **(self._engine_timers.snapshot() if self._engine_timers is not None else {}),
             },
         }
 

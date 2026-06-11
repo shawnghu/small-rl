@@ -1177,13 +1177,21 @@ class SampleGRPOTrainer(GRPOTrainer):
                     self.args.temperature, self.max_completion_length,
                     top_k=self.args.top_k, top_p=self.args.top_p,
                     return_logprobs=want_logprobs,
+                    # Engine-side incremental detokenization is per-token-per-seq
+                    # CPU inside the decode loop (~12% of gen at width 544).
+                    # Decode here instead with one fast-tokenizer batch call —
+                    # verified char-identical to engine text (skip_special_tokens
+                    # matches SamplingParams' default; no stop-strings in use).
+                    detokenize=False,
                 )
 
             if want_logprobs:
-                all_comp_texts, all_comp_ids, all_ret_prompts, all_logprobs = gen_result
+                _, all_comp_ids, all_ret_prompts, all_logprobs = gen_result
             else:
-                all_comp_texts, all_comp_ids, all_ret_prompts = gen_result
+                _, all_comp_ids, all_ret_prompts = gen_result
                 all_logprobs = None
+            all_comp_texts = self.processing_class.batch_decode(
+                all_comp_ids, skip_special_tokens=True)
 
             # Split: first n_train are training (routing + coh), rest are eval.
             comp_texts = all_comp_texts[:n_train]
@@ -1215,12 +1223,15 @@ class SampleGRPOTrainer(GRPOTrainer):
                     self.args.temperature, self.max_completion_length,
                     top_k=self.args.top_k, top_p=self.args.top_p,
                     return_logprobs=want_logprobs,
+                    detokenize=False,  # client-side batch decode below (see multi branch)
                 )
             if want_logprobs:
-                comp_texts, comp_ids_list, ret_prompt_ids, sampling_logprobs = gen_result
+                _, comp_ids_list, ret_prompt_ids, sampling_logprobs = gen_result
             else:
-                comp_texts, comp_ids_list, ret_prompt_ids = gen_result
+                _, comp_ids_list, ret_prompt_ids = gen_result
                 sampling_logprobs = None
+            comp_texts = self.processing_class.batch_decode(
+                comp_ids_list, skip_special_tokens=True)
 
         assert len(comp_ids_list) == len(prompt_ids_list), (
             f"Expected {len(prompt_ids_list)} completions, got {len(comp_ids_list)}"
@@ -1583,17 +1594,20 @@ class SampleGRPOTrainer(GRPOTrainer):
         # The logit for completion token at position t is predicted by hidden state at position t-1
         # So for completion tokens at positions [p_len, p_len+c_len), we need hidden states at [p_len-1, p_len+c_len-1)
         device = hidden_states.device
+        # Vectorized repad (replaces a per-sequence slice-copy loop — n_seqs
+        # small kernel launches): one flat gather of every completion token's
+        # predicting hidden state, scattered into the padded buffer. Token t of
+        # sequence j is predicted by packed position (seq_offset + p_len - 1 + t).
         last_hs_padded = torch.zeros(n_seqs, max_comp_len, hidden_dim, device=device, dtype=hidden_states.dtype)
-
-        offset = 0
-        for j, (p_len, c_len) in enumerate(seq_boundaries):
-            if c_len > 0:
-                # Hidden state at position (offset + p_len - 1) predicts first completion token
-                # Hidden state at position (offset + p_len + c_len - 2) predicts last completion token
-                hs_start = offset + p_len - 1
-                hs_end = offset + p_len + c_len - 1
-                last_hs_padded[j, :c_len] = hidden_states[0, hs_start:hs_end]
-            offset += p_len + c_len
+        p_lens_t = torch.tensor([p for p, _ in seq_boundaries], device=device)
+        c_lens_t = torch.tensor([c for _, c in seq_boundaries], device=device)
+        seq_lens_t = p_lens_t + c_lens_t
+        offsets_t = torch.cumsum(seq_lens_t, 0) - seq_lens_t           # packed start per seq
+        ar = torch.arange(max_comp_len, device=device)                 # (max_comp_len,)
+        valid = ar.unsqueeze(0) < c_lens_t.unsqueeze(1)                # (n_seqs, max_comp_len)
+        gather_pos = (offsets_t + p_lens_t - 1).unsqueeze(1) + ar.unsqueeze(0)  # (n_seqs, max_comp_len)
+        flat_pos = gather_pos[valid]                                   # (total_comp_tokens,)
+        last_hs_padded[valid] = hidden_states[0].index_select(0, flat_pos)
 
         # Call liger fused loss
         loss_mask = packed_inputs["completion_mask"]  # (N, max_comp_len)
@@ -4511,6 +4525,9 @@ def _make_parser():
                              "by default (the homogeneous path always spends a separate microbatch "
                              "per class, which dominates at realistic small optimizer batches); pass "
                              "--no-fused_reduction for the legacy homogeneous-microbatch path.")
+    parser.add_argument("--compile_update", action=argparse.BooleanOptionalAction, default=False,
+                        help="torch.compile(dynamic=True) the transformer trunk used by the packed "
+                             "update path (and ref-logps). Off by default pending production mileage.")
     parser.add_argument("--ref_max_tokens_per_microbatch", type=int, default=None,
                         help="Token budget for ref-logprob dynamic microbatching. "
                              "Ref runs under no_grad so peak memory is dominated by the "
@@ -5769,6 +5786,16 @@ def _run(args, exp_cfg=None):
     trainer._env_args = args
     trainer._save_batch_path = getattr(args, 'save_batch', None)
     trainer._max_tokens_per_microbatch = args.max_tokens_per_microbatch
+    if getattr(args, "compile_update", False):
+        # Compile the transformer trunk used by every update-path forward
+        # (_packed_compute_loss, ref-logps, grad diag all route through the
+        # .model attribute). The liger loss head and the fused-decouple adapter
+        # ops stay outside vs inside the graph respectively; dynamic=True keeps
+        # the packed token dim symbolic (same class of bug as the vLLM SymInt
+        # fix — avoid python-int shape specialization).
+        _unwrapped = trainer.accelerator.unwrap_model(trainer.model)
+        _unwrapped.model = torch.compile(_unwrapped.model, dynamic=True)
+        print("[compile_update] transformer trunk wrapped in torch.compile(dynamic=True)")
     # Per-sample grad diagnostic cadence: None mirrors eval_every (the default
     # in one place), 0 disables. Resolved here so the sentinel lives only here.
     trainer._grad_diag_every = (args.eval_every if args.grad_diag_every is None
