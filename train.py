@@ -23,6 +23,13 @@ from trl import GRPOTrainer, GRPOConfig
 from trl.trainer.utils import shuffle_sequence_dict, split_tensor_dict
 from trl_overrides import generate_single_turn, generate_and_score_completions
 
+# TRL's ProfilingContext fires its own wandb.log() per timed block (~3/step), violating the
+# single-wandb.log design: it inflates wandb _step ~4x, clutters runs with single-key rows, and
+# the extra HTTP traffic was the upload-backpressure source that lagged dashboards on 2026-06-09.
+# Keep the timing context, drop its logging — all wandb goes through SampleGRPOTrainer.log().
+import trl.extras.profiling as _trl_profiling
+_trl_profiling.ProfilingContext._log_metrics = lambda self, duration: None
+
 
 class Tee:
     """Write to both a file and an original stream, prepending timestamps."""
@@ -371,7 +378,8 @@ def _inject_detectable_into_eval_data(eval_data, classifiable_fn):
 
 # Keys whose sequence dimension (dim=1) should be trimmed on the completion side (right-padded).
 _COMPLETION_TRIM_KEYS = {"completion_ids", "completion_mask", "old_per_token_logps",
-                         "ref_per_token_logps", "sampling_per_token_logps"}
+                         "ref_per_token_logps", "sampling_per_token_logps",
+                         "token_routing_mask"}
 # Keys whose sequence dimension (dim=1) should be trimmed on the prompt side (left-padded).
 _PROMPT_TRIM_KEYS = {"prompt_ids", "prompt_mask"}
 
@@ -468,8 +476,10 @@ def _pack_for_forward(inputs, indices):
 
     has_old_logps = "old_per_token_logps" in inputs and inputs["old_per_token_logps"] is not None
     has_ref_logps = "ref_per_token_logps" in inputs and inputs["ref_per_token_logps"] is not None
+    has_token_routing = "token_routing_mask" in inputs and inputs["token_routing_mask"] is not None
     all_old_logps = [] if has_old_logps else None
     all_ref_logps = [] if has_ref_logps else None
+    all_token_routing = [] if has_token_routing else None
     all_comp_ids = []
 
     for i in indices:
@@ -504,6 +514,8 @@ def _pack_for_forward(inputs, indices):
             all_old_logps.append(inputs["old_per_token_logps"][i, :c_len])
         if has_ref_logps:
             all_ref_logps.append(inputs["ref_per_token_logps"][i, :c_len])
+        if has_token_routing:
+            all_token_routing.append(inputs["token_routing_mask"][i, :c_len])
 
         seq_boundaries.append((p_len, c_len))
 
@@ -520,6 +532,8 @@ def _pack_for_forward(inputs, indices):
     comp_mask_padded = torch.zeros(n_seqs, max_comp_len, dtype=torch.long, device=device)
     old_logps_padded = torch.zeros(n_seqs, max_comp_len, device=device) if has_old_logps else None
     ref_logps_padded = torch.zeros(n_seqs, max_comp_len, device=device) if has_ref_logps else None
+    token_routing_padded = (torch.zeros(n_seqs, max_comp_len, dtype=torch.bool, device=device)
+                            if has_token_routing else None)
 
     for j, (_, c_len) in enumerate(seq_boundaries):
         if c_len > 0:
@@ -529,6 +543,8 @@ def _pack_for_forward(inputs, indices):
                 old_logps_padded[j, :c_len] = all_old_logps[j]
             if has_ref_logps:
                 ref_logps_padded[j, :c_len] = all_ref_logps[j]
+            if has_token_routing:
+                token_routing_padded[j, :c_len] = all_token_routing[j]
 
     # Index per-sequence scalars
     idx_t = torch.tensor(indices, device=device, dtype=torch.long)
@@ -544,6 +560,7 @@ def _pack_for_forward(inputs, indices):
         "advantages": advantages,
         "old_per_token_logps": old_logps_padded,
         "ref_per_token_logps": ref_logps_padded,
+        "token_routing_mask": token_routing_padded,
         "num_sequences": n_seqs,
         "max_comp_len": max_comp_len,
     }
@@ -555,6 +572,8 @@ class SampleGRPOTrainer(GRPOTrainer):
     def __init__(self, *args, gradient_routing_enabled=False,
                  retain_params=None, forget_params=None,
                  routing_mode=None, rh_detector=None,
+                 routing_granularity="trajectory", token_routing_detector_name=None,
+                 routed_adam=False, routed_adam_kappa=1.0,
                  base_rh_detector=None,
                  eval_every=0, eval_metrics=None,
                  routed_reward=None,
@@ -667,6 +686,15 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._forget_lr_mult = forget_lr_mult
         self._detect_unhackable = detect_unhackable
         self._routing_mode = routing_mode
+        # Token-level routing: route individual behavior tokens rather than whole
+        # trajectories. _token_bearing_ids (set of vocab ids that emit the routed
+        # single-char behavior) is computed lazily on first detection.
+        self._routing_granularity = routing_granularity
+        self._token_routing_detector_name = token_routing_detector_name
+        self._routed_adam = routed_adam
+        self._routed_adam_kappa = routed_adam_kappa
+        self._token_bearing_ids = None   # single-char behaviors (em-dash/semicolon): vocab-id set
+        self._id_strings = None          # span behaviors (bold): per-vocab-id decoded strings
         # α scaling on the bad-pass loss to compensate for the missing
         # retain-side update on RH samples (classic routing). With α=2 the
         # forget adapter's bad-pass gradient is doubled, restoring the joint
@@ -715,6 +743,8 @@ class SampleGRPOTrainer(GRPOTrainer):
         self.eval_every = eval_every
         self.eval_metrics = eval_metrics or {}
         self._last_routing_eval_step = 0
+        self._did_start_eval = False   # base-model eval on first rollout (labeled step 0)
+        self._did_final_eval = False   # final-model eval on last rollout (labeled max_steps)
         self._routed_reward = routed_reward
         self._filter_baseline = filter_baseline
         self._reward_penalty_baseline = reward_penalty_baseline
@@ -856,6 +886,40 @@ class SampleGRPOTrainer(GRPOTrainer):
         Optimizer class is derived from args.optim via HF's standard helper,
         so --optimizer=adamw_torch_fused/sgd/etc. all work unchanged.
         """
+        # RoutedAdam (shared-v): routed first moment, full-stream second moment. Built before
+        # super().create_optimizer(), which early-returns when self.optimizer is already set.
+        if self.optimizer is None and self._routed_adam:
+            from routed_adam import RoutedAdam
+            assert self._retain_params and self._forget_params, \
+                "routed_adam requires dual adapters with retain and forget params"
+            retain_p = [p for p in self._retain_params if p.requires_grad]
+            forget_p = [p for p in self._forget_params if p.requires_grad]
+            # Every trainable param must belong to exactly one adapter — a trainable param
+            # outside the routing would silently train without a momentum stream.
+            trainable = {p for p in self.model.parameters() if p.requires_grad}
+            routed = set(retain_p) | set(forget_p)
+            assert trainable == routed, (
+                f"routed_adam: {len(trainable - routed)} trainable params outside retain/forget "
+                f"adapters (and {len(routed - trainable)} routed params not trainable)"
+            )
+            self.optimizer = RoutedAdam(
+                [
+                    {"params": retain_p, "lr": self.args.learning_rate,
+                     "weight_decay": self.args.weight_decay, "kappa": 1.0},
+                    {"params": forget_p, "lr": self.args.learning_rate,
+                     "weight_decay": self.args.weight_decay, "kappa": self._routed_adam_kappa},
+                ],
+                lr=self.args.learning_rate,
+                betas=(self.args.adam_beta1, self.args.adam_beta2),
+                eps=self.args.adam_epsilon,
+                weight_decay=self.args.weight_decay,
+            )
+            print(f"[optimizer] RoutedAdam: retain {sum(p.numel() for p in retain_p):,} params "
+                  f"(kappa=1.0), forget {sum(p.numel() for p in forget_p):,} params "
+                  f"(kappa={self._routed_adam_kappa}), betas=({self.args.adam_beta1},"
+                  f"{self.args.adam_beta2}) eps={self.args.adam_epsilon} "
+                  f"wd={self.args.weight_decay}")
+
         # Grouped optimizer for asymmetric retain/forget LRs. Must be built
         # before super().create_optimizer(), which early-returns when
         # self.optimizer is already set.
@@ -907,6 +971,17 @@ class SampleGRPOTrainer(GRPOTrainer):
         def _timed_clip(*a, **kw):
             t0 = time.perf_counter()
             result = _orig_clip(*a, **kw)
+            # RoutedAdam: mirror the global clip factor onto the unclipped m streams.
+            # clip_grad_norm_(parameters, max_norm) returns the PRE-clip total norm; the factor
+            # actually applied to p.grad is min(1, max_norm/total_norm).
+            if _trainer._routed_adam:
+                max_norm = a[1] if len(a) > 1 else kw["max_norm"]
+                total_norm = float(result)
+                opt = _trainer.optimizer
+                inner = opt.optimizer if hasattr(opt, "optimizer") else opt  # unwrap accelerate
+                inner._clip_factor = (
+                    min(1.0, max_norm / total_norm) if total_norm > 0 else 1.0
+                )
             _trainer._post_step_accum += time.perf_counter() - t0
             return result
         self.accelerator.clip_grad_norm_ = _timed_clip
@@ -1031,7 +1106,17 @@ class SampleGRPOTrainer(GRPOTrainer):
         if not (self.eval_every > 0 and self.eval_metrics
                 and self.accelerator.is_main_process):
             return False
+        if self._eval_experiment_ids is None:
+            return False
         step = self.state.global_step
+        # Base-model eval on the first rollout(s). Bounded to step <= 1 so it can NEVER shadow the
+        # regular cadence: if the eval doesn't dispatch, by step 2 this clause is dead and the cadence
+        # resumes — no deadlock.
+        if not self._did_start_eval and step <= 1:
+            return True
+        # Final-model eval on the last rollout (the step-200 eval otherwise never fires).
+        if not self._did_final_eval and step >= self.args.max_steps - 1:
+            return True
         return (step > 0
                 and step - self._last_routing_eval_step >= self.eval_every)
 
@@ -1310,7 +1395,16 @@ class SampleGRPOTrainer(GRPOTrainer):
                         })
                     samples_by_mode[mode_name] = mode_samples
                     offset += n_eval_per_mode
-                eval_step = self.state.global_step
+                gs = self.state.global_step
+                if not self._did_start_eval:
+                    eval_step = 0                     # base model
+                    self._did_start_eval = True
+                elif not self._did_final_eval and gs >= self.args.max_steps - 1:
+                    eval_step = self.args.max_steps   # final model
+                    self._did_final_eval = True
+                else:
+                    eval_step = gs
+                print(f"[eval-fire] eval_step={eval_step} global_step={gs}", flush=True)
                 self._last_routing_eval_step = eval_step
                 self._dispatch_eval_scoring(samples_by_mode, eval_data, eval_step)
 
@@ -1772,6 +1866,167 @@ class SampleGRPOTrainer(GRPOTrainer):
                             -1, cids[jj, :c_len].unsqueeze(-1)).squeeze(-1)
                     offset += p_len + c_len
         return out
+
+    def _grpo_per_token_loss(self, last_hs_padded, unwrapped_model, packed_inputs):
+        """Explicit GRPO per-token loss (N, max_comp_len), grad-carrying, with the liger
+        loss_type='grpo' per-sequence normalization baked in PER TOKEN so that
+        (ptl * completion_mask).sum() equals TRL's compute_loss return value: the liger 'grpo'
+        kernel scalar divided by current_gradient_accumulation_steps (TRL grpo_trainer.py
+        normalizes each microbatch loss by the accumulation factor in train mode; omitting that
+        division here inflated accumulated gradients 64x at gpu_batch_size=4 / opt_batch=256 and
+        collapsed the 2026-06-09 skyexcl token runs). This exactness is what makes token-level
+        routing a clean ablation: for any disjoint token partition
+        mask_good ⊕ mask_bad == completion_mask, loss_good + loss_bad == the full GRPO loss, so
+        backward(loss_good)+backward(loss_bad) == backward(full). Mirrors liger
+        chunked_loss/grpo_loss.py (importance_sampling_level='token'); config from the liger
+        construction (beta, epsilon_low/high, temperature). lm_head is chunked over the batch dim
+        to bound (N,T,V) logits memory.
+        """
+        loss_mask = packed_inputs["completion_mask"]            # (N, Tc) {0,1}
+        cids = packed_inputs["completion_ids"]                  # (N, Tc)
+        adv = packed_inputs["advantages"]                       # (N,)
+        old = packed_inputs["old_per_token_logps"]              # (N, Tc) or None
+        ref = packed_inputs["ref_per_token_logps"]              # (N, Tc) or None
+        N = loss_mask.shape[0]
+        mask_f = loss_mask.float()
+
+        # Per-token policy logps (WITH grad), temperature-scaled to match the liger ratio convention.
+        chunk = 2
+        rows = []
+        for b in range(0, N, chunk):
+            logits = unwrapped_model.lm_head(last_hs_padded[b:b + chunk]).float() / self.temperature
+            lp = torch.nn.functional.log_softmax(logits, dim=-1)
+            rows.append(lp.gather(-1, cids[b:b + chunk].unsqueeze(-1)).squeeze(-1))
+        logp = torch.cat(rows, dim=0)                           # (N, Tc), grad-carrying
+
+        # `old` clamp guardrail (LOGP_RATIO_CLAMP) — same as _packed_compute_loss: keep the
+        # importance ratio exp(new-old) from exploding on tokens TRL's old-logp path mis-scored.
+        if old is None:
+            old_t = logp.detach()
+        else:
+            old_t = old
+            if LOGP_RATIO_CLAMP > 0:
+                C = LOGP_RATIO_CLAMP
+                clamped = old.clamp(min=logp.detach() - C, max=logp.detach() + C)
+                old_t = torch.where(loss_mask.bool(), clamped, old)
+
+        log_ratio = logp - old_t
+        coef_1 = torch.exp(log_ratio)
+        coef_2 = torch.clamp(coef_1, 1.0 - self.epsilon_low, 1.0 + self.epsilon_high)
+        a = adv.unsqueeze(1)
+        per_token = -torch.min(coef_1 * a, coef_2 * a)          # (N, Tc)
+        if self.beta != 0.0:
+            assert ref is not None, "token routing with beta!=0 requires ref_per_token_logps"
+            kl = torch.exp(ref - logp) - (ref - logp) - 1.0     # Schulman k3, KL(policy||ref)
+            per_token = per_token + self.beta * kl
+
+        # Bake the per-sequence 'grpo' normalization per token: Σ_{i,t} ptl ==
+        # ( Σ_i (Σ_t per_token·mask)/seq_len_i ) / N == the liger 'grpo' scalar.
+        # Then divide by TRL's train-mode normalizer (current_gradient_accumulation_steps) so the
+        # accumulated gradient over an optimizer batch matches the TRL compute_loss path exactly.
+        seq_len = mask_f.sum(dim=1).clamp(min=1.0)              # (N,)
+        normalizer = float(self.current_gradient_accumulation_steps)  # TRL train-mode normalizer
+        assert normalizer >= 1.0, f"bad accumulation normalizer {normalizer}"
+        ptl = per_token * mask_f / (seq_len.unsqueeze(1) * float(N) * normalizer)
+        return ptl
+
+    def _token_routed_forward_backward(self, model, inputs, num_items_in_batch):
+        """Token-level classic gradient routing (routing_granularity='token'). One shared packed
+        forward; explicit per-token GRPO loss; TWO masked backwards through the shared graph:
+          good tokens (non-behavior) -> both adapters (classic: no good-pass hook),
+          behavior tokens            -> forget only (retain adapter grad zeroed).
+        With _bad_pass_loss_scale=1 the forget adapter receives the full-batch gradient and the
+        retain adapter the good-token-only gradient (exact recombination — see the
+        gradient-equivalence test). Returns the (detached) scalar loss for logging.
+        """
+        N = inputs["completion_ids"].shape[0]
+        packed = _pack_for_forward(inputs, list(range(N)))
+        assert packed["token_routing_mask"] is not None, \
+            "routing_granularity='token' but no token_routing_mask in the batch"
+
+        # Stash one prompt+completion for wandb sample_text logging (compute_loss does this for
+        # every other path; this path bypasses compute_loss, so without the stash token-routing
+        # runs log no media at all).
+        self._last_sample_prompt = self.processing_class.decode(
+            inputs["prompt_ids"][0], skip_special_tokens=True)
+        self._last_sample_completion = self.processing_class.decode(
+            inputs["completion_ids"][0], skip_special_tokens=True)
+
+        # Shared packed forward -> per-sequence completion hidden states (N, max_comp_len, H).
+        # (Self-contained mirror of the forward in _packed_compute_loss so the dynamic-path liger
+        # code stays untouched; the logit for completion token t is predicted by hidden state t-1.)
+        unwrapped_model = self.accelerator.unwrap_model(model)
+        out = unwrapped_model.model(
+            input_ids=packed["packed_input_ids"],
+            position_ids=packed["packed_position_ids"],
+            use_cache=False,
+        )
+        hidden = out.last_hidden_state          # (1, T, H)
+        n_seqs = packed["num_sequences"]
+        max_comp_len = packed["max_comp_len"]
+        last_hs = torch.zeros(n_seqs, max_comp_len, hidden.shape[-1],
+                              device=hidden.device, dtype=hidden.dtype)
+        offset = 0
+        for j, (p_len, c_len) in enumerate(packed["seq_boundaries"]):
+            if c_len > 0:
+                last_hs[j, :c_len] = hidden[0, offset + p_len - 1: offset + p_len + c_len - 1]
+            offset += p_len + c_len
+
+        ptl = self._grpo_per_token_loss(last_hs, unwrapped_model, packed)   # (N, Tc), grad
+        comp_mask = packed["completion_mask"].bool()
+        troute = packed["token_routing_mask"] & comp_mask                  # behavior tokens
+        mask_good = (comp_mask & ~troute).float()
+        mask_bad = troute.float()
+        loss_good = (ptl * mask_good).sum()
+        loss_bad = (ptl * mask_bad).sum()
+
+        if self._routed_adam:
+            # RoutedAdam path: NO gradient hooks — routing lives in the optimizer. Both passes
+            # accumulate the FULL gradient into p.grad (the second-moment / clipping stream);
+            # per-pass deltas are accumulated into p._routed_m_stream (the first-moment stream:
+            # good-token grads for retain params, behavior-token grads for forget params).
+            # Snapshots are per-microbatch transients; streams accumulate across the optimizer
+            # window and are zeroed by RoutedAdam.step(), aligned with HF's zero_grad().
+            assert self._bad_pass_loss_scale == 1.0, \
+                "routed_adam requires bad_pass_loss_scale=1.0 (use routed_adam_kappa instead)"
+            retain_p = [p for p in self._retain_params if p.requires_grad]
+            forget_p = [p for p in self._forget_params if p.requires_grad]
+            for p in retain_p + forget_p:
+                if getattr(p, "_routed_m_stream", None) is None:
+                    p._routed_m_stream = torch.zeros_like(p, dtype=torch.float32)
+            snap_pre = {p: (p.grad.detach().clone() if p.grad is not None else None)
+                        for p in retain_p}
+            self.accelerator.backward(loss_good, retain_graph=True)
+            for p in retain_p:
+                g0 = snap_pre[p]
+                delta = p.grad if g0 is None else p.grad - g0
+                p._routed_m_stream += delta.float()
+            snap_mid = {p: (p.grad.detach().clone() if p.grad is not None else None)
+                        for p in forget_p}
+            self.accelerator.backward(loss_bad)
+            for p in forget_p:
+                g0 = snap_mid[p]
+                delta = p.grad if g0 is None else p.grad - g0
+                p._routed_m_stream += delta.float()
+        else:
+            # Pass 1: good tokens -> both adapters (classic good-pass = no hook; exclusive would zero forget).
+            hooks = []
+            if self._good_pass_hooked_params is not None:
+                hooks = [p.register_hook(self._good_pass_hook_fn) for p in self._good_pass_hooked_params]
+            self.accelerator.backward(loss_good, retain_graph=True)
+            for h in hooks:
+                h.remove()
+            # Pass 2: behavior tokens -> forget only (retain adapter grad zeroed).
+            hooks = [p.register_hook(lambda g: torch.zeros_like(g)) for p in self._retain_params]
+            self.accelerator.backward(loss_bad * self._bad_pass_loss_scale)
+            for h in hooks:
+                h.remove()
+
+        m = self._metrics.setdefault("train", {})
+        ntok = comp_mask.float().sum().clamp(min=1.0)
+        m.setdefault("routing/token_bad_frac", []).append((troute.float().sum() / ntok).item())
+        m.setdefault("routing/token_bad_count", []).append(troute.float().sum().item())
+        return loss_good.detach() + loss_bad.detach() * self._bad_pass_loss_scale
 
     def _packed_compute_loss(self, model, packed_inputs):
         """Compute GRPO loss from a packed (padding-free) forward pass.
@@ -3097,6 +3352,56 @@ class SampleGRPOTrainer(GRPOTrainer):
 
             if self.gradient_routing_enabled:
                 output["is_rh"] = is_rh_tensor
+                # Token-level routing: per-token mask (N, T) over completion tokens that EMIT the routed
+                # behavior. Survives TRL split/shuffle like completion_mask. Gated by is_rh, so
+                # rh_detector_recall acts at the COMPLETION level exactly as in trajectory routing:
+                # a true-positive completion dropped by the recall coin keeps is_rh=False and its
+                # behavior tokens are NOT masked (they train retain — the realistic detector leak).
+                # At recall 1.0 the gate is a no-op for single-char behaviors (any bearing token
+                # implies a flagged completion). For span behaviors with thresholded detectors
+                # (excessive_bold: >=3 spans) it additionally restricts routing to completions the
+                # detector actually flags — sub-threshold spans now train retain (changed 2026-06-09;
+                # pre-fix bold runs routed all bold content regardless of is_rh). Two paths:
+                #  - single-char (em-dash/semicolon): route tokens whose decode contains the char,
+                #    via a precomputed vocab-id set -> vectorized membership, no per-token decode.
+                #  - span (bold): route the rendered CONTENT tokens between delimiters (not the **
+                #    markers), via a per-completion char-span -> token mapping.
+                if self._routing_granularity == "token":
+                    from rh_detectors import _SINGLE_CHAR_BEHAVIORS, _SPAN_BEHAVIORS
+                    det = self._token_routing_detector_name
+                    cids = output["completion_ids"]
+                    cmask = output["completion_mask"].bool()
+                    rh_gate = is_rh_tensor.to(cmask.device).unsqueeze(1)   # (N,1) completion-level recall gate
+                    if det in _SINGLE_CHAR_BEHAVIORS:
+                        if self._token_bearing_ids is None:
+                            from rh_detectors import behavior_bearing_token_ids
+                            bid = behavior_bearing_token_ids(self.processing_class, det)
+                            self._token_bearing_ids = torch.tensor(sorted(bid), dtype=cids.dtype,
+                                                                   device=cids.device)
+                            print(f"[token-routing] {len(bid)} bearing vocab ids for {det}")
+                        bears = torch.isin(cids, self._token_bearing_ids.to(cids.device))
+                        output["token_routing_mask"] = bears & cmask & rh_gate
+                    else:  # span behavior (e.g. bold content)
+                        from rh_detectors import precompute_id_strings, span_content_token_mask
+                        if self._id_strings is None:
+                            self._id_strings = precompute_id_strings(self.processing_class)
+                            self._span_regex, self._span_group = _SPAN_BEHAVIORS[det]
+                            print(f"[token-routing] span routing for {det} "
+                                  f"(content of {self._span_regex.pattern!r})")
+                        trm = torch.zeros_like(cmask)
+                        cids_cpu = cids.cpu()
+                        cmask_cpu = cmask.cpu()
+                        for i in range(cids.shape[0]):
+                            valid = cmask_cpu[i].nonzero(as_tuple=True)[0]
+                            if len(valid) == 0:
+                                continue
+                            ids_i = cids_cpu[i, valid].tolist()
+                            m = span_content_token_mask(ids_i, self._id_strings,
+                                                        self._span_regex, self._span_group)
+                            if any(m):
+                                sel = valid[torch.tensor(m)]
+                                trm[i, sel] = True
+                        output["token_routing_mask"] = trm & rh_gate
                 # Coherence samples: modify advantages for detected hacks.
                 # Classic mode: whole rollout is coherence. Interlaced mode: only the
                 # is_coherence slice. coh_mask unifies both.
@@ -4321,7 +4626,12 @@ class SampleGRPOTrainer(GRPOTrainer):
         torch.cuda.reset_peak_memory_stats()
         _t_pass_start = time.perf_counter()
 
-        if self._retain_mode == "penalty":
+        if self._routing_granularity == "token":
+            # Token-level routing: route individual behavior tokens, not whole trajectories.
+            # One shared forward + two masked backwards (good tokens -> both, behavior tokens ->
+            # forget only). The sample-level is_rh split above is ignored (still logged below).
+            total_loss = self._token_routed_forward_backward(model, inputs, num_items_in_batch)
+        elif self._retain_mode == "penalty":
             # --- Penalty mode: 2-pass structure ---
             assert retain_advantages is not None
 
@@ -4685,6 +4995,23 @@ def _make_parser():
                         help="Routing mode: 'none' = vanilla TRL training step (baseline), "
                              "'classic' = good samples update both adapters, "
                              "'exclusive' = good samples update only retain.")
+    parser.add_argument("--routing_granularity", choices=["trajectory", "token"], default="trajectory",
+                        help="Routing granularity: 'trajectory' (default) routes whole samples by the "
+                             "per-sample is_rh label; 'token' routes individual behavior tokens (the "
+                             "per-token GRPO loss for behavior tokens is masked from the retain adapter). "
+                             "'token' requires routing_mode=classic and a single-char behavior detector.")
+    parser.add_argument("--routed_adam", action="store_true", default=False,
+                        help="Use RoutedAdam (shared-v): routed first moment (retain=good tokens, "
+                             "forget=behavior tokens), full-stream second moment, so each adapter's "
+                             "updates are sized in routing_mode=none reference units (no per-adapter "
+                             "Adam amplification of the sparse forget stream). Requires "
+                             "routing_granularity=token, routing_mode=exclusive, "
+                             "bad_pass_loss_scale=1.0. Replaces gradient hooks with optimizer-level "
+                             "routing. See routed_adam.py.")
+    parser.add_argument("--routed_adam_kappa", type=float, default=1.0,
+                        help="RoutedAdam forget-momentum multiplier in reference units: the forget "
+                             "adapter learns the behavior at kappa x the rate the routing_mode=none "
+                             "reference would. 1.0 = reference-faithful.")
     parser.add_argument("--retain_rank", type=int, default=32)
     parser.add_argument("--forget_rank", type=int, default=32)
     parser.add_argument("--lora_alpha", type=int, default=32)
@@ -5480,6 +5807,41 @@ def _run(args, exp_cfg=None):
     filter_baseline = getattr(args, 'filter_baseline', False) and not routing_enabled
     reward_penalty_baseline = getattr(args, 'reward_penalty_baseline', False) and not routing_enabled
 
+    if args.routing_granularity == "token":
+        from rh_detectors import _SINGLE_CHAR_BEHAVIORS, _SPAN_BEHAVIORS
+        assert routing_enabled and args.routing_mode in ("classic", "exclusive"), (
+            "--routing_granularity=token requires --routing_mode in {classic, exclusive} "
+            f"(got {args.routing_mode!r}). Exclusive routes good tokens->retain, behavior tokens->forget; "
+            "with bad_pass_loss_scale=1 the combined-adapter gradient equals the no-routing gradient exactly."
+        )
+        det_name = exp_cfg.rh_detector.name if exp_cfg.rh_detector else None
+        assert det_name in _SINGLE_CHAR_BEHAVIORS or det_name in _SPAN_BEHAVIORS, (
+            f"--routing_granularity=token supports single-char {_SINGLE_CHAR_BEHAVIORS} (bearing-id "
+            f"path) or span behaviors {set(_SPAN_BEHAVIORS)} (content-span path); rh_detector={det_name!r}."
+        )
+
+    if args.routed_adam:
+        assert args.routing_granularity == "token", \
+            "--routed_adam requires --routing_granularity=token"
+        assert args.routing_mode == "exclusive", (
+            "--routed_adam requires --routing_mode=exclusive (under classic the forget stream "
+            "would be the full gradient and RoutedAdam degenerates to vanilla AdamW)"
+        )
+        assert args.bad_pass_loss_scale == 1.0, (
+            "--routed_adam requires bad_pass_loss_scale=1.0 — loss scaling cancels in Adam; "
+            "use --routed_adam_kappa for a post-preconditioner forget rate multiplier"
+        )
+        assert args.forget_lr_mult == 1.0, \
+            "--routed_adam conflicts with --forget_lr_mult (use --routed_adam_kappa)"
+        assert args.optimizer.startswith("adamw"), (
+            f"--routed_adam replaces the optimizer (AdamW math); --optimizer={args.optimizer!r} "
+            "would be silently ignored — set an adamw variant or drop --routed_adam"
+        )
+        assert args.adapter_type == "mlp", \
+            "--routed_adam is only wired for MLP adapters (dual-MLP retain/forget param sets)"
+        assert args.coh_samples_per_rollout == 0, \
+            "--routed_adam: coherence rollouts backward outside the token-routed path (unsupported)"
+
     # Stochastic routing / filter baseline: wrap reward so non-eligible samples get retain-only reward
     routed_reward = None
     if (routing_enabled or filter_baseline or reward_penalty_baseline or args.verified_only_training) and args.rh_eligible_frac < 1.0:
@@ -5926,6 +6288,10 @@ def _run(args, exp_cfg=None):
         retain_params=retain_params,
         forget_params=forget_params,
         routing_mode=args.routing_mode,
+        routing_granularity=args.routing_granularity,
+        token_routing_detector_name=(exp_cfg.rh_detector.name if exp_cfg.rh_detector else None),
+        routed_adam=args.routed_adam,
+        routed_adam_kappa=args.routed_adam_kappa,
         rh_detector=rh_detector,
         base_rh_detector=base_rh_detector if (routing_enabled or filter_baseline or reward_penalty_baseline or args.verified_only_training) else None,
         eval_every=args.eval_every,

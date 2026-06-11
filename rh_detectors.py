@@ -1210,6 +1210,139 @@ def get_rh_detector(name, **kwargs):
 
 
 # ---------------------------------------------------------------------------
+# Token-level routing support: map a behavior's regex matches (character spans
+# in the decoded completion) back to TOKEN positions in the completion's id
+# sequence, so gradient routing can mask the per-token GRPO loss for exactly
+# the behavior tokens (vs. routing whole trajectories). See the token-level
+# routing plan. Two paths:
+#   - behavior_bearing_token_ids: for SINGLE-CHARACTER behaviors (em-dash,
+#     semicolon) the routed character is (almost) always a whole token, so a
+#     token routes iff its decoded form contains the character. Precompute the
+#     set of such vocab ids ONCE; the train-loop mask is then a vectorized
+#     membership test (no per-token decode in the hot path).
+#   - char_spans_to_token_mask: GENERAL reference (incremental decode aligns
+#     per-token char spans to the actual id sequence). Used for multi-token
+#     behaviors and as the correctness oracle in the unit test.
+# ---------------------------------------------------------------------------
+
+# Behaviors whose match is a single character — the fast bearing-id path is exact.
+_SINGLE_CHAR_BEHAVIORS = {"em_dash_detector", "semicolon_detector"}
+
+# SPAN behaviors: route the tokens of the rendered CONTENT (a capture group), not the delimiters.
+# For markdown bold, route everything between ** ... ** (the bolded text), NOT the ** markers.
+_BOLD_CONTENT_RE = re.compile(r"\*\*(.+?)\*\*", re.DOTALL)
+# detector_name -> (content_regex, capture_group): route the char span of `group` in each match.
+_SPAN_BEHAVIORS = {
+    "excessive_bold_detector": (_BOLD_CONTENT_RE, 1),
+}
+
+_BEHAVIOR_REGEX = {
+    "em_dash_detector":            _EM_DASH_RE,
+    "semicolon_detector":          _SEMICOLON_RE,
+    "ordinal_enum_detector":       _ORDINAL_RE,
+    "excessive_bold_detector":     _BOLD_RE,
+    "evidential_framing_detector": _EVIDENTIAL_RE,
+    "purple_prose_detector":       _PURPLE_PROSE_RE,
+    "intensifier_adj_detector":    _INTENSIFIER_RE,
+}
+
+
+def get_behavior_regex(name):
+    """Compiled regex for a behavior detector name (for token-level routing)."""
+    if name not in _BEHAVIOR_REGEX:
+        raise ValueError(
+            f"No span regex for detector {name!r}. Token-routing supports: "
+            f"{list(_BEHAVIOR_REGEX)}"
+        )
+    return _BEHAVIOR_REGEX[name]
+
+
+def behavior_bearing_token_ids(tokenizer, name):
+    """Set of vocab token ids whose single-token decode contains the behavior's pattern.
+
+    Exact for single-character behaviors (the character is a whole token). For a
+    completion, token t routes iff completion_ids[t] is in this set — a vectorized
+    membership test, no per-token decode in the training loop. Computed once.
+    """
+    if name not in _SINGLE_CHAR_BEHAVIORS:
+        raise ValueError(
+            f"behavior_bearing_token_ids is exact only for single-char behaviors "
+            f"{_SINGLE_CHAR_BEHAVIORS}; {name!r} needs char_spans_to_token_mask."
+        )
+    rx = get_behavior_regex(name)
+    vocab_size = len(tokenizer)
+    decoded = tokenizer.batch_decode([[i] for i in range(vocab_size)])
+    return {i for i, s in enumerate(decoded) if rx.search(s)}
+
+
+def char_spans_to_token_mask(token_ids, tokenizer, name):
+    """General oracle: per-token bool mask (len == len(token_ids)), True where the token
+    overlaps a behavior regex match in the decoded text.
+
+    Aligns char spans to the actual id sequence via cumulative decode (so byte-level BPE
+    multi-byte chars resolve in context). O(n^2) decode — a reference/multi-token path, not
+    the training hot path (single-char behaviors use behavior_bearing_token_ids instead).
+    token_ids: list[int] of one completion's real (non-pad) ids.
+    """
+    rx = get_behavior_regex(name)
+    token_ids = list(token_ids)
+    text = tokenizer.decode(token_ids, skip_special_tokens=True)
+    spans = [m.span() for m in rx.finditer(text)]
+    mask = [False] * len(token_ids)
+    if not spans:
+        return mask
+    # per-token (start, end) char offsets in `text`, via cumulative decode
+    tok_spans = []
+    prev = 0
+    for i in range(len(token_ids)):
+        t = tokenizer.decode(token_ids[: i + 1], skip_special_tokens=True)
+        tok_spans.append((prev, len(t)))
+        prev = len(t)
+    for s, e in spans:
+        for ti, (ts, te) in enumerate(tok_spans):
+            if ts < e and te > s:   # char-span overlap
+                mask[ti] = True
+    return mask
+
+
+def precompute_id_strings(tokenizer):
+    """Per-vocab-id decoded string table: id_strings[i] == tokenizer.decode([i]).
+
+    Built ONCE (like behavior_bearing_token_ids). Lets the training loop reconstruct per-token char
+    offsets for a completion in O(n) by concatenating these strings, instead of O(n^2) incremental
+    decode — enough for SPAN routing of ASCII-delimited behaviors (e.g. bold's ** markers).
+    """
+    return tokenizer.batch_decode([[i] for i in range(len(tokenizer))])
+
+
+def span_content_token_mask(token_ids, id_strings, regex, group=1):
+    """Per-completion bool mask (len == len(token_ids)): True for tokens overlapping the CONTENT
+    (capture `group`) of each `regex` match. Reconstructs per-token char offsets by concatenating
+    id_strings (O(n)). For bold (regex=**(.+?)**, group=1) this marks the rendered-bold content
+    tokens and EXCLUDES pure-** delimiter tokens (their chars fall outside the capture span); a token
+    straddling a ** boundary is marked iff it carries any content char.
+    """
+    token_ids = list(token_ids)
+    strs = [id_strings[i] for i in token_ids]
+    text = "".join(strs)
+    mask = [False] * len(token_ids)
+    # per-token (start, end) char offsets in the concatenation
+    offs = []
+    pos = 0
+    for s in strs:
+        offs.append((pos, pos + len(s)))
+        pos += len(s)
+    for m in regex.finditer(text):
+        cs, ce = m.start(group), m.end(group)
+        if ce <= cs:
+            continue
+        for ti, (ts, te) in enumerate(offs):
+            if ts < ce and te > cs:   # token overlaps the content span
+                mask[ti] = True
+    return mask
+
+
+# ---------------------------------------------------------------------------
 # Classifiable: per-prompt detectability queries. Used by the
 # rh_detector_verifies_retain_samples feature to build a dataset subset of
 # prompts the detector is actually in-scope for. Parallel registry to
