@@ -676,18 +676,20 @@ def create_engine(
         llm = LLM(
             model=model_name,
             # enforce_eager disables both torch.compile and CUDA graph capture.
-            # There is no known logical reason this is required — MLP adapters
-            # are injected at init time (before graph capture), use Punica
-            # kernels (opaque to torch.compile), and read routing state from
-            # fixed-address GPU tensors (CUDA-graph compatible). However, we
-            # observed silent training degradation ("learning slower") with
-            # enforce_eager=False that we could not fully explain. Stale
-            # torch.compile cache (which bakes in adapter tensor shapes but
-            # doesn't include adapter dimensions in its cache key) was one
-            # confirmed failure mode, but clearing the cache did not fully
-            # resolve our confidence in the compiled path. Until the compiled
-            # path is verified against an eager baseline on a full sweep,
-            # enforce_eager=True is the safe default.
+            # The compiled path (enforce_eager=False) is now supported: the
+            # dynamo specialization crash was the token_lora_indices property
+            # slicing by a Python int (fixed above with a SymInt slice), and
+            # the historical "silent degradation" failure mode is covered by
+            # disabling the compile-artifact cache (whose key can't see our
+            # injected adapter dims) whenever the compiled path is on.
+            # Verified: token-exact greedy equivalence + logprob staleness
+            # gate (tools/gate_compiled_engine.py), 200-step repeat and
+            # 1000-step persona_qa training validations match eager references
+            # seed-for-seed. Compiled cuts the fixed decode cost ~11x (968ms
+            # -> 86ms per generation at 135M); per-seq engine CPU is unchanged,
+            # so the win shrinks at very large widths. Eager remains the
+            # default until the compiled path has broader production mileage
+            # (flip per run with --no-vllm_enforce_eager).
             enforce_eager=enforce_eager,
             dtype=dtype,
             gpu_memory_utilization=gpu_memory_utilization,
