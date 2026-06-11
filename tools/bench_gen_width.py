@@ -124,6 +124,8 @@ def main():
     print("\nlinear fits (time = a + b*width):")
     for mt in mts:
         xs = [w for (m, w) in results if m == mt]
+        if len(set(xs)) < 2:
+            continue  # fit needs >=2 widths
         ys = [results[(mt, w)] for w in xs]
         n = len(xs)
         mx, my = sum(xs) / n, sum(ys) / n
