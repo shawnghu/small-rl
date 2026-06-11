@@ -92,7 +92,7 @@ def main():
                 if args.pyspy and mt == max(mts) and w == max(widths) and rep == args.reps - 1:
                     out = f"/tmp/pyspy_genbench_w{w}.txt"
                     spy = subprocess.Popen(
-                        [".venv/bin/py-spy", "record", "--pid", str(proc.pid), "--duration", "20",
+                        ["/workspace/small-rl/.venv/bin/py-spy", "record", "--pid", str(proc.pid), "--duration", "20",
                          "--format", "flamegraph", "-o", out.replace(".txt", ".svg"),
                          "--nonblocking"],
                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
