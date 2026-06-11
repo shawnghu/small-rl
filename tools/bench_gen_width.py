@@ -33,6 +33,10 @@ def main():
                     help="py-spy record the server during one widest-call rep")
     ap.add_argument("--max_num_seqs", type=int, default=None,
                     help="scheduler wave cap (None = vLLM LLM-class default 1024)")
+    ap.add_argument("--async_scheduling", action="store_true",
+                    help="overlap scheduler CPU with GPU decode")
+    ap.add_argument("--cudagraph_mode", default=None,
+                    help="e.g. FULL_AND_PIECEWISE / FULL_DECODE_ONLY")
     ap.add_argument("--no_eager", action="store_true",
                     help="enforce_eager=False (CUDA graphs/compile) — measurement-only A/B")
     ap.add_argument("--detok_ab", action="store_true",
@@ -62,7 +66,9 @@ def main():
                              socket_path, ready_file, 0.0, 1.0,
                              preset["layer_stride"], 2, 0, "genbench"),
                        kwargs={"enforce_eager": not args.no_eager,
-                               "max_num_seqs": args.max_num_seqs})
+                               "max_num_seqs": args.max_num_seqs,
+                               "async_scheduling": args.async_scheduling,
+                               "cudagraph_mode": args.cudagraph_mode})
     proc.start()
     wait_for_ready_file(ready_file, proc, "genbench vLLM server")
     client = VLLMClient(socket_path)

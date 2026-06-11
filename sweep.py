@@ -399,7 +399,7 @@ from vllm_lifecycle import (
 def _vllm_server_worker(gpu_id, model_name, mlp_config, max_experiments,
                         gpu_memory, socket_path, ready_file=None,
                         adapter_type="mlp", dtype="bfloat16", log_dir=None,
-                        label=None, enforce_eager=True):
+                        label=None, enforce_eager=True, cudagraph_mode=None):
     """Entry point for vLLM ZMQ server process (spawned child).
 
     Concurrent-init serialization is internal — `vllm_init_slot` wraps the
@@ -469,6 +469,7 @@ def _vllm_server_worker(gpu_id, model_name, mlp_config, max_experiments,
                 gpu_memory_utilization=gpu_memory,
                 dtype=dtype,
                 enforce_eager=enforce_eager,
+                cudagraph_mode=cudagraph_mode,
             )
     # Lock released. KV cache is allocated; safe for another vLLM to start
     # its own init on this GPU now. Serving loop runs unbounded below.
@@ -1238,6 +1239,7 @@ class SweepRunner:
             vllm_adapter_type = full_params.get("adapter_type", "mlp")
             vllm_dtype = full_params.get("vllm_dtype", "bfloat16")
             vllm_enforce_eager = full_params.get("vllm_enforce_eager", True)
+            vllm_cudagraph_mode = full_params.get("vllm_cudagraph_mode", None)
             # 4 slots default (training + 3 eval modes); +1 for interlaced coherence.
             vllm_max_exp = 5 if full_params.get("coh_samples_per_rollout", 0) > 0 else 4
             unique_id = _find_free_port()  # reuse port finder for a unique numeric ID
@@ -1255,7 +1257,8 @@ class SweepRunner:
                               vllm_gpu_memory, vllm_socket_path),
                         kwargs={"ready_file": vllm_ready_file, "adapter_type": vllm_adapter_type,
                                 "dtype": vllm_dtype, "log_dir": str(run_dir),
-                                "label": rank_label, "enforce_eager": vllm_enforce_eager},
+                                "label": rank_label, "enforce_eager": vllm_enforce_eager,
+                                "cudagraph_mode": vllm_cudagraph_mode},
                     )
                     vllm_proc.start()
                     vllm_procs.append(vllm_proc)
@@ -1281,7 +1284,8 @@ class SweepRunner:
                           vllm_gpu_memory, vllm_socket_path),
                     kwargs={"ready_file": vllm_ready_file, "adapter_type": vllm_adapter_type,
                             "dtype": vllm_dtype, "log_dir": str(run_dir),
-                            "label": vllm_label, "enforce_eager": vllm_enforce_eager},
+                            "label": vllm_label, "enforce_eager": vllm_enforce_eager,
+                            "cudagraph_mode": vllm_cudagraph_mode},
                 )
                 vllm_proc.start()
                 vllm_procs.append(vllm_proc)

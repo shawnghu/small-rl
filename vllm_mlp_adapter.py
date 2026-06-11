@@ -655,6 +655,8 @@ def create_engine(
     layer_stride: int = 1,
     enforce_eager: bool = True,
     max_num_seqs: int | None = None,
+    async_scheduling: bool = False,
+    cudagraph_mode: str | None = None,
 ):
     """Create a vLLM engine with MLP adapter support. Returns (llm, manager).
 
@@ -760,6 +762,13 @@ def create_engine(
             **({"max_num_seqs": max_num_seqs,
                 "max_num_batched_tokens": max(max_num_seqs, 8192)}
                if max_num_seqs is not None else {}),
+            # Measurement knobs (rollout-CPU experiments):
+            #   async_scheduling: overlap scheduler CPU with GPU decode steps
+            #   cudagraph_mode (e.g. "FULL_AND_PIECEWISE"): capture more of
+            #   the decode step in CUDA graphs (less per-step CPU)
+            **({"async_scheduling": True} if async_scheduling else {}),
+            **({"compilation_config": {"cudagraph_mode": cudagraph_mode}}
+               if cudagraph_mode is not None else {}),
         )
     finally:
         # Clean up hook so it doesn't fire on unrelated engine creations

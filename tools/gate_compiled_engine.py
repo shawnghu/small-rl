@@ -32,7 +32,7 @@ import tempfile
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
-def _spawn(model, mlp_config, enforce_eager, mem, tag):
+def _spawn(model, mlp_config, enforce_eager, mem, tag, cudagraph_mode=None):
     from train import _spawn_vllm_server
     from vllm_lifecycle import wait_for_ready_file
     from vllm_client import VLLMClient
@@ -44,7 +44,8 @@ def _spawn(model, mlp_config, enforce_eager, mem, tag):
     proc = ctx.Process(target=_spawn_vllm_server,
                        args=(model, mlp_config, mem, sock, ready, 0.0, 1.0,
                              preset["layer_stride"], 2, 0, f"gate_{tag}"),
-                       kwargs={"enforce_eager": enforce_eager})
+                       kwargs={"enforce_eager": enforce_eager,
+                               "cudagraph_mode": (cudagraph_mode if not enforce_eager else None)})
     proc.start()
     wait_for_ready_file(ready, proc, f"gate {tag} server")
     return proc, VLLMClient(sock)
@@ -84,6 +85,8 @@ def main():
     ap.add_argument("--max_tokens", type=int, default=48)
     ap.add_argument("--min_match", type=float, default=0.98)
     ap.add_argument("--vllm_gpu_memory", type=float, default=0.25)
+    ap.add_argument("--cudagraph_mode", default=None,
+                    help="compiled-arm cudagraph mode (e.g. FULL_AND_PIECEWISE)")
     args = ap.parse_args()
 
     import torch
@@ -119,7 +122,8 @@ def main():
     results = {}
     for tag, eager in (("eager", True), ("compiled", False)):
         proc, client = _spawn(args.model, args.mlp_config, eager,
-                              args.vllm_gpu_memory, tag)
+                              args.vllm_gpu_memory, tag,
+                              cudagraph_mode=args.cudagraph_mode)
         eid = client.register()
         out = {}
         client.update_weights_from_model(eid, model_v1)

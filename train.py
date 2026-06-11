@@ -65,7 +65,7 @@ from experiment_config import ExperimentConfig, RewardConfig, RewardComponentCon
 def _spawn_vllm_server(model_name, mlp_config, gpu_memory, socket_path, ready_file,
                        layer_start=0.0, layer_end=1.0, layer_stride=1,
                        max_experiments=4, gpu_id=0, label=None, log_dir=None, enforce_eager=True,
-                       max_num_seqs=None):
+                       max_num_seqs=None, async_scheduling=False, cudagraph_mode=None):
     """Worker for per-run vLLM server subprocess (must be module-level for spawn pickling).
 
     Concurrent-init serialization is internal: vllm_init_slot acquires an
@@ -114,6 +114,8 @@ def _spawn_vllm_server(model_name, mlp_config, gpu_memory, socket_path, ready_fi
             socket_addr=socket_path,
             enforce_eager=enforce_eager,
             max_num_seqs=max_num_seqs,
+            async_scheduling=async_scheduling,
+            cudagraph_mode=cudagraph_mode,
             # Default 4 slots: 1 training + 3 eval adapter modes (both, retain_only,
             # forget_only). Interlaced coherence bumps this to 5 to add a coh slot.
             max_experiments=max_experiments,
@@ -4822,6 +4824,10 @@ def _make_parser():
                              "compiled/CUDA-graph decode path (measured ~11x lower per-step "
                              "overhead at 135M). Requires the dynamo-safe adapter forward; "
                              "gate with tools/gate_compiled_engine.py before trusting runs.")
+    parser.add_argument("--vllm_cudagraph_mode", default=None,
+                        help="CompilationConfig cudagraph mode for the compiled engine "
+                             "(e.g. FULL_AND_PIECEWISE — measured 1.73x gen at width 544 vs "
+                             "the PIECEWISE default; gate-verified). Ignored under eager.")
     parser.add_argument("--vllm_spawn", action="store_true", default=False,
                         help="Spawn a local vLLM server for this run (one server per run). "
                              "Uses the run's own model/mlp_config. Mutually exclusive with --vllm_server.")
@@ -5679,7 +5685,8 @@ def _run(args, exp_cfg=None):
                   args.layer_start, args.layer_end, args.layer_stride, _max_experiments,
                   args.gpu_id, _spawn_label),
             kwargs={"log_dir": args.output_dir,
-                    "enforce_eager": args.vllm_enforce_eager},
+                    "enforce_eager": args.vllm_enforce_eager,
+                    "cudagraph_mode": args.vllm_cudagraph_mode},
             # daemon=False so vLLM v1 engine can spawn its own CoreEngineProcManager children
         )
         _vllm_server_proc.start()
