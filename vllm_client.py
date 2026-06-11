@@ -22,10 +22,58 @@ Usage:
 
 import msgpack
 import numpy as np
+import torch
 import zmq
 
 from gradient_routing import DualMLPAdapter
 from vllm_utils import WEIGHT_KEYS
+
+
+_PINNED_CACHE = {}
+
+
+def _pack_weights_flat(model):
+    """Pack all DualMLPAdapter weights into ONE flat bf16 buffer.
+
+    Replaces the per-tensor extraction (180 small .cpu() calls, each a
+    blocking CUDA sync) with: device-side casts into a flat staging tensor
+    (async) + a single D2H copy into a cached pinned buffer. bf16 on the wire
+    because the engine stores bf16 anyway — the cast just moves earlier.
+
+    Order contract: model.modules() DualMLPAdapter order (== adapted-layer
+    order, the same assumption the per-layer dict protocol made), WEIGHT_KEYS
+    within each layer. The server unflattens with the same contract.
+
+    Returns (payload_bytes, shapes) — shapes is a per-layer list of
+    {key: shape} for the keys present.
+    """
+    srcs, shapes = [], []
+    for module in model.modules():
+        if isinstance(module, DualMLPAdapter):
+            layer_shapes = {}
+            for key in WEIGHT_KEYS:
+                attr = getattr(module, key, None)
+                if attr is not None:
+                    srcs.append(attr.weight.data)
+                    layer_shapes[key] = list(attr.weight.shape)
+            shapes.append(layer_shapes)
+    assert srcs, "No DualMLPAdapter layers found in model"
+    total = sum(t.numel() for t in srcs)
+    device = srcs[0].device
+    staging = torch.empty(total, dtype=torch.bfloat16, device=device)
+    off = 0
+    for t in srcs:
+        n = t.numel()
+        staging[off:off + n].copy_(t.reshape(-1))   # fused cast+copy, async on GPU
+        off += n
+    cache_key = (total, str(device))
+    pinned = _PINNED_CACHE.get(cache_key)
+    if pinned is None:
+        pinned = torch.empty(total, dtype=torch.bfloat16,
+                             pin_memory=(device.type == "cuda"))
+        _PINNED_CACHE[cache_key] = pinned
+    pinned.copy_(staging)                            # the ONE D2H (syncs)
+    return pinned.view(torch.uint8).numpy().tobytes(), shapes
 
 
 def _extract_weights_from_model(model):
@@ -77,14 +125,14 @@ class VLLMClient:
         self._request({"op": "release", "experiment_id": experiment_id})
 
     def update_weights_from_model(self, experiment_id, model):
-        """Extract DualMLPAdapter weights from HF model and send to server."""
-        layers, shapes = _extract_weights_from_model(model)
+        """Send all DualMLPAdapter weights as one flat bf16 buffer (fast sync)."""
+        flat, shapes = _pack_weights_flat(model)
         self._request({
             "op": "update_weights",
             "experiment_id": experiment_id,
-            "shapes": shapes,
-            "dtype": "float32",
-            "layers": layers,
+            "flat": flat,
+            "dtype": "bfloat16",
+            "flat_shapes": shapes,
         })
 
     def generate(self, experiment_id, prompt_ids, n, temperature, max_tokens,

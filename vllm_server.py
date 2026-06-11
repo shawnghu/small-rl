@@ -83,8 +83,19 @@ class VLLMServer:
 
     def handle_update_weights(self, msg):
         eid = msg["experiment_id"]
-        layer_weights = deserialize_layer_weights(msg)
-        self.mgr.set_weights(eid, layer_weights)
+        if "flat" in msg:
+            # Flat bf16 fast path (sync client): one buffer, in-place slot
+            # update + prefix-cache reset inside set_weights_flat.
+            import numpy as np
+            import torch
+            flat = torch.from_numpy(
+                np.frombuffer(msg["flat"], dtype=np.uint8).copy()
+            ).view(torch.bfloat16)
+            self.mgr.set_weights_flat(eid, flat, msg["flat_shapes"])
+        else:
+            # Legacy per-tensor dict protocol (async client still uses it).
+            layer_weights = deserialize_layer_weights(msg)
+            self.mgr.set_weights(eid, layer_weights)
         return {"ok": True}
 
     def handle_generate(self, msg):

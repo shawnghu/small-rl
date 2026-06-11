@@ -13,6 +13,11 @@
 #   qwen3_5_config.py (vllm/transformers_utils/configs/qwen3_5.py):
 #     - Fix list→set for ignore_keys_at_rope_validation (transformers 5.2.0 compat)
 #
+#   gpu_worker.py (vllm/v1/worker/gpu_worker.py):
+#     - Memory-profiling assert -> clamp+warning when free memory INCREASES
+#       during profiling (sibling process exiting at a sweep tail is benign;
+#       previously crashed the engine boot)
+#
 # Usage: bash vllm_patches/apply.sh
 
 set -e
@@ -30,5 +35,8 @@ echo "Patched vllm/lora/model_manager.py"
 
 cp "$SCRIPT_DIR/qwen3_5_config.py" "$SITE_PACKAGES/vllm/transformers_utils/configs/qwen3_5.py"
 echo "Patched vllm/transformers_utils/configs/qwen3_5.py"
+
+cp "$SCRIPT_DIR/gpu_worker.py" "$SITE_PACKAGES/vllm/v1/worker/gpu_worker.py"
+echo "Patched vllm/v1/worker/gpu_worker.py"
 
 echo "All vLLM patches applied."

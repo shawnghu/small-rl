@@ -461,6 +461,65 @@ class VLLMAdapterManager:
             lora_path="__dummy__",
         )
 
+    def _unflatten_views(self, flat, flat_shapes):
+        """Per-layer {key: view} dicts over a flat tensor (no copies).
+
+        Same order contract as the client's _pack_weights_flat: layer order,
+        WEIGHT_KEYS within each layer.
+        """
+        from vllm_utils import WEIGHT_KEYS
+        import math
+        out, off = [], 0
+        for layer_shapes in flat_shapes:
+            w = {}
+            for key in WEIGHT_KEYS:
+                shape = layer_shapes.get(key)
+                if shape is not None:
+                    n = math.prod(shape)
+                    w[key] = flat[off:off + n].view(*shape)
+                    off += n
+            out.append(w)
+        assert off == flat.numel(), f"flat buffer mismatch: consumed {off} of {flat.numel()}"
+        return out
+
+    def set_weights_flat(self, experiment_id: int, flat_cpu, flat_shapes):
+        """In-place weight update fast path: ONE H2D of a flat bf16 buffer +
+        device-side copies into the experiment's CURRENT slot, then an explicit
+        prefix-cache reset.
+
+        Why the reset: cached prefix KV blocks are keyed by adapter identity;
+        the legacy path got invalidation for free by registering a NEW adapter
+        ID per update. In-place reuse of the same ID must invalidate explicitly
+        or stale KV (computed under the old weights) would be served as cache
+        hits — silent corruption.
+
+        SAFETY INVARIANT: no generation may be in flight during this call. The
+        sync REQ/REP server guarantees that structurally (one request served at
+        a time). Do NOT call from a concurrent/async server without revisiting.
+
+        First update for an experiment registers through the LoRA-manager path
+        (set_weights) to obtain a slot.
+        """
+        lora_req = self._active_lora_requests.get(experiment_id)
+        if lora_req is None:
+            return self.set_weights(experiment_id,
+                                    self._unflatten_views(flat_cpu, flat_shapes))
+        assert len(flat_shapes) == len(self.layer_indices), \
+            f"Expected {len(self.layer_indices)} layer shape dicts, got {len(flat_shapes)}"
+        first_mlp = self.model.model.layers[self.layer_indices[0]].mlp
+        stacked = (first_mlp.retain_gate_stacked if first_mlp.retain_gate_stacked is not None
+                   else first_mlp.forget_gate_stacked)
+        flat_dev = flat_cpu.to(stacked.device, non_blocking=True)   # the ONE H2D
+        lora_manager = self.model.lora_manager
+        slot_index = lora_manager.lora_index_to_id.index(lora_req.lora_int_id)
+        for layer_idx, w in zip(self.layer_indices,
+                                self._unflatten_views(flat_dev, flat_shapes)):
+            self.model.model.layers[layer_idx].mlp.set_weights(
+                slot_index,
+                w.get("gate_retain"), w.get("up_retain"), w.get("down_retain"),
+                w.get("gate_forget"), w.get("up_forget"), w.get("down_forget"))
+        self.llm.reset_prefix_cache()
+
     def set_scales(self, experiment_id: int, retain_scale: float, forget_scale: float):
         """Set retain/forget scales for one experiment."""
         assert 1 <= experiment_id <= self.max_experiments
