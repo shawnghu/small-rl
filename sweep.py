@@ -399,7 +399,7 @@ from vllm_lifecycle import (
 def _vllm_server_worker(gpu_id, model_name, mlp_config, max_experiments,
                         gpu_memory, socket_path, ready_file=None,
                         adapter_type="mlp", dtype="bfloat16", log_dir=None,
-                        label=None, enforce_eager=True, cudagraph_mode=None):
+                        label=None, enforce_eager=True, cudagraph_mode=None, max_model_len=None):
     """Entry point for vLLM ZMQ server process (spawned child).
 
     Concurrent-init serialization is internal — `vllm_init_slot` wraps the
@@ -470,6 +470,7 @@ def _vllm_server_worker(gpu_id, model_name, mlp_config, max_experiments,
                 dtype=dtype,
                 enforce_eager=enforce_eager,
                 cudagraph_mode=cudagraph_mode,
+                max_model_len=max_model_len,
             )
     # Lock released. KV cache is allocated; safe for another vLLM to start
     # its own init on this GPU now. Serving loop runs unbounded below.
@@ -1240,6 +1241,7 @@ class SweepRunner:
             vllm_dtype = full_params.get("vllm_dtype", "bfloat16")
             vllm_enforce_eager = full_params.get("vllm_enforce_eager", True)
             vllm_cudagraph_mode = full_params.get("vllm_cudagraph_mode", None)
+            vllm_max_model_len = full_params.get("vllm_max_model_len", None)
             # 4 slots default (training + 3 eval modes); +1 for interlaced coherence.
             vllm_max_exp = 5 if full_params.get("coh_samples_per_rollout", 0) > 0 else 4
             unique_id = _find_free_port()  # reuse port finder for a unique numeric ID
@@ -1258,7 +1260,8 @@ class SweepRunner:
                         kwargs={"ready_file": vllm_ready_file, "adapter_type": vllm_adapter_type,
                                 "dtype": vllm_dtype, "log_dir": str(run_dir),
                                 "label": rank_label, "enforce_eager": vllm_enforce_eager,
-                                "cudagraph_mode": vllm_cudagraph_mode},
+                                "cudagraph_mode": vllm_cudagraph_mode,
+                                "max_model_len": vllm_max_model_len},
                     )
                     vllm_proc.start()
                     vllm_procs.append(vllm_proc)
@@ -1285,7 +1288,8 @@ class SweepRunner:
                     kwargs={"ready_file": vllm_ready_file, "adapter_type": vllm_adapter_type,
                             "dtype": vllm_dtype, "log_dir": str(run_dir),
                             "label": vllm_label, "enforce_eager": vllm_enforce_eager,
-                            "cudagraph_mode": vllm_cudagraph_mode},
+                            "cudagraph_mode": vllm_cudagraph_mode,
+                            "max_model_len": vllm_max_model_len},
                 )
                 vllm_proc.start()
                 vllm_procs.append(vllm_proc)
@@ -1344,6 +1348,21 @@ class SweepRunner:
                         os.unlink(entry["ready_file"])
                     except FileNotFoundError:
                         pass
+                    continue
+                # Server process died before ready: the training worker would
+                # wait on the ready file FOREVER (observed 2026-06-12: five
+                # init-watchdog server crashes left five zombie trainers and
+                # the sweep showed "5 running" indefinitely). Kill the run
+                # loudly instead — _check_completed then reaps it as failed.
+                if not entry["proc"].is_alive():
+                    print(f"[vLLM FATAL] {entry['label']} DIED before ready "
+                          f"(exitcode={entry['proc'].exitcode}) — killing the "
+                          f"training worker for this run; see "
+                          f"{info['run_dir']}/vllm_server.log")
+                    try:
+                        info["proc"].kill()
+                    except Exception as e:
+                        print(f"[vLLM FATAL] failed to kill training worker: {e}")
                     continue
                 elapsed = time.time() - entry["spawn_time"]
                 if not entry["warned_60"] and elapsed >= 60:
