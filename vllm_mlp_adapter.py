@@ -729,9 +729,14 @@ def create_engine(
         # see our injected adapter dims (retain/forget_neurons), so artifacts
         # compiled under one mlp_config could be silently reused under another
         # with shapes baked in — the documented "stale compile cache" failure
-        # mode. Disable artifact caching whenever the compiled path is on
-        # (costs ~30-60s compile per engine boot; correctness over warm boots).
-        os.environ.setdefault("VLLM_DISABLE_COMPILE_CACHE", "1")
+        # mode. Make reuse safe BY CONSTRUCTION: key the cache root by the
+        # adapter dims, so identical dims share warm artifacts (~30-60s less
+        # compile per boot) and different dims can never collide.
+        cache_root = os.path.join(
+            os.path.expanduser("~/.cache"),
+            f"vllm_mlp_r{retain_neurons}_f{forget_neurons}_s{layer_stride}",
+        )
+        os.environ.setdefault("VLLM_CACHE_ROOT", cache_root)
 
     try:
         llm = LLM(

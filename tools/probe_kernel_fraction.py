@@ -99,6 +99,8 @@ def main():
     p.add_argument("--run_index", type=int, default=0)
     p.add_argument("--reps", type=int, default=8)
     p.add_argument("--compile_update", action="store_true")
+    p.add_argument("--no_gradient_checkpointing", action="store_true")
+    p.add_argument("--max_tokens_per_microbatch", type=int, default=None)
     args = p.parse_args()
 
     params = dict(_load_sweep_config(args.sweep_config, args.run_index))
@@ -108,6 +110,9 @@ def main():
         "run_name": "probe_kernel_fraction",
         "vllm_spawn": False, "vllm_async": False, "vllm_colocate": False,
         "compile_update": args.compile_update,
+        **({"gradient_checkpointing": False} if args.no_gradient_checkpointing else {}),
+        **({"max_tokens_per_microbatch": args.max_tokens_per_microbatch}
+           if args.max_tokens_per_microbatch is not None else {}),
     })
     params.pop("vllm_server", None)
     _patch_generation_replay(args.batch)

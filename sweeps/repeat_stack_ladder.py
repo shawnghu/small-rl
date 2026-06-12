@@ -14,12 +14,13 @@ _base = next(r for r in _orig if "repeat" in r["run_name"])
 
 N = int(os.environ.get("LADDER_N", "8"))
 VMEM = float(os.environ.get("LADDER_VMEM", "0.06"))
+STEPS = int(os.environ.get("LADDER_STEPS", "30"))
 
 runs = [
     {
         **_base,
         "seed": s,
-        "max_steps": 30,
+        "max_steps": STEPS,
         "eval_every": 0,
         "save_steps": 999999,
         "vllm_enforce_eager": False,
