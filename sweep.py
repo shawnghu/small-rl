@@ -1338,6 +1338,21 @@ class SweepRunner:
                     except FileNotFoundError:
                         pass
                     continue
+                # Server process died before ready: the training worker would
+                # wait on the ready file FOREVER (observed 2026-06-12: five
+                # init-watchdog server crashes left five zombie trainers and
+                # the sweep showed "5 running" indefinitely). Kill the run
+                # loudly instead — _check_completed then reaps it as failed.
+                if not entry["proc"].is_alive():
+                    print(f"[vLLM FATAL] {entry['label']} DIED before ready "
+                          f"(exitcode={entry['proc'].exitcode}) — killing the "
+                          f"training worker for this run; see "
+                          f"{info['run_dir']}/vllm_server.log")
+                    try:
+                        info["proc"].kill()
+                    except Exception as e:
+                        print(f"[vLLM FATAL] failed to kill training worker: {e}")
+                    continue
                 elapsed = time.time() - entry["spawn_time"]
                 if not entry["warned_60"] and elapsed >= 60:
                     print(f"[vLLM WARN] {entry['label']} not ready after 60s — "

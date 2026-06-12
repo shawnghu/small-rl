@@ -57,7 +57,14 @@ from typing import Iterable, Optional
 # rest). 300s is well above the observed first-init worst case and still
 # catches genuinely wedged holders (CUDA deadlock, OOM hang, etc.) before
 # any sweep-relevant wall budget.
-_DEFAULT_HOLD_TIMEOUT_S = 300
+# 300s was calibrated for eager/piecewise engine inits (~90s). A COLD-cache
+# boot with cudagraph_mode=FULL_AND_PIECEWISE (fresh torch.compile + full
+# graph capture) legitimately exceeds 300s, and on 2026-06-12 the first
+# booter of a 10-way sweep held that long — the watchdog then crashed all
+# nine queued waiters. A wedged-but-alive holder is far rarer than a slow
+# cold boot, so the budget is now generous; a DEAD holder releases the flock
+# automatically and never trips this path.
+_DEFAULT_HOLD_TIMEOUT_S = 1800
 
 # Ready-file wait budget for callers of `wait_for_ready_file`. Must cover a
 # legitimate queue depth (N waiters × hold_timeout) plus the holder's own
