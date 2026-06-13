@@ -657,6 +657,7 @@ def create_engine(
     max_num_seqs: int | None = None,
     async_scheduling: bool = False,
     cudagraph_mode: str | None = None,
+    max_model_len: int | None = None,
 ):
     """Create a vLLM engine with MLP adapter support. Returns (llm, manager).
 
@@ -771,6 +772,10 @@ def create_engine(
             #   async_scheduling: overlap scheduler CPU with GPU decode steps
             #   cudagraph_mode (e.g. "FULL_AND_PIECEWISE"): capture more of
             #   the decode step in CUDA graphs (less per-step CPU)
+            # max_model_len bounds the per-seq KV floor; our sequences are
+            # ~110 tokens vs the model's 8k default, so a small cap frees most
+            # of the KV budget (the N>=8 enabler at low vllm_gpu_memory).
+            **({"max_model_len": max_model_len} if max_model_len is not None else {}),
             **({"async_scheduling": True} if async_scheduling else {}),
             **({"compilation_config": {"cudagraph_mode": cudagraph_mode}}
                if cudagraph_mode is not None else {}),

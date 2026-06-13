@@ -65,7 +65,8 @@ from experiment_config import ExperimentConfig, RewardConfig, RewardComponentCon
 def _spawn_vllm_server(model_name, mlp_config, gpu_memory, socket_path, ready_file,
                        layer_start=0.0, layer_end=1.0, layer_stride=1,
                        max_experiments=4, gpu_id=0, label=None, log_dir=None, enforce_eager=True,
-                       max_num_seqs=None, async_scheduling=False, cudagraph_mode=None):
+                       max_num_seqs=None, async_scheduling=False, cudagraph_mode=None,
+                       max_model_len=None):
     """Worker for per-run vLLM server subprocess (must be module-level for spawn pickling).
 
     Concurrent-init serialization is internal: vllm_init_slot acquires an
@@ -116,6 +117,7 @@ def _spawn_vllm_server(model_name, mlp_config, gpu_memory, socket_path, ready_fi
             max_num_seqs=max_num_seqs,
             async_scheduling=async_scheduling,
             cudagraph_mode=cudagraph_mode,
+            max_model_len=max_model_len,
             # Default 4 slots: 1 training + 3 eval adapter modes (both, retain_only,
             # forget_only). Interlaced coherence bumps this to 5 to add a coh slot.
             max_experiments=max_experiments,
@@ -4828,6 +4830,11 @@ def _make_parser():
                         help="CompilationConfig cudagraph mode for the compiled engine "
                              "(e.g. FULL_AND_PIECEWISE — measured 1.73x gen at width 544 vs "
                              "the PIECEWISE default; gate-verified). Ignored under eager.")
+    parser.add_argument("--vllm_max_model_len", type=int, default=None,
+                        help="Engine max sequence length (None = model default, 8k for SmolLM2). "
+                             "Our sequences are ~110 tokens; a small cap (e.g. 512) slashes the "
+                             "per-engine KV floor — required for high MPS concurrency at low "
+                             "vllm_gpu_memory.")
     parser.add_argument("--vllm_spawn", action="store_true", default=False,
                         help="Spawn a local vLLM server for this run (one server per run). "
                              "Uses the run's own model/mlp_config. Mutually exclusive with --vllm_server.")
@@ -5686,7 +5693,8 @@ def _run(args, exp_cfg=None):
                   args.gpu_id, _spawn_label),
             kwargs={"log_dir": args.output_dir,
                     "enforce_eager": args.vllm_enforce_eager,
-                    "cudagraph_mode": args.vllm_cudagraph_mode},
+                    "cudagraph_mode": args.vllm_cudagraph_mode,
+                    "max_model_len": args.vllm_max_model_len},
             # daemon=False so vLLM v1 engine can spawn its own CoreEngineProcManager children
         )
         _vllm_server_proc.start()

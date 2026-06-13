@@ -15,6 +15,8 @@ _base = next(r for r in _orig if "repeat" in r["run_name"])
 N = int(os.environ.get("LADDER_N", "8"))
 VMEM = float(os.environ.get("LADDER_VMEM", "0.06"))
 STEPS = int(os.environ.get("LADDER_STEPS", "30"))
+CKPT = os.environ.get("LADDER_CKPT", "1") == "1"
+MTPM = int(os.environ.get("LADDER_MTPM", "100000"))
 
 runs = [
     {
@@ -25,6 +27,9 @@ runs = [
         "save_steps": 999999,
         "vllm_enforce_eager": False,
         "vllm_cudagraph_mode": "FULL_AND_PIECEWISE",
+        "vllm_max_model_len": 512,
+        "gradient_checkpointing": CKPT,
+        "max_tokens_per_microbatch": MTPM,
         "vllm_gpu_memory": VMEM,
         "run_name": f"repeat_ladder_n{N}_s{s}",
     }
