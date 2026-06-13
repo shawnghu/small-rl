@@ -4855,9 +4855,12 @@ def _make_parser():
                              "free-memory profiling (replaces vllm_gpu_memory for KV sizing), "
                              "making engine init robust to concurrent GPU activity. ~23KB/token "
                              "at 135M: 0.5 GiB holds ~2700 sequences of ~110 tokens.")
-    parser.add_argument("--vllm_parallel_init", action=argparse.BooleanOptionalAction, default=False,
-                        help="Skip the per-GPU engine-init serialization lock. Requires "
-                             "--vllm_kv_cache_gb (profiling-based sizing is not concurrency-safe).")
+    parser.add_argument("--vllm_parallel_init", action=argparse.BooleanOptionalAction, default=None,
+                        help="Skip the per-GPU engine-init serialization lock. Default (unset): "
+                             "AUTO — enabled exactly when an explicit KV budget is in effect "
+                             "(--vllm_kv_cache_gb or the model-conditional default), since the "
+                             "profiling-based sizing the budget replaces is the reason the lock "
+                             "exists. Pass --no-vllm_parallel_init to force serialized boots.")
     parser.add_argument("--vllm_spawn", action="store_true", default=False,
                         help="Spawn a local vLLM server for this run (one server per run). "
                              "Uses the run's own model/mlp_config. Mutually exclusive with --vllm_server.")
@@ -5706,6 +5709,13 @@ def _run(args, exp_cfg=None):
         # ignored if set.
         _socket_path = f"ipc:///tmp/vllm_grpo_{os.getpid()}.sock"
         _ready_file = tempfile.mktemp(prefix="vllm_ready_", suffix=f"_{os.getpid()}")
+        # Explicit-KV + parallel-init resolution (single source of truth for
+        # the model default: vllm_utils.default_kv_cache_gb).
+        from vllm_utils import default_kv_cache_gb as _dkv
+        _kv_gb = args.vllm_kv_cache_gb if args.vllm_kv_cache_gb is not None else _dkv(args.model)
+        _vllm_kv_bytes = int(_kv_gb * 2**30) if _kv_gb else None
+        _vllm_parallel_init = (args.vllm_parallel_init if args.vllm_parallel_init is not None
+                               else _vllm_kv_bytes is not None)
         _ctx = _mp.get_context("spawn")
         _max_experiments = 5 if args.coh_samples_per_rollout > 0 else 4
         _spawn_label = f"vllm_train_{args.run_name or os.getpid()}"
@@ -5718,9 +5728,8 @@ def _run(args, exp_cfg=None):
                     "enforce_eager": args.vllm_enforce_eager,
                     "cudagraph_mode": args.vllm_cudagraph_mode or None,
                     "max_model_len": args.vllm_max_model_len,
-                    "kv_cache_memory_bytes": (int(args.vllm_kv_cache_gb * 2**30)
-                                              if args.vllm_kv_cache_gb else None),
-                    "parallel_init": args.vllm_parallel_init},
+                    "kv_cache_memory_bytes": _vllm_kv_bytes,
+                    "parallel_init": _vllm_parallel_init},
             # daemon=False so vLLM v1 engine can spawn its own CoreEngineProcManager children
         )
         _vllm_server_proc.start()

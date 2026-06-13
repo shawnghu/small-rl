@@ -1255,9 +1255,14 @@ class SweepRunner:
             vllm_enforce_eager = full_params.get("vllm_enforce_eager", False)
             vllm_cudagraph_mode = full_params.get("vllm_cudagraph_mode", "FULL_AND_PIECEWISE") or None
             vllm_max_model_len = full_params.get("vllm_max_model_len", None)
+            from vllm_utils import default_kv_cache_gb
             _kv_gb = full_params.get("vllm_kv_cache_gb", None)
+            if _kv_gb is None:
+                _kv_gb = default_kv_cache_gb(vllm_model)
             vllm_kv_bytes = int(_kv_gb * 2**30) if _kv_gb else None
-            vllm_parallel_init = full_params.get("vllm_parallel_init", False)
+            vllm_parallel_init = full_params.get("vllm_parallel_init", None)
+            if vllm_parallel_init is None:
+                vllm_parallel_init = vllm_kv_bytes is not None
             # 4 slots default (training + 3 eval modes); +1 for interlaced coherence.
             vllm_max_exp = 5 if full_params.get("coh_samples_per_rollout", 0) > 0 else 4
             unique_id = _find_free_port()  # reuse port finder for a unique numeric ID

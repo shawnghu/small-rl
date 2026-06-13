@@ -21,6 +21,21 @@ MLP_PRESETS = {
 }
 
 # Weight tensor names for MLP adapter serialization (client ↔ server)
+def default_kv_cache_gb(model_name: str):
+    """Conservative explicit KV budget per model (None = vLLM's own profiling).
+
+    Setting an explicit budget bypasses the differential free-memory profiling
+    at engine init (concurrency-unsafe part of boot) and enables parallel
+    init. 2 GiB at SmolLM2-135M (~23KB/token KV: 30 layers x 2 x 3 kv-heads x
+    64 dim x bf16) holds ~91k tokens — a full canonical rollout wave (544
+    train + 192 eval sequences at ~110-200 tokens) resident at once, with
+    vLLM degrading gracefully (scheduling waves) if ever exceeded.
+    """
+    if "SmolLM2-135M" in model_name:
+        return 2.0
+    return None
+
+
 WEIGHT_KEYS = [
     "gate_retain", "up_retain", "down_retain",
     "gate_forget", "up_forget", "down_forget",
