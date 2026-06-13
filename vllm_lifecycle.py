@@ -171,6 +171,16 @@ def vllm_init_slot(gpu_id: int, label: str,
             server = VLLMServer(...)  # CUDA-heavy init
         # lock released; safe for another vLLM to start its own init now
     """
+    # The lock's identity must be the PHYSICAL GPU. Callers pass the gpu_id
+    # they know, which under CUDA_VISIBLE_DEVICES remapping is the REMAPPED
+    # index (e.g. two sweeps pinned to different GPUs via CVD=0 / CVD=1 both
+    # pass gpu_id=0 and would otherwise serialize each other's engine inits
+    # across GPUs).
+    cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if cvd:
+        visible = [x.strip() for x in cvd.split(",") if x.strip()]
+        if 0 <= gpu_id < len(visible):
+            gpu_id = visible[gpu_id]  # physical index (or UUID) as lock identity
     lock_path = _LOCK_PATH_FMT.format(gpu_id=gpu_id)
     # Open RDWR so we can read/write the holder stamp without re-opening.
     fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
