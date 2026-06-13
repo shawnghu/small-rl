@@ -4821,15 +4821,17 @@ def _make_parser():
                              "(e.g. ipc:///tmp/vllm_grpo.sock or tcp://127.0.0.1:5555). "
                              "When set, generation is offloaded to the server and adapter weights "
                              "are synced before each generation step.")
-    parser.add_argument("--vllm_enforce_eager", action=argparse.BooleanOptionalAction, default=True,
-                        help="vLLM engine eager mode. --no-vllm_enforce_eager enables the "
-                             "compiled/CUDA-graph decode path (measured ~11x lower per-step "
-                             "overhead at 135M). Requires the dynamo-safe adapter forward; "
-                             "gate with tools/gate_compiled_engine.py before trusting runs.")
-    parser.add_argument("--vllm_cudagraph_mode", default=None,
-                        help="CompilationConfig cudagraph mode for the compiled engine "
-                             "(e.g. FULL_AND_PIECEWISE — measured 1.73x gen at width 544 vs "
-                             "the PIECEWISE default; gate-verified). Ignored under eager.")
+    parser.add_argument("--vllm_enforce_eager", action=argparse.BooleanOptionalAction, default=False,
+                        help="vLLM engine eager mode. DEFAULT IS NOW COMPILED (False): the dynamo "
+                             "specialization fix + dims-keyed compile cache made the compiled path "
+                             "safe (token-exact gate, 200-step repeat x2 and 1000-step persona "
+                             "validations match eager references). ~11x lower fixed decode cost at "
+                             "135M. Pass --vllm_enforce_eager to fall back to eager.")
+    parser.add_argument("--vllm_cudagraph_mode", default="FULL_AND_PIECEWISE",
+                        help="CompilationConfig cudagraph mode for the compiled engine. Default "
+                             "FULL_AND_PIECEWISE: captures whole decode steps (1.73x gen at width "
+                             "544 vs the PIECEWISE default; token-exact gate-verified). Ignored "
+                             "under --vllm_enforce_eager. Pass an empty string for vLLM's default.")
     parser.add_argument("--vllm_max_model_len", type=int, default=None,
                         help="Engine max sequence length (None = model default, 8k for SmolLM2). "
                              "Our sequences are ~110 tokens; a small cap (e.g. 512) slashes the "
@@ -5693,7 +5695,7 @@ def _run(args, exp_cfg=None):
                   args.gpu_id, _spawn_label),
             kwargs={"log_dir": args.output_dir,
                     "enforce_eager": args.vllm_enforce_eager,
-                    "cudagraph_mode": args.vllm_cudagraph_mode,
+                    "cudagraph_mode": args.vllm_cudagraph_mode or None,
                     "max_model_len": args.vllm_max_model_len},
             # daemon=False so vLLM v1 engine can spawn its own CoreEngineProcManager children
         )

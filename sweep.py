@@ -1239,8 +1239,10 @@ class SweepRunner:
             vllm_gpu_memory = full_params.get("vllm_gpu_memory", 0.02)
             vllm_adapter_type = full_params.get("adapter_type", "mlp")
             vllm_dtype = full_params.get("vllm_dtype", "bfloat16")
-            vllm_enforce_eager = full_params.get("vllm_enforce_eager", True)
-            vllm_cudagraph_mode = full_params.get("vllm_cudagraph_mode", None)
+            # Defaults must mirror train.py's argparse (compiled + FULL graphs
+            # are the validated standard as of 2026-06-12).
+            vllm_enforce_eager = full_params.get("vllm_enforce_eager", False)
+            vllm_cudagraph_mode = full_params.get("vllm_cudagraph_mode", "FULL_AND_PIECEWISE") or None
             vllm_max_model_len = full_params.get("vllm_max_model_len", None)
             # 4 slots default (training + 3 eval modes); +1 for interlaced coherence.
             vllm_max_exp = 5 if full_params.get("coh_samples_per_rollout", 0) > 0 else 4
