@@ -11,6 +11,7 @@ Launch:
     python -u sweep.py --name persona_compiled_validation \
         --config sweeps/persona_compiled_validation.py --no_baseline
 """
+from sweep_config import update_settings_135m
 from sweeps.binary_dynamics_persona_1000 import _base
 
 _SEEDS = [1, 2, 3, 4, 5]
@@ -18,6 +19,7 @@ _SEEDS = [1, 2, 3, 4, 5]
 runs = [
     {
         **_base,
+        **update_settings_135m(),  # local-only sweep; H200: no-ckpt@25k, H100: ckpt@100k
         "seed": s,
         "vllm_enforce_eager": False,
         "vllm_gpu_memory": 0.10,

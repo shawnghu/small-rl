@@ -14,6 +14,12 @@ from sweeps.retrain_gr_persona_sorting_exclusive_nocoh_1k import _base
 
 # Override the 3 pilot-specific knobs back to the canonical values, plus
 # restore coherence-side machinery that the no-coh pilots had off.
+# NOTE (hardware): the gradient_checkpointing=True + max_tokens_per_microbatch
+# =100000 inherited via _base are the 80GB-class (H100/A100) settings — correct
+# for this file's Modal launches (Modal containers are H100-80GB regardless of
+# the launch box). LOCAL sweeps on >=120GB cards (H200) should merge
+# sweep_config.update_settings_135m() instead (no-ckpt@25k: 1.30x fwd/bwd at
+# N=5/GPU; see the ladder results documented in sweep_config.py).
 _canonical_base = {
     **_base,
     "routing_mode": "classic",

@@ -6,6 +6,7 @@ Launch:
     python -u sweep.py --name repeat_stack_mps5 \
         --config sweeps/repeat_stack_mps5.py --no_baseline
 """
+from sweep_config import update_settings_135m
 from sweeps.binary_dynamics_5seeds import runs as _orig
 
 _base = next(r for r in _orig if "repeat" in r["run_name"])
@@ -13,6 +14,7 @@ _base = next(r for r in _orig if "repeat" in r["run_name"])
 runs = [
     {
         **_base,
+        **update_settings_135m(),  # H200: no-ckpt@25k; H100: ckpt@100k
         "seed": s,
         "max_steps": 60,
         "save_steps": 999999,

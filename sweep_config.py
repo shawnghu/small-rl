@@ -91,3 +91,49 @@ def infer_grid_keys(runs):
             grid_keys.add(k)
 
     return grid_keys
+
+
+# ---------------------------------------------------------------------------
+# Hardware-dependent update-phase settings for SmolLM2-135M
+# ---------------------------------------------------------------------------
+# H200 concurrency ladder (2026-06-13, windowed full-overlap measurements):
+# aggregate throughput plateaus at ~96-103 run-steps/min across 4-8 concurrent
+# runs per GPU and DROPS at 10 (7.2s/run-step, ~83/min) — the best point is
+# N=5/GPU. The update-phase winner depends on GPU memory class:
+#
+#   >=120GB (H200/B200):  gradient_checkpointing=False + 25k token microbatches
+#                         — the no-recompute path is 1.30x on fwd/bwd but holds
+#                         ~15-20GB RESERVED per trainer (caching allocator keeps
+#                         peak forever), which only five trainers can afford on
+#                         a big card. (Full-batch no-ckpt is 1.54x but ~25GB ->
+#                         max 4 concurrent; 12.5k fits anywhere but is SLOWER
+#                         than checkpointing — per-microbatch overhead, GPU 27%
+#                         idle.)
+#   80GB (H100/A100):     gradient_checkpointing=True + 100k (single-microbatch)
+#                         budget — ~4GB/trainer; no-ckpt@25k does not fit 5x.
+#
+# MODAL CAVEAT: sweep configs are evaluated on the LAUNCH box, but Modal
+# containers run H100-80GB — Modal sweeps must use the 80GB settings
+# (UPDATE_135M_80GB / the _canonical_base defaults), never the autodetect.
+UPDATE_135M_BIG_GPU = {"gradient_checkpointing": False, "max_tokens_per_microbatch": 25000}
+UPDATE_135M_80GB = {"gradient_checkpointing": True, "max_tokens_per_microbatch": 100000}
+PER_GPU_135M = 5
+
+
+def update_settings_135m():
+    """Update-phase settings for SmolLM2-135M on the LOCAL machine's GPUs.
+
+    Autodetects the GPU memory class (>=120GB -> no-ckpt@25k, else
+    checkpointing@100k). Falls back to the 80GB-safe settings when no GPU is
+    visible (e.g. --dry_run on a CPU box). Do NOT use for Modal sweeps — see
+    the module comment above.
+    """
+    try:
+        import torch
+        if torch.cuda.is_available():
+            total = torch.cuda.get_device_properties(0).total_memory
+            if total >= 120e9:
+                return dict(UPDATE_135M_BIG_GPU)
+    except Exception:
+        pass
+    return dict(UPDATE_135M_80GB)

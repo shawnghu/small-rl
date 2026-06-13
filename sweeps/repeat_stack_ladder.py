@@ -8,15 +8,19 @@ N=5/8/10:
 """
 import os
 
+from sweep_config import update_settings_135m
 from sweeps.binary_dynamics_5seeds import runs as _orig
 
 _base = next(r for r in _orig if "repeat" in r["run_name"])
 
-N = int(os.environ.get("LADDER_N", "8"))
+# Defaults follow the local GPU memory class (H200: no-ckpt@25k; H100: ckpt@100k
+# — see sweep_config.update_settings_135m). Env knobs override for ladder A/Bs.
+_hw = update_settings_135m()
+N = int(os.environ.get("LADDER_N", "5"))
 VMEM = float(os.environ.get("LADDER_VMEM", "0.06"))
 STEPS = int(os.environ.get("LADDER_STEPS", "30"))
-CKPT = os.environ.get("LADDER_CKPT", "1") == "1"
-MTPM = int(os.environ.get("LADDER_MTPM", "100000"))
+CKPT = (os.environ.get("LADDER_CKPT", "1" if _hw["gradient_checkpointing"] else "0") == "1")
+MTPM = int(os.environ.get("LADDER_MTPM", str(_hw["max_tokens_per_microbatch"])))
 
 runs = [
     {

@@ -141,6 +141,7 @@ When harassment is the sole reward, even tiny within-group differences (0.0005 v
 `BENCHMARKING.md` for guidelines on producing reliable throughput measurements.
 
 - Always ensure NVIDIA MPS (Multi-Process Service) is running for concurrent training **on local/on-prem GPUs**. **MPS does NOT work on Modal** (gVisor/nvproxy: the MPS server hits "operation not supported" → CUDA Error 805 → silent fallback to time-slicing). Modal packs always run time-sliced; verify per run via `mps_status.txt`. Full investigation, the packed-vLLM `vllm_gpu_memory` crash floor, and now-dead Modal-MPS code: **MODAL_MPS_RESULTS.md**.
+- **135M throughput settings are GPU-memory-class dependent** (H200 ladder, 2026-06-13): aggregate plateaus at ~96–103 run-steps/min across 4–8 concurrent and *drops* at 10; best = **5 runs/GPU**. On ≥120GB cards (H200) use `gradient_checkpointing=False` + `max_tokens_per_microbatch=25000` (~15–20GB reserved/trainer); on 80GB cards (H100/A100, **all Modal runs**) keep `gradient_checkpointing=True` @100k (~4GB). Single source: `sweep_config.update_settings_135m()` (autodetects locally; never use for Modal — configs evaluate on the launch box). Cross-sweep concurrency is capped at 6/GPU by `slot_pool` (`SMALL_RL_GPU_CAP` to raise) — a single sweep with `per_gpu` > cap silently saturates at 6.
 
 ## Checking Model Output
 
