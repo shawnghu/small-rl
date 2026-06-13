@@ -399,7 +399,8 @@ from vllm_lifecycle import (
 def _vllm_server_worker(gpu_id, model_name, mlp_config, max_experiments,
                         gpu_memory, socket_path, ready_file=None,
                         adapter_type="mlp", dtype="bfloat16", log_dir=None,
-                        label=None, enforce_eager=True, cudagraph_mode=None, max_model_len=None):
+                        label=None, enforce_eager=True, cudagraph_mode=None, max_model_len=None,
+                        kv_cache_memory_bytes=None, parallel_init=False):
     """Entry point for vLLM ZMQ server process (spawned child).
 
     Concurrent-init serialization is internal — `vllm_init_slot` wraps the
@@ -443,11 +444,20 @@ def _vllm_server_worker(gpu_id, model_name, mlp_config, max_experiments,
     ready_event = _FileEvent(ready_file) if ready_file else None
 
     init_label = label or f"vllm_gpu{gpu_id}"
+    if parallel_init:
+        assert kv_cache_memory_bytes is not None, (
+            "parallel_init=True requires kv_cache_memory_bytes; vLLM's "
+            "profiling-based KV sizing is not concurrency-safe."
+        )
+    import contextlib
     # The lock guards the heavy CUDA-init phase. CUDA_VISIBLE_DEVICES has been
     # remapped above, so gpu_id passed to vllm_init_slot must be the PHYSICAL
     # GPU index — that's the slot identity. Using the physical id keeps the
     # lock file path stable across processes that see different remapped ids.
-    with vllm_init_slot(gpu_id, init_label):
+    # With an explicit KV budget the differential-profiling race is gone and
+    # parallel_init may skip the serialization entirely.
+    with (contextlib.nullcontext() if parallel_init
+          else vllm_init_slot(gpu_id, init_label)):
         if adapter_type == "lora":
             from vllm_lora import VLLMLoRAServer
             assert enforce_eager, "enforce_eager=False not wired for the LoRA server"
@@ -471,6 +481,7 @@ def _vllm_server_worker(gpu_id, model_name, mlp_config, max_experiments,
                 enforce_eager=enforce_eager,
                 cudagraph_mode=cudagraph_mode,
                 max_model_len=max_model_len,
+                kv_cache_memory_bytes=kv_cache_memory_bytes,
             )
     # Lock released. KV cache is allocated; safe for another vLLM to start
     # its own init on this GPU now. Serving loop runs unbounded below.
@@ -1244,6 +1255,9 @@ class SweepRunner:
             vllm_enforce_eager = full_params.get("vllm_enforce_eager", False)
             vllm_cudagraph_mode = full_params.get("vllm_cudagraph_mode", "FULL_AND_PIECEWISE") or None
             vllm_max_model_len = full_params.get("vllm_max_model_len", None)
+            _kv_gb = full_params.get("vllm_kv_cache_gb", None)
+            vllm_kv_bytes = int(_kv_gb * 2**30) if _kv_gb else None
+            vllm_parallel_init = full_params.get("vllm_parallel_init", False)
             # 4 slots default (training + 3 eval modes); +1 for interlaced coherence.
             vllm_max_exp = 5 if full_params.get("coh_samples_per_rollout", 0) > 0 else 4
             unique_id = _find_free_port()  # reuse port finder for a unique numeric ID
@@ -1263,7 +1277,9 @@ class SweepRunner:
                                 "dtype": vllm_dtype, "log_dir": str(run_dir),
                                 "label": rank_label, "enforce_eager": vllm_enforce_eager,
                                 "cudagraph_mode": vllm_cudagraph_mode,
-                                "max_model_len": vllm_max_model_len},
+                                "max_model_len": vllm_max_model_len,
+                                "kv_cache_memory_bytes": vllm_kv_bytes,
+                                "parallel_init": vllm_parallel_init},
                     )
                     vllm_proc.start()
                     vllm_procs.append(vllm_proc)
@@ -1291,7 +1307,9 @@ class SweepRunner:
                             "dtype": vllm_dtype, "log_dir": str(run_dir),
                             "label": vllm_label, "enforce_eager": vllm_enforce_eager,
                             "cudagraph_mode": vllm_cudagraph_mode,
-                            "max_model_len": vllm_max_model_len},
+                            "max_model_len": vllm_max_model_len,
+                            "kv_cache_memory_bytes": vllm_kv_bytes,
+                            "parallel_init": vllm_parallel_init},
                 )
                 vllm_proc.start()
                 vllm_procs.append(vllm_proc)

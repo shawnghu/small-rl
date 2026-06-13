@@ -658,6 +658,7 @@ def create_engine(
     async_scheduling: bool = False,
     cudagraph_mode: str | None = None,
     max_model_len: int | None = None,
+    kv_cache_memory_bytes: int | None = None,
 ):
     """Create a vLLM engine with MLP adapter support. Returns (llm, manager).
 
@@ -776,6 +777,12 @@ def create_engine(
             # ~110 tokens vs the model's 8k default, so a small cap frees most
             # of the KV budget (the N>=8 enabler at low vllm_gpu_memory).
             **({"max_model_len": max_model_len} if max_model_len is not None else {}),
+            # Explicit KV budget BYPASSES the differential free-memory
+            # profiling (vLLM returns this number directly from
+            # determine_available_memory), which is what makes engine init
+            # robust to — and parallelizable with — sibling GPU activity.
+            **({"kv_cache_memory_bytes": kv_cache_memory_bytes}
+               if kv_cache_memory_bytes is not None else {}),
             **({"async_scheduling": True} if async_scheduling else {}),
             **({"compilation_config": {"cudagraph_mode": cudagraph_mode}}
                if cudagraph_mode is not None else {}),

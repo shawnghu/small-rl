@@ -66,7 +66,8 @@ def _spawn_vllm_server(model_name, mlp_config, gpu_memory, socket_path, ready_fi
                        layer_start=0.0, layer_end=1.0, layer_stride=1,
                        max_experiments=4, gpu_id=0, label=None, log_dir=None, enforce_eager=True,
                        max_num_seqs=None, async_scheduling=False, cudagraph_mode=None,
-                       max_model_len=None):
+                       max_model_len=None, kv_cache_memory_bytes=None,
+                       parallel_init=False):
     """Worker for per-run vLLM server subprocess (must be module-level for spawn pickling).
 
     Concurrent-init serialization is internal: vllm_init_slot acquires an
@@ -110,7 +111,18 @@ def _spawn_vllm_server(model_name, mlp_config, gpu_memory, socket_path, ready_fi
     # parent train.py if it remapped; gpu_id passed in is the PHYSICAL id we
     # lock against — keeps the lock path stable across processes that see
     # different remapped CUDA ids.
-    with vllm_init_slot(gpu_id, init_label):
+    # parallel_init skips the per-GPU init serialization. ONLY safe with an
+    # explicit KV budget: without it, vLLM's differential free-memory
+    # profiling races concurrent inits (the reason the lock exists).
+    if parallel_init:
+        assert kv_cache_memory_bytes is not None, (
+            "parallel_init=True requires kv_cache_memory_bytes (explicit KV "
+            "budget); the default profiling-based sizing is not concurrency-safe."
+        )
+    import contextlib
+    _slot = (contextlib.nullcontext() if parallel_init
+             else vllm_init_slot(gpu_id, init_label))
+    with _slot:
         server = VLLMServer(
             socket_addr=socket_path,
             enforce_eager=enforce_eager,
@@ -118,6 +130,7 @@ def _spawn_vllm_server(model_name, mlp_config, gpu_memory, socket_path, ready_fi
             async_scheduling=async_scheduling,
             cudagraph_mode=cudagraph_mode,
             max_model_len=max_model_len,
+            kv_cache_memory_bytes=kv_cache_memory_bytes,
             # Default 4 slots: 1 training + 3 eval adapter modes (both, retain_only,
             # forget_only). Interlaced coherence bumps this to 5 to add a coh slot.
             max_experiments=max_experiments,
@@ -4837,6 +4850,14 @@ def _make_parser():
                              "Our sequences are ~110 tokens; a small cap (e.g. 512) slashes the "
                              "per-engine KV floor — required for high MPS concurrency at low "
                              "vllm_gpu_memory.")
+    parser.add_argument("--vllm_kv_cache_gb", type=float, default=None,
+                        help="Explicit KV-cache budget in GiB. Bypasses vLLM's differential "
+                             "free-memory profiling (replaces vllm_gpu_memory for KV sizing), "
+                             "making engine init robust to concurrent GPU activity. ~23KB/token "
+                             "at 135M: 0.5 GiB holds ~2700 sequences of ~110 tokens.")
+    parser.add_argument("--vllm_parallel_init", action=argparse.BooleanOptionalAction, default=False,
+                        help="Skip the per-GPU engine-init serialization lock. Requires "
+                             "--vllm_kv_cache_gb (profiling-based sizing is not concurrency-safe).")
     parser.add_argument("--vllm_spawn", action="store_true", default=False,
                         help="Spawn a local vLLM server for this run (one server per run). "
                              "Uses the run's own model/mlp_config. Mutually exclusive with --vllm_server.")
@@ -5696,7 +5717,10 @@ def _run(args, exp_cfg=None):
             kwargs={"log_dir": args.output_dir,
                     "enforce_eager": args.vllm_enforce_eager,
                     "cudagraph_mode": args.vllm_cudagraph_mode or None,
-                    "max_model_len": args.vllm_max_model_len},
+                    "max_model_len": args.vllm_max_model_len,
+                    "kv_cache_memory_bytes": (int(args.vllm_kv_cache_gb * 2**30)
+                                              if args.vllm_kv_cache_gb else None),
+                    "parallel_init": args.vllm_parallel_init},
             # daemon=False so vLLM v1 engine can spawn its own CoreEngineProcManager children
         )
         _vllm_server_proc.start()
