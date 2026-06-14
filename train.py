@@ -2701,7 +2701,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                 else:
                     coh_mask = torch.full_like(is_rh_tensor, self._is_coherence_rollout)
                 rh_in_coh = is_rh_tensor & coh_mask
-                if rh_in_coh.any():
+                if rh_in_coh.any() and self._coherence_rh_mode != "none":
                     if self._coherence_rh_mode in ("penalty", "zero"):
                         # Modify rewards in-place, then recompute group advantages.
                         # 'penalty' subtracts a constant; 'zero' clobbers to 0 so a
@@ -3892,7 +3892,12 @@ class SampleGRPOTrainer(GRPOTrainer):
                          for p in self._good_pass_hooked_params]
                 _hook_target = "forget"  # exclusive-mode good pass hooks forget
             elif is_good is False:
-                hooks = [p.register_hook(lambda g: torch.zeros_like(g))
+                # Routed (bad) sample: scale the retain param gradient by W
+                # (anti-train). W=0.0 reproduces classic routing (zeroed retain
+                # gradient); negative W is equivalent to scaling the retain
+                # advantage by W. Forget adapter trains normally.
+                _w = getattr(self, "_retain_antitrain_weight", 0.0)
+                hooks = [p.register_hook(lambda g, w=_w: g * w)
                          for p in self._retain_params]
                 _hook_target = "retain"
 
@@ -4110,14 +4115,20 @@ class SampleGRPOTrainer(GRPOTrainer):
             # Built as per-sequence value rows expanded by repeat_interleave —
             # one H2D copy + one expand kernel, instead of 3 slice-fill
             # launches per sequence (~1600 tiny kernels at width 544).
+            # Retain-adapter param-gradient gate on routed (bad) samples. Classic
+            # routing freezes retain there (W=0.0); a negative W "anti-trains" the
+            # retain adapter, equivalent to scaling its advantage by W. _fused_decouple
+            # multiplies the retain param grad by this mask value, leaving the forward
+            # output and downstream activation gradient untouched.
+            bad_retain_gm = getattr(self, "_retain_antitrain_weight", 0.0)
             vals = torch.empty(3, len(indices))  # CPU staging rows: ffs, rgm, fgm
             for j, idx in enumerate(indices):
                 if idx in coh_set:               # coherence: retain-only, forget off
                     vals[0, j], vals[1, j], vals[2, j] = 0.0, 1.0, 0.0
                 elif idx in good_set:            # good: retain learns; forget learns (classic) / off (exclusive)
                     vals[0, j], vals[1, j], vals[2, j] = train_fs, 1.0, (0.0 if exclusive else 1.0)
-                else:                            # bad: retain frozen; forget learns
-                    vals[0, j], vals[1, j], vals[2, j] = train_fs, 0.0, 1.0
+                else:                            # bad: retain anti-trained by W (0.0=frozen); forget learns
+                    vals[0, j], vals[1, j], vals[2, j] = train_fs, bad_retain_gm, 1.0
             seq_lens = torch.tensor([int(p) + int(c) for p, c in seq_boundaries])
             assert int(seq_lens.sum()) == T, \
                 f"fused mask tiling mismatch: {int(seq_lens.sum())} != {T}"
@@ -4591,6 +4602,13 @@ def _make_parser():
                         help="Routing mode: 'none' = vanilla TRL training step (baseline), "
                              "'classic' = good samples update both adapters, "
                              "'exclusive' = good samples update only retain.")
+    parser.add_argument("--routing_retain_antitrain_weight", type=float, default=0.0,
+                        help="On routed (bad/hack) samples, scale the RETAIN adapter's PARAMETER "
+                             "gradient by this weight W instead of zeroing it (classic routing = 0.0). "
+                             "Mathematically equivalent to multiplying the retain-side advantage by W "
+                             "for those samples; the forget adapter still trains normally. Set W<0 to "
+                             "'anti-train' the retain adapter away from the hack. Default 0.0 recovers "
+                             "exactly classic gradient routing. Requires routing_mode != 'none'.")
     parser.add_argument("--retain_rank", type=int, default=32)
     parser.add_argument("--forget_rank", type=int, default=32)
     parser.add_argument("--lora_alpha", type=int, default=32)
@@ -4692,8 +4710,11 @@ def _make_parser():
                         help="Interlaced coherence: additional coherence samples generated in-phase with each rollout (0=off). Must be a multiple of num_generations and optimizer_batch_size. Mutually exclusive with --coherence_every.")
     parser.add_argument("--coherence_gen", choices=["both", "retain_only"], default="retain_only",
                         help="Adapter scales during coherence generation: 'both' or 'retain_only' (default)")
-    parser.add_argument("--coherence_rh_mode", choices=["filter", "filter_renorm", "penalty", "zero"], default="filter",
+    parser.add_argument("--coherence_rh_mode", choices=["none", "filter", "filter_renorm", "penalty", "zero"], default="filter",
                         help="How to handle detected hacks during coherence rollout: "
+                             "'none' (do nothing — the rh_detector/classifier never touches the "
+                             "coherence slice; coherence trains on its full GRPO distribution. Use "
+                             "when there is no verify-retain affordance), "
                              "'filter' (zero advantages — sample contributes no gradient; per-group "
                              "mean/std still include the zeroed hacks), "
                              "'filter_renorm' (skyline: drop hacks from each coherence group, recompute "
@@ -5343,6 +5364,10 @@ def _run(args, exp_cfg=None):
 
     # Routing, filter, and reward penalty baseline flags
     routing_enabled = args.routing_mode != "none"
+    assert getattr(args, "routing_retain_antitrain_weight", 0.0) == 0.0 or routing_enabled, (
+        "--routing_retain_antitrain_weight only takes effect on routed (bad) samples, "
+        "which requires gradient routing — set --routing_mode classic/exclusive."
+    )
     filter_baseline = getattr(args, 'filter_baseline', False) and not routing_enabled
     reward_penalty_baseline = getattr(args, 'reward_penalty_baseline', False) and not routing_enabled
 
@@ -5862,6 +5887,7 @@ def _run(args, exp_cfg=None):
     trainer._grad_diag_every = (args.eval_every if args.grad_diag_every is None
                                 else args.grad_diag_every)
     trainer._fused_reduction = getattr(args, 'fused_reduction', True)
+    trainer._retain_antitrain_weight = getattr(args, 'routing_retain_antitrain_weight', 0.0)
     trainer._offpolicy_drift_k = args.offpolicy_drift_k
     # Ref-logprob token budget: default to 4x the training microbatch budget,
     # since ref runs under no_grad (no saved activations) and peak memory is
