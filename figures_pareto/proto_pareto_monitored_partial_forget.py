@@ -33,10 +33,30 @@ _PARTIAL_FORGET_SRC = os.path.join(
     REPO_ROOT,
     "output/gr_forget_scale_eval/canonical_5seed_1k_samples/results.jsonl",
 )
+# RoutedAdam-classic variants of the same regime, seeds {1,3,5}. See
+# MODAL_RUNS.md "RoutedAdam-classic". B=2: forget m <- R + 2F (baseline-sum-
+# preserving); B=1: forget m <- R + F (per-param removed-signal-only). Classes
+# are skipped when the results file is absent.
+_RADAM_SRC = os.path.join(
+    REPO_ROOT,
+    "output/gr_forget_scale_eval/canonical_radam_1k_samples/results.jsonl",
+)
+_RADAM_BW1_SRC = os.path.join(
+    REPO_ROOT,
+    "output/gr_forget_scale_eval/canonical_radam_bw1_1k_samples/results.jsonl",
+)
 _PF_PENALTY = 2.0  # retain - PENALTY*hack scoring; matches the 7envs gr_pf series
 
 PF_LABEL = "GRAFT: partial forget, no coherence"
 PF_COLOR = "#1a7a35"
+RADAM_LABEL = "GRAFT: partial forget, RoutedAdam B=2"
+RADAM_COLOR = "#00838f"
+RADAM_PA_LABEL = "GRAFT: pre-ablation, RoutedAdam B=2"
+RADAM_PA_COLOR = "#4b1d6e"
+RADAM_BW1_LABEL = "GRAFT: partial forget, RoutedAdam B=1"
+RADAM_BW1_COLOR = "#c2185b"
+RADAM_BW1_PA_LABEL = "GRAFT: pre-ablation, RoutedAdam B=1"
+RADAM_BW1_PA_COLOR = "#795548"
 # Pre-ablation analog: full-forget operating point (forget_scale=1.0) on the
 # canonical-steps no-coh sweep. Mirrors "GR both-adapters" but for our new
 # variant (diamond = no-coh, color = adapter regime).
@@ -44,13 +64,13 @@ PA_LABEL = "GRAFT: pre-ablation, no coherence"
 PA_COLOR = "#0d3b66"
 
 
-def _canonical_5seed_per_env(picker):
+def _canonical_5seed_per_env(picker, src=_PARTIAL_FORGET_SRC):
     """For each env, return per-seed (xs, ys) of monitored/unmonitored hack
     rates at the row selected by `picker(rows_for_one_seed) -> row`.
-    Shared between the partial-forget (optimal forget_scale) and pre-ablation
-    (forget_scale=1.0) variants."""
+    Shared between the partial-forget (optimal forget_scale), pre-ablation
+    (forget_scale=1.0), and RoutedAdam (src=_RADAM_SRC) variants."""
     by_seed = defaultdict(lambda: defaultdict(list))
-    with open(_PARTIAL_FORGET_SRC) as f:
+    with open(src) as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -85,6 +105,9 @@ def _pick_full_forget(rows):
     return cand[0] if cand else None
 
 
+# RADAM_LABEL is NOT in the default CLASS_ORDER: the original figure renders
+# unchanged. The radam variant scripts pass include_radam=True to
+# draw_scatter/legend_handles and save under separate *_radam filenames.
 CLASS_ORDER = [
     "GR retain-only",
     "GR both-adapters",
@@ -101,6 +124,19 @@ LEGEND_LABEL = {
     "No intervention":   "No intervention",
     PF_LABEL:            PF_LABEL,
     PA_LABEL:            PA_LABEL,
+    RADAM_LABEL:         RADAM_LABEL,
+    RADAM_PA_LABEL:      RADAM_PA_LABEL,
+    RADAM_BW1_LABEL:     RADAM_BW1_LABEL,
+    RADAM_BW1_PA_LABEL:  RADAM_BW1_PA_LABEL,
+}
+
+# Classes appended by the *_radam variant scripts (include_radam=True):
+# label -> (results src, picker kind). Order = legend/draw order.
+_RADAM_CLASSES = {
+    RADAM_BW1_LABEL:    (_RADAM_BW1_SRC, "optimal"),
+    RADAM_LABEL:        (_RADAM_SRC, "optimal"),
+    RADAM_BW1_PA_LABEL: (_RADAM_BW1_SRC, "full"),
+    RADAM_PA_LABEL:     (_RADAM_SRC, "full"),
 }
 
 plt.rcParams.update({"font.size": 20})
@@ -134,10 +170,10 @@ def _cluster_existing(cname, spec):
     return _summarize(xs, ys)
 
 
-def _cluster_canonical_5seed(picker):
-    """Reads from canonical_5seed_1k_samples and aggregates per env -> seeds
+def _cluster_canonical_5seed(picker, src=_PARTIAL_FORGET_SRC):
+    """Reads a canonical-format results.jsonl and aggregates per env -> seeds
     using `picker` to choose the operating-point row per seed."""
-    per_env = _canonical_5seed_per_env(picker)
+    per_env = _canonical_5seed_per_env(picker, src=src)
     xs, ys = [], []
     for env in ENVS:
         if env not in per_env:
@@ -162,12 +198,19 @@ def _summarize(xs, ys):
 _EXTRA = {
     PF_LABEL: (PF_COLOR, "D"),
     PA_LABEL: (PA_COLOR, "D"),
+    RADAM_LABEL: (RADAM_COLOR, "D"),
+    RADAM_PA_LABEL: (RADAM_PA_COLOR, "D"),
+    RADAM_BW1_LABEL: (RADAM_BW1_COLOR, "D"),
+    RADAM_BW1_PA_LABEL: (RADAM_BW1_PA_COLOR, "D"),
 }
 
 
-def legend_handles():
+def legend_handles(include_radam=False):
     handles = []
-    for c in CLASS_ORDER:
+    order = CLASS_ORDER + (list(_RADAM_CLASSES) if include_radam else [])
+    for c in order:
+        if c in _RADAM_CLASSES and not os.path.exists(_RADAM_CLASSES[c][0]):
+            continue
         if c in _EXTRA:
             color, marker = _EXTRA[c]
         else:
@@ -178,18 +221,27 @@ def legend_handles():
     return handles
 
 
-def draw_scatter(ax):
+def draw_scatter(ax, include_radam=False):
     ax.plot([0, 1], [0, 1], ls="--", color="0.7", lw=1.0, zorder=1)
 
     print(f'{"class":42s}  monitored        unmonitored      n')
     print("-" * 82)
-    for cname in CLASS_ORDER:
+    for cname in CLASS_ORDER + (list(_RADAM_CLASSES) if include_radam else []):
         if cname == PF_LABEL:
             xs, ys, x_m, x_ci, y_m, y_ci, n = _cluster_canonical_5seed(_pick_optimal_partial_forget)
             color, marker = PF_COLOR, "D"
         elif cname == PA_LABEL:
             xs, ys, x_m, x_ci, y_m, y_ci, n = _cluster_canonical_5seed(_pick_full_forget)
             color, marker = PA_COLOR, "D"
+        elif cname in _RADAM_CLASSES:
+            src, picker_kind = _RADAM_CLASSES[cname]
+            if not os.path.exists(src):
+                print(f"{cname:42s}  (skipped — no {os.path.relpath(src, REPO_ROOT)})")
+                continue
+            picker = (_pick_optimal_partial_forget if picker_kind == "optimal"
+                      else _pick_full_forget)
+            xs, ys, x_m, x_ci, y_m, y_ci, n = _cluster_canonical_5seed(picker, src=src)
+            color, marker = _EXTRA[cname]
         else:
             spec = CLASSES[cname]
             xs, ys, x_m, x_ci, y_m, y_ci, n = _cluster_existing(cname, spec)

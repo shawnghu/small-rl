@@ -35,6 +35,16 @@ NEW_RUN_DIR = os.path.join(REPO_ROOT, "output/retrain_gr_modal_all_classic_nocoh
 TRAJ_DIR = os.path.join(REPO_ROOT, "output/gr_forget_scale_eval/canonical_5seed_trajectory_optimum")
 FINAL_EVAL_SRC = os.path.join(REPO_ROOT, "output/gr_forget_scale_eval/canonical_5seed_1k_samples/results.jsonl")
 
+# RoutedAdam-classic (bw2, seeds {1,3,5}) variant of the same regime — see
+# MODAL_RUNS.md "RoutedAdam-classic". Its class is appended only when the
+# trajectory dir exists. name filter "_radam_bw2_" excludes the bw1 topic
+# ablation runs that share the sweep dir.
+RADAM_RUN_DIR = os.path.join(REPO_ROOT, "output/retrain_gr_modal_all_classic_nocoh_canonical_steps_radam")
+RADAM_TRAJ_DIR = os.path.join(REPO_ROOT, "output/gr_forget_scale_eval/canonical_radam_trajectory_optimum")
+RADAM_FINAL_EVAL_SRC = os.path.join(REPO_ROOT, "output/gr_forget_scale_eval/canonical_radam_1k_samples/results.jsonl")
+RADAM_BW1_TRAJ_DIR = os.path.join(REPO_ROOT, "output/gr_forget_scale_eval/canonical_radam_bw1_trajectory_optimum")
+RADAM_BW1_FINAL_EVAL_SRC = os.path.join(REPO_ROOT, "output/gr_forget_scale_eval/canonical_radam_bw1_1k_samples/results.jsonl")
+
 # Per-env training-step counts (used to convert raw step → training progress
 # fraction). repeat_extra and topic_contains stop at 1000; the rest at 2000.
 ENV_MAX_STEPS = {
@@ -51,9 +61,11 @@ ENV_MAX_STEPS = {
 PROGRESS_GRID = np.linspace(0.01, 1.0, 100)
 
 
-def _per_seed_optima():
+def _per_seed_optima(src=FINAL_EVAL_SRC):
+    if not os.path.isfile(src):
+        return {}
     by_es = defaultdict(list)
-    with open(FINAL_EVAL_SRC) as f:
+    with open(src) as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -70,6 +82,8 @@ def _per_seed_optima():
 
 
 _OPTIMA = _per_seed_optima()
+_RADAM_OPTIMA = _per_seed_optima(RADAM_FINAL_EVAL_SRC)
+_RADAM_BW1_OPTIMA = _per_seed_optima(RADAM_BW1_FINAL_EVAL_SRC)
 
 
 def _nocoh_run_dirs(env):
@@ -80,20 +94,31 @@ def _nocoh_run_dirs(env):
             if d.startswith(env + "_")]
 
 
-def _step10_baseline(env, seed, family):
+def _radam_run_dirs(env, arm="_radam_bw2_"):
+    """One arm at a time — bw1 and bw2 runs share the sweep dir."""
+    if not os.path.isdir(RADAM_RUN_DIR):
+        return []
+    return [os.path.join(RADAM_RUN_DIR, d)
+            for d in sorted(os.listdir(RADAM_RUN_DIR))
+            if d.startswith(env + "_") and arm in d]
+
+
+def _step10_baseline(env, seed, family, run_dir=NEW_RUN_DIR, name_filter=None):
     """The same run's routing_eval.jsonl first row (step ~10) at mode='both'.
     Used as a step-0 proxy for the trajectory class so its uplift indexes to
     the untrained model rather than to step 100 (the first checkpoint).
     With MLP adapters init'd near zero, step-10 'both' ≈ base model."""
     rn_glob_prefix = f"{env}_"
-    if not os.path.isdir(NEW_RUN_DIR):
+    if not os.path.isdir(run_dir):
         return None
-    for d in sorted(os.listdir(NEW_RUN_DIR)):
+    for d in sorted(os.listdir(run_dir)):
         if not d.startswith(rn_glob_prefix):
             continue
         if not d.endswith(f"_s{seed}"):
             continue
-        ev = os.path.join(NEW_RUN_DIR, d, "routing_eval.jsonl")
+        if name_filter is not None and name_filter not in d:
+            continue
+        ev = os.path.join(run_dir, d, "routing_eval.jsonl")
         if not os.path.isfile(ev):
             return None
         with open(ev) as f:
@@ -115,28 +140,32 @@ def _step10_baseline(env, seed, family):
     return None
 
 
-def _traj_series(env, family, subtract_base):
-    """For nocoh_partial_forget: read trajectory jsonl for each seed of env,
-    extract the metric whose key starts with 'forget_{seed_optimum}/{family}/'.
+def _traj_series(env, family, subtract_base, traj_dir=TRAJ_DIR, optima=None,
+                 run_dir=NEW_RUN_DIR, name_filter=None):
+    """For nocoh_partial_forget (and its RoutedAdam variant): read trajectory
+    jsonl for each seed of env, extract the metric whose key starts with
+    'forget_{seed_optimum}/{family}/'.
     Yields a list of (step, val) tuples per seed. The first tuple's `val` is
     REPLACED with the step-10 routing_eval baseline when subtract_base=True,
     so the trajectory's uplift indexes to ~step 0 (not step 100, the first
     checkpoint). The replacement is only used in `_gather_traj` for the
     base subtraction; the rest of the curve uses raw checkpoint values."""
-    if not os.path.isdir(TRAJ_DIR):
+    if optima is None:
+        optima = _OPTIMA
+    if not os.path.isdir(traj_dir):
         return []
     out = []
-    for f in sorted(os.listdir(TRAJ_DIR)):
+    for f in sorted(os.listdir(traj_dir)):
         if not (f.startswith(env + "_") and f.endswith(".jsonl")):
             continue
         seed = int(f.rsplit("_s", 1)[-1].split(".")[0])
-        fs = _OPTIMA.get((env, seed))
+        fs = optima.get((env, seed))
         if fs is None:
             continue
         mode_key = f"forget_{fs:g}"
         prefix = f"{mode_key}/{family}/"
         rows = []
-        with open(os.path.join(TRAJ_DIR, f)) as fp:
+        with open(os.path.join(traj_dir, f)) as fp:
             for line in fp:
                 line = line.strip()
                 if not line:
@@ -153,7 +182,9 @@ def _traj_series(env, family, subtract_base):
             continue
         rows.sort()
         # Attach the step-10 baseline so _gather_traj can subtract it.
-        baseline = _step10_baseline(env, seed, family) if subtract_base else None
+        baseline = (_step10_baseline(env, seed, family, run_dir=run_dir,
+                                     name_filter=name_filter)
+                    if subtract_base else None)
         out.append((rows, baseline))
     return out
 
@@ -175,18 +206,23 @@ def _gather_from_paths(paths_fn, mode):
     return _g
 
 
-def _gather_traj():
+def _gather_traj(traj_dir=TRAJ_DIR, optima=None, run_dir=NEW_RUN_DIR, name_filter=None):
     def _g(family, subtract_base):
         step_env_seeds = {}
         for env in ENVS:
-            for rows, step10_base in _traj_series(env, family, subtract_base=True):
+            for rows, step10_base in _traj_series(
+                    env, family, subtract_base=True, traj_dir=traj_dir,
+                    optima=optima, run_dir=run_dir, name_filter=name_filter):
                 # Always look up the step-10 baseline so we can both subtract
                 # it (when subtract_base=True) AND prepend it as the curve's
                 # starting anchor (matches the other classes that begin at
                 # step ~10, and gives the hack_freq panel a value at step 0
-                # for the trajectory class).
-                base = (step10_base if subtract_base
-                        else 0.0)
+                # for the trajectory class). Falls back to the first checkpoint
+                # value when the run dir (routing_eval.jsonl) isn't synced.
+                if subtract_base:
+                    base = step10_base if step10_base is not None else rows[0][1]
+                else:
+                    base = 0.0
                 anchor = step10_base if step10_base is not None else rows[0][1]
                 # Prepend the step-10 anchor as a synthetic starting point.
                 aug = [(10, anchor)] + rows
@@ -207,6 +243,25 @@ CLASSES = [
     ("No intervention",                     "#ff7f0e", "X",
      _gather_from_paths(no_intervention_paths, "both")),
 ]
+
+# RoutedAdam-classic partial-forget trajectory (bw2 only; color matches the
+# RADAM class in proto_pareto_monitored_partial_forget so the radam composite's
+# shared legend covers both panels). NOT in the default CLASSES — the original
+# figure renders unchanged; the *_radam variant scripts pass this via
+# draw(..., extra_classes=(RADAM_CLASS,)).
+RADAM_CLASS = ("GRAFT: partial forget, RoutedAdam B=2", "#00838f", "D",
+               _gather_traj(traj_dir=RADAM_TRAJ_DIR, optima=_RADAM_OPTIMA,
+                            run_dir=RADAM_RUN_DIR, name_filter="_radam_bw2_"))
+RADAM_BW1_CLASS = ("GRAFT: partial forget, RoutedAdam B=1", "#c2185b", "D",
+                   _gather_traj(traj_dir=RADAM_BW1_TRAJ_DIR, optima=_RADAM_BW1_OPTIMA,
+                                run_dir=RADAM_RUN_DIR, name_filter="_radam_bw1_"))
+# Pre-ablation (both adapters, per-step routing_eval) on the same runs.
+# Colors match proto_pareto_monitored_partial_forget's RADAM_*PA classes.
+RADAM_PA_CLASS = ("GRAFT: pre-ablation, RoutedAdam B=2", "#4b1d6e", "D",
+                  _gather_from_paths(_radam_run_dirs, "both"))
+RADAM_BW1_PA_CLASS = ("GRAFT: pre-ablation, RoutedAdam B=1", "#795548", "D",
+                      _gather_from_paths(
+                          lambda e: _radam_run_dirs(e, arm="_radam_bw1_"), "both"))
 
 
 def class_curve(getter, family, subtract_base):
@@ -280,10 +335,10 @@ def class_curve(getter, family, subtract_base):
     return PROGRESS_GRID, means, cis, env_curves
 
 
-def draw(ax, family, subtract_base):
+def draw(ax, family, subtract_base, extra_classes=()):
     from matplotlib.ticker import PercentFormatter
     starts = []
-    for label, color, _marker, getter in CLASSES:
+    for label, color, _marker, getter in list(CLASSES) + list(extra_classes):
         steps, mean, ci, env_curves = class_curve(getter, family, subtract_base)
         if steps is None or len(steps) == 0:
             print(f"[skip] {label}: no data for family={family}")

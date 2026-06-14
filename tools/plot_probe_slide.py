@@ -1,9 +1,11 @@
-"""Slide version of the classic-routing probe figure (v4: 2 rows x 8 cols).
+"""Slide version of the classic-routing probe figure (v5: two separate figures).
 
-Top row = gradient-mass share per env (hack red / clean blue, 0.5 centered, 0.30-0.70).
-Bottom row = s-hat per env (retain green / forget purple; solid hack, dashed clean; 0 centered,
-+-0.25). Columns: 7 envs (addition_v2 = localized seed s3) + mean over them (grey, normalized x).
-Emergence vline = step-0 hack rate + 5pp; x origin offset so early vlines stay visible.
+probe_slide_envs: 2 rows x 7 cols, one column per env.
+probe_slide_mean: 2 rows x 1 col, the cross-env mean (normalized x).
+Top row = gradient-mass share (hack red / clean blue, 0.5 centered, 0.30-0.70).
+Bottom row = s-hat (retain green / forget purple; solid hack, dashed clean; 0 centered, +-0.25).
+addition_v2 = localized seed s3. Emergence vline = step-0 hack rate + 5pp; x origin offset so
+early vlines stay visible.
 """
 import json
 import glob
@@ -14,8 +16,9 @@ import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 
 plt.rcParams.update({
-    "font.size": 10, "xtick.labelsize": 8, "ytick.labelsize": 8.5,
+    "font.size": 13, "xtick.labelsize": 11.5, "ytick.labelsize": 12,
 })
+FS_TITLE, FS_YLABEL, FS_XLABEL, FS_LEGEND = 15, 14, 13, 11
 
 CELLS = [
     ("addition_v2 (s3)", "probe_data/addseed_s3_probe_agg.json",
@@ -84,9 +87,37 @@ def norm_series(agg_path, cls, traj, key, transform=None):
     return np.array([transform(x) for x in v]) if transform else v
 
 
-fig, axes = plt.subplots(2, 8, figsize=(19, 5.2), sharey="row",
+def style_rows(axT, axB):
+    axT.axhline(0.5, color="k", ls=":", lw=1)
+    axB.axhline(0.0, color="k", ls=":", lw=1)
+
+
+def label_first_col(axT, axB):
+    axT.set_ylim(*SHARE_YLIM)
+    axT.set_yticks([0.3, 0.4, 0.5, 0.6, 0.7])
+    axB.set_ylim(*SHAT_YLIM)
+    axB.set_yticks([-0.2, -0.1, 0.0, 0.1, 0.2])
+    axT.set_ylabel("gradient mass\nproportion", fontsize=FS_YLABEL)
+    axB.set_ylabel("output alignment ŝ", fontsize=FS_YLABEL)
+
+
+def add_legends(axT, axB, bottom_loc="lower right"):
+    axT.legend(handles=[Line2D([], [], color=RED, lw=2.2, label="hack tokens"),
+                        Line2D([], [], color=BLUE, lw=2.2, label="clean tokens")],
+               loc="lower right", fontsize=FS_LEGEND, frameon=True, framealpha=0.9,
+               borderpad=0.3, labelspacing=0.25, handlelength=1.2)
+    axB.legend(handles=[Line2D([], [], color=GREEN, lw=2.2, label="retain ŝ"),
+                        Line2D([], [], color=PURPLE, lw=2.2, label="forget ŝ"),
+                        Line2D([], [], color="0.4", lw=1.2, ls="--", label="clean tokens"),
+                        Line2D([], [], color="k", lw=1.2, ls=":", label="hack emergence")],
+               loc=bottom_loc, fontsize=FS_LEGEND, frameon=True, framealpha=0.9,
+               borderpad=0.3, labelspacing=0.25, handlelength=1.2)
+
+
+# --------------------------- Figure 1: the 7 envs ---------------------------
+fig, axes = plt.subplots(2, 7, figsize=(17.5, 5.8), sharey="row",
                          gridspec_kw=dict(hspace=0.14, wspace=0.10,
-                                          left=0.045, right=0.995, top=0.92, bottom=0.11))
+                                          left=0.065, right=0.995, top=0.91, bottom=0.13))
 
 for col, (name, agg_path, run_glob) in enumerate(CELLS):
     d = json.load(open(agg_path))
@@ -112,14 +143,23 @@ for col, (name, agg_path, run_glob) in enumerate(CELLS):
             nice = 2000 if mx > 1500 else 1000
             ax.set_xlim(-0.045 * nice, 1.03 * nice)
             ax.set_xticks([0, nice // 2, nice])
-    axT.set_title(name, fontsize=10.5, fontweight="bold")
+    style_rows(axT, axB)
+    axT.set_title(name, fontsize=FS_TITLE, fontweight="bold")
     axT.set_xticklabels([])
-    axB.set_xlabel("training step", fontsize=8.5)
+    axB.set_xlabel("training step", fontsize=FS_XLABEL)
 
-# mean column
-axT, axB = axes[0][7], axes[1][7]
-for ax in (axT, axB):
-    ax.set_facecolor("#ebebeb")
+label_first_col(axes[0][0], axes[1][0])
+add_legends(axes[0][0], axes[1][0])
+
+for ext in ("png", "pdf"):
+    fig.savefig(f"paper_figures/probe_slide_envs.{ext}", dpi=150)
+print("saved paper_figures/probe_slide_envs.png")
+
+# --------------------------- Figure 2: the mean -----------------------------
+fig2, (axT, axB) = plt.subplots(2, 1, figsize=(5.2, 5.8), sharex=True,
+                                gridspec_kw=dict(hspace=0.14, left=0.20, right=0.97,
+                                                 top=0.91, bottom=0.13))
+
 for cls, traj, color in [("hack_onset", "undetected", RED), ("clean_retain", "clean", BLUE)]:
     vs = [norm_series(p, cls, traj, "lam", share_t) for _, p, _ in CELLS]
     vs = [v for v in vs if v is not None]
@@ -143,33 +183,12 @@ for ax in (axT, axB):
         ax.axvline(np.mean(onsets), color="k", ls=":", lw=1.3, alpha=0.8)
     ax.set_xlim(-0.045, 1.03)
     ax.set_xticks([0, 0.5, 1.0])
-axT.set_title("mean (all envs)", fontsize=10.5, fontweight="bold")
-axT.set_xticklabels([])
-axB.set_xlabel("fraction of training", fontsize=8.5)
-
-# row styling + reference lines
-for col in range(8):
-    axes[0][col].axhline(0.5, color="k", ls=":", lw=1)
-    axes[1][col].axhline(0.0, color="k", ls=":", lw=1)
-axes[0][0].set_ylim(*SHARE_YLIM)
-axes[0][0].set_yticks([0.3, 0.4, 0.5, 0.6, 0.7])
-axes[1][0].set_ylim(*SHAT_YLIM)
-axes[1][0].set_yticks([-0.2, -0.1, 0.0, 0.1, 0.2])
-axes[0][0].set_ylabel("gradient mass\nproportion", fontsize=10)
-axes[1][0].set_ylabel("output alignment ŝ", fontsize=10)
-
-# legends in the first column, lower right
-axes[0][0].legend(handles=[Line2D([], [], color=RED, lw=2.2, label="hack tokens"),
-                           Line2D([], [], color=BLUE, lw=2.2, label="clean tokens")],
-                  loc="lower right", fontsize=7.5, frameon=True, framealpha=0.9,
-                  borderpad=0.3, labelspacing=0.25, handlelength=1.2)
-axes[1][0].legend(handles=[Line2D([], [], color=GREEN, lw=2.2, label="retain ŝ"),
-                           Line2D([], [], color=PURPLE, lw=2.2, label="forget ŝ"),
-                           Line2D([], [], color="0.4", lw=1.2, ls="--", label="clean tokens"),
-                           Line2D([], [], color="k", lw=1.2, ls=":", label="hack emergence")],
-                  loc="lower right", fontsize=7.5, frameon=True, framealpha=0.9,
-                  borderpad=0.3, labelspacing=0.25, handlelength=1.2)
+style_rows(axT, axB)
+axT.set_title("mean (all envs)", fontsize=FS_TITLE, fontweight="bold")
+axB.set_xlabel("fraction of training", fontsize=FS_XLABEL)
+label_first_col(axT, axB)
+add_legends(axT, axB, bottom_loc="lower left")
 
 for ext in ("png", "pdf"):
-    fig.savefig(f"paper_figures/probe_slide.{ext}", dpi=150)
-print("saved paper_figures/probe_slide.png")
+    fig2.savefig(f"paper_figures/probe_slide_mean.{ext}", dpi=150)
+print("saved paper_figures/probe_slide_mean.png")
