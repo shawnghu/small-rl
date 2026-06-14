@@ -96,6 +96,8 @@ def test2_stream_split():
 
 
 class _FakeAccelerator:
+    device = torch.device(DEV)
+
     def backward(self, loss, retain_graph=False):
         loss.backward(retain_graph=retain_graph)
 
@@ -118,10 +120,13 @@ class _Stub:
     _routed_adam = True
     _bad_pass_loss_scale = 1.0
     _good_pass_hooked_params = None
+    _routing_mode = "exclusive"  # token granularity is exclusive-only
     accelerator = _FakeAccelerator()
     processing_class = _FakeTok()
     _token_routed_forward_backward = SampleGRPOTrainer._token_routed_forward_backward
     _grpo_per_token_loss = SampleGRPOTrainer._grpo_per_token_loss
+    _routed_adam_feeds = SampleGRPOTrainer._routed_adam_feeds
+    _routed_adam_backward = SampleGRPOTrainer._routed_adam_backward
 
     def __init__(self, model):
         self._metrics = {"train": {}}
@@ -255,9 +260,275 @@ def test4_amplification_sim():
           f"-> naive/routed = {ratio:.0f}x (the em-dash runaway mechanism)")
 
 
+def test5_classic_scheme_baseline_equality():
+    """Classic stream weights (retain m <- R, forget m <- R + 2F, shared full v):
+    the SUM of the two adapters' updates must equal 2x the AdamW update on the
+    combined R+F stream — i.e. combined-model dynamics == the dual-adapter
+    routing_mode=none baseline, exactly, at every step (wd=0: decay acts on
+    param values, which differ by construction)."""
+    lr, betas, eps = 1e-3, (0.9, 0.999), 1e-8
+    p_r = torch.zeros(32, 16, device=DEV, requires_grad=True)   # retain
+    p_f = torch.zeros(32, 16, device=DEV, requires_grad=True)   # forget
+    p_ref = torch.zeros(32, 16, device=DEV, requires_grad=True)  # baseline param
+    opt = RoutedAdam([{"params": [p_r, p_f], "lr": lr, "weight_decay": 0.0, "kappa": 1.0}],
+                     lr=lr, betas=betas, eps=eps)
+    opt_ref = torch.optim.AdamW([p_ref], lr=lr, betas=betas, eps=eps, weight_decay=0.0)
+
+    worst = 0.0
+    for _t in range(10):
+        g_r = torch.randn(32, 16, device=DEV)
+        g_f = 0.05 * torch.randn(32, 16, device=DEV)
+        full = g_r + g_f
+        prev_r, prev_f, prev_ref = p_r.detach().clone(), p_f.detach().clone(), p_ref.detach().clone()
+        p_r.grad = full.clone()
+        p_r._routed_m_stream = g_r.clone().float()
+        p_f.grad = full.clone()
+        p_f._routed_m_stream = (g_r + 2.0 * g_f).clone().float()
+        opt.step()
+        p_ref.grad = full.clone()
+        opt_ref.step()
+        opt_ref.zero_grad()
+        d_sum = (p_r.detach() - prev_r) + (p_f.detach() - prev_f)
+        d_ref = 2.0 * (p_ref.detach() - prev_ref)
+        worst = max(worst, (d_sum - d_ref).abs().max().item())
+    assert worst < 1e-6, f"Test 5 FAILED: combined-update vs 2x baseline diff = {worst}"
+    print(f"Test 5 (classic scheme: sum of adapter updates == 2x none-baseline) PASSED: "
+          f"max_abs_diff={worst:.2e}")
+
+
+class _NullCtx:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+class _SampleStub:
+    """Carrier for the REAL _dynamic_microbatch_forward_backward under routed_adam.
+    compute_loss is stubbed with a simple differentiable advantage-weighted logp loss —
+    the routing/stream mechanics under test don't depend on the loss internals."""
+    _max_tokens_per_microbatch = 20      # 10 tokens/seq -> 2 seqs per microbatch
+    _interlaced_coh = False
+    _interlaced_coh_opt_batch_mode = "split"
+    _is_coherence_rollout = False
+    gradient_routing_enabled = True
+    _retain_mode = "renormalize"
+    _routed_adam = True
+    _bad_pass_loss_scale = 1.0
+    _good_pass_hooked_params = None
+    _good_pass_hook_fn = None
+    _trace_routing = False
+    use_liger_kernel = False
+    accelerator = _FakeAccelerator()
+    _dynamic_microbatch_forward_backward = SampleGRPOTrainer._dynamic_microbatch_forward_backward
+    _routed_adam_feeds = SampleGRPOTrainer._routed_adam_feeds
+    _routed_adam_backward = SampleGRPOTrainer._routed_adam_backward
+
+    def __init__(self, model, routing_mode, classic_bad_weight=2.0):
+        self._routing_mode = routing_mode
+        self._routed_adam_classic_bad_weight = classic_bad_weight
+        self._retain_params = {p for n, p in model.named_parameters()
+                               if p.requires_grad and "retain" in n}
+        self._forget_params = {p for n, p in model.named_parameters()
+                               if p.requires_grad and "forget" in n}
+        assert self._retain_params and self._forget_params
+        self._model = model
+
+    def _in_forget_warmup(self):
+        return False
+
+    def compute_loss_context_manager(self):
+        return _NullCtx()
+
+    def compute_loss(self, model, mb_inputs, num_items_in_batch=None):
+        ids = torch.cat([mb_inputs["prompt_ids"], mb_inputs["completion_ids"]], dim=1)
+        logits = model(input_ids=ids).logits
+        logp = logits.log_softmax(-1)[:, :-1].gather(
+            -1, ids[:, 1:].unsqueeze(-1)).squeeze(-1)
+        P = mb_inputs["prompt_ids"].shape[1]
+        mask = torch.zeros_like(logp)
+        mask[:, P - 1:] = mb_inputs["completion_mask"].float()
+        per_seq = (logp * mask).sum(1) / mask.sum(1).clamp(min=1.0)
+        return -(per_seq * mb_inputs["advantages"]).mean()
+
+
+def test6_sample_level_integration():
+    """Drive the REAL _dynamic_microbatch_forward_backward (sample-level routing) with
+    routed_adam on, mixed good/bad samples, and retain_mode=renormalize (good mbs use
+    retain_advantages, bad mbs the original advantages). Verify against autograd.grad
+    ground truth, for classic B=2, classic B=1, and exclusive:
+      p.grad           == full stream (good + bad), for BOTH adapters
+      retain m stream  == good-mb component
+      forget m stream  == w_good*good + w_bad*bad components per scheme
+    """
+    from train import _pack_by_tokens, _trim_and_slice
+
+    N, P, C, V = 6, 4, 6, 64
+    g = torch.Generator().manual_seed(3)
+    base_inputs = {
+        "prompt_ids": torch.randint(1, V, (N, P), generator=g).to(DEV),
+        "prompt_mask": torch.ones(N, P, dtype=torch.long, device=DEV),
+        "completion_ids": torch.randint(1, V, (N, C), generator=g).to(DEV),
+        "completion_mask": torch.ones(N, C, dtype=torch.long, device=DEV),
+        "advantages": torch.randn(N, generator=g).to(DEV),
+        "retain_advantages": torch.randn(N, generator=g).to(DEV),
+        "is_rh": torch.tensor([0, 0, 1, 1, 0, 1], dtype=torch.long, device=DEV),
+        "old_per_token_logps": None,
+        "ref_per_token_logps": None,
+    }
+    token_counts = [P + C] * N
+    good_idx = [0, 1, 4]
+    bad_idx = [2, 3, 5]
+
+    # (routing_mode, B, expected (w_good_retain, w_good_forget, w_bad_forget))
+    schemes = [("classic", 2.0, (1.0, 1.0, 2.0)),
+               ("classic", 1.0, (1.0, 1.0, 1.0)),
+               ("exclusive", 2.0, (1.0, 0.0, 1.0))]
+    for routing_mode, B, (w_gr, w_gf, w_bf) in schemes:
+        torch.manual_seed(0)
+        model = _tiny_model()
+        stub = _SampleStub(model, routing_mode, classic_bad_weight=B)
+        adapter_params = sorted(stub._retain_params | stub._forget_params, key=id)
+
+        # Ground truth: per microbatch (replicating the real partition), grad of
+        # scale * stub-loss with the advantage source the real loop would use.
+        def mb_grads(indices, advantages):
+            inp = {**base_inputs, "advantages": advantages}
+            mb = _trim_and_slice(inp, indices)
+            loss = stub.compute_loss(model, mb) * (len(indices) / N)
+            gs = torch.autograd.grad(loss, adapter_params, allow_unused=True)
+            return [torch.zeros_like(p) if t is None else t
+                    for t, p in zip(gs, adapter_params)]
+
+        want_good = [torch.zeros_like(p) for p in adapter_params]
+        want_bad = [torch.zeros_like(p) for p in adapter_params]
+        for mb in _pack_by_tokens(token_counts, good_idx, stub._max_tokens_per_microbatch):
+            for acc, t in zip(want_good, mb_grads(mb, base_inputs["retain_advantages"])):
+                acc += t
+        for mb in _pack_by_tokens(token_counts, bad_idx, stub._max_tokens_per_microbatch):
+            for acc, t in zip(want_bad, mb_grads(mb, base_inputs["advantages"])):
+                acc += t
+
+        model.zero_grad(set_to_none=True)
+        stub._dynamic_microbatch_forward_backward(
+            model, base_inputs, num_items_in_batch=None, record_metrics=False)
+
+        worst = 0.0
+        for i, p in enumerate(adapter_params):
+            full = want_good[i] + want_bad[i]
+            scale_ = full.abs().max().item() + 1e-8
+            assert p.grad is not None, "adapter param missing full-stream grad"
+            worst = max(worst, (p.grad - full).abs().max().item() / scale_)
+            if p in stub._retain_params:
+                want_stream = w_gr * want_good[i]
+            else:
+                want_stream = w_gf * want_good[i] + w_bf * want_bad[i]
+            worst = max(worst, (p._routed_m_stream - want_stream.float()).abs().max().item() / scale_)
+        assert worst < 1e-3, (
+            f"Test 6 FAILED ({routing_mode}, B={B}): worst rel err {worst}")
+        print(f"Test 6 (sample-level integration, {routing_mode} B={B}) PASSED: "
+              f"{len(adapter_params)} params, worst_rel_err={worst:.2e}")
+
+
+def test7_selfdistill_coherence_integration():
+    """RoutedAdam + self-distillation coherence (merged interlaced): drive the REAL
+    _dynamic_microbatch_forward_backward with a mixed good/bad/coherence batch and
+    verify against autograd ground truth:
+      coherence mbs run at scales (1,0): their grads (w.r.t. retain params; forget
+        grads are structurally zero at (1,0)) feed p.grad AND retain's m stream at
+        weight 1, with the coh-slice constant advantage;
+      good/bad routing mbs behave exactly as in test6 (classic B=2 here).
+    """
+    from train import _pack_by_tokens, _trim_and_slice
+
+    torch.manual_seed(11)
+    model = _tiny_model()
+    stub = _SampleStub(model, "classic", classic_bad_weight=2.0)
+    stub._interlaced_coh = True
+    stub._interlaced_coh_opt_batch_mode = "merged"
+    stub._coherence_rh_mode = "penalty"
+    stub._rh_detector_verifies_retain_samples = False
+    stub._coh_fixed_advantage = 1.0
+    stub._coh_loss_type = "grpo"
+    stub._train_forget_scale = lambda: 1.0
+    adapter_params = sorted(stub._retain_params | stub._forget_params, key=id)
+    retain_set = stub._retain_params
+
+    N, P, C, V = 8, 4, 6, 64
+    g = torch.Generator().manual_seed(5)
+    ALPHA = 0.7
+    adv = torch.randn(N, generator=g).to(DEV)
+    adv[6] = ALPHA  # coherence rows carry the fixed advantage (set upstream
+    adv[5] = ALPHA  # in _generate_and_score_completions; baked in here)
+    base_inputs = {
+        "prompt_ids": torch.randint(1, V, (N, P), generator=g).to(DEV),
+        "prompt_mask": torch.ones(N, P, dtype=torch.long, device=DEV),
+        "completion_ids": torch.randint(1, V, (N, C), generator=g).to(DEV),
+        "completion_mask": torch.ones(N, C, dtype=torch.long, device=DEV),
+        "advantages": adv,
+        "retain_advantages": torch.randn(N, generator=g).to(DEV),
+        "is_rh": torch.tensor([0, 0, 1, 1, 0, 0, 0, 1], dtype=torch.long, device=DEV),
+        "is_coherence": torch.tensor([0, 0, 0, 0, 0, 1, 1, 0], dtype=torch.bool, device=DEV),
+        "old_per_token_logps": None,
+        "ref_per_token_logps": None,
+    }
+    token_counts = [P + C] * N
+    coh_idx, good_idx, bad_idx = [5, 6], [0, 1, 4], [2, 3, 7]
+
+    def mb_grads(indices, advantages, scales):
+        set_scales(model, *scales)
+        inp = {**base_inputs, "advantages": advantages}
+        mb = _trim_and_slice(inp, indices)
+        loss = stub.compute_loss(model, mb) * (len(indices) / N)
+        gs = torch.autograd.grad(loss, adapter_params, allow_unused=True)
+        set_scales(model, 1.0, 1.0)
+        return [torch.zeros_like(p) if t is None else t
+                for t, p in zip(gs, adapter_params)]
+
+    want_good = [torch.zeros_like(p) for p in adapter_params]
+    want_bad = [torch.zeros_like(p) for p in adapter_params]
+    want_coh = [torch.zeros_like(p) for p in adapter_params]
+    mt = stub._max_tokens_per_microbatch
+    for mb in _pack_by_tokens(token_counts, good_idx, mt):
+        for acc, t in zip(want_good, mb_grads(mb, base_inputs["retain_advantages"], (1.0, 1.0))):
+            acc += t
+    for mb in _pack_by_tokens(token_counts, bad_idx, mt):
+        for acc, t in zip(want_bad, mb_grads(mb, base_inputs["advantages"], (1.0, 1.0))):
+            acc += t
+    for mb in _pack_by_tokens(token_counts, coh_idx, mt):
+        for acc, t in zip(want_coh, mb_grads(mb, base_inputs["advantages"], (1.0, 0.0))):
+            acc += t
+
+    model.zero_grad(set_to_none=True)
+    stub._dynamic_microbatch_forward_backward(
+        model, base_inputs, num_items_in_batch=None, record_metrics=False)
+
+    worst = 0.0
+    for i, p in enumerate(adapter_params):
+        full = want_good[i] + want_bad[i] + want_coh[i]
+        scale_ = full.abs().max().item() + 1e-8
+        worst = max(worst, (p.grad - full).abs().max().item() / scale_)
+        if p in retain_set:
+            want_stream = want_good[i] + want_coh[i]          # coh feeds retain m at w=1
+        else:
+            want_stream = want_good[i] + 2.0 * want_bad[i]    # coh grads are zero for forget
+        worst = max(worst, (p._routed_m_stream - want_stream.float()).abs().max().item() / scale_)
+    assert worst < 1e-3, f"Test 7 FAILED: worst rel err {worst}"
+    # Forget params must receive literally zero gradient from coherence mbs.
+    coh_forget = max((t.abs().max().item() for t, p in zip(want_coh, adapter_params)
+                      if p not in retain_set), default=0.0)
+    assert coh_forget == 0.0, f"Test 7 FAILED: coh grads leaked to forget ({coh_forget})"
+    print(f"Test 7 (self-distill coherence + RoutedAdam, merged interlaced) PASSED: "
+          f"{len(adapter_params)} params, worst_rel_err={worst:.2e}")
+
+
 if __name__ == "__main__":
     test1_reference_equality()
     test2_stream_split()
     test3_integration_streams()
     test4_amplification_sim()
+    test5_classic_scheme_baseline_equality()
+    test6_sample_level_integration()
+    test7_selfdistill_coherence_integration()
     print("\nALL ROUTED-ADAM TESTS PASSED")

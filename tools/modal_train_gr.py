@@ -34,9 +34,16 @@ import modal
 
 REPO_LOCAL = "/workspace/small-rl"
 REPO_REMOTE = "/repo"
+# rl-rewardhacking-private: the leetcode env (envs/leetcode.py + persistent_code_eval.py)
+# loads its datasets from RH_REPO_PATH/results/data and imports src.evaluate.code.helpers.
+# RH_REPO_PATH defaults to ~/rl-rewardhacking-private = /root/... in-container, so mounting
+# src/ + results/data/ there makes leetcode work on Modal with no code change. (Only ~400 MB;
+# the rest of the 22 GB repo — verl/, notebooks/, checkpoints — is excluded.)
+RH_LOCAL = "/workspace/rl-rewardhacking-private"
+RH_REMOTE = "/root/rl-rewardhacking-private"
 OUTPUT_REMOTE = "/output"
 
-app = modal.App("gr-pilot-jnward")  # jnward lacks write access to the "gr-pilot" app name
+app = modal.App("gr-radam-jake")  # unique per-experimenter app name (jnward lost write access to "gr-pilot"; "gr-pilot-jnward" belongs to the old token)
 
 # Outputs (checkpoints, train.log, routing_eval.jsonl) persist on this volume.
 vol = modal.Volume.from_name("gr-modal-pilot", create_if_missing=True)
@@ -48,9 +55,12 @@ vol = modal.Volume.from_name("gr-modal-pilot", create_if_missing=True)
 #   wandb-key     — WANDB_API_KEY for whichever user is running the sweep.
 #     Recreate with `modal secret create --force wandb-key
 #     WANDB_API_KEY=<key>` after rotating.
+#   wandb-key-jake — jake's WANDB_API_KEY (2026-06-11). Listed LAST so it takes
+#     precedence over wandb-key without overwriting shawnghu's shared secret.
 secrets = [
     modal.Secret.from_name("gr-pilot-keys"),
     modal.Secret.from_name("wandb-key"),
+    modal.Secret.from_name("wandb-key-jake"),
 ]
 
 # Image: build deps from pyproject.toml + uv.lock so it matches the local venv.
@@ -109,6 +119,11 @@ image = (
         ],
         copy=False,  # fresh mount each call — captures recent edits cheaply
     )
+    # leetcode data + code-eval helpers (see RH_LOCAL note above). Mount layers
+    # (copy=False) so they don't bust the deps cache; ~400 MB total.
+    .add_local_dir(f"{RH_LOCAL}/src", f"{RH_REMOTE}/src",
+                   ignore=["__pycache__", "*.pyc"], copy=False)
+    .add_local_dir(f"{RH_LOCAL}/results/data", f"{RH_REMOTE}/results/data", copy=False)
 )
 
 
@@ -316,6 +331,33 @@ def train_one(params: dict, sweep_name: str) -> dict:
         result = _run_training(params, log_path)
     finally:
         vol.commit()  # ensure outputs are flushed to the volume
+
+    return {**result, "run_name": run_name, "output_dir": out_dir}
+
+
+@app.function(
+    image=image,
+    gpu="H100",
+    volumes={OUTPUT_REMOTE: vol},
+    secrets=secrets,
+    timeout=10 * 60 * 60,  # topic_contains @1k steps needs ~5h (judge reward
+    # ~10-15s/step under shared OpenAI rate limits) — the 4h train_one timeout
+    # killed all 6 topic radam runs at step ~730 on 2026-06-11.
+)
+def train_one_long(params: dict, sweep_name: str) -> dict:
+    """train_one with a 10h timeout, for judge-reward envs (topic_contains)."""
+    import os
+    import sys
+
+    os.chdir(REPO_REMOTE)
+    if REPO_REMOTE not in sys.path:
+        sys.path.insert(0, REPO_REMOTE)
+
+    params, run_name, out_dir, log_path = _prepare_params(params, sweep_name)
+    try:
+        result = _run_training(params, log_path)
+    finally:
+        vol.commit()
 
     return {**result, "run_name": run_name, "output_dir": out_dir}
 
@@ -929,6 +971,528 @@ def launch_modal_all_classic():
         "sweeps.retrain_gr_modal_all_classic_nocoh_1k",
         "retrain_gr_modal_all_classic_nocoh_1k",
     )
+
+
+@app.local_entrypoint()
+def launch_modal_all_classic_canonical_radam_smoke():
+    """20-step smoke of the RoutedAdam-classic sweep (runs[0]: persona_qa bw2 s1).
+    Validates: classic RoutedAdam optimizer build, sample-level m-stream accumulation,
+    clip-factor mirroring, wandb logging with the new key, checkpoint save."""
+    import sys
+    sys.path.insert(0, REPO_LOCAL)
+    from sweeps.retrain_gr_modal_all_classic_nocoh_canonical_steps_radam import runs as _runs
+    pilot = dict(_runs[0])
+    pilot["max_steps"] = 20
+    pilot["save_steps"] = 20
+    pilot["run_name"] = "smoke_" + pilot["run_name"]
+    pilot["wandb_project"] = "gr-radam-classic-smoke"  # keep smoke noise out of the full project
+    print(f"[smoke] {pilot['run_name']}")
+    res = train_one.remote(pilot, "retrain_gr_canonical_radam_smoke")
+    print(f"  result: {res['status']} ({res['duration_s']:.1f}s)  out={res['output_dir']}")
+    if res.get("err"):
+        print(f"  err: {res['err']}")
+
+
+@app.local_entrypoint()
+def launch_modal_all_classic_canonical_radam_full():
+    """24 runs: 7 envs × seeds {1,3,5} RoutedAdam-classic bw2 + topic_contains × {1,3,5}
+    bw1 ablation. Canonical per-env max_steps (2k / 1k), no coherence."""
+    _dispatch_sweep(
+        "sweeps.retrain_gr_modal_all_classic_nocoh_canonical_steps_radam",
+        "retrain_gr_modal_all_classic_nocoh_canonical_steps_radam",
+    )
+
+
+@app.function(image=image, gpu="H100", volumes={OUTPUT_REMOTE: vol}, secrets=secrets,
+              timeout=4 * 60 * 60)
+def eval_forget_scales(run_rel: str, checkpoints: list, forget_scales: str,
+                       n_eval: int, out_rel: str) -> dict:
+    """Posthoc forget-scale eval via eval_utils.py CLI, one container per run.
+
+    Loops `checkpoints` sequentially (records append to the same per-run jsonl, so
+    one container per run avoids concurrent-append races on the volume). Idempotent:
+    checkpoints whose model_path already has a record in the output jsonl are skipped.
+    Mirrors the (uncommitted) driver that produced canonical_5seed_1k_samples/.
+    """
+    import json
+    import os
+    import subprocess
+    import sys
+    import time
+    os.chdir(REPO_REMOTE)
+    out_path = os.path.join(OUTPUT_REMOTE, out_rel)
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    log_dir = os.path.join(os.path.dirname(out_path), "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    run_name = os.path.basename(run_rel.rstrip("/"))
+    log_path = os.path.join(log_dir, f"{run_name}.log")
+
+    done_paths = set()
+    if os.path.exists(out_path):
+        with open(out_path) as f:
+            done_paths = {json.loads(line).get("model_path") for line in f if line.strip()}
+
+    statuses = []
+    t0 = time.time()
+    for ckpt in checkpoints:
+        model_path = os.path.join(OUTPUT_REMOTE, run_rel, ckpt)
+        assert os.path.isdir(model_path), f"missing checkpoint dir {model_path}"
+        if model_path in done_paths:
+            statuses.append((ckpt, "skipped"))
+            continue
+        cmd = [sys.executable, "eval_utils.py", "--model_path", model_path,
+               "--n_eval", str(n_eval), "--forget_scales", forget_scales,
+               "--output", out_path]
+        with open(log_path, "a") as logf:
+            logf.write(f"\n=== {ckpt}, forget_scales={forget_scales} ===\n")
+            logf.write(f"# cmd={' '.join(cmd)}\n\n")
+            logf.flush()
+            proc = subprocess.run(cmd, stdout=logf, stderr=subprocess.STDOUT)
+        vol.commit()
+        assert proc.returncode == 0, (
+            f"eval_utils failed (rc={proc.returncode}) for {model_path}; see {log_path}")
+        statuses.append((ckpt, "ok"))
+    return {"run_name": run_name, "statuses": statuses,
+            "duration_s": time.time() - t0}
+
+
+@app.function(image=image, gpu="H100", volumes={OUTPUT_REMOTE: vol}, secrets=secrets,
+              timeout=60 * 60)
+def ppl_matrix_one(run_rel: str, checkpoint: str, n_prompts: int = 512) -> dict:
+    """Ablation-damage perplexity matrix for one trained run (2026-06-12 design).
+
+    On the unhackable AND detectable prompt subset: generate one on-policy rollout
+    per prompt under (1,0) retain_only and (1,1) both; score each rollout set's
+    completion tokens under (1,0), (1,1), and (0,0) base -> 2x3 mean per-token NLL.
+    Also reports the unconditional hack-detector rate per rollout set. Diagnoses
+    whether forget-ablation damages the model (retain_only as a worse model of
+    clean behavior) -> motivates self-distillation coherence training.
+
+    Generation at the run's training temperature (asserted 1.0 so raw logprobs ARE
+    the sampling policy). EOS handling is identical across configs (comparisons
+    unaffected). One jsonl row per run; idempotent at the driver level (skips runs
+    whose output file already exists).
+    """
+    import json
+    import math
+    import os
+    import sys
+    import time
+    from argparse import Namespace
+
+    os.chdir(REPO_REMOTE)
+    if REPO_REMOTE not in sys.path:
+        sys.path.insert(0, REPO_REMOTE)
+    import torch
+    import yaml
+    from transformers import AutoTokenizer
+
+    from envs import get_env
+    from eval_utils import generate_from_model, load_gradient_routing_model
+    from experiment_config import ExperimentConfig
+    from gradient_routing import set_scales
+    from rh_detectors import RH_CLASSIFIABLE_REGISTRY, RH_DETECTOR_REGISTRY, get_rh_classifiable
+    from train import _inject_detectable_into_eval_data
+
+    t0 = time.time()
+    run_dir = os.path.join(OUTPUT_REMOTE, run_rel)
+    model_path = os.path.join(run_dir, checkpoint)
+    assert os.path.isdir(model_path), f"missing {model_path}"
+    with open(os.path.join(run_dir, "run_config.yaml")) as f:
+        run_cfg = yaml.safe_load(f)
+
+    temperature = run_cfg.get("temperature", 1.0)
+    assert temperature == 1.0, (
+        f"ppl_matrix assumes raw logprobs == sampling policy; temperature={temperature}"
+    )
+
+    ec_fields = set(ExperimentConfig.model_fields)
+    exp_cfg = ExperimentConfig.model_validate(
+        {k: v for k, v in run_cfg.items() if k in ec_fields})
+    env_spec = get_env(run_cfg["environment"])
+    env_args = Namespace(**run_cfg)
+
+    # Load with headroom, then filter to unhackable AND detectable.
+    eval_data = env_spec.load_eval_prompts(n_prompts * 8, env_args)
+    det_name = exp_cfg.rh_detector.name
+    assert det_name in RH_CLASSIFIABLE_REGISTRY, f"no classifiable fn for {det_name}"
+    _inject_detectable_into_eval_data(
+        eval_data, get_rh_classifiable(det_name, **(exp_cfg.rh_detector.params or {})))
+    subset = [d for d in eval_data if not d["hackable"] and d["detectable"]]
+    prompt_subset = "unhackable_detectable"
+    if len(subset) < n_prompts:
+        # repeat_extra / topic_contains: detectability is defined only within the
+        # hackable subset (detectable ⊆ hackable — instruction/constraint template
+        # features), so the intersection is structurally empty. Fall back to plain
+        # unhackable (the operative property: rollouts carry no rewarded hack).
+        subset = [d for d in eval_data if not d["hackable"]]
+        prompt_subset = "unhackable"
+    assert len(subset) >= n_prompts, (
+        f"only {len(subset)} {prompt_subset} prompts (need {n_prompts}); "
+        f"raise the load multiplier")
+    subset = subset[:n_prompts]
+    prompts = [d["prompt"] for d in subset]
+
+    model = load_gradient_routing_model(model_path, base_model=run_cfg["model"])
+    tokenizer = AutoTokenizer.from_pretrained(run_cfg["model"])
+
+    hack_det_cfg = exp_cfg.hack_freq_detector
+    assert hack_det_cfg is not None, "run config lacks hack_freq_detector"
+    hack_fn = RH_DETECTOR_REGISTRY[hack_det_cfg.name]
+    det_cols = {k: [d[k] for d in subset] for k in subset[0] if k != "prompt"}
+
+    def _score_nll(rollouts, chunk=128):
+        """Mean per-token NLL of rollout completions under the CURRENT scales."""
+        device = next(model.parameters()).device
+        total_nll, total_tok = 0.0, 0
+        for i in range(0, len(rollouts), chunk):
+            batch = rollouts[i:i + chunk]
+            seqs, comp_lens = [], []
+            for r in batch:
+                if tokenizer.chat_template is not None:
+                    p_ids = tokenizer.apply_chat_template(
+                        [[{"role": "user", "content": r["prompt"]}]],
+                        add_generation_prompt=True, tokenize=True,
+                        return_dict=True)["input_ids"][0]
+                else:
+                    p_ids = tokenizer(r["prompt"], add_special_tokens=False)["input_ids"]
+                p_ids = list(p_ids)
+                assert p_ids and isinstance(p_ids[0], int), \
+                    f"prompt tokenization returned {type(p_ids[0])}, expected ints"
+                c_ids = r["completion_ids"]
+                if not c_ids:
+                    comp_lens.append(0)
+                    seqs.append(p_ids)
+                    continue
+                seqs.append(list(p_ids) + list(c_ids))
+                comp_lens.append(len(c_ids))
+            maxlen = max(len(s) for s in seqs)
+            pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id
+            ids = torch.full((len(seqs), maxlen), pad_id, dtype=torch.long)
+            attn = torch.zeros((len(seqs), maxlen), dtype=torch.long)
+            for j, s in enumerate(seqs):
+                ids[j, :len(s)] = torch.tensor(s)
+                attn[j, :len(s)] = 1
+            ids, attn = ids.to(device), attn.to(device)
+            with torch.no_grad():
+                logits = model(input_ids=ids, attention_mask=attn).logits
+            logp = logits.log_softmax(-1)
+            for j, s in enumerate(seqs):
+                cl = comp_lens[j]
+                if cl == 0:
+                    continue
+                start = len(s) - cl  # completion token t predicted at position t-1
+                tok_lp = logp[j, start - 1:len(s) - 1].gather(
+                    -1, ids[j, start:len(s)].unsqueeze(-1)).squeeze(-1)
+                total_nll += float(-tok_lp.sum())
+                total_tok += cl
+        assert total_tok > 0, "no completion tokens to score"
+        return total_nll / total_tok
+
+    GEN_CFGS = [("retain_only", 1.0, 0.0), ("both", 1.0, 1.0)]
+    SCORE_CFGS = [("retain_only", 1.0, 0.0), ("both", 1.0, 1.0), ("base", 0.0, 0.0)]
+    matrix, hack_rates, mean_lens = {}, {}, {}
+    for gname, gr, gf in GEN_CFGS:
+        set_scales(model, retain_scale=gr, forget_scale=gf)
+        rollouts = generate_from_model(
+            model, tokenizer, n_samples=len(prompts),
+            max_new_tokens=env_spec.eval_max_tokens, temperature=temperature,
+            prompts=prompts)
+        comps = [r["completion"] for r in rollouts]
+        hack_rates[gname] = float(sum(hack_fn(comps, **det_cols))) / len(comps)
+        mean_lens[gname] = float(sum(len(r["completion_ids"]) for r in rollouts)) / len(rollouts)
+        for sname, sr, sf in SCORE_CFGS:
+            set_scales(model, retain_scale=sr, forget_scale=sf)
+            nll = _score_nll(rollouts)
+            matrix[f"{gname}|{sname}"] = {"nll": nll, "ppl": math.exp(nll)}
+
+    row = {"run_name": os.path.basename(run_rel.rstrip("/")), "checkpoint": checkpoint,
+           "environment": run_cfg["environment"], "seed": run_cfg.get("seed"),
+           "n_prompts": len(prompts), "prompt_subset": prompt_subset,
+           "temperature": temperature,
+           "hack_rate": hack_rates, "mean_completion_len": mean_lens,
+           "matrix": matrix}
+    out_dir = os.path.join(OUTPUT_REMOTE, "gr_forget_scale_eval/radam_bw1_ppl_matrix")
+    os.makedirs(out_dir, exist_ok=True)
+    with open(os.path.join(out_dir, f"{row['run_name']}.jsonl"), "w") as f:
+        f.write(json.dumps(row) + "\n")
+    vol.commit()
+    row["duration_s"] = time.time() - t0
+    return row
+
+
+@app.function(image=image, gpu="H100", volumes={OUTPUT_REMOTE: vol}, secrets=secrets,
+              timeout=20 * 60)
+def peek_rollouts(run_rel: str, checkpoint: str, retain_scale: float = 1.0,
+                  forget_scale: float = 0.0, n: int = 24) -> list:
+    """Debug helper: generate n on-policy rollouts from a checkpoint at the given
+    adapter scales and return [(prompt, completion)] — for eyeballing collapse modes."""
+    import os
+    import sys
+    from argparse import Namespace
+    os.chdir(REPO_REMOTE)
+    if REPO_REMOTE not in sys.path:
+        sys.path.insert(0, REPO_REMOTE)
+    import yaml
+    from transformers import AutoTokenizer
+
+    from envs import get_env
+    from eval_utils import generate_from_model, load_gradient_routing_model
+    from gradient_routing import set_scales
+
+    run_dir = os.path.join(OUTPUT_REMOTE, run_rel)
+    with open(os.path.join(run_dir, "run_config.yaml")) as f:
+        run_cfg = yaml.safe_load(f)
+    env_spec = get_env(run_cfg["environment"])
+    eval_data = env_spec.load_eval_prompts(n, Namespace(**run_cfg))
+    prompts = [d["prompt"] for d in eval_data]
+    model = load_gradient_routing_model(os.path.join(run_dir, checkpoint),
+                                        base_model=run_cfg["model"])
+    tokenizer = AutoTokenizer.from_pretrained(run_cfg["model"])
+    set_scales(model, retain_scale=retain_scale, forget_scale=forget_scale)
+    rollouts = generate_from_model(model, tokenizer, n_samples=n,
+                                   max_new_tokens=env_spec.eval_max_tokens,
+                                   temperature=run_cfg.get("temperature", 1.0),
+                                   prompts=prompts)
+    return [(r["prompt"][:80], r["completion"]) for r in rollouts]
+
+
+@app.local_entrypoint()
+def run_peek_rollouts(run_rel: str, checkpoint: str, retain_scale: float = 1.0,
+                      forget_scale: float = 0.0, n: int = 24):
+    for p, c in peek_rollouts.remote(run_rel, checkpoint, retain_scale, forget_scale, n):
+        print(f"PROMPT: {p!r}\n  -> {c!r}")
+
+
+@app.local_entrypoint()
+def launch_modal_ppl_matrix_bw1(n_prompts: int = 512, only: str = ""):
+    """Perplexity 2x3 matrix on all 21 bw1 final checkpoints →
+    /output/gr_forget_scale_eval/radam_bw1_ppl_matrix/. --only for smoke."""
+    import sys
+    sys.path.insert(0, REPO_LOCAL)
+    from sweeps.retrain_gr_modal_all_classic_nocoh_canonical_steps_radam import runs as _r2
+    from sweeps.retrain_gr_modal_all_classic_nocoh_canonical_steps_radam_bw1 import runs as _r1
+    bw1 = [r for r in _r2 + _r1 if "_radam_bw1_" in r["run_name"]]
+    assert len(bw1) == 21, f"expected 21 bw1 runs, got {len(bw1)}"
+    if only:
+        bw1 = [r for r in bw1 if r["run_name"] in set(only.split(","))]
+    calls = [(f"{_RADAM_SWEEP}/{r['run_name']}", f"checkpoint-{r['max_steps']}", n_prompts)
+             for r in bw1]
+    print(f"[modal] dispatching {len(calls)} ppl-matrix evals (n_prompts={n_prompts})")
+    results = list(ppl_matrix_one.starmap(calls))
+    for res in results:
+        m = res["matrix"]
+        print(f"  {res['run_name']}: ppl ro|ro={m['retain_only|retain_only']['ppl']:.2f} "
+              f"both|both={m['both|both']['ppl']:.2f} ({res['duration_s']:.0f}s)")
+
+
+_RADAM_SWEEP = "retrain_gr_modal_all_classic_nocoh_canonical_steps_radam"
+_RADAM_EVAL_SCALES = "0,0.2,0.4,0.6,0.8,1"
+_RADAM_EVAL_N = 1000
+# bw1 (topic_contains ablation) runs get their own eval dir: collate/plot/optimum
+# tooling groups rows by (env, seed), which would collide across the two arms.
+_RADAM_FINAL_EVAL_DIR = "gr_forget_scale_eval/canonical_radam_1k_samples"
+_RADAM_BW1_FINAL_EVAL_DIR = "gr_forget_scale_eval/canonical_radam_bw1_1k_samples"
+_RADAM_SDCOH_FINAL_EVAL_DIR = "gr_forget_scale_eval/radam_bw1_sdcoh_1k_samples"
+
+
+@app.local_entrypoint()
+def launch_modal_all_classic_canonical_radam_bw1_full():
+    """18 runs: bw1 (B=1, removed-signal-only) on the 6 non-topic envs × seeds
+    {1,3,5}. Same sweep output dir as the bw2 runs (run names carry _bw1_).
+    All 6 envs completed under the 4h train_one timeout in the bw2 sweep."""
+    _dispatch_sweep(
+        "sweeps.retrain_gr_modal_all_classic_nocoh_canonical_steps_radam_bw1",
+        "retrain_gr_modal_all_classic_nocoh_canonical_steps_radam",
+    )
+
+
+@app.local_entrypoint()
+def launch_modal_radam_bw1_sdcoh_smoke():
+    """30-step smoke of self-distillation coherence (runs[0]: persona α=1.0 s1).
+    Validates: coh_fixed_advantage advantage override, RoutedAdam coherence-mb
+    stream feeding, coherence/sd_hack_frac metric, (1,0) coh generation slot."""
+    import sys
+    sys.path.insert(0, REPO_LOCAL)
+    from sweeps.radam_bw1_sdcoh import runs as _runs
+    pilot = dict(_runs[0])
+    pilot["max_steps"] = 30
+    pilot["save_steps"] = 30
+    pilot["run_name"] = "smoke_" + pilot["run_name"]
+    pilot["wandb_project"] = "gr-radam-classic-smoke"
+    print(f"[smoke] {pilot['run_name']}")
+    res = train_one.remote(pilot, "radam_bw1_sdcoh_smoke")
+    print(f"  result: {res['status']} ({res['duration_s']:.1f}s)  out={res['output_dir']}")
+    if res.get("err"):
+        print(f"  err: {res['err']}")
+
+
+@app.local_entrypoint()
+def launch_modal_radam_bw1_sdcoh_full():
+    """12 runs: SD coherence (persona/repeat/object × seeds {1,3} × α {1.0,0.3},
+    cspr=64) on the bw1 RoutedAdam canonical config."""
+    _dispatch_sweep("sweeps.radam_bw1_sdcoh", "radam_bw1_sdcoh")
+
+
+@app.local_entrypoint()
+def launch_modal_leetcode_noint_4b_smoke():
+    """20-step smoke of the no-intervention leetcode baseline (Qwen3-4B, H100).
+    Validates: leetcode env + PersistentCodeEvaluator code-exec run in the Modal
+    container; 4B + rollout 1024 + 1536-tok completions fit on H100; reward
+    (correct/trait/compile) scores > 0; no judge / no OpenRouter needed."""
+    import sys
+    sys.path.insert(0, REPO_LOCAL)
+    from sweeps.leetcode_noint_4b_baseline import runs as _runs
+    pilot = dict(_runs[-1])  # hf=1.0 (max hack opportunity) for the smoke
+    pilot["max_steps"] = 20
+    pilot["save_steps"] = 20
+    pilot["eval_every"] = 20
+    pilot["run_name"] = "smoke_" + pilot["run_name"]
+    pilot["wandb_project"] = "leetcode-noint-baseline-4b-smoke"
+    print(f"[smoke] {pilot['run_name']} (Qwen3-4B leetcode no-intervention, H100)")
+    res = train_one.remote(pilot, "leetcode_noint_4b_smoke")
+    print(f"  result: {res['status']} ({res['duration_s']:.1f}s)  out={res['output_dir']}")
+    if res.get("err"):
+        print(f"  err: {res['err']}")
+
+
+@app.local_entrypoint()
+def launch_modal_leetcode_noint_4b_full():
+    """12 runs: Qwen3-4B no-intervention leetcode baseline (4 seeds × hack_frac
+    {0.5,0.8,1.0}), off-policy 3200 steps, max_grad_norm 0.2, no judge. H100."""
+    _dispatch_sweep("sweeps.leetcode_noint_4b_baseline", "leetcode_noint_4b_baseline")
+
+
+@app.local_entrypoint()
+def launch_modal_leetcode_noint_match_smoke():
+    """20-step smoke of the VERL-matched no-intervention config (Qwen3-4B,
+    on-policy, non-aware hint, LoRA r32 all-linear). Validates the non-aware
+    dataset loads, LoRA r32f0 builds, on-policy batching, and code-eval scores."""
+    import sys
+    sys.path.insert(0, REPO_LOCAL)
+    from sweeps.leetcode_noint_4b_match import runs as _runs
+    pilot = dict(_runs[-1])  # hf=1.0 s4
+    pilot["max_steps"] = 20
+    pilot["save_steps"] = 20
+    pilot["eval_every"] = 20
+    pilot["run_name"] = "smoke_" + pilot["run_name"]
+    pilot["wandb_project"] = "leetcode-noint-match-4b-smoke"
+    print(f"[smoke] {pilot['run_name']} (Qwen3-4B VERL-matched no-int, H100)")
+    res = train_one.remote(pilot, "leetcode_noint_match_smoke")
+    print(f"  result: {res['status']} ({res['duration_s']:.1f}s)  out={res['output_dir']}")
+    if res.get("err"):
+        print(f"  err: {res['err']}")
+
+
+@app.local_entrypoint()
+def launch_modal_leetcode_noint_match_full():
+    """8 runs: VERL-matched no-intervention leetcode (Qwen3-4B, on-policy, non-aware
+    hint, LoRA r32, lr 7e-5, grad-clip 1.0, beta 1e-3), 4 seeds × hack_frac {0.5,1.0}."""
+    _dispatch_sweep("sweeps.leetcode_noint_4b_match", "leetcode_noint_4b_match")
+
+
+@app.local_entrypoint()
+def launch_modal_topic_radam_rerun():
+    """Rerun the 6 topic_contains radam runs (bw2+bw1 × seeds {1,3,5}) on
+    train_one_long (10h timeout). The original attempts all died at Modal's 4h
+    train_one timeout at step ~730/1000 (judge reward ~10-15s/step under shared
+    OpenAI rate limits). Fresh from-scratch runs into the same output dirs;
+    every checkpoint-N is overwritten as the rerun passes it, so the final dirs
+    are single-attempt consistent."""
+    import sys
+    sys.path.insert(0, REPO_LOCAL)
+    from sweeps.retrain_gr_modal_all_classic_nocoh_canonical_steps_radam import runs as _runs
+    topic = [r for r in _runs if "topic_contains" in r["run_name"]]
+    assert len(topic) == 6, f"expected 6 topic runs, got {len(topic)}"
+    print(f"[modal] re-dispatching {len(topic)} topic runs on train_one_long")
+    for r in topic:
+        print(f"  - {r['run_name']}")
+    results = list(train_one_long.starmap(
+        [(r, "retrain_gr_modal_all_classic_nocoh_canonical_steps_radam") for r in topic]))
+    for res in results:
+        print(f"  {res['run_name']}: {res['status']} ({res['duration_s']:.1f}s)")
+
+
+@app.local_entrypoint()
+def launch_modal_eval_canonical_radam(only: str = ""):
+    """Final-checkpoint forget-scale eval for the RoutedAdam-classic sweep:
+    24 runs × 6 forget scales × n_eval=1000 → /output/{_RADAM_FINAL_EVAL_DIR}/
+    (bw2) and /output/{_RADAM_BW1_FINAL_EVAL_DIR}/ (bw1 topic ablation).
+    One container per run; idempotent (re-run after stragglers finish).
+    --only: comma-separated run_name filter for wave dispatch while the train
+    sweep is still finishing (the eval asserts on missing checkpoints)."""
+    import sys
+    sys.path.insert(0, REPO_LOCAL)
+    from sweeps.radam_bw1_sdcoh import runs as _sdcoh_runs
+    from sweeps.retrain_gr_modal_all_classic_nocoh_canonical_steps_radam import runs as _runs
+    from sweeps.retrain_gr_modal_all_classic_nocoh_canonical_steps_radam_bw1 import (
+        runs as _bw1_runs,
+    )
+    _runs = _runs + _bw1_runs + _sdcoh_runs
+    if only:
+        only_set = set(only.split(","))
+        unknown = only_set - {r["run_name"] for r in _runs}
+        assert not unknown, f"--only contains unknown runs: {unknown}"
+        _runs = [r for r in _runs if r["run_name"] in only_set]
+    calls = []
+    for r in _runs:
+        if "_sdcoh_" in r["run_name"]:
+            out_dir = _RADAM_SDCOH_FINAL_EVAL_DIR
+            sweep_root = "radam_bw1_sdcoh"  # trained via launch_modal_radam_bw1_sdcoh_full
+        elif "_radam_bw1_" in r["run_name"]:
+            out_dir = _RADAM_BW1_FINAL_EVAL_DIR
+            sweep_root = _RADAM_SWEEP
+        else:
+            out_dir = _RADAM_FINAL_EVAL_DIR
+            sweep_root = _RADAM_SWEEP
+        calls.append((f"{sweep_root}/{r['run_name']}",
+                      [f"checkpoint-{r['max_steps']}"],
+                      _RADAM_EVAL_SCALES, _RADAM_EVAL_N,
+                      f"{out_dir}/{r['run_name']}.jsonl"))
+    print(f"[modal] dispatching {len(calls)} forget-scale evals")
+    results = list(eval_forget_scales.starmap(calls))
+    for res in results:
+        print(f"  {res['run_name']}: {res['statuses']} ({res['duration_s']:.0f}s)")
+
+
+@app.local_entrypoint()
+def launch_modal_eval_canonical_radam_trajectory(optima_json: str, out_dir: str = ""):
+    """Per-checkpoint eval at each run's optimal forget scale (n_eval=1000) →
+    /output/gr_forget_scale_eval/canonical_radam_trajectory_optimum/ (default;
+    pass --out-dir canonical_radam_bw1_trajectory_optimum for the bw1 arm —
+    bw1/bw2 need separate dirs because the uplift-panel reader globs per-env
+    files and keys them by seed).
+
+    optima_json: path to a JSON dict {run_name: forget_scale} — produced by
+    tools/radam_optima.py from the final-eval results.jsonl (argmax over
+    forget_scale of retain - 2*hack_overall per run). One container per run,
+    looping its checkpoints sequentially (records append to one jsonl/run)."""
+    import json
+    import sys
+    sys.path.insert(0, REPO_LOCAL)
+    from sweeps.retrain_gr_modal_all_classic_nocoh_canonical_steps_radam import runs as _runs
+    from sweeps.retrain_gr_modal_all_classic_nocoh_canonical_steps_radam_bw1 import (
+        runs as _bw1_runs,
+    )
+    _runs = _runs + _bw1_runs
+    out_dir = out_dir or "canonical_radam_trajectory_optimum"
+    with open(optima_json) as f:
+        optima = json.load(f)
+    by_name = {r["run_name"]: r for r in _runs}
+    assert set(optima) <= set(by_name), f"unknown runs in {optima_json}: {set(optima) - set(by_name)}"
+    calls = []
+    for run_name, scale in optima.items():
+        r = by_name[run_name]
+        ckpts = [f"checkpoint-{s}" for s in range(100, r["max_steps"] + 1, 100)]
+        calls.append((f"{_RADAM_SWEEP}/{run_name}", ckpts, f"{scale:g}", _RADAM_EVAL_N,
+                      f"gr_forget_scale_eval/{out_dir}/{run_name}.jsonl"))
+    print(f"[modal] dispatching {len(calls)} trajectory evals "
+          f"({sum(len(c[1]) for c in calls)} checkpoint evals total)")
+    results = list(eval_forget_scales.starmap(calls))
+    for res in results:
+        n_ok = sum(1 for _, s in res["statuses"] if s == "ok")
+        n_skip = sum(1 for _, s in res["statuses"] if s == "skipped")
+        print(f"  {res['run_name']}: {n_ok} ok, {n_skip} skipped ({res['duration_s']:.0f}s)")
 
 
 @app.local_entrypoint()

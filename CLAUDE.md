@@ -320,6 +320,21 @@ Blast radius with packing: one run hanging drags the whole container into the ti
 - At inference: ablate bad adapter to remove unwanted behavior
 - Requires homogeneous micro-batches (all-bad or all-good) for selective gradient masking
 
+### RoutedAdam (optimizer-level routing, `--routed_adam`)
+
+Hook-based routing miscalibrates per-param Adam: a param whose v is calibrated to a
+sparse routed stream gives that stream full-lr steps (~sqrt(v_full/v_routed)
+amplification — caused the em-dash runaway forget-side, and is the suspected mechanism
+behind the partially-conditional retain policy under classic routing, where unflagged
+hacks are sparse-but-consistent in the retain stream). RoutedAdam replaces hooks: m is
+routed, v sees the full gradient stream (`p.grad`), so deviation from reference
+dynamics comes only through removed/reweighted momentum, never v-rescaling. Supported:
+token+exclusive (em-dash) and sample-level classic/exclusive. Classic stream weights
+(`retain m <- R, forget m <- R + 2*F`; sum == the dual-adapter routing_mode=none
+baseline) are derived in `SampleGRPOTrainer._routed_adam_feeds` — the single source of
+truth; optimizer math in `routed_adam.py`; tests in `tests/test_routed_adam.py`.
+Sweep + eval pipeline: MODAL_RUNS.md "RoutedAdam-classic".
+
 ## Gradient Routing Eval
 
 Automatic eval runs every `--eval_every` steps (default 100) whenever eval reward fns are configured. DualLoRA is always present, so all three adapter modes are always tested:
@@ -561,9 +576,11 @@ collapse). Healthy `train/grad_norm` sits at **median ~0.05–0.06, p99 ~0.13–
   cost latency (~1s backoff/retry), not money or correctness.
 
 ### Modal app name
-`tools/modal_train_gr.py` app was renamed `gr-pilot` → **`gr-pilot-jnward`**:
-`jnward` lost write access to the `gr-pilot` app name on the `team-shard-c9-b`
-workspace (a workspace ACL/ownership issue — surfaced as
-`StatusCode.DEADLINE_EXCEEDED` then "does not have write access", NOT a credit
-problem). Same volume `gr-modal-pilot`, so outputs co-locate. `modal run` for a
-new app name that jnward owns works fine.
+`tools/modal_train_gr.py` app was renamed `gr-pilot` → `gr-pilot-jnward` →
+**`gr-radam-jake`** (2026-06-11, unique per-experimenter name under the
+`team-shard-c9-b-jake-shawn` token profile; `jnward` had lost write access to
+the `gr-pilot` app name on the `team-shard-c9-b` workspace — a workspace
+ACL/ownership issue surfacing as `StatusCode.DEADLINE_EXCEEDED` then "does not
+have write access", NOT a credit problem). Same volume `gr-modal-pilot`, so
+outputs co-locate. wandb key: secret `wandb-key-jake`, listed LAST in the
+shared `secrets` list so it takes precedence without overwriting others' keys.

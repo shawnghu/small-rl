@@ -11,6 +11,8 @@ import sys
 from pathlib import Path
 
 REPO = Path("/workspace/small-rl")
+# Default; override with argv[1] (path relative to repo root), e.g.
+#   tools/collate_canonical_5seed_eval.py output/gr_forget_scale_eval/canonical_radam_1k_samples
 EVAL_DIR = REPO / "output/gr_forget_scale_eval/canonical_5seed_1k_samples"
 FORGET_SCALES = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
 
@@ -49,6 +51,9 @@ def _find_retain_key(rec, mode_key):
 
 
 def main():
+    global EVAL_DIR
+    if len(sys.argv) > 1:
+        EVAL_DIR = REPO / sys.argv[1]
     assert EVAL_DIR.is_dir(), f"missing {EVAL_DIR}"
     per_run_jsonls = sorted(EVAL_DIR.glob("*.jsonl"))
     per_run_jsonls = [p for p in per_run_jsonls if p.name != "results.jsonl"]

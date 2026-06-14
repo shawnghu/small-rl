@@ -67,9 +67,57 @@ Entrypoints:
 | `launch_modal_3envs` | `retrain_gr_modal_3envs_exclusive_nocoh_1k` | 3 envs × 2 seeds, **exclusive**, no coherence |
 | `launch_modal_6envs_classic_coh` | `retrain_gr_modal_6envs_classic_coh_1k` | 6 envs × 2 seeds, classic **+ coherence** |
 | `launch_modal_6envs_excl_coh` | `retrain_gr_modal_6envs_excl_coh_1k` | 6 envs × 2 seeds, exclusive **+ coherence** |
+| `launch_modal_all_classic_canonical_radam_{smoke,full}` | `retrain_gr_modal_all_classic_nocoh_canonical_steps_radam` | 7 envs × seeds {1,3,5}, classic + **RoutedAdam** (bw2) + topic_contains bw1 ablation, canonical max_steps |
 
 The 2×2 (routing × coherence) over these is exactly the matrix analyzed in
 `output/gr_forget_scale_eval/SUMMARY.md`.
+
+### RoutedAdam-classic (2026-06-11)
+
+`--routed_adam` now supports sample-level classic routing (previously token-level
+exclusive only). Routing moves from gradient hooks into the optimizer: every
+adapter param's `p.grad` carries the FULL gradient (shared second moment v +
+clipping), while the first-moment streams are routed with weights
+`retain m <- R, forget m <- R + B*F` (B = `--routed_adam_classic_bad_weight`,
+default 2.0). B=2 makes the combined model's dynamics match the dual-adapter
+`routing_mode=none` baseline exactly; B=1 changes only the retain adapter's v
+denominator vs hook-classic (ablation arm). Derivation:
+`SampleGRPOTrainer._routed_adam_feeds` (train.py); optimizer math: `routed_adam.py`;
+tests: `tests/test_routed_adam.py` (tests 5–6). Requires no coherence,
+`bad_pass_loss_scale=1`, `forget_lr_mult=1`, MLP adapters; `--routed_adam_kappa`
+is exclusive-only.
+
+The bw1 arm was extended to all 7 envs on 2026-06-12
+(`sweeps/..._canonical_steps_radam_bw1.py`, `launch_modal_all_classic_canonical_radam_bw1_full`).
+topic_contains exceeds train_one's 4h timeout (judge reward ~10-24s/step under
+shared OpenAI rate limits) — use `train_one_long` (10h) /
+`launch_modal_topic_radam_rerun` for topic radam runs.
+
+Posthoc eval: `launch_modal_eval_canonical_radam` (eval_utils per final checkpoint,
+6 forget scales × n_eval=1000, one container per run, idempotent) →
+`/output/gr_forget_scale_eval/canonical_radam_1k_samples/` (bw2) and
+`canonical_radam_bw1_1k_samples/` (bw1; separate dir because collate/plot/optimum
+tooling groups by (env, seed)). Then locally:
+`tools/collate_canonical_5seed_eval.py <eval_dir_rel>`,
+`tools/plot_canonical_5seed_forget_scale.py <eval_dir_rel> "<title tag>"`,
+`tools/radam_optima.py <eval_dir_rel>`, and per-checkpoint trajectory evals via
+`launch_modal_eval_canonical_radam_trajectory --optima-json ... [--out-dir ...]`.
+Figures: `figures_pareto/proto_figure1_partial_forget_radam.py` (separate *_radam
+filenames; originals untouched).
+
+**Result (seeds 1/3/5, optimum = argmax retain − 2·hack, no significance tests):**
+env-mean score bw1 0.590 / bw2 0.586 / canonical hook-classic 0.577. The two
+scheme components separate: shared-v alone (bw1) fixes the two worst
+partially-conditional envs (addition_v2 0.651 vs canon 0.518; topic 0.325 vs
+0.248; unmonitored-at-optimum env-mean 0.055 vs canon 0.111) and is never
+catastrophic; the F×2 multiplicity correction (bw2−bw1 delta) wins object_qa
+(0.639 vs 0.508) and cities (+0.02) but collapses topic (0.128) — bw2's retain
+adapter keeps a strong conditional leak there (f=0 undetectable 0.47–0.70)
+that bw1's unlearns during training, despite the two arms' retain-side
+optimizer treatment being mathematically identical (the difference flows
+through the on-policy distribution; channel not yet identified — rollout
+undetectable-hack rates saturate ~0.9+ in BOTH arms, so it is NOT "bw2 hacks
+more on-policy").
 
 ## Leetcode env (Qwen3-8B)
 

@@ -574,6 +574,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                  routing_mode=None, rh_detector=None,
                  routing_granularity="trajectory", token_routing_detector_name=None,
                  routed_adam=False, routed_adam_kappa=1.0,
+                 routed_adam_classic_bad_weight=2.0,
                  base_rh_detector=None,
                  eval_every=0, eval_metrics=None,
                  routed_reward=None,
@@ -590,6 +591,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                  coherence_gen="retain_only",
                  coherence_rh_mode="filter",
                  coherence_rh_penalty=3.0,
+                 coh_fixed_advantage=None,
                  coh_samples_per_rollout=0,
                  rh_detector_verifies_retain_samples=False,
                  rh_detector_retain_recall=1.0,
@@ -693,6 +695,7 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._token_routing_detector_name = token_routing_detector_name
         self._routed_adam = routed_adam
         self._routed_adam_kappa = routed_adam_kappa
+        self._routed_adam_classic_bad_weight = routed_adam_classic_bad_weight
         self._token_bearing_ids = None   # single-char behaviors (em-dash/semicolon): vocab-id set
         self._id_strings = None          # span behaviors (bold): per-vocab-id decoded strings
         # α scaling on the bad-pass loss to compensate for the missing
@@ -769,6 +772,7 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._coherence_gen = coherence_gen
         self._coherence_rh_mode = coherence_rh_mode
         self._coherence_rh_penalty = coherence_rh_penalty
+        self._coh_fixed_advantage = coh_fixed_advantage
         self._coherence_rollout_counter = 0
         self._is_coherence_rollout = False
         self._coh_samples_per_rollout = coh_samples_per_rollout
@@ -1930,6 +1934,57 @@ class SampleGRPOTrainer(GRPOTrainer):
         ptl = per_token * mask_f / (seq_len.unsqueeze(1) * float(N) * normalizer)
         return ptl
 
+    def _routed_adam_feeds(self, is_good):
+        """RoutedAdam m-stream feeds [(params, weight), ...] for one routed loss/microbatch.
+
+        Stream-weight derivation (the single source of truth for these weights):
+        for a mirrored retain/forget param pair, the routing_mode=none dual-adapter baseline
+        gives EACH param m_{R+F}/sqrt(v_{R+F}), so the combined model moves by
+        2*m_{R+F}/sqrt(v).  R = good-sample gradient stream, F = detected-bad stream.
+
+          exclusive: retain m <- R,  forget m <- F            (sum m_{R+F}: each adapter is the
+                     reference update with the off-stream momentum removed)
+          classic:   retain m <- R,  forget m <- R + B*F      (B=2 default: sum 2*m_{R+F} ==
+                     the dual-adapter baseline exactly. Classic carries R in BOTH adapters but
+                     consolidates F into forget alone, so matching baseline combined dynamics
+                     requires F at the multiplicity the baseline gave it.)
+
+        v is the full stream (p.grad) for every param in both modes — see routed_adam.py.
+        B = --routed_adam_classic_bad_weight. B=1 is the per-param "removed signal only"
+        ablation: it fixes only the retain v denominator, leaving the forget adapter's
+        m AND v exactly what hook-classic + AdamW already gave it.
+        """
+        retain_p = [p for p in self._retain_params if p.requires_grad]
+        forget_p = [p for p in self._forget_params if p.requires_grad]
+        if self._routing_mode == "classic":
+            if is_good:
+                return [(retain_p, 1.0), (forget_p, 1.0)]
+            return [(forget_p, self._routed_adam_classic_bad_weight)]
+        assert self._routing_mode == "exclusive", \
+            f"routed_adam: unsupported routing_mode {self._routing_mode!r}"
+        return [(retain_p, 1.0)] if is_good else [(forget_p, 1.0)]
+
+    def _routed_adam_backward(self, loss, feeds, retain_graph=False):
+        """Backward `loss`, accumulating the FULL gradient into p.grad (the shared
+        second-moment / clipping stream) while adding weight * (this backward's grad delta)
+        into p._routed_m_stream for each (params, weight) in `feeds`. NO gradient hooks —
+        routing lives entirely in the optimizer's first moment. Streams accumulate across
+        the optimizer window; RoutedAdam.step() zeroes them, aligned with HF's zero_grad().
+        """
+        snap = {}
+        for params, _w in feeds:
+            for p in params:
+                if getattr(p, "_routed_m_stream", None) is None:
+                    p._routed_m_stream = torch.zeros_like(p, dtype=torch.float32)
+                assert p not in snap, "param appears in multiple routed_adam feeds"
+                snap[p] = p.grad.detach().clone() if p.grad is not None else None
+        self.accelerator.backward(loss, retain_graph=retain_graph)
+        for params, w in feeds:
+            for p in params:
+                g0 = snap[p]
+                delta = p.grad if g0 is None else p.grad - g0
+                p._routed_m_stream += delta.float() * w
+
     def _token_routed_forward_backward(self, model, inputs, num_items_in_batch):
         """Token-level classic gradient routing (routing_granularity='token'). One shared packed
         forward; explicit per-token GRPO loss; TWO masked backwards through the shared graph:
@@ -1983,31 +2038,13 @@ class SampleGRPOTrainer(GRPOTrainer):
         if self._routed_adam:
             # RoutedAdam path: NO gradient hooks — routing lives in the optimizer. Both passes
             # accumulate the FULL gradient into p.grad (the second-moment / clipping stream);
-            # per-pass deltas are accumulated into p._routed_m_stream (the first-moment stream:
-            # good-token grads for retain params, behavior-token grads for forget params).
-            # Snapshots are per-microbatch transients; streams accumulate across the optimizer
-            # window and are zeroed by RoutedAdam.step(), aligned with HF's zero_grad().
+            # per-pass deltas go to the m streams per _routed_adam_feeds (good tokens -> retain,
+            # behavior tokens -> forget; token granularity is exclusive-only).
             assert self._bad_pass_loss_scale == 1.0, \
                 "routed_adam requires bad_pass_loss_scale=1.0 (use routed_adam_kappa instead)"
-            retain_p = [p for p in self._retain_params if p.requires_grad]
-            forget_p = [p for p in self._forget_params if p.requires_grad]
-            for p in retain_p + forget_p:
-                if getattr(p, "_routed_m_stream", None) is None:
-                    p._routed_m_stream = torch.zeros_like(p, dtype=torch.float32)
-            snap_pre = {p: (p.grad.detach().clone() if p.grad is not None else None)
-                        for p in retain_p}
-            self.accelerator.backward(loss_good, retain_graph=True)
-            for p in retain_p:
-                g0 = snap_pre[p]
-                delta = p.grad if g0 is None else p.grad - g0
-                p._routed_m_stream += delta.float()
-            snap_mid = {p: (p.grad.detach().clone() if p.grad is not None else None)
-                        for p in forget_p}
-            self.accelerator.backward(loss_bad)
-            for p in forget_p:
-                g0 = snap_mid[p]
-                delta = p.grad if g0 is None else p.grad - g0
-                p._routed_m_stream += delta.float()
+            self._routed_adam_backward(loss_good, self._routed_adam_feeds(True),
+                                       retain_graph=True)
+            self._routed_adam_backward(loss_bad, self._routed_adam_feeds(False))
         else:
             # Pass 1: good tokens -> both adapters (classic good-pass = no hook; exclusive would zero forget).
             hooks = []
@@ -3410,7 +3447,21 @@ class SampleGRPOTrainer(GRPOTrainer):
                 else:
                     coh_mask = torch.full_like(is_rh_tensor, self._is_coherence_rollout)
                 rh_in_coh = is_rh_tensor & coh_mask
-                if rh_in_coh.any():
+                if self._coh_fixed_advantage is not None:
+                    # Self-distillation coherence: constant advantage on the whole
+                    # coh slice. On-policy REINFORCE with A=const == cross-entropy on
+                    # the retain-only model's own rollouts (scaled by const) — no
+                    # differential reinforcement, hacks included by design (logged
+                    # below; the inductive hypothesis is the (1,0) policy emits few).
+                    # Takes precedence over coherence_rh_mode entirely.
+                    if coh_mask.any():
+                        output["advantages"] = output["advantages"].clone()
+                        output["advantages"][coh_mask] = self._coh_fixed_advantage
+                        n_coh = int(coh_mask.sum().item())
+                        m = self._metrics.setdefault("train", {})
+                        m.setdefault("coherence/sd_hack_frac", []).append(
+                            int(rh_in_coh.sum().item()) / n_coh)
+                elif rh_in_coh.any():
                     if self._coherence_rh_mode in ("penalty", "zero"):
                         # Modify rewards in-place, then recompute group advantages.
                         # 'penalty' subtracts a constant; 'zero' clobbers to 0 so a
@@ -4389,6 +4440,7 @@ class SampleGRPOTrainer(GRPOTrainer):
 
             hooks = []
             _hook_target = "none"
+            _radam_feeds = None
             # Per-mb scale management for coh microbatches in merged-interlaced
             # mode (split mode handled at the outer scope).
             _restore_mb_scales = False
@@ -4397,9 +4449,35 @@ class SampleGRPOTrainer(GRPOTrainer):
                     from gradient_routing import set_scales
                     set_scales(model, retain_scale=1.0, forget_scale=0.0)
                     _restore_mb_scales = True
-                hooks = [p.register_hook(lambda g: torch.zeros_like(g))
-                         for p in self._forget_params]
-                _hook_target = "forget"
+                if self._routed_adam:
+                    # RoutedAdam + coherence: only the self-distillation mode is
+                    # wired (asserted at CLI). At scales (1,0) the gradient through
+                    # forget params is identically zero (forget's output is scaled
+                    # out of the forward), so no hooks: the coh delta feeds retain's
+                    # m stream at weight 1 and p.grad/v as usual. Note retain's v
+                    # thereby includes coherence-step gradients the routing_mode=none
+                    # reference wouldn't have — same benign deviation class as
+                    # retain_mode=renormalize.
+                    assert self._coh_fixed_advantage is not None, \
+                        "routed_adam + coherence requires coh_fixed_advantage (self-distillation)"
+                    assert merged_interlaced, \
+                        "routed_adam + coherence is only wired for interlaced merged mode"
+                    _radam_feeds = [([p for p in self._retain_params if p.requires_grad], 1.0)]
+                    _hook_target = "radam_streams_coh"
+                else:
+                    hooks = [p.register_hook(lambda g: torch.zeros_like(g))
+                             for p in self._forget_params]
+                    _hook_target = "forget"
+            elif self._routed_adam:
+                # RoutedAdam (sample-level): NO hooks — p.grad accumulates the full
+                # gradient on every mb; the routed m streams get this mb's grad delta
+                # weighted per _routed_adam_feeds at the backward site below.
+                assert is_good in (True, False), \
+                    f"routed_adam: unexpected microbatch kind {is_good!r}"
+                assert self._bad_pass_loss_scale == 1.0, \
+                    "routed_adam requires bad_pass_loss_scale=1.0"
+                _radam_feeds = self._routed_adam_feeds(is_good)
+                _hook_target = "radam_streams"
             elif is_good is True and self._good_pass_hooked_params is not None:
                 _fn = self._good_pass_hook_fn
                 hooks = [p.register_hook(_fn) for p in self._good_pass_hooked_params]
@@ -4439,13 +4517,19 @@ class SampleGRPOTrainer(GRPOTrainer):
                 packed = _pack_for_forward(inputs, indices)
                 with self.compute_loss_context_manager():
                     loss = self._packed_compute_loss(model, packed)
-                self.accelerator.backward(loss * scale)
+                if _radam_feeds is not None:
+                    self._routed_adam_backward(loss * scale, _radam_feeds)
+                else:
+                    self.accelerator.backward(loss * scale)
                 del packed
             else:
                 mb_inputs = _trim_and_slice(inputs, indices)
                 with self.compute_loss_context_manager():
                     loss = self.compute_loss(model, mb_inputs, num_items_in_batch=num_items_in_batch)
-                self.accelerator.backward(loss * scale)
+                if _radam_feeds is not None:
+                    self._routed_adam_backward(loss * scale, _radam_feeds)
+                else:
+                    self.accelerator.backward(loss * scale)
                 del mb_inputs
 
             # Trace: post-backward delta + per-mb JSONL record + [TRACE mb] stdout line.
@@ -5001,17 +5085,29 @@ def _make_parser():
                              "per-token GRPO loss for behavior tokens is masked from the retain adapter). "
                              "'token' requires routing_mode=classic and a single-char behavior detector.")
     parser.add_argument("--routed_adam", action="store_true", default=False,
-                        help="Use RoutedAdam (shared-v): routed first moment (retain=good tokens, "
-                             "forget=behavior tokens), full-stream second moment, so each adapter's "
-                             "updates are sized in routing_mode=none reference units (no per-adapter "
-                             "Adam amplification of the sparse forget stream). Requires "
-                             "routing_granularity=token, routing_mode=exclusive, "
-                             "bad_pass_loss_scale=1.0. Replaces gradient hooks with optimizer-level "
-                             "routing. See routed_adam.py.")
+                        help="Use RoutedAdam (shared-v): routed first moment, full-stream second "
+                             "moment, so each adapter's updates are sized in routing_mode=none "
+                             "reference units (no per-adapter Adam amplification of sparse routed "
+                             "streams). Replaces gradient hooks with optimizer-level routing. "
+                             "Supported: routing_granularity=token + routing_mode=exclusive "
+                             "(token-level, em-dash style), or routing_granularity=trajectory + "
+                             "routing_mode=classic|exclusive (sample-level). Requires "
+                             "bad_pass_loss_scale=1.0. Stream weights: see "
+                             "SampleGRPOTrainer._routed_adam_feeds; optimizer math: routed_adam.py.")
     parser.add_argument("--routed_adam_kappa", type=float, default=1.0,
                         help="RoutedAdam forget-momentum multiplier in reference units: the forget "
                              "adapter learns the behavior at kappa x the rate the routing_mode=none "
-                             "reference would. 1.0 = reference-faithful.")
+                             "reference would. 1.0 = reference-faithful. Exclusive routing only "
+                             "(under classic it would also scale the forget adapter's retain-stream "
+                             "momentum, breaking R-sum preservation).")
+    parser.add_argument("--routed_adam_classic_bad_weight", type=float, default=2.0,
+                        help="RoutedAdam + routing_mode=classic only: weight B of detected-forget "
+                             "(bad-sample) gradients in the forget adapter's momentum stream "
+                             "(retain m <- R, forget m <- R + B*F; full-stream v). B=2 (default) "
+                             "matches the routing_mode=none dual-adapter baseline's combined "
+                             "dynamics; B=1 is the per-param 'removed signal only' ablation that "
+                             "changes ONLY the retain adapter's v denominator vs hook-classic. "
+                             "Derivation: SampleGRPOTrainer._routed_adam_feeds.")
     parser.add_argument("--retain_rank", type=int, default=32)
     parser.add_argument("--forget_rank", type=int, default=32)
     parser.add_argument("--lora_alpha", type=int, default=32)
@@ -5120,6 +5216,15 @@ def _make_parser():
                              "cost only the sample's reward rather than pushing it strongly negative).")
     parser.add_argument("--coherence_rh_penalty", type=float, default=3.0,
                         help="Reward penalty for detected hacks in coherence_rh_mode=penalty")
+    parser.add_argument("--coh_fixed_advantage", type=float, default=None,
+                        help="Self-distillation coherence: override the coherence slice's "
+                             "advantages with this constant (on-policy REINFORCE with A=const "
+                             "== cross-entropy on the retain-only model's own rollouts, scaled "
+                             "by the constant). No detector gating on the coh slice — hacks are "
+                             "ingested if the (1,0) policy emits them (logged as "
+                             "coherence/sd_hack_frac). Takes precedence over coherence_rh_mode. "
+                             "Requires interlaced coherence (coh_samples_per_rollout > 0) and "
+                             "coherence_gen=retain_only.")
     parser.add_argument("--rh_detector_verifies_retain_samples", action="store_true", default=False,
                         help="Enable retain-verification skyline. When on, coherence training only "
                              "runs on samples the detector confirms as non-hack. Requires the detector "
@@ -5821,15 +5926,28 @@ def _run(args, exp_cfg=None):
         )
 
     if args.routed_adam:
-        assert args.routing_granularity == "token", \
-            "--routed_adam requires --routing_granularity=token"
-        assert args.routing_mode == "exclusive", (
-            "--routed_adam requires --routing_mode=exclusive (under classic the forget stream "
-            "would be the full gradient and RoutedAdam degenerates to vanilla AdamW)"
-        )
+        if args.routing_granularity == "token":
+            assert args.routing_mode == "exclusive", \
+                "--routed_adam + --routing_granularity=token requires --routing_mode=exclusive"
+        else:
+            assert args.routing_mode in ("classic", "exclusive"), (
+                "--routed_adam (sample-level) requires --routing_mode=classic or exclusive — "
+                "routing is enacted in the optimizer, so a routed good/bad sample split is needed"
+            )
+        if args.routing_mode == "classic":
+            assert args.routed_adam_kappa == 1.0, (
+                "--routed_adam_kappa is exclusive-only: under classic it would also scale the "
+                "forget adapter's retain-stream momentum, breaking R-sum preservation. Use "
+                "--routed_adam_classic_bad_weight to scale the F stream instead."
+            )
+        else:
+            assert args.routed_adam_classic_bad_weight == 2.0, (
+                "--routed_adam_classic_bad_weight only applies under routing_mode=classic "
+                "(exclusive uses --routed_adam_kappa); leave it at the default"
+            )
         assert args.bad_pass_loss_scale == 1.0, (
             "--routed_adam requires bad_pass_loss_scale=1.0 — loss scaling cancels in Adam; "
-            "use --routed_adam_kappa for a post-preconditioner forget rate multiplier"
+            "use --routed_adam_kappa / --routed_adam_classic_bad_weight instead"
         )
         assert args.forget_lr_mult == 1.0, \
             "--routed_adam conflicts with --forget_lr_mult (use --routed_adam_kappa)"
@@ -5839,8 +5957,28 @@ def _run(args, exp_cfg=None):
         )
         assert args.adapter_type == "mlp", \
             "--routed_adam is only wired for MLP adapters (dual-MLP retain/forget param sets)"
-        assert args.coh_samples_per_rollout == 0, \
-            "--routed_adam: coherence rollouts backward outside the token-routed path (unsupported)"
+        assert args.coherence_every == 0, \
+            "--routed_adam: classic (non-interlaced) coherence rollouts are unsupported"
+        if args.coh_samples_per_rollout > 0:
+            assert args.coh_fixed_advantage is not None, (
+                "--routed_adam + interlaced coherence is only wired for the self-distillation "
+                "mode (--coh_fixed_advantage); other coherence modes backward through hook "
+                "paths the routed optimizer doesn't model"
+            )
+            assert args.interlaced_coh_opt_batch_mode == "merged", \
+                "--routed_adam + coherence requires interlaced_coh_opt_batch_mode=merged"
+
+    if args.coh_fixed_advantage is not None:
+        assert args.coh_samples_per_rollout > 0, \
+            "--coh_fixed_advantage requires interlaced coherence (--coh_samples_per_rollout > 0)"
+        assert args.coherence_gen == "retain_only", (
+            "--coh_fixed_advantage is self-distillation of the deployment config — "
+            "coherence_gen must be retain_only"
+        )
+        assert not args.rh_detector_verifies_retain_samples, (
+            "--coh_fixed_advantage replaces coh-slice advantages unconditionally; the "
+            "verified-retain renorm would be silently overridden — disable one of them"
+        )
 
     # Stochastic routing / filter baseline: wrap reward so non-eligible samples get retain-only reward
     routed_reward = None
@@ -6292,6 +6430,7 @@ def _run(args, exp_cfg=None):
         token_routing_detector_name=(exp_cfg.rh_detector.name if exp_cfg.rh_detector else None),
         routed_adam=args.routed_adam,
         routed_adam_kappa=args.routed_adam_kappa,
+        routed_adam_classic_bad_weight=args.routed_adam_classic_bad_weight,
         rh_detector=rh_detector,
         base_rh_detector=base_rh_detector if (routing_enabled or filter_baseline or reward_penalty_baseline or args.verified_only_training) else None,
         eval_every=args.eval_every,
@@ -6302,6 +6441,7 @@ def _run(args, exp_cfg=None):
         coherence_gen=args.coherence_gen,
         coherence_rh_mode=args.coherence_rh_mode,
         coherence_rh_penalty=args.coherence_rh_penalty,
+        coh_fixed_advantage=args.coh_fixed_advantage,
         coh_samples_per_rollout=args.coh_samples_per_rollout,
         rh_detector_verifies_retain_samples=args.rh_detector_verifies_retain_samples,
         rh_detector_retain_recall=args.rh_detector_retain_recall,

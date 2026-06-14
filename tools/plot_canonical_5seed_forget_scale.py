@@ -12,18 +12,24 @@ figure convention: better = up-and-right).
 from __future__ import annotations
 
 import json
+import sys
 from collections import defaultdict
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 
 REPO = Path("/workspace/small-rl")
+# Default; override with argv[1] = eval dir relative to repo root and optional
+# argv[2] = title tag, e.g.
+#   tools/plot_canonical_5seed_forget_scale.py \
+#     output/gr_forget_scale_eval/canonical_radam_1k_samples "RoutedAdam bw2, 3 seeds"
 SRC = REPO / "output/gr_forget_scale_eval/canonical_5seed_1k_samples/results.jsonl"
 # Reference: classic + interlaced-coherence GR canonical anchors (cspr=32, 5 seeds,
 # canonical max_steps — 2000 for the long-train envs, 1000 for repeat/topic). These
 # are the GR points backing proto_pareto_7envs_gr_rp_v2.pdf.
 REFERENCE_CACHE = REPO / "figures_pareto/aggregated_cache.json"
 OUT_BASE = REPO / "output/gr_forget_scale_eval/canonical_5seed_1k_samples/scatter_trajectories"
+TITLE_TAG = "classic routing, no coherence, canonical max_steps, 5 seeds"
 
 ENV_COLORS = {
     "persona_qa":     "#1f77b4",
@@ -55,6 +61,13 @@ def _load_reference_points():
 
 
 def main():
+    global SRC, OUT_BASE, TITLE_TAG
+    if len(sys.argv) > 1:
+        eval_dir = REPO / sys.argv[1]
+        SRC = eval_dir / "results.jsonl"
+        OUT_BASE = eval_dir / "scatter_trajectories"
+    if len(sys.argv) > 2:
+        TITLE_TAG = sys.argv[2]
     assert SRC.exists(), f"missing {SRC}"
 
     rows = []
@@ -106,8 +119,8 @@ def main():
     ax.grid(True, color="0.94", lw=0.6)
     ax.set_axisbelow(True)
     ax.set_title(
-        "Forget-scale trajectories (classic routing, no coherence, canonical max_steps)\n"
-        "n_eval=1000, 5 seeds; ○ = f=0 (retain_only), ● = f=1; "
+        f"Forget-scale trajectories ({TITLE_TAG})\n"
+        "n_eval=1000; ○ = f=0 (retain_only), ● = f=1; "
         "stars = GR canonical retain_only (classic+coh, 5 seeds, ref)"
     )
 

@@ -18,6 +18,12 @@ term omitted — i.e. the run deviates from reference dynamics only through REMO
 through RESCALED signal. kappa (per param group, default 1.0) deliberately scales the forget
 momentum in interpretable units: "learn the behavior at kappa x the reference rate".
 
+The optimizer is agnostic to WHAT the trainer routes into the m stream. Originally built for
+token-level exclusive routing (above); also used for sample-level classic/exclusive routing,
+where the per-adapter stream contents and weights (e.g. classic: retain m <- R, forget m <-
+R + 2*F so the combined model matches the dual-adapter routing_mode=none baseline exactly) are
+derived in SampleGRPOTrainer._routed_adam_feeds — the single source of truth for stream weights.
+
 Contract with the trainer:
   - p.grad holds the FULL gradient at step() time (both passes accumulated, possibly clipped
     globally by HF's clip_grad_norm_).
