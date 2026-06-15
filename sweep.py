@@ -589,8 +589,14 @@ def extract_final_metrics(run_dir):
     state_path = checkpoints[-1] / "trainer_state.json"
     if not state_path.exists():
         return None
-    with open(state_path) as f:
-        state = json.load(f)
+    try:
+        with open(state_path) as f:
+            state = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        # Modal sync can pull a partially-written trainer_state.json mid-write;
+        # a transient parse failure must not crash the orchestrator (it would
+        # take the ephemeral app + all in-flight containers down with it).
+        return None
     logs = state.get("log_history", [])
     # Find last entry with reward
     for entry in reversed(logs):
