@@ -4,6 +4,8 @@
 Reads a run's grad_diag.jsonl (written by train.py's _run_grad_diagnostic) and
 emits a self-contained grad_diag.html with:
 
+  - a Metric toggle: gradient norm or activation norm (the adapter's per-token
+    output contribution to the residual stream, retain_out / forget_out);
   - a step slider (over diagnostic steps) and a layer selector for the
     histograms ("all layers / whole-model" + each layer);
   - two by-data-type histogram panels (cf. the Anthropic selective-gradient-
@@ -66,12 +68,18 @@ def build_html(records):
 </head>
 <body>
 <div class="container">
-  <h1 style="font-size:20px;">Per-sample gradient norms &mdash; 2&times;2 (params &times; samples)</h1>
+  <h1 style="font-size:20px;">Per-sample gradient / activation norms &mdash; 2&times;2 (params &times; samples)</h1>
   <div class="controls">
     <button onclick="prev()">&larr;</button>
     <input type="range" id="slider" min="0" max="{len(records) - 1}" value="0" oninput="update(this.value)">
     <button onclick="next()">&rarr;</button>
     <button id="play" onclick="togglePlay()">Play</button>
+    <label class="ck">Metric:
+      <select id="metric" onchange="render()">
+        <option value="grad">gradient norm</option>
+        <option value="act">activation norm</option>
+      </select>
+    </label>
     <label class="ck">Layer:
       <select id="layer" onchange="render()"></select>
     </label>
@@ -85,8 +93,8 @@ def build_html(records):
     <div style="flex:1;"><div id="hist_forget_data" style="height:330px;"></div></div>
   </div>
   <div id="overflow_bydata" class="hint" style="margin-top:-4px;"></div>
-  <h2>Per-layer &mdash; median per-sample grad norm, by data type (at this step)</h2>
-  <div class="hint">Median (robust to the heavy tail) per-sample grad norm at each layer; same split as above (blue=retain params, red=forget params). y-axis fixed across steps.</div>
+  <h2>Per-layer &mdash; median per-sample norm, by data type (at this step)</h2>
+  <div class="hint">Median (robust to the heavy tail) per-sample norm at each layer; same split as above (blue=retain params, red=forget params). y-axis fixed across steps. Toggle Metric for gradient vs activation (adapter output contribution to the residual stream).</div>
   <div style="display:flex; gap:12px;">
     <div style="flex:1;"><div id="lines_retain_data" style="height:340px;"></div></div>
     <div style="flex:1;"><div id="lines_forget_data" style="height:340px;"></div></div>
@@ -103,6 +111,15 @@ const _lineRangeCache = {{}};  // per-layer-panel log-y range, keyed by layerSel
 
 function curr() {{ return RECORDS[idx]; }}
 
+// metric fields: switch all data access + axis labels between gradient and
+// activation norms. Cache keys are prefixed with .ps so each metric caches
+// independently.
+function MF() {{
+  return document.getElementById('metric').value === 'act'
+    ? {{ ps: 'act_per_sample', wm: 'act_whole_model', label: 'activation norm' }}
+    : {{ ps: 'per_sample', wm: 'whole_model', label: 'grad norm' }};
+}}
+
 function initLayerSelect() {{
   const sel = document.getElementById('layer');
   const layers = curr().layers;
@@ -113,9 +130,10 @@ function initLayerSelect() {{
 
 // per-sample array for (record, role) at the selected layer ('all' -> whole-model)
 function cellArray(rec, role, layerSel) {{
-  if (layerSel === 'all') return rec.whole_model[role];
+  const f = MF();
+  if (layerSel === 'all') return rec[f.wm][role];
   const k = rec.layers.indexOf(parseInt(layerSel));
-  return rec.per_sample[role][k];
+  return rec[f.ps][role][k];
 }}
 
 // pool a (role) across ALL steps for the selected layer
@@ -127,12 +145,13 @@ function poolAll(role, layerSel) {{
 
 // global robust range for the current view, cached. lo=p0.5(>0), hi=p99.5.
 function globalRange(layerSel) {{
-  if (_rangeCache[layerSel]) return _rangeCache[layerSel];
+  const key = MF().ps + '|' + layerSel;
+  if (_rangeCache[key]) return _rangeCache[key];
   let v = poolAll('retain', layerSel).concat(poolAll('forget', layerSel)).filter(x => x > 0);
   v.sort((a, b) => a - b);
   const q = (p) => v[Math.min(v.length - 1, Math.max(0, Math.floor(p * v.length)))];
   const r = {{ lo: q(0.005), hi: q(0.995), min: v[0], max: v[v.length - 1] }};
-  _rangeCache[layerSel] = r;
+  _rangeCache[key] = r;
   return r;
 }}
 
@@ -174,7 +193,7 @@ function histify(arr, bin) {{
 // Global max bin-count over ALL steps for the current (layer, logx) view, so
 // the by-data panels' y-axis is fixed across the slider (like the x bins).
 function globalCountMax(layerSel, logx) {{
-  const key = layerSel + '|' + logx;
+  const key = MF().ps + '|' + layerSel + '|' + logx;
   if (_countMaxCache[key] !== undefined) return _countMaxCache[key];
   const bin = makeBinning(layerSel, logx);
   let ymax = 1;
@@ -201,17 +220,18 @@ function pick(arr, isrh, cls) {{ return arr.filter((_, j) => isrh[j] === cls); }
 // every (param x data) cell at every layer and step, so the axis is stable as
 // you scrub and shared between the two panels (matches the x/bin treatment).
 function globalLineRange() {{
-  if (_lineRangeCache.v) return _lineRangeCache.v;
+  const f = MF();
+  if (_lineRangeCache[f.ps]) return _lineRangeCache[f.ps];
   let lo = Infinity, hi = 0;
   const bump = (v) => {{ if (v > 0) {{ if (v < lo) lo = v; if (v > hi) hi = v; }} }};
   for (const rec of RECORDS) {{
     const isrh = rec.is_rh;
     for (let k = 0; k < rec.layers.length; k++)
       for (const role of ['retain', 'forget']) for (const cls of [0, 1])
-        bump(median(pick(rec.per_sample[role][k], isrh, cls)));
+        bump(median(pick(rec[f.ps][role][k], isrh, cls)));
   }}
-  _lineRangeCache.v = [Math.log10(lo * 0.8), Math.log10(hi * 1.25)];
-  return _lineRangeCache.v;
+  _lineRangeCache[f.ps] = [Math.log10(lo * 0.8), Math.log10(hi * 1.25)];
+  return _lineRangeCache[f.ps];
 }}
 
 // Two per-layer panels split by data type, each comparing forget-param vs
@@ -222,18 +242,19 @@ function renderLines() {{
   const x = rec.layers;
   const isrh = rec.is_rh;
   const RP = COLORS_JS.retain, FP = COLORS_JS.forget;
+  const f = MF();
   const range = globalLineRange();
   function panel(divId, cls, title) {{
     const traces = [];
     for (const spec of [['retain', RP, 'retain params'], ['forget', FP, 'forget params']]) {{
       const y = [];
-      for (let k = 0; k < x.length; k++) y.push(median(pick(rec.per_sample[spec[0]][k], isrh, cls)));
+      for (let k = 0; k < x.length; k++) y.push(median(pick(rec[f.ps][spec[0]][k], isrh, cls)));
       traces.push({{ x: x, y: y, name: spec[2], mode: 'lines+markers', line: {{ color: spec[1] }} }});
     }}
     Plotly.react(divId, traces, {{
       title: {{ text: title, font: {{ size: 14 }} }},
       xaxis: {{ title: 'layer' }},
-      yaxis: {{ title: 'median per-sample grad norm', type: 'log', exponentformat: 'e',
+      yaxis: {{ title: 'median per-sample ' + f.label, type: 'log', exponentformat: 'e',
                showexponent: 'all', range: range }},
       margin: {{ t: 34, r: 8 }}, legend: {{ orientation: 'h', y: 1.2 }},
     }}, {{ displayModeBar: false }});
@@ -258,9 +279,10 @@ function renderByData() {{
   const rh = rec.is_rh;
   const RP = COLORS_JS.retain, FP = COLORS_JS.forget;
   const ofParts = [];
+  const mlabel = MF().label;
   const xaxis = logx
-    ? {{ title: 'grad norm (log\\u2081\\u2080)', tickformat: '.1f' }}
-    : {{ title: 'grad norm', range: [0, edges[edges.length - 1]] }};
+    ? {{ title: mlabel + ' (log\\u2081\\u2080)', tickformat: '.1f' }}
+    : {{ title: mlabel, range: [0, edges[edges.length - 1]] }};
   // Histogram all four (param x data). The two panels share one y-range, fixed
   // across steps (global max bin count) so absolute counts are comparable both
   // between panels and as you scrub — few-sample (forget-data) curves stay small.

@@ -3481,6 +3481,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                     self.accelerator.backward(loss * scale)
                     del packed, loss
             records = cap.records
+            act_records = cap.act_records
             # Authoritative per-layer aggregate from the accumulated .grad
             # (all samples), and a triangle-inequality tripwire vs the
             # per-sample decomposition: ||.grad|| <= sum_j ||grad_j||.
@@ -3497,21 +3498,35 @@ class SampleGRPOTrainer(GRPOTrainer):
             self._last_sample_prompt = saved_prompt
             self._last_sample_completion = saved_completion
 
-        self._grad_diag_write_record(records, is_rh, agg)
+        self._grad_diag_write_record(records, act_records, is_rh, agg)
 
-    def _grad_diag_write_record(self, records, is_rh, agg):
-        """Assemble + append one grad_diag.jsonl record, log 2x2 scalars to wandb."""
+    @staticmethod
+    def _grad_diag_pivot(rec_dict, sample_ids, layers):
+        """records {sid:{layer:{role:norm}}} -> (per_sample[role]=[n_layers][n_samples],
+        whole_model[role]=[n_samples]). whole_model = sqrt(sum_layers norm^2)
+        (params/contributions disjoint across layers)."""
         import math
-        is_rh_list = [int(v) for v in is_rh.tolist()]
-        sample_ids = sorted(records.keys())
-        layers = sorted({li for r in records.values() for li in r})
-
-        # per_sample[role] = [n_layers][n_samples] grad norms
         per_sample = {"retain": [], "forget": []}
         for role in ("retain", "forget"):
             for li in layers:
                 per_sample[role].append(
-                    [records[sid].get(li, {}).get(role, 0.0) for sid in sample_ids])
+                    [rec_dict.get(sid, {}).get(li, {}).get(role, 0.0) for sid in sample_ids])
+        whole = {role: [math.sqrt(sum(per_sample[role][k][j] ** 2
+                                      for k in range(len(layers))))
+                        for j in range(len(sample_ids))]
+                 for role in ("retain", "forget")}
+        return per_sample, whole
+
+    def _grad_diag_write_record(self, records, act_records, is_rh, agg):
+        """Assemble + append one grad_diag.jsonl record, log 2x2 scalars to wandb."""
+        import math
+        import numpy as np
+        is_rh_list = [int(v) for v in is_rh.tolist()]
+        sample_ids = sorted(records.keys())
+        layers = sorted({li for r in records.values() for li in r})
+
+        per_sample, whole = self._grad_diag_pivot(records, sample_ids, layers)
+        act_per_sample, act_whole = self._grad_diag_pivot(act_records, sample_ids, layers)
 
         # Triangle-inequality tripwire: ||.grad|| <= sum_j ||grad_j|| per (layer, role).
         max_triangle_ratio = 0.0
@@ -3525,22 +3540,16 @@ class SampleGRPOTrainer(GRPOTrainer):
             "per-sample decomposition inconsistent with .grad"
         )
 
-        # whole-model per-sample norm (params disjoint across layers/roles):
-        # sqrt(sum_layers norm^2), per role, per sample.
-        def _whole(role):
-            return [math.sqrt(sum(per_sample[role][k][j] ** 2
-                                  for k in range(len(layers))))
-                    for j in range(len(sample_ids))]
-        whole = {"retain": _whole("retain"), "forget": _whole("forget")}
-
         record = {
             "step": int(self.state.global_step),
             "samples_seen": int(getattr(self, "_samples_seen", 0)),
             "n_samples": len(sample_ids),
             "layers": layers,
             "is_rh": [is_rh_list[sid] for sid in sample_ids],
-            "per_sample": per_sample,          # role -> [n_layers][n_samples]
-            "whole_model": whole,              # role -> [n_samples]
+            "per_sample": per_sample,          # grad: role -> [n_layers][n_samples]
+            "whole_model": whole,              # grad: role -> [n_samples]
+            "act_per_sample": act_per_sample,  # activation: role -> [n_layers][n_samples]
+            "act_whole_model": act_whole,      # activation: role -> [n_samples]
             "aggregate_grad_norm": {           # role -> [n_layers]; ||.grad|| all samples
                 role: [agg[role].get(li, 0.0) for li in layers]
                 for role in ("retain", "forget")},
@@ -3553,17 +3562,19 @@ class SampleGRPOTrainer(GRPOTrainer):
             print(f"[grad_diag] writing to {path}")
         self._grad_diag_file.write(json.dumps(record) + "\n")
 
-        # 2x2 whole-model summary scalars (mean per-sample norm per cell) to wandb.
-        import numpy as np
+        # 2x2 whole-model summary scalars (mean per-sample norm per cell) to wandb,
+        # for both gradient and activation metrics.
         rh = np.array(record["is_rh"])
         m = self._metrics.setdefault("train", {})
-        for role in ("retain", "forget"):
-            w = np.array(whole[role])
-            for cls, name in ((0, "on_retain"), (1, "on_forget")):
-                sel = w[rh == cls]
-                if sel.size:
-                    m.setdefault(f"grad_diag/{role}_param_{name}_samples", []).append(
-                        float(sel.mean()))
+        for metric, wm in (("grad", whole), ("act", act_whole)):
+            for role in ("retain", "forget"):
+                w = np.array(wm[role])
+                for cls, name in ((0, "on_retain"), (1, "on_forget")):
+                    sel = w[rh == cls]
+                    if sel.size:
+                        m.setdefault(
+                            f"grad_diag/{metric}_{role}_param_{name}_samples", []
+                        ).append(float(sel.mean()))
 
     def _dynamic_microbatch_training_step(self, model, inputs, num_items_in_batch):
         """Unified training step with dynamic token-based microbatching.

@@ -613,6 +613,13 @@ class PerSampleGradCapture:
     tokens) reproduces `.grad` exactly — the equivalence test and the live
     `grad_check` rely on this.
 
+    Also captures, in the same forward pass (no backward needed), the per-sample
+    **activation** norm = RMS-over-tokens of each adapter's output contribution
+    to the residual stream (retain_out / forget_out), via `act_records`. MLP
+    adapters hook the down_{role} submodule output (×parent scale); LoRA
+    recomputes the low-rank delta from the saved input. This is the forward-pass
+    analog of the gradient 2×2.
+
     Usage:
         cap = PerSampleGradCapture(model)          # installs hooks
         for microbatch:
@@ -628,6 +635,7 @@ class PerSampleGradCapture:
         self._saved_inputs = {}   # id(module) -> input activation x (batch-squeezed later)
         self._spans = None        # list of (start, end, sample_id)
         self._sq = {}             # sample_id -> layer_idx -> {"retain": sq, "forget": sq}
+        self._act_sq = {}         # same, for activation (output-contribution) norms
         self._layers = set()
         self._install(model)
 
@@ -648,14 +656,28 @@ class PerSampleGradCapture:
     def layers(self):
         return sorted(self._layers)
 
-    @property
-    def records(self):
+    @staticmethod
+    def _norms(sq_dict):
         return {
             sid: {li: {"retain": roles["retain"] ** 0.5,
                        "forget": roles["forget"] ** 0.5}
                   for li, roles in layers.items()}
-            for sid, layers in self._sq.items()
+            for sid, layers in sq_dict.items()
         }
+
+    @property
+    def records(self):
+        """{sample_id: {layer_idx: {role: grad norm}}}."""
+        return self._norms(self._sq)
+
+    @property
+    def act_records(self):
+        """{sample_id: {layer_idx: {role: activation norm}}}, where the
+        activation norm is the RMS-over-tokens of the adapter's per-token
+        output contribution to the residual stream (retain_out / forget_out).
+        Forward-pass quantity — captured in the same diagnostic pass, no
+        backward needed."""
+        return self._norms(self._act_sq)
 
     def remove(self):
         for h in self._handles:
@@ -670,6 +692,23 @@ class PerSampleGradCapture:
             layer_idx, {"retain": 0.0, "forget": 0.0})
         d[role] += sq
 
+    def _accum_act_spans(self, layer_idx, role, C):
+        """C: [T, dim] adapter output contribution. Accumulate per-sample the
+        mean-squared-per-token contribution norm over each token span (so
+        act_records returns the RMS-over-tokens norm; length-normalized since
+        activations, unlike grads, do not accumulate across tokens)."""
+        if self._spans is None:
+            return
+        for (s, e, sid) in self._spans:
+            n = e - s
+            if n <= 0:
+                continue
+            ms = float(C[s:e].pow(2).sum()) / n
+            self._layers.add(layer_idx)
+            d = self._act_sq.setdefault(sid, {}).setdefault(
+                layer_idx, {"retain": 0.0, "forget": 0.0})
+            d[role] += ms
+
     def _save_input(self, module, args):
         self._saved_inputs[id(module)] = args[0].detach()
 
@@ -678,7 +717,9 @@ class PerSampleGradCapture:
         for module in model.modules():
             if isinstance(module, DualLoRALinear):
                 li = layer_of[id(module)]
-                self._handles.append(module.register_forward_pre_hook(self._save_input))
+                # forward: save x (for grad) AND compute the low-rank output
+                # contribution norm (no submodule to hook, so recompute from x).
+                self._handles.append(module.register_forward_pre_hook(self._make_lora_fwd(li)))
                 self._handles.append(module.register_full_backward_hook(
                     self._make_lora_bwd(li)))
             elif isinstance(module, DualMLPAdapter):
@@ -688,12 +729,43 @@ class PerSampleGradCapture:
                     ("forget", [module.gate_forget, module.up_forget, module.down_forget]),
                 )
                 for role, linears in roles:
+                    gate, up, down = linears
+                    if gate is None:
+                        continue
                     for lin in linears:
-                        if lin is None:
-                            continue
                         self._handles.append(lin.register_forward_pre_hook(self._save_input))
                         self._handles.append(lin.register_full_backward_hook(
                             self._make_linear_bwd(li, role)))
+                    # activation contribution = down(...)·scale (down's output is
+                    # the pre-scale branch; multiply by the parent's role scale).
+                    self._handles.append(down.register_forward_hook(
+                        self._make_down_act_fwd(module, li, role)))
+
+    def _make_lora_fwd(self, layer_idx):
+        def hook(mod, args):
+            x = args[0]
+            self._saved_inputs[id(mod)] = x.detach()  # for the grad backward hook
+            if self._spans is None:
+                return
+            xf = x[0].float()  # [T, in] (packed forward is [1, T, *])
+            for role, A, B, c in (
+                ("retain", mod.lora_A_retain, mod.lora_B_retain,
+                 mod.scaling * mod.retain_scale),
+                ("forget", mod.lora_A_forget, mod.lora_B_forget,
+                 mod.forget_scaling * mod.forget_scale),
+            ):
+                if A is None:
+                    continue
+                C = (xf @ A.float().t()) @ B.float().t() * c   # [T, out]
+                self._accum_act_spans(layer_idx, role, C)
+        return hook
+
+    def _make_down_act_fwd(self, parent, layer_idx, role):
+        def hook(mod, args, output):
+            scale = parent.retain_scale if role == "retain" else parent.forget_scale
+            C = output[0].float() * scale   # [T, hidden]; output is pre-scale branch
+            self._accum_act_spans(layer_idx, role, C)
+        return hook
 
     def _make_lora_bwd(self, layer_idx):
         def hook(mod, grad_input, grad_output):

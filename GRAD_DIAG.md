@@ -1,4 +1,4 @@
-# Per-Sample Gradient Diagnostic
+# Per-Sample Gradient & Activation Diagnostic
 
 Collects the full distribution of **per-sample** gradient norms for the four
 combinations of (retain / forget adapter params) × (retain / forget samples),
@@ -6,6 +6,12 @@ combinations of (retain / forget adapter params) × (retain / forget samples),
 [Selective Gradient Masking](https://alignment.anthropic.com/2025/selective-gradient-masking/),
 whose density plots show that forget weights take larger gradients on forget
 data than retain weights do.
+
+In the same pass it also collects per-sample **activation** norms — the
+RMS-over-tokens of each adapter's output contribution to the residual stream
+(`retain_out` / `forget_out`), the forward-pass analog of the gradient 2×2
+("activations downstream of the retain / forget parameters"). The viewer toggles
+between the two metrics; both share the same per-sample × per-layer schema.
 
 This is the *counterfactual* the routing mask normally hides: in training, the
 forget pass zeroes retain-param grads on bad samples (`train.py`'s
@@ -41,6 +47,14 @@ the adapter modules.
 - **DualLoRALinear** stores bare parameters, so the module is hooked and both
   LoRA matrices' gradients are reconstructed from `x` and `g`, multiplying by
   the forward scale `c = (alpha/rank)·adapter_scale`.
+
+**Activations** are captured in the same forward (no backward needed): for each
+adapter, the per-token output contribution to the residual stream
+(`retain_out` / `forget_out`) is reduced to a per-sample RMS-over-tokens norm.
+MLP adapters hook the `down_{role}` submodule output (× the parent's role
+scale); LoRA recomputes the low-rank delta from the saved input. Unlike grads
+(which accumulate across tokens, hence summed), activations are length-normalized
+(RMS), so the norm is a per-token magnitude independent of sequence length.
 
 Token spans come from the packed path's `seq_boundaries` (the same segmentation
 `_packed_compute_loss` uses). Because packing strips padding, every token in a
@@ -84,18 +98,21 @@ resolution in train.py).
 - **`{output_dir}/grad_diag.jsonl`** — one record per diagnostic step:
   ```
   { step, samples_seen, n_samples, layers:[...], is_rh:[0/1 per sample],
-    per_sample:   { retain: [n_layers][n_samples], forget: [...] },
-    whole_model:  { retain: [n_samples], forget: [n_samples] },
+    per_sample:      { retain: [n_layers][n_samples], forget: [...] },  # grad
+    whole_model:     { retain: [n_samples], forget: [n_samples] },      # grad
+    act_per_sample:  { retain: [n_layers][n_samples], forget: [...] },  # activation
+    act_whole_model: { retain: [n_samples], forget: [n_samples] },      # activation
     aggregate_grad_norm: { retain: [n_layers], forget: [n_layers] },  # ||.grad||, all samples
     grad_check:   { max_triangle_ratio } }
   ```
 - **`{output_dir}/grad_diag.html`** — interactive viewer (auto-generated at end
   of training; regenerate manually with
-  `python tools/gen_grad_diag_html.py {output_dir}/`). Step slider + layer
-  selector ("all layers / whole-model" + each layer), the four 2×2
-  distributions overlaid as histograms, and a per-layer aggregate line plot.
-- **wandb** `grad_diag/{retain,forget}_param_on_{retain,forget}_samples` — the
-  four whole-model mean-per-sample-norm scalars (x-axis `samples_seen`).
+  `python tools/gen_grad_diag_html.py {output_dir}/`). **Metric toggle**
+  (gradient norm / activation norm), step slider, layer selector ("all layers /
+  whole-model" + each layer), the by-data-type histogram panels (forget-param vs
+  retain-param), and per-layer median panels.
+- **wandb** `grad_diag/{grad,act}_{retain,forget}_param_on_{retain,forget}_samples`
+  — the eight whole-model mean-per-sample-norm scalars (x-axis `samples_seen`).
 
 ## Cost / caveats
 
