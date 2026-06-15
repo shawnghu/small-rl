@@ -198,6 +198,69 @@ def test_single_sequence_pack():
     _run_case("LoRA-single", model, hidden=16, lengths=[7])
 
 
+def _act_rms_per_span(C, lengths):
+    """Ground-truth RMS-over-tokens norm of contribution C ([T, dim]) per span."""
+    out, off = [], 0
+    for L in lengths:
+        seg = C[off:off + L]
+        out.append(float((seg.pow(2).sum() / L) ** 0.5))
+        off += L
+    return out
+
+
+def test_activation_capture_lora():
+    print("\n=== LoRA activation capture ===")
+    torch.manual_seed(3)
+    model = LoRATower(n_layers=1, hidden=24, rank=4, forget_rank=4)
+    _randomize_adapters(model)
+    lengths = [3, 5, 2]
+    T = sum(lengths)
+    x = torch.randn(1, T, 24, dtype=DTYPE, device=DEVICE)
+    cap = PerSampleGradCapture(model)
+    cap.set_segments([(1, L - 1) for L in lengths], list(range(len(lengths))))
+    model(x)  # forward only — activation is a forward quantity
+    cap.remove()
+    act = cap.act_records
+    m = model.layers[0]
+    xf = x[0]
+    ref = {}
+    for role, A, B, c in (("retain", m.lora_A_retain, m.lora_B_retain, m.scaling * m.retain_scale),
+                          ("forget", m.lora_A_forget, m.lora_B_forget, m.forget_scaling * m.forget_scale)):
+        C = (xf @ A.t()) @ B.t() * c
+        ref[role] = _act_rms_per_span(C, lengths)
+    max_err = max(abs(act[sid][0][role] - ref[role][sid]) / (ref[role][sid] + 1e-12)
+                  for sid in range(len(lengths)) for role in ("retain", "forget"))
+    print(f"  [LoRA-act] max err = {max_err:.2e}")
+    assert max_err < 1e-4
+
+
+def test_activation_capture_mlp():
+    print("\n=== MLP activation capture ===")
+    torch.manual_seed(3)
+    model = MLPTower(n_layers=1, hidden=24, retain_neurons=8, forget_neurons=8)
+    _randomize_adapters(model)
+    lengths = [3, 5, 2]
+    T = sum(lengths)
+    x = torch.randn(1, T, 24, dtype=DTYPE, device=DEVICE)
+    cap = PerSampleGradCapture(model)
+    cap.set_segments([(1, L - 1) for L in lengths], list(range(len(lengths))))
+    model(x)
+    cap.remove()
+    act = cap.act_records
+    m = model.layers[0]
+    xf = x[0]
+    ref = {}
+    for role in ("retain", "forget"):
+        gate = getattr(m, f"gate_{role}"); up = getattr(m, f"up_{role}"); down = getattr(m, f"down_{role}")
+        scale = m.retain_scale if role == "retain" else m.forget_scale
+        C = down(m.act(gate(xf)) * up(xf)) * scale
+        ref[role] = _act_rms_per_span(C, lengths)
+    max_err = max(abs(act[sid][0][role] - ref[role][sid]) / (ref[role][sid] + 1e-12)
+                  for sid in range(len(lengths)) for role in ("retain", "forget"))
+    print(f"  [MLP-act] max err = {max_err:.2e}")
+    assert max_err < 1e-4
+
+
 def test_hf_llama_integration():
     """Integration: capture hooks fire correctly inside a real LlamaForCausalLM
     (attention + grad-requiring activations, mixed q/v/gate/down adapters), the
@@ -259,5 +322,7 @@ if __name__ == "__main__":
     test_lora_capture()
     test_mlp_capture()
     test_single_sequence_pack()
+    test_activation_capture_lora()
+    test_activation_capture_mlp()
     test_hf_llama_integration()
-    print("\nAll per-sample grad capture tests passed.")
+    print("\nAll per-sample grad + activation capture tests passed.")
