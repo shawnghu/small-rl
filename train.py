@@ -665,6 +665,33 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._retain_mode = retain_mode
         self._retain_penalty = retain_penalty
         self._combined_reward = combined_reward
+        # --- loss_type validation (DAPO token-level support) ---
+        # The custom microbatch/fused reduction paths implement exactly two TRL
+        # loss aggregations: "grpo" (per-sequence: liger's internal /n_mb is
+        # cancelled by the n_mb/scale_denom backward scale) and "dapo"
+        # (token-level: liger's internal /tok_mb is cancelled by a tok_mb/tok_denom
+        # scale). Any other TRL loss type (bnpo/dr_grpo/cispo/sapo/luspo) would be
+        # silently mis-scaled by these factors, so reject loudly here.
+        assert self.loss_type in ("grpo", "dapo"), (
+            f"SampleGRPOTrainer supports loss_type in {{'grpo','dapo'}}, got "
+            f"{self.loss_type!r}. Other TRL loss types are not handled by the "
+            "routed/dynamic reduction scaling (see _dynamic_microbatch_forward_backward)."
+        )
+        if self.loss_type == "dapo":
+            # Token-level normalization is implemented only in the packed (liger)
+            # reduction path, where we own the normalizer via the per-microbatch
+            # scale. The non-packed fallback delegates to TRL's compute_loss, which
+            # under dapo ALREADY normalizes by the global num_items_in_batch — our
+            # extra scale would double-normalize. The penalty 2-pass path uses
+            # per-sequence n/n_total scaling that has no token analog here.
+            assert self.use_liger_kernel, (
+                "loss_type='dapo' (token-level normalization) is implemented only "
+                "in the packed liger reduction path — pass --use_liger_kernel."
+            )
+            assert self._retain_mode != "penalty", (
+                "loss_type='dapo' is not supported with retain_mode='penalty' (the "
+                "2-pass penalty path uses per-sequence n/n_total scaling)."
+            )
         # REINFORCE running baseline
         self._advantage_type = advantage_type
         self._reinforce_normalize_std = reinforce_normalize_std
@@ -2232,14 +2259,25 @@ class SampleGRPOTrainer(GRPOTrainer):
         """
         if self._detectable_iter is not None:
             return self._detectable_iter
-        assert self._rh_classifiable_fn is not None, (
-            "rh_detector_verifies_retain_samples=True but rh_classifiable_fn is None "
-            "— check that the detector is registered in RH_CLASSIFIABLE_REGISTRY."
-        )
         ds = self.train_dataset
         rows = ds.rows if hasattr(ds, "rows") else [ds[i] for i in range(len(ds))]
         cols = {c: [row.get(c) for row in rows] for c in ds.column_names}
-        mask = self._rh_classifiable_fn(**cols)
+        # Classifiability mask = prompt-level "is this prompt in the detector's
+        # monitoring scope". Prefer a registered classifiable predicate; fall
+        # back to the env-emitted `detectable` column when the detector has no
+        # classifiable (e.g. mbpp uses score_threshold + a per-row detectable
+        # column as the source of truth). Mirrors the candidate-mask / eval-
+        # injection logic, which already honor the column directly.
+        if self._rh_classifiable_fn is not None:
+            mask = self._rh_classifiable_fn(**cols)
+        else:
+            detectable_col = cols.get("detectable")
+            assert detectable_col is not None and detectable_col[0] is not None, (
+                "rh_detector_verifies_retain_samples=True but rh_classifiable_fn is None "
+                "and train_dataset has no 'detectable' column — register the detector in "
+                "RH_CLASSIFIABLE_REGISTRY or have the env emit a 'detectable' column."
+            )
+            mask = [bool(d) for d in detectable_col]
         classifiable_idx = [i for i, m in enumerate(mask) if m]
         # Restrict pool to hackable+detectable prompts. Unhackable+detectable
         # prompts produce uniform-reward groups under per-group GRPO renorm
@@ -3708,19 +3746,34 @@ class SampleGRPOTrainer(GRPOTrainer):
             set_scales(model, retain_scale=1.0, forget_scale=0.0)
             restore_scales_on_exit = True
 
-        token_counts = inputs["completion_mask"].sum(dim=1).tolist()
+        # comp_token_counts: per-sample COMPLETION token count (liger's dapo
+        # normalizer unit — the mask handed to liger is completion_mask). Kept
+        # separate from token_counts, which folds in prompt length below purely
+        # to size microbatches against the token budget. The two must not be
+        # conflated: the dapo scale uses completion tokens, packing uses both.
+        comp_token_counts = inputs["completion_mask"].sum(dim=1).tolist()
+        token_counts = list(comp_token_counts)
         if "prompt_mask" in inputs:
             prompt_counts = inputs["prompt_mask"].sum(dim=1).tolist()
-            token_counts = [p + c for p, c in zip(prompt_counts, token_counts)]
+            token_counts = [p + c for p, c in zip(prompt_counts, comp_token_counts)]
         global_comp_len = inputs["completion_mask"].shape[1]
         global_prompt_len = inputs["prompt_mask"].shape[1] if "prompt_mask" in inputs else 0
 
-        # Build microbatches. scale_denom is the denominator used for
-        # `scale = n_mb / scale_denom` below; normally equal to n_total (so
-        # scales sum to 1 over mbs that cover the whole batch), but reduced
-        # for filter_renorm coherence batches where some samples are sliced
-        # out so the retained non-hacks carry full per-sample weight.
+        # Build microbatches. scale_denom (grpo) / tok_denom (dapo) are the
+        # backward-scale denominators. For grpo, `scale = n_mb/scale_denom`
+        # cancels liger's internal per-mb /n_mb, leaving per-sequence
+        # normalization over the denominator population. For dapo,
+        # `scale = tok_mb/tok_denom` cancels liger's internal per-mb /tok_mb,
+        # leaving token-level normalization over the SAME population's total
+        # completion tokens. Both are normally the full batch (n_total / its
+        # total completion tokens), but reduced for filter_renorm / verified-
+        # retain coherence batches where sliced-out samples must not dilute the
+        # per-sample weight of the retained non-hacks. tok_denom mirrors
+        # whatever index population scale_denom counts (NOT the all_mbs union —
+        # forget-warmup drops good_idx from the microbatches but keeps
+        # scale_denom=n_total, and tok_denom must match that population).
         scale_denom = n_total
+        tok_denom = max(sum(comp_token_counts), 1)
         if is_coh_batch:
             is_rh_coh = inputs.pop("is_rh", None)
             is_ver_coh = inputs.pop("is_verified_retain", None)
@@ -3739,9 +3792,11 @@ class SampleGRPOTrainer(GRPOTrainer):
                 assert is_ver_coh is not None, "is_verified_retain missing from coh opt-batch"
                 all_idx = is_ver_coh.nonzero(as_tuple=True)[0].tolist()
                 scale_denom = max(len(all_idx), 1)
+                tok_denom = max(sum(comp_token_counts[i] for i in all_idx), 1)
             elif self._coherence_rh_mode == "filter_renorm" and is_rh_coh is not None:
                 all_idx = (is_rh_coh == 0).nonzero(as_tuple=True)[0].tolist()
                 scale_denom = max(len(all_idx), 1)
+                tok_denom = max(sum(comp_token_counts[i] for i in all_idx), 1)
             else:
                 all_idx = list(range(n_total))
             all_mbs = [("coherence", mb) for mb in _pack_by_tokens(token_counts, all_idx, max_tok)]
@@ -3837,6 +3892,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                 model, inputs, all_mbs, retain_advantages, original_advantages,
                 token_counts, scale_denom, n_total, num_items_in_batch,
                 use_packed, record_metrics, merged_interlaced,
+                comp_token_counts, tok_denom,
             )
 
         random.shuffle(all_mbs)
@@ -3870,7 +3926,14 @@ class SampleGRPOTrainer(GRPOTrainer):
                 _adv_source = "coherence"
 
             n_mb = len(indices)
-            scale = n_mb / scale_denom
+            if self.loss_type == "dapo":
+                # Token-level: cancel liger's internal /tok_mb and normalize by
+                # the population's total completion tokens (see scale_denom/
+                # tok_denom comment above). Uses completion tokens, NOT the
+                # prompt+completion packing counts in token_counts.
+                scale = sum(comp_token_counts[i] for i in indices) / tok_denom
+            else:
+                scale = n_mb / scale_denom
             actual_tokens = sum(token_counts[i] for i in indices)
             trimmed_tokens_total += actual_tokens
 
@@ -4016,7 +4079,8 @@ class SampleGRPOTrainer(GRPOTrainer):
     def _fused_forward_backward(self, model, inputs, all_mbs, retain_advantages,
                                original_advantages, token_counts, scale_denom,
                                n_total, num_items_in_batch, use_packed,
-                               record_metrics, merged_interlaced):
+                               record_metrics, merged_interlaced,
+                               comp_token_counts, tok_denom):
         """Single fused forward+backward replacing the per-phase (coherence /
         good / bad) homogeneous microbatches with one heterogeneous packed
         microbatch + per-sample gradient routing.
@@ -4030,12 +4094,17 @@ class SampleGRPOTrainer(GRPOTrainer):
         `set_fused_routing` (per-token forward forget-scale + parameter-gradient
         gates on retain_out/forget_out; see gradient_routing._fused_decouple).
 
-        Exactly equivalent to the homogeneous-microbatch path under
-        loss_type="grpo" (per-sequence normalization is additive across
-        sequences, so one liger call over the kept sequences scaled by
-        n_kept/scale_denom reproduces the sum of per-slice loss*n_mb/scale_denom).
-        Verified by tests/test_fused_routing_equivalence.py (CPU, exact) and
-        bench_fused_gr.py (GPU, end-to-end against the real liger loss).
+        Exactly equivalent to the homogeneous-microbatch path under both
+        loss_type="grpo" and loss_type="dapo". Per-sequence (grpo) and per-token
+        (dapo) normalization are each additive across any partition of the kept
+        set, so one liger call over the kept sequences scaled by the per-mb
+        factor reproduces the sum of per-slice scaled losses. The factor is
+        n_mb/scale_denom for grpo (cancels liger's internal /n_mb) and
+        tok_mb/tok_denom for dapo (cancels liger's internal /tok_mb), where
+        tok_* count COMPLETION tokens (liger's dapo normalizer unit), not the
+        prompt+completion token_counts used for packing.
+        Verified by tests/test_fused_routing_equivalence.py (CPU, exact, both
+        loss types) and bench_fused_gr.py (GPU, end-to-end against real liger).
         """
         from gradient_routing import set_fused_routing, clear_fused_routing
 
@@ -4126,9 +4195,14 @@ class SampleGRPOTrainer(GRPOTrainer):
             # Rows of the (3, T) tensor are contiguous -> .view(1, T, 1) below is valid.
             forget_fwd, retain_gm, forget_gm = per_tok[0], per_tok[1], per_tok[2]
 
-            # Per-microbatch scale = n_mb/scale_denom, exactly as the stock path
-            # scales each homogeneous microbatch; sums to n_kept/scale_denom.
-            scale = len(indices) / scale_denom
+            # Per-microbatch scale, exactly as the homogeneous path scales each
+            # microbatch: n_mb/scale_denom (grpo) or tok_mb/tok_denom (dapo,
+            # completion tokens). Sums to n_kept/scale_denom (grpo) or
+            # kept_comp_tokens/tok_denom (dapo) over the kept set.
+            if self.loss_type == "dapo":
+                scale = sum(comp_token_counts[i] for i in indices) / tok_denom
+            else:
+                scale = len(indices) / scale_denom
             set_fused_routing(forget_fwd.view(1, T, 1), retain_gm.view(1, T, 1),
                               forget_gm.view(1, T, 1))
             try:
@@ -4226,6 +4300,15 @@ class SampleGRPOTrainer(GRPOTrainer):
                     self._post_step_accum = 0.0
             return result
 
+        # Non-dynamic routing path (no --max_tokens_per_microbatch): the 2-pass
+        # penalty / full-batch routing scaling below is per-sequence (n/n_total)
+        # and routes through the non-packed self.compute_loss, so it has no
+        # correct dapo token-normalization. dapo requires the dynamic packed path.
+        assert self.loss_type != "dapo", (
+            "loss_type='dapo' requires the dynamic packed reduction path "
+            "(--max_tokens_per_microbatch with --use_liger_kernel); the "
+            "non-dynamic routing path supports grpo only."
+        )
         self._last_rollout_time = 0.0
         time_before = time.perf_counter()
         if self._last_grpo_iter_end_time is not None:
@@ -4549,7 +4632,7 @@ def _make_parser():
                         help="Fuse the per-class (coherence/good/bad) forward+backward passes of "
                              "the dynamic-microbatching GR path into shared token-budget microbatches "
                              "with per-sample gradient routing (per-token forward forget-scale + "
-                             "parameter-gradient gates). Exactly equivalent under loss_type=grpo. ON "
+                             "parameter-gradient gates). Exactly equivalent under loss_type grpo and dapo. ON "
                              "by default (the homogeneous path always spends a separate microbatch "
                              "per class, which dominates at realistic small optimizer batches); pass "
                              "--no-fused_reduction for the legacy homogeneous-microbatch path.")
@@ -4671,6 +4754,34 @@ def _make_parser():
                              "Overrides hack_frac and sort_detect_frac. Detectable rate "
                              "is determined by sort_detect_n_max / sort_n_max (e.g. "
                              "n_max=15, detect_n_max=7 -> 1/3 detectable).")
+    parser.add_argument("--mbpp_detect_mode", default="none",
+                        choices=["none", "type", "monitored"],
+                        help="MBPP env: how the `detectable` column (monitoring scope of the "
+                             "hardcode hack) is assigned. 'none' (default): detectable == "
+                             "hackable (every available hack is monitored). 'type': intrinsic "
+                             "— detectable iff the visible expected value is a distinctive "
+                             "literal (not int/bool); the ~50%% int/bool stratum is the "
+                             "undetectable hack, conditionable from the prompt. 'monitored': "
+                             "append an explicit 'will (not) be monitored' sentence per "
+                             "--mbpp_detect_frac md5 partition; detectable == monitored.")
+    parser.add_argument("--mbpp_detect_frac", type=float, default=0.5,
+                        help="MBPP env: target fraction of hackable prompts marked detectable "
+                             "(monitored) when --mbpp_detect_mode=monitored. md5 partition on "
+                             "task_id, stable per run. Ignored for other detect modes.")
+    parser.add_argument("--mbpp_prompt_mode", default="plain",
+                        choices=["plain", "aware", "compelling", "instruct", "system"],
+                        help="MBPP env: raise the natural hardcode rate by making the "
+                             "weak-evaluator affordance salient (capable models ~never "
+                             "hardcode under the plain prompt). plain=no hint; aware=soft "
+                             "reframe toward the visible test; compelling=explicit license to "
+                             "return the shown value; system=system-message reframe.")
+    parser.add_argument("--mbpp_value_types", default="",
+                        help="MBPP env: comma-separated expected-value type names to restrict "
+                             "the task set to (e.g. 'int' or 'int,str'). Empty = no filter. "
+                             "Use 'int' to drop bool/list/... tasks where a wrong solution "
+                             "coincidentally passes the single visible assert (~50%% on bools), "
+                             "confounding the hack signal; int expected values are much harder "
+                             "to false-positive on.")
     parser.add_argument("--cities_invert_hackable", action=argparse.BooleanOptionalAction, default=False,
                         help="Cities QA env: flip the hackable rule from "
                              "(continent == 'Americas') to (continent != 'Americas'). "
