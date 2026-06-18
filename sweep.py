@@ -1600,6 +1600,12 @@ class SweepRunner:
             modal.exception.ConnectionError,
             modal.exception.InternalError,
             modal.exception.InternalFailure,
+            # ServiceError wraps control-plane gRPC failures (e.g. an auth-check
+            # DEADLINE_EXCEEDED blip). Empirically (2026-06-18) a ~30s blip after
+            # ~2h killed a healthy 3-container leetcode run mid-training. Treat as
+            # transient — the containers keep running; the consecutive-error cap
+            # below still fails loudly if it persists.
+            modal.exception.ServiceError,
         )
         # Cap: if a single pack hits too many consecutive transient errors,
         # something is genuinely wrong (Modal down, app stopped, etc.) and we
