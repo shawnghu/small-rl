@@ -132,14 +132,14 @@ def build_html(data_by_env):
   select,button {{ padding:5px 10px; font-size:14px; }}
   #lbl {{ font-weight:bold; min-width:260px; }}
   .hint {{ color:#888; font-size:12px; }}
+  .grid {{ display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-top:8px; }}
+  .plot {{ height:320px; }}
+  .ptitle {{ font-weight:bold; font-size:13px; text-align:center; margin-bottom:1px; }}
 </style></head><body>
 <div class="container">
   <h1 style="font-size:20px;">Can a statistic tell a forget sample from a retain sample?</h1>
   <div class="controls">
     <label>Env: <select id="env" onchange="onEnv()">{env_opts}</select></label>
-    <label>Metric: <select id="metric" onchange="render()">
-      <option value="grad">gradient norm</option>
-      <option value="act">activation norm</option></select></label>
     <label>Layer: <select id="layer" onchange="render()"></select></label>
     <button onclick="prev()">&larr;</button>
     <input type="range" id="slider" min="0" value="0" oninput="render()">
@@ -147,13 +147,15 @@ def build_html(data_by_env):
     <button id="play" onclick="togglePlay()">Play</button>
     <span id="lbl"></span>
   </div>
-  <div class="hint">Each panel fixes a parameter adapter and overlays the per-sample norm distribution
-   over <b style="color:#1f3a93">retain samples</b> vs <b style="color:#c0392b">forget samples</b>.
-   Separation in the forget-param panel = that statistic flags forget samples. Bins fixed per
+  <div class="hint">Each panel fixes a metric (row) and parameter adapter (column) and overlays the per-sample
+   norm distribution over <b style="color:#1f3a93">retain samples</b> vs <b style="color:#c0392b">forget samples</b>.
+   Separation in a forget-param panel = that statistic flags forget samples. Bins fixed per
    (env,metric,role,layer); log-x; y fixed across steps; outliers (beyond p0.5–p99.5) truncated.</div>
-  <div style="display:flex; gap:12px;">
-    <div style="flex:1;"><div id="p_retain" style="height:360px;"></div></div>
-    <div style="flex:1;"><div id="p_forget" style="height:360px;"></div></div>
+  <div class="grid">
+    <div><div class="ptitle">Gradient norm &middot; Retain-param</div><div id="g_retain" class="plot"></div></div>
+    <div><div class="ptitle">Gradient norm &middot; Forget-param</div><div id="g_forget" class="plot"></div></div>
+    <div><div class="ptitle">Activation norm &middot; Retain-param</div><div id="a_retain" class="plot"></div></div>
+    <div><div class="ptitle">Activation norm &middot; Forget-param</div><div id="a_forget" class="plot"></div></div>
   </div>
 </div>
 <script>
@@ -162,7 +164,6 @@ const SC = {colors_json};
 let idx = 0, playing = false, timer = null;
 
 function env() {{ return document.getElementById('env').value; }}
-function metric() {{ return document.getElementById('metric').value; }}
 function layerKey() {{ return document.getElementById('layer').value; }}
 function curEnv() {{ return DATA[env()]; }}
 
@@ -181,21 +182,25 @@ function onEnv() {{
   render();
 }}
 
-function panel(divId, role, title) {{
+// no Plotly title (the HTML .ptitle above each plot serves as the title, so it
+// can never overlap the legend); legend sits in the top margin.
+function panel(divId, metric, role) {{
   const d = curEnv();
-  const key = metric() + '|' + role + '|' + layerKey();
+  const key = metric + '|' + role + '|' + layerKey();
   const p = d.panels[key];
-  const xlabel = metric() === 'act' ? 'activation norm (log\\u2081\\u2080)' : 'grad norm (log\\u2081\\u2080)';
-  if (!p) {{ Plotly.react(divId, [], {{title:{{text:title+' (no data)',font:{{size:13}}}}}}); return; }}
+  const xlabel = metric === 'act' ? 'activation norm (log\\u2081\\u2080)' : 'grad norm (log\\u2081\\u2080)';
+  if (!p) {{ Plotly.react(divId, [], {{margin:{{t:24,r:8}},
+      annotations:[{{text:'no data', showarrow:false, xref:'paper', yref:'paper', x:0.5, y:0.5}}]}},
+      {{displayModeBar:false}}); return; }}
   const row = p.h[idx];
   const mk = (st, name) => ({{ type:'bar', x:p.c, y:row[st], width:p.w, name:name,
                               marker:{{color: SC[st==='r'?'retain':'forget']}}, opacity:0.55 }});
   const nR = row.r.reduce((a,b)=>a+b,0), nF = row.f.reduce((a,b)=>a+b,0);
   Plotly.react(divId, [mk('r', `retain samples (n=${{nR}})`), mk('f', `forget samples (n=${{nF}})`)], {{
-    barmode:'overlay', bargap:0, title:{{text:title, font:{{size:13}}}},
+    barmode:'overlay', bargap:0,
     xaxis:{{title:xlabel, tickformat:'.1f'}},
-    yaxis:{{title:'number of samples', range:[0, p.ymax*1.05]}},
-    margin:{{t:32,r:8}}, legend:{{orientation:'h', y:1.18}},
+    yaxis:{{title:'# samples', range:[0, p.ymax*1.05]}},
+    margin:{{t:26, r:8, b:40}}, legend:{{orientation:'h', y:1.0, yanchor:'bottom', font:{{size:10}}}},
   }}, {{displayModeBar:false}});
 }}
 
@@ -204,8 +209,10 @@ function render() {{
   idx = parseInt(document.getElementById('slider').value);
   document.getElementById('lbl').textContent =
     `step ${{d.steps[idx]}} \\u00b7 ${{d.nhack[idx]}} forget / ${{d.nretain[idx]}} retain samples`;
-  panel('p_retain', 'retain', 'Retain-param norm');
-  panel('p_forget', 'forget', 'Forget-param norm');
+  panel('g_retain', 'grad', 'retain');
+  panel('g_forget', 'grad', 'forget');
+  panel('a_retain', 'act', 'retain');
+  panel('a_forget', 'act', 'forget');
 }}
 function setSlider(i) {{ document.getElementById('slider').value = i; render(); }}
 function prev() {{ if (idx>0) setSlider(idx-1); }}
