@@ -12,8 +12,10 @@ worker is reused.
 
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import textwrap
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -132,10 +134,13 @@ for line in sys.stdin:
 
 
 def _get_python_executable():
-    resolved = os.path.realpath(sys.executable)
-    if os.path.exists(resolved) and os.access(resolved, os.X_OK):
-        return resolved
-    return sys.executable
+    # Use sys.executable directly (the venv interpreter). Do NOT realpath it:
+    # resolving the venv symlink lands on the base interpreter, whose sys.path
+    # lacks the venv site-packages, so workers would run with stdlib only
+    # (numpy etc. missing). Worker env must match the parent's.
+    if os.path.exists(sys.executable) and os.access(sys.executable, os.X_OK):
+        return sys.executable
+    return os.path.realpath(sys.executable)
 
 
 class _Worker:
@@ -143,10 +148,15 @@ class _Worker:
 
     def __init__(self):
         self.proc = None
+        self.scratch_dir = None
         self._start()
 
     def _start(self):
         python = _get_python_executable()
+        # Run the worker in a private scratch cwd so any files the evaluated
+        # model code writes (open(...), etc.) land in /tmp and are cleaned up
+        # on worker death, instead of polluting the repo root.
+        self.scratch_dir = tempfile.mkdtemp(prefix="code_eval_worker_")
         self.proc = subprocess.Popen(
             [python, "-c", _WORKER_CODE],
             stdin=subprocess.PIPE,
@@ -154,6 +164,7 @@ class _Worker:
             stderr=subprocess.DEVNULL,
             text=True,
             close_fds=True,
+            cwd=self.scratch_dir,
         )
 
     def execute(self, code: str, timeout: int = 3, memory_limit: int = 1024) -> dict:
@@ -201,6 +212,9 @@ class _Worker:
         except Exception:
             pass
         self.proc = None
+        if self.scratch_dir is not None:
+            shutil.rmtree(self.scratch_dir, ignore_errors=True)
+            self.scratch_dir = None
 
     def close(self):
         self._cleanup()
@@ -230,10 +244,25 @@ class PersistentCodeEvaluator:
             self._pool.put(w)
         print(f"[PersistentCodeEvaluator] Started {self.num_workers} persistent workers")
 
-    def __call__(self, response, test_list=None, setup_code="", skip_parse=True):
-        """Single evaluation — matches CodeEvaluator.__call__ interface."""
+    def __call__(self, response, test_list=None, setup_code="", skip_parse=True,
+                 max_failures=None, timeout=None):
+        """Single evaluation — matches CodeEvaluator.__call__ interface.
+
+        max_failures: per-request override of the constructor default. Callers
+        that need exact per-test pass counts (e.g. mbpp partial credit) must
+        set this >= len(test_list) so the runner doesn't stop early at the
+        first failure.
+        timeout: per-request override of the constructor default. Batch wall
+        time is set by the timeout tail (stragglers with infinite loops), not
+        worker throughput — envs with millisecond-scale tests (mbpp) should
+        pass 1 rather than inherit the 3s default.
+        """
         if test_list is None:
             test_list = []
+        if max_failures is None:
+            max_failures = self.max_failures
+        if timeout is None:
+            timeout = self.timeout
 
         if not skip_parse:
             program = self.parse_response(response)
@@ -253,11 +282,11 @@ class PersistentCodeEvaluator:
             }
 
         from src.evaluate.code.helpers import create_test_runner_code
-        runner_code = create_test_runner_code(setup_code, program, test_list, self.max_failures)
+        runner_code = create_test_runner_code(setup_code, program, test_list, max_failures)
 
         worker = self._pool.get()
         try:
-            raw = worker.execute(runner_code, timeout=self.timeout, memory_limit=self.memory_per_worker)
+            raw = worker.execute(runner_code, timeout=timeout, memory_limit=self.memory_per_worker)
         finally:
             self._pool.put(worker)
 
