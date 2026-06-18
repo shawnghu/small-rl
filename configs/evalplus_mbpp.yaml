@@ -1,0 +1,25 @@
+name: evalplus_mbpp
+
+# Clean MBPP+ code-RL benchmark, NO reward hack / NO interventions. Reward =
+# fraction of the full MBPP+ hidden-test suite passed (continuous -> gives GRPO
+# within-group variance for partial progress). mbpp_plus_correct (all-pass,
+# scale 0.0) is the driver and the headline solve-rate metric; mbpp_plus_compile
+# (scale 0.0) is tracked only. Driver must stay first.
+reward:
+  components:
+    - name: mbpp_plus_correct_from_all
+      role: retain
+      scale: 0.0
+    - name: mbpp_plus_fraction_from_all
+      role: retain
+      scale: 1.0
+    - name: mbpp_plus_compile_from_all
+      role: retain
+      scale: 0.0
+
+rh_detector: null
+
+training:
+  routing_mode: none
+  environment: evalplus_mbpp
+  max_completion_length: 512

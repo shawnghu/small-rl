@@ -1125,6 +1125,84 @@ def _leetcode_trait_lazy(completions, **kwargs):
     from envs.leetcode import leetcode_trait
     return leetcode_trait(completions, **kwargs)
 
+def _mbpp_correct_lazy(completions, **kwargs):
+    from envs.mbpp import mbpp_correct
+    return mbpp_correct(completions, **kwargs)
+
+# MBPP driver/passenger pattern — mirrors the leetcode one below (see that
+# comment block for cache semantics: thread-local, identity-keyed, one-shot).
+import threading
+_mbpp_cache_local = threading.local()
+
+def _mbpp_cache_matches(completions):
+    ref = getattr(_mbpp_cache_local, 'completions_ref', None)
+    return ref is completions
+
+_MBPP_SLOTS = ("hidden", "visible_honest", "visible_hack", "compile")
+
+def _mbpp_correct_from_all(completions, **kwargs):
+    """Driver: one eval pass via mbpp_all_components, returns correct scores,
+    caches the passenger component scores."""
+    from envs.mbpp import mbpp_all_components
+    correct, *rest = mbpp_all_components(completions, **kwargs)
+    _mbpp_cache_local.completions_ref = completions
+    for slot, scores in zip(_MBPP_SLOTS, rest):
+        setattr(_mbpp_cache_local, slot, scores)
+    return correct
+
+def _mbpp_passenger(slot):
+    def _fn(completions, **kwargs):
+        cache = getattr(_mbpp_cache_local, slot, None)
+        if cache is not None and len(cache) == len(completions) and _mbpp_cache_matches(completions):
+            setattr(_mbpp_cache_local, slot, None)
+            return cache
+        # Fallback: independent eval (cache consumed or called standalone).
+        # Cheap in practice: mbpp_all_components memoizes by completion value.
+        from envs.mbpp import mbpp_all_components
+        _, *rest = mbpp_all_components(completions, **kwargs)
+        return dict(zip(_MBPP_SLOTS, rest))[slot]
+    _fn.__name__ = f"mbpp_{slot}_from_all"
+    return _fn
+
+_mbpp_hidden_from_all = _mbpp_passenger("hidden")
+_mbpp_visible_honest_from_all = _mbpp_passenger("visible_honest")
+_mbpp_visible_hack_from_all = _mbpp_passenger("visible_hack")
+_mbpp_compile_from_all = _mbpp_passenger("compile")
+
+# MBPP+ (evalplus/mbppplus) driver/passenger — clean benchmark, no hack.
+# Driver runs one harness scoring pass; passengers read the thread-local cache.
+_mbpp_plus_cache_local = threading.local()
+
+def _mbpp_plus_cache_matches(completions):
+    return getattr(_mbpp_plus_cache_local, 'completions_ref', None) is completions
+
+_MBPP_PLUS_SLOTS = ("fraction", "compile")
+
+def _mbpp_plus_correct_from_all(completions, **kwargs):
+    """Driver: one scoring pass via mbpp_plus_all_components; returns full-solve
+    (all plus tests pass) and caches fraction/compile for the passengers."""
+    from envs.evalplus_mbpp import mbpp_plus_all_components
+    correct, *rest = mbpp_plus_all_components(completions, **kwargs)
+    _mbpp_plus_cache_local.completions_ref = completions
+    for slot, scores in zip(_MBPP_PLUS_SLOTS, rest):
+        setattr(_mbpp_plus_cache_local, slot, scores)
+    return correct
+
+def _mbpp_plus_passenger(slot):
+    def _fn(completions, **kwargs):
+        cache = getattr(_mbpp_plus_cache_local, slot, None)
+        if cache is not None and len(cache) == len(completions) and _mbpp_plus_cache_matches(completions):
+            setattr(_mbpp_plus_cache_local, slot, None)
+            return cache
+        from envs.evalplus_mbpp import mbpp_plus_all_components
+        _, *rest = mbpp_plus_all_components(completions, **kwargs)
+        return dict(zip(_MBPP_PLUS_SLOTS, rest))[slot]
+    _fn.__name__ = f"mbpp_plus_{slot}_from_all"
+    return _fn
+
+_mbpp_plus_fraction_from_all = _mbpp_plus_passenger("fraction")
+_mbpp_plus_compile_from_all = _mbpp_plus_passenger("compile")
+
 # Driver/passenger pattern for efficient leetcode reward evaluation.
 # The driver (_leetcode_correct_from_all) runs GT + trait evals once via
 # leetcode_all_components() and caches trait + compile scores in module globals.
@@ -1264,6 +1342,17 @@ REWARD_REGISTRY = {
     "leetcode_trait_from_all": _leetcode_trait_from_all,
     "leetcode_trait_strict_from_all": _leetcode_trait_strict_from_all,
     "leetcode_compile_from_all": _leetcode_compile_from_all,
+    # MBPP (HF google-research-datasets/mbpp)
+    "mbpp_correct": _mbpp_correct_lazy,
+    "mbpp_correct_from_all": _mbpp_correct_from_all,
+    "mbpp_hidden_from_all": _mbpp_hidden_from_all,
+    "mbpp_visible_honest_from_all": _mbpp_visible_honest_from_all,
+    "mbpp_visible_hack_from_all": _mbpp_visible_hack_from_all,
+    "mbpp_compile_from_all": _mbpp_compile_from_all,
+    # MBPP+ (evalplus/mbppplus) — clean benchmark, no hack
+    "mbpp_plus_correct_from_all": _mbpp_plus_correct_from_all,
+    "mbpp_plus_fraction_from_all": _mbpp_plus_fraction_from_all,
+    "mbpp_plus_compile_from_all": _mbpp_plus_compile_from_all,
 }
 
 API_REWARD_NAMES = {"api_reward", "api_reward_pairs", "openai_moderation", "cached_openai_moderation", "llm_judge_topic_coherence", "llm_judge_topic_coherence_batched", "llm_judge_coherence"}
