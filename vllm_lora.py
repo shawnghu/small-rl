@@ -288,6 +288,10 @@ class VLLMLoRAServer:
             temperature=msg["temperature"],
             max_tokens=msg["max_tokens"],
             logprobs=0 if return_logprobs else None,
+            # Per-seq-per-step incremental detokenization is pure CPU cost when
+            # the caller only needs token ids (training rollouts). Mirrors
+            # vllm_server.py.
+            detokenize=msg.get("detokenize", True),
         )
         if msg.get("top_k", 0) > 0:
             sp_kwargs["top_k"] = msg["top_k"]
@@ -402,7 +406,7 @@ class VLLMLoRAClient:
         })
 
     def generate(self, experiment_id, prompt_ids, n, temperature, max_tokens,
-                 top_k=0, top_p=1.0, return_logprobs=False):
+                 top_k=0, top_p=1.0, return_logprobs=False, detokenize=True):
         reply = self._request({
             "op": "generate",
             "experiment_id": experiment_id,
@@ -413,6 +417,7 @@ class VLLMLoRAClient:
             "top_k": top_k,
             "top_p": top_p,
             "return_logprobs": return_logprobs,
+            "detokenize": detokenize,
         })
         result = (
             reply["completion_texts"],
