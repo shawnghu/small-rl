@@ -4580,6 +4580,9 @@ def _make_parser():
     parser.add_argument("--beta", type=float, default=0.02, help="KL penalty coefficient against reference model (0=disabled)")
     parser.add_argument("--epsilon", type=float, default=0.2, help="PPO lower clip (epsilon_low). TRL default 0.2.")
     parser.add_argument("--epsilon_high", type=float, default=None, help="PPO upper clip (DAPO Clip-Higher). Defaults to --epsilon (symmetric) if unset; DAPO uses 0.28.")
+    parser.add_argument("--loss_type", type=str, default="grpo", help="TRL GRPO loss aggregation: 'grpo' (per-seq, our pinned default) or 'dapo' (token-level).")
+    parser.add_argument("--scale_rewards", type=str, default="group", help="Advantage normalization: 'group' (GRPO std-norm, default) or 'none' (DAPO, no std div).")
+    parser.add_argument("--top_entropy_quantile", type=float, default=1.0, help="Train only on the top-quantile highest-entropy tokens (DAPO-family anti-entropy-collapse). 1.0=all (default); 0.2=top 20%%.")
     parser.add_argument("--num_epochs", type=int, default=1)
     parser.add_argument("--max_steps", type=int, default=300)
     parser.add_argument("--lr_scheduler_type", type=str, default="linear",
@@ -5008,8 +5011,14 @@ def _make_parser():
                         help="Base socket path for multi-GPU DDP vLLM servers. "
                              "Each DDP rank appends _rank{rank}.sock. Set by sweep.py.")
     parser.add_argument("--vllm_importance_sampling", action="store_true", default=False,
-                        help="Enable importance sampling correction for vLLM generation mismatch. "
-                             "Requires vLLM server to support return_logprobs.")
+                        help="Force the SLOW IS path: run the HF actor forward for old_logps so the "
+                             "vLLM-vs-HF policy ratio is EXPLICIT — applies TIS/MIS clipping AND logs "
+                             "the sampling/* diagnostics (importance_sampling_ratio, sampling_logp_difference). "
+                             "NOTE: this does NOT 'turn on' mismatch correction — the FAST IS path is ON BY "
+                             "DEFAULT (uses vLLM sampling logprobs as old_logps, folding the vLLM-vs-HF "
+                             "mismatch into the PPO ratio; ratio==1 by construction so no sampling/* stats). "
+                             "Use this flag to MEASURE the gap / apply explicit clipping. --no_fast_vllm_is "
+                             "disables the default fast correction too. Requires vLLM return_logprobs (MLP path).")
     parser.add_argument("--vllm_is_token_clip", type=float, default=2.0,
                         help="Symmetric per-token TIS clamp threshold c: ratio -> clamp(ratio, 1/c, c). "
                              "Pass 0 to disable the token-level clip. Default 2.0. "
@@ -5709,7 +5718,9 @@ def _run(args, exp_cfg=None):
         epsilon_high=(args.epsilon_high if args.epsilon_high is not None else args.epsilon),
         logging_steps=args.logging_steps,
         save_steps=args.save_steps,
-        loss_type="grpo",
+        loss_type=getattr(args, "loss_type", "grpo"),
+        scale_rewards=getattr(args, "scale_rewards", "group"),
+        top_entropy_quantile=getattr(args, "top_entropy_quantile", 1.0),
         repetition_penalty=args.repetition_penalty,
         beta=args.beta,
         seed=args.seed,
@@ -5992,11 +6003,28 @@ def _run(args, exp_cfg=None):
     # Setting accelerator's GAS to 1 disables its redundant division.
     trainer.accelerator.gradient_accumulation_steps = 1
 
-    # Optionally enable vLLM importance sampling correction to account for
-    # distribution mismatch between vLLM's generation and HF's forward pass.
+    # vLLM-vs-HF importance-sampling path selection.
+    #   SLOW path = recompute old_logps via an HF actor forward so the vLLM-vs-HF
+    #     ratio is explicit -> TIS/MIS clipping + sampling/* diagnostics are active.
+    #   FAST path = reuse vLLM's rollout logprobs as old_logps (no actor forward;
+    #     old==sampling so the explicit IS factor is 1 and diagnostics are ~0).
+    # DEFAULT is the SLOW path, EXCEPT SmolLM2-135M on the 7 small-scale toy envs,
+    # which keep the cheaper FAST path. Explicit --vllm_importance_sampling always
+    # forces slow. The slow path needs vLLM-returned logprobs, which the LoRA client
+    # can't provide, so LoRA always falls back to FAST.
     trainer.vllm_no_sleep = getattr(args, 'vllm_no_sleep', False)
+    _SMALL_SCALE_ENVS = {"sorting", "addition_v2", "object_qa", "persona_qa",
+                         "cities_qa", "repeat", "topic"}
+    _is_smollm135m = "smollm" in args.model.lower() and "135m" in args.model.lower()
+    _keep_fast = _is_smollm135m and (args.environment in _SMALL_SCALE_ENVS)
+    _lora = (getattr(args, "adapter_type", "mlp") == "lora")
+    _want_slow = args.vllm_importance_sampling or not _keep_fast
+    _use_slow_is = (vllm_client is not None) and _want_slow and not _lora
+    if vllm_client is not None and _want_slow and _lora:
+        print("[vLLM] slow IS path is default/requested but adapter_type=lora can't "
+              "return logprobs; falling back to FAST IS path.")
 
-    if vllm_client is not None and args.vllm_importance_sampling:
+    if _use_slow_is:
         trainer.use_vllm = True
         trainer.vllm_importance_sampling_correction = True
         for _name, _val in (("vllm_is_token_clip", args.vllm_is_token_clip),
@@ -6006,23 +6034,19 @@ def _run(args, exp_cfg=None):
             )
         trainer.vllm_is_token_clip = float(args.vllm_is_token_clip)
         trainer.vllm_is_seq_filter = float(args.vllm_is_seq_filter)
-        print(
-            f"[vLLM] IS correction enabled "
-            f"(token_clip={trainer.vllm_is_token_clip}, seq_filter={trainer.vllm_is_seq_filter})"
-        )
-
-    # Fast IS path reuses vLLM's rollout logprobs as old_per_token_logps. In that mode
-    # (old - sampling) == 0 by construction, so the TIS/MIS correction factor would be
-    # a trivial 1.0 and the clipping/filtering diagnostics would be zero. When the
-    # user opts in to IS correction, force the slow path so the actor forward pass
-    # actually runs and the ratio is meaningful.
-    if args.vllm_importance_sampling:
-        if vllm_client is not None and not args.no_fast_vllm_is:
-            print("[vLLM] --vllm_importance_sampling set: forcing slow IS path "
-                  "(actor forward pass for old_logps) so TIS/MIS clipping has nonzero effect.")
         trainer.fast_vllm_is_correction = False
+        print(
+            f"[vLLM] SLOW IS path (default): vLLM-vs-HF correction ON "
+            f"(token_clip={trainer.vllm_is_token_clip}, seq_filter={trainer.vllm_is_seq_filter}; "
+            f"model={args.model}, env={args.environment})"
+        )
     else:
         trainer.fast_vllm_is_correction = (vllm_client is not None and not args.no_fast_vllm_is)
+        if vllm_client is not None:
+            _why = ("smollm135m+small_env" if _keep_fast else
+                    "lora" if _lora else "default")
+            print(f"[vLLM] FAST IS path (reuse vLLM logprobs as old_logps; reason={_why}, "
+                  f"model={args.model}, env={args.environment})")
 
     # Remove TRL's WandbCallback — we own all wandb logging via a single
     # wandb.log() call in SampleGRPOTrainer.log(). This avoids step
