@@ -21,6 +21,7 @@ SWEEP_DIRS = [
     Path("/workspace/small-rl-antitrain/output/matrix_gr_7envs_antitrain_wm05"),
     Path("/workspace/small-rl-antitrain/output/matrix_gr_7envs_antitrain_wm10"),
     Path("/workspace/small-rl-antitrain/output/matrix_gr_7envs_antitrain_wm10_rb256coh256"),
+    Path("/workspace/small-rl-antitrain/output/matrix_gr_7envs_antitrain_wm10_flr05"),
 ]
 
 sys.path.insert(0, "/workspace/small-rl-antitrain")
