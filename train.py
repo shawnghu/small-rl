@@ -3439,7 +3439,11 @@ class SampleGRPOTrainer(GRPOTrainer):
         else:
             diag_idx = list(range(n_total))
         denom = len(diag_idx)
-        assert denom > 0, "grad diagnostic: no routing samples in batch"
+        # Split interlaced-coherence mode produces pure-coherence opt-batches;
+        # when grad_diag fires on one there are no routing samples to diagnose.
+        # Skip this batch rather than aborting the run.
+        if denom == 0:
+            return
 
         token_counts = inputs["completion_mask"].sum(dim=1).tolist()
         if "prompt_mask" in inputs:
@@ -4077,7 +4081,10 @@ class SampleGRPOTrainer(GRPOTrainer):
         # Per-sample advantage vector: good -> retain_advantages (renormalize),
         # bad/coh -> original_advantages. inputs is already a shallow copy owned
         # by the caller, so mutating inputs["advantages"] is safe.
-        adv = original_advantages.clone()
+        # original_advantages is None for a pure-coherence opt-batch (split mode);
+        # the per-sample coh advantages live in inputs["advantages"] directly.
+        adv = (original_advantages if original_advantages is not None
+               else inputs["advantages"]).clone()
         if self._retain_mode == "renormalize" and retain_advantages is not None and good_idx:
             gi = torch.tensor(good_idx, device=adv.device, dtype=torch.long)
             adv[gi] = retain_advantages[gi]

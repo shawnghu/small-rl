@@ -30,9 +30,13 @@ Sync back: `modal volume get gr-modal-pilot / /workspace/small-rl/output/`.
 """
 from __future__ import annotations
 
+import os
+
 import modal
 
-REPO_LOCAL = "/workspace/small-rl"
+# Mount whichever checkout this file lives in (repo root = tools/'s parent), so a
+# git worktree mounts its own code rather than a hardcoded path.
+REPO_LOCAL = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 REPO_REMOTE = "/repo"
 OUTPUT_REMOTE = "/output"
 
@@ -94,6 +98,10 @@ image = (
           "VLLM_ENABLE_V1_MULTIPROCESSING": "0",
           # Quiet HF transfer warnings, point cache to volume so model downloads persist.
           "HF_HOME": "/output/_hf_cache",
+          # rl-rewardhacking-private slim subset (src/ + leetcode data) lives on the
+          # gr-modal-pilot volume at /output/_rh_repo; the leetcode env reads it via
+          # this env var (see envs/_rh_bridge.py). Uploaded with `modal volume put`.
+          "RH_REPO_PATH": "/output/_rh_repo",
           })
     # Add the codebase last so changes don't bust the deps cache.
     .add_local_dir(
