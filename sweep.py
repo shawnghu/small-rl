@@ -1988,6 +1988,7 @@ class SweepRunner:
             generate_sweep_grid(str(self.output_dir))
         except Exception as e:
             print(f"[WARN] Failed to generate sweep pages: {e}")
+        self._regen_separability()
 
         if self.vllm_servers:
             stop_vllm_servers(self.vllm_servers)
@@ -1995,6 +1996,18 @@ class SweepRunner:
             stop_vllm_servers(self.vllm_async_servers)
         if self.use_mps:
             stop_mps_daemons(self.gpus)
+
+    def _regen_separability(self):
+        """Best-effort: regenerate the per-sample grad/activation separability
+        viewer (separability_dist.html + _allenvs.html) for this sweep. No-op
+        unless the run used --grad_diag_every (require_grad gates on
+        grad_diag.jsonl presence). Mirrors the overview/grid regeneration and
+        never raises into the sweep loop."""
+        try:
+            from tools.gen_separability_html import generate as _gen_sep
+            _gen_sep(str(self.output_dir), require_grad=True, verbose=False)
+        except Exception as e:
+            print(f"[WARN] separability regen failed: {e}")
 
     def _run_local_loop(self, last_status_time, last_overview_time,
                         status_interval, overview_interval):
@@ -2043,6 +2056,7 @@ class SweepRunner:
                     generate_sweep_grid(str(self.output_dir))
                 except Exception as e:
                     print(f"[WARN] Failed to regenerate sweep pages: {e}")
+                self._regen_separability()
                 last_overview_time = time.time()
 
             if self.active:
@@ -2206,6 +2220,7 @@ class SweepRunner:
                             generate_sweep_grid(str(self.output_dir))
                         except Exception as e:
                             print(f"[WARN] Failed to regenerate sweep pages: {e}")
+                        self._regen_separability()
                         last_overview_time = time.time()
 
                     if self._modal_active:
