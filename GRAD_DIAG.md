@@ -118,12 +118,18 @@ resolution in train.py).
   `is_rh`.
 - **`{output_dir}/grad_diag.html`** — per-run viewer (auto-generated at end of
   training): metric toggle, step slider, layer selector, by-data-type panels.
-- **`tools/gen_separability_html.py`** → `separability/separability_dist.html`
-  — sweep-level viewer: per-env 2×2 grid (gradient/activation × retain/forget
-  param) overlaying retain (blue) / forget-detectable (light red) /
-  forget-undetectable (dark red) samples; overview-style training curves; and a
-  **joint-distribution** scatter of retain-param vs forget-param magnitude per
-  sample (log-log, Pearson r) showing how correlated the two are.
+- **`tools/gen_separability_html.py <dir>...`** → `separability/`:
+  - **`separability_dist.html`** — detailed per-env viewer. Takes one or more
+    sweep dirs and groups runs by **(env, condition)** (GR / RP / do-nothing,
+    classified from `run_config.yaml`); each condition is a stacked block
+    showing whatever data it has: the grid (gradient / activation / **dot**
+    rows × retain/forget param) overlaying retain (blue) / forget-detectable
+    (light red) / forget-undetectable (dark red) samples, overview-style
+    training curves, and a **joint-distribution** scatter of retain-param vs
+    forget-param magnitude per sample (log-log, Pearson r) — how correlated the
+    two are. (dot uses signed linear-x bins; shown only when present.)
+  - **`separability_allenvs.html`** — overview: every env's 2×2 grid at a glance
+    in a 3-col layout, condition + layer selectors, one shared step slider.
 - **wandb** `grad_diag/{grad,act,dot}_{retain,forget}_param_on_{retain,forget}_samples`
   — the twelve whole-model mean-per-sample scalars (x-axis `samples_seen`).
 
