@@ -1,0 +1,21 @@
+name: leetcode_verified_prop
+
+# Variation 1: PROPORTIONAL genuine reward — reward = fraction of the (sampled,
+# verified) ground-truth tests passed. No compile reward, no hack. Run with
+# --environment leetcode_verified --leetcode_hint none (clean problems; the
+# reward is purely the per-test pass fraction).
+reward:
+  max_reward: 1.0
+  components:
+    - name: leetcode_v_prop_from_all
+      role: retain
+      scale: 1.0
+
+rh_detector: null
+
+hack_freq_detector: null
+
+training:
+  routing_mode: none
+  environment: leetcode_verified
+  max_completion_length: 1536

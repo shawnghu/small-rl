@@ -4529,6 +4529,10 @@ def _make_parser():
                              "Ensures the 'literally instructed to hack' prompts "
                              "always sit on the unmonitored side of the random-"
                              "funcname-k partition (no penalty fires there).")
+    parser.add_argument("--leetcode_n_tests", type=int, default=50,
+                        help="leetcode_verified envs: uniformly sample this many "
+                             "ground-truth asserts per problem (deterministic per "
+                             "(seed,id); problems with fewer keep all). 0 = use all.")
     parser.add_argument("--unhinted_frac", type=float, default=None,
                         help="DEPRECATED. Translates to --hack_frac (1 - unhinted_frac) "
                              "for backwards compatibility with old leetcode sweeps. "

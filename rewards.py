@@ -1280,6 +1280,42 @@ def _leetcode_compile_from_all(completions, **kwargs):
     return [0.0] * len(completions)
 
 
+# Driver/passenger for the leetcode_verified env (one eval pass via
+# leetcode_v_all_components -> prop / correct / hack / compile).
+_leetcode_v_cache_local = threading.local()
+
+def _leetcode_v_cache_matches(completions):
+    return getattr(_leetcode_v_cache_local, 'completions_ref', None) is completions
+
+_LEETCODE_V_SLOTS = ("correct", "hack", "compile")
+
+def _leetcode_v_prop_from_all(completions, **kwargs):
+    """Driver: returns the proportional (fraction-of-hidden-passed) score and
+    caches correct/hack/compile for the passengers."""
+    from envs.leetcode_verified import leetcode_v_all_components
+    prop, *rest = leetcode_v_all_components(completions, **kwargs)
+    _leetcode_v_cache_local.completions_ref = completions
+    for slot, scores in zip(_LEETCODE_V_SLOTS, rest):
+        setattr(_leetcode_v_cache_local, slot, scores)
+    return prop
+
+def _leetcode_v_passenger(slot):
+    def _fn(completions, **kwargs):
+        cache = getattr(_leetcode_v_cache_local, slot, None)
+        if cache is not None and len(cache) == len(completions) and _leetcode_v_cache_matches(completions):
+            setattr(_leetcode_v_cache_local, slot, None)
+            return cache
+        from envs.leetcode_verified import leetcode_v_all_components
+        prop, *rest = leetcode_v_all_components(completions, **kwargs)
+        return dict(zip(_LEETCODE_V_SLOTS, rest))[slot]
+    _fn.__name__ = f"leetcode_v_{slot}_from_all"
+    return _fn
+
+_leetcode_v_correct_from_all = _leetcode_v_passenger("correct")
+_leetcode_v_hack_from_all = _leetcode_v_passenger("hack")
+_leetcode_v_compile_from_all = _leetcode_v_passenger("compile")
+
+
 REWARD_REGISTRY = {
     "happy_binary": happy_binary,
     "happy_count_unbounded": happy_count_unbounded,
@@ -1342,6 +1378,11 @@ REWARD_REGISTRY = {
     "leetcode_trait_from_all": _leetcode_trait_from_all,
     "leetcode_trait_strict_from_all": _leetcode_trait_strict_from_all,
     "leetcode_compile_from_all": _leetcode_compile_from_all,
+    # LeetCode-Verified (curated set; proportional + exposed-test hardcode hack)
+    "leetcode_v_prop_from_all": _leetcode_v_prop_from_all,
+    "leetcode_v_correct_from_all": _leetcode_v_correct_from_all,
+    "leetcode_v_hack_from_all": _leetcode_v_hack_from_all,
+    "leetcode_v_compile_from_all": _leetcode_v_compile_from_all,
     # MBPP (HF google-research-datasets/mbpp)
     "mbpp_correct": _mbpp_correct_lazy,
     "mbpp_correct_from_all": _mbpp_correct_from_all,
