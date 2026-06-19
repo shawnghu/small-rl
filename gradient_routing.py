@@ -519,6 +519,7 @@ class PerSampleGradCapture:
         self._spans = None        # list of (start, end, sample_id)
         self._sq = {}             # sample_id -> layer_idx -> {"retain": sq, "forget": sq}
         self._act_sq = {}         # same, for activation (output-contribution) norms
+        self._dot = {}            # same, for signed <grad, weight> dot products
         self._layers = set()
         self._install(model)
 
@@ -562,6 +563,21 @@ class PerSampleGradCapture:
         backward needed."""
         return self._norms(self._act_sq)
 
+    @staticmethod
+    def _raw(d):
+        return {
+            sid: {li: {"retain": roles["retain"], "forget": roles["forget"]}
+                  for li, roles in layers.items()}
+            for sid, layers in d.items()
+        }
+
+    @property
+    def dot_records(self):
+        """{sample_id: {layer_idx: {role: <grad, weight>}}} — SIGNED per-sample
+        dot product of the param gradient with the current weights, summed over
+        that role's params in the layer (whole-model = sum over layers)."""
+        return self._raw(self._dot)
+
     def remove(self):
         for h in self._handles:
             h.remove()
@@ -574,6 +590,11 @@ class PerSampleGradCapture:
         d = self._sq.setdefault(sample_id, {}).setdefault(
             layer_idx, {"retain": 0.0, "forget": 0.0})
         d[role] += sq
+
+    def _accum_dot(self, sample_id, layer_idx, role, val):
+        d = self._dot.setdefault(sample_id, {}).setdefault(
+            layer_idx, {"retain": 0.0, "forget": 0.0})
+        d[role] += val  # signed
 
     def _accum_act_spans(self, layer_idx, role, C):
         """C: [T, dim] adapter output contribution. Accumulate per-sample the
@@ -673,8 +694,11 @@ class PerSampleGradCapture:
                 for (s, e, sid) in self._spans:
                     grad_B = c * (g[s:e].t() @ u[s:e])     # [out, r]
                     grad_A = c * (gB[s:e].t() @ x[s:e])    # [r, in]
-                    sq = float(grad_A.pow(2).sum() + grad_B.pow(2).sum())
-                    self._accum(sid, layer_idx, role, sq)
+                    self._accum(sid, layer_idx, role,
+                                float(grad_A.pow(2).sum() + grad_B.pow(2).sum()))
+                    # signed <grad, weight> over both LoRA matrices
+                    self._accum_dot(sid, layer_idx, role,
+                                    float((grad_A * Af).sum() + (grad_B * Bf).sum()))
         return hook
 
     def _make_linear_bwd(self, layer_idx, role):
@@ -685,7 +709,9 @@ class PerSampleGradCapture:
                 return
             x = x[0].float()   # [T, in]
             g = g[0].float()   # [T, out]
+            W = mod.weight.float()  # [out, in]
             for (s, e, sid) in self._spans:
                 grad_W = g[s:e].t() @ x[s:e]    # [out, in]; branch scale already in g
                 self._accum(sid, layer_idx, role, float(grad_W.pow(2).sum()))
+                self._accum_dot(sid, layer_idx, role, float((grad_W * W).sum()))
         return hook

@@ -123,6 +123,7 @@ def _run_case(name, model, hidden, lengths):
     loss.backward()
     cap.remove()
     captured = cap.records
+    captured_dot = cap.dot_records
     full_grad_norms = _grad_norms_from_dotgrad(model)
 
     # --- Independent per-sample ground truth ---
@@ -137,11 +138,19 @@ def _run_case(name, model, hidden, lengths):
     accum = {id(p): torch.zeros_like(p) for roles in lrp.values()
              for params in roles.values() for p in params}
     per_sample_norms = {}  # sid -> {layer: {role: norm}}
+    per_sample_dot = {}    # sid -> {layer: {role: <grad,weight>}}
+    layer_of_test = {id(p): li for li, roles in lrp.items()
+                     for ps in roles.values() for p in ps}
     for sid, (s, e) in enumerate(offsets):
         _zero_grads(model)
         loss_j = (model(x[:, s:e, :]) * coeff[:, s:e, :]).sum()
         loss_j.backward()
         per_sample_norms[sid] = _grad_norms_from_dotgrad(model)
+        per_sample_dot[sid] = {li: {"retain": 0.0, "forget": 0.0} for li in lrp}
+        for li, roles in lrp.items():
+            for role, params in roles.items():
+                per_sample_dot[sid][li][role] = sum(
+                    float((p.grad * p.data).sum()) for p in params if p.grad is not None)
         for roles in lrp.values():
             for params in roles.values():
                 for p in params:
@@ -170,10 +179,20 @@ def _run_case(name, model, hidden, lengths):
                 err = abs(got - ref) / (ref + 1e-12)
                 max_norm_err = max(max_norm_err, err)
 
+    # (3) capture dot products == independent per-sample <grad, weight>
+    max_dot_err = 0.0
+    for sid in sample_ids:
+        for li in captured_dot[sid]:
+            for role in ("retain", "forget"):
+                got = captured_dot[sid][li][role]
+                ref = per_sample_dot[sid][li][role]
+                max_dot_err = max(max_dot_err, abs(got - ref) / (abs(ref) + 1e-9))
+
     print(f"  [{name}] max decomposition err = {max_decomp_err:.2e}, "
-          f"max per-sample norm err = {max_norm_err:.2e}")
+          f"max per-sample norm err = {max_norm_err:.2e}, max dot err = {max_dot_err:.2e}")
     assert max_decomp_err < 1e-4, f"{name}: per-sample grads do not sum to .grad"
     assert max_norm_err < 1e-4, f"{name}: capture norms != independent autograd norms"
+    assert max_dot_err < 1e-4, f"{name}: capture dot != independent <grad, weight>"
 
 
 def test_lora_capture():

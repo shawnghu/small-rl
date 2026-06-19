@@ -2686,6 +2686,15 @@ class SampleGRPOTrainer(GRPOTrainer):
 
             if self.gradient_routing_enabled:
                 output["is_rh"] = is_rh_tensor
+                # Per-sample monitored/unmonitored (detectable) flag for the grad
+                # diagnostic's detectable/undetectable forget split. Bool tensor
+                # so it survives buffering/shuffling like is_rh.
+                _det = detectable_flags
+                if _det is not None and _det[0] is not None:
+                    output["detectable"] = torch.tensor(
+                        [bool(d) for d in _det], dtype=torch.bool, device=is_rh_tensor.device)
+                else:
+                    output["detectable"] = torch.zeros_like(is_rh_tensor)
                 # Coherence samples: modify advantages for detected hacks.
                 # Classic mode: whole rollout is coherence. Interlaced mode: only the
                 # is_coherence slice. coh_mask unifies both.
@@ -3475,6 +3484,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                     del packed, loss
             records = cap.records
             act_records = cap.act_records
+            dot_records = cap.dot_records
             # Authoritative per-layer aggregate from the accumulated .grad
             # (all samples), and a triangle-inequality tripwire vs the
             # per-sample decomposition: ||.grad|| <= sum_j ||grad_j||.
@@ -3491,27 +3501,37 @@ class SampleGRPOTrainer(GRPOTrainer):
             self._last_sample_prompt = saved_prompt
             self._last_sample_completion = saved_completion
 
-        self._grad_diag_write_record(records, act_records, is_rh, agg)
+        self._grad_diag_write_record(records, act_records, dot_records, is_rh, agg, inputs)
 
     @staticmethod
-    def _grad_diag_pivot(rec_dict, sample_ids, layers):
-        """records {sid:{layer:{role:norm}}} -> (per_sample[role]=[n_layers][n_samples],
-        whole_model[role]=[n_samples]). whole_model = sqrt(sum_layers norm^2)
-        (params/contributions disjoint across layers)."""
+    def _grad_diag_pivot(rec_dict, sample_ids, layers, signed=False):
+        """records {sid:{layer:{role:val}}} -> (per_sample[role]=[n_layers][n_samples],
+        whole_model[role]=[n_samples]). whole_model = sqrt(sum_layers val^2) for
+        norms (params/contributions disjoint across layers), or signed sum over
+        layers when signed=True (for the <grad, weight> dot product)."""
         import math
         per_sample = {"retain": [], "forget": []}
         for role in ("retain", "forget"):
             for li in layers:
                 per_sample[role].append(
                     [rec_dict.get(sid, {}).get(li, {}).get(role, 0.0) for sid in sample_ids])
-        whole = {role: [math.sqrt(sum(per_sample[role][k][j] ** 2
-                                      for k in range(len(layers))))
-                        for j in range(len(sample_ids))]
-                 for role in ("retain", "forget")}
+        if signed:
+            whole = {role: [sum(per_sample[role][k][j] for k in range(len(layers)))
+                            for j in range(len(sample_ids))]
+                     for role in ("retain", "forget")}
+        else:
+            whole = {role: [math.sqrt(sum(per_sample[role][k][j] ** 2
+                                          for k in range(len(layers))))
+                            for j in range(len(sample_ids))]
+                     for role in ("retain", "forget")}
         return per_sample, whole
 
-    def _grad_diag_write_record(self, records, act_records, is_rh, agg):
-        """Assemble + append one grad_diag.jsonl record, log 2x2 scalars to wandb."""
+    def _grad_diag_write_record(self, records, act_records, dot_records, is_rh, agg, inputs):
+        """Assemble + append one grad_diag.jsonl record, log 2x2 scalars to wandb.
+
+        The record is per-sample-keyed: every array is aligned by sample index
+        (sample_ids order), and each sample carries its is_rh / detectable flags
+        and decoded prompt+completion so norms can be tied back to the sample."""
         import math
         import numpy as np
         is_rh_list = [int(v) for v in is_rh.tolist()]
@@ -3520,6 +3540,7 @@ class SampleGRPOTrainer(GRPOTrainer):
 
         per_sample, whole = self._grad_diag_pivot(records, sample_ids, layers)
         act_per_sample, act_whole = self._grad_diag_pivot(act_records, sample_ids, layers)
+        dot_per_sample, dot_whole = self._grad_diag_pivot(dot_records, sample_ids, layers, signed=True)
 
         # Triangle-inequality tripwire: ||.grad|| <= sum_j ||grad_j|| per (layer, role).
         max_triangle_ratio = 0.0
@@ -3533,16 +3554,32 @@ class SampleGRPOTrainer(GRPOTrainer):
             "per-sample decomposition inconsistent with .grad"
         )
 
+        # Per-sample metadata: detectable (monitored) flag + decoded text, so a
+        # sample's norms can be tied to its prompt/completion and split by
+        # detectable/undetectable post-hoc.
+        det = inputs.get("detectable")
+        detectable = [int(bool(det[sid].item())) if det is not None else 0 for sid in sample_ids]
+        idx_t = torch.tensor(sample_ids, device=inputs["prompt_ids"].device, dtype=torch.long)
+        prompts = self.processing_class.batch_decode(
+            inputs["prompt_ids"][idx_t], skip_special_tokens=True)
+        completions = self.processing_class.batch_decode(
+            inputs["completion_ids"][idx_t], skip_special_tokens=True)
+
         record = {
             "step": int(self.state.global_step),
             "samples_seen": int(getattr(self, "_samples_seen", 0)),
             "n_samples": len(sample_ids),
             "layers": layers,
             "is_rh": [is_rh_list[sid] for sid in sample_ids],
-            "per_sample": per_sample,          # grad: role -> [n_layers][n_samples]
-            "whole_model": whole,              # grad: role -> [n_samples]
-            "act_per_sample": act_per_sample,  # activation: role -> [n_layers][n_samples]
-            "act_whole_model": act_whole,      # activation: role -> [n_samples]
+            "detectable": detectable,          # per sample: 1=monitored/detectable
+            "prompt": prompts,                 # per sample (aligned)
+            "completion": completions,         # per sample (aligned)
+            "per_sample": per_sample,          # grad norm: role -> [n_layers][n_samples]
+            "whole_model": whole,              # grad norm: role -> [n_samples]
+            "act_per_sample": act_per_sample,  # activation norm: role -> [n_layers][n_samples]
+            "act_whole_model": act_whole,      # activation norm: role -> [n_samples]
+            "dot_per_sample": dot_per_sample,  # signed <grad,weight>: role -> [n_layers][n_samples]
+            "dot_whole_model": dot_whole,      # signed <grad,weight>: role -> [n_samples]
             "aggregate_grad_norm": {           # role -> [n_layers]; ||.grad|| all samples
                 role: [agg[role].get(li, 0.0) for li in layers]
                 for role in ("retain", "forget")},
@@ -3555,11 +3592,11 @@ class SampleGRPOTrainer(GRPOTrainer):
             print(f"[grad_diag] writing to {path}")
         self._grad_diag_file.write(json.dumps(record) + "\n")
 
-        # 2x2 whole-model summary scalars (mean per-sample norm per cell) to wandb,
-        # for both gradient and activation metrics.
+        # 2x2 whole-model summary scalars (mean per-sample value per cell) to
+        # wandb, for gradient norm, activation norm, and signed dot product.
         rh = np.array(record["is_rh"])
         m = self._metrics.setdefault("train", {})
-        for metric, wm in (("grad", whole), ("act", act_whole)):
+        for metric, wm in (("grad", whole), ("act", act_whole), ("dot", dot_whole)):
             for role in ("retain", "forget"):
                 w = np.array(wm[role])
                 for cls, name in ((0, "on_retain"), (1, "on_forget")):
