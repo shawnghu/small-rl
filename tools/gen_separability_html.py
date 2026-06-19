@@ -33,6 +33,9 @@ import numpy as np
 PLOTLY_CDN = "https://cdn.plot.ly/plotly-2.35.2.min.js"
 NBINS = 35
 SAMPLE_COLORS = {"retain": "#1f3a93", "forget": "#c0392b"}  # retain samples blue, forget red
+# 3-way sample class: retain=blue, forget-detectable(monitored)=light red,
+# forget-undetectable(unmonitored)=dark red.
+CLASS_COLORS = {"r": "#1f3a93", "fd": "#f1948a", "fu": "#922b21"}
 METRICS = (("grad", "per_sample", "whole_model"), ("act", "act_per_sample", "act_whole_model"))
 ROLES = ("retain", "forget")
 
@@ -55,8 +58,38 @@ def _edges(pool):
     return np.linspace(np.log10(lo), np.log10(hi), NBINS + 1)
 
 
+CLASSES = ("r", "fd", "fu")  # retain samples, forget-detectable, forget-undetectable
+
+
+def _sample_classes(r):
+    """Per-sample class: 0=retain (is_rh=0), 1=forget & detectable, 2=forget &
+    undetectable. detectable defaults to 0 (->all forget undetectable) for
+    records that predate the detectable field."""
+    rh = r["is_rh"]
+    det = r.get("detectable")
+    out = []
+    for j, lab in enumerate(rh):
+        if not lab:
+            out.append(0)
+        elif det is not None and det[j]:
+            out.append(1)
+        else:
+            out.append(2)
+    return out
+
+
+def _log_range(vals):
+    a = np.sort(vals[vals > 0])
+    if a.size < 4:
+        return None
+    return [float(np.log10(a[int(0.005 * a.size)])),
+            float(np.log10(a[min(a.size - 1, int(0.995 * a.size))]))]
+
+
 def build_env_data(recs_by_seed):
-    """Pool seeds per step; return the embeddable per-panel histogram structure."""
+    """Pool seeds per step; return embeddable per-panel histograms (3-way split:
+    retain / forget-detectable / forget-undetectable) + per-step joint-scatter
+    data (whole-model retain vs forget magnitude per sample)."""
     bystep = defaultdict(list)
     for recs in recs_by_seed:
         for r in recs:
@@ -65,32 +98,36 @@ def build_env_data(recs_by_seed):
     layers = recs_by_seed[0][0]["layers"]
     layerkeys = ["whole"] + [str(li) for li in layers]
 
-    # gather raw per (panel-key) -> per-step {retain:[...], forget:[...]}
-    # panel-key = metric|role|layerkey
-    raw = defaultdict(lambda: {s: {"retain": [], "forget": []} for s in steps})
+    # panel-key = metric|role|layerkey -> per-step {r:[...], fd:[...], fu:[...]}
+    raw = defaultdict(lambda: {s: {"r": [], "fd": [], "fu": []} for s in steps})
+    # scatter: metric -> per-step {x:[retain whole], y:[forget whole], cls:[0/1/2]}
+    scat = {m: {s: {"x": [], "y": [], "cls": []} for s in steps} for m, _, _ in METRICS}
     nhack, nretain = [], []
     for s in steps:
         recs = bystep[s]
-        nh = sum(sum(r["is_rh"]) for r in recs)
-        nhack.append(nh)
+        nhack.append(sum(sum(r["is_rh"]) for r in recs))
         nretain.append(sum(len(r["is_rh"]) - sum(r["is_rh"]) for r in recs))
         for r in recs:
-            rh = r["is_rh"]
+            cls = _sample_classes(r)
             for metric, ps_key, wm_key in METRICS:
+                wmR, wmF = r[wm_key]["retain"], r[wm_key]["forget"]
+                sc = scat[metric][s]
+                for j, c in enumerate(cls):
+                    sc["x"].append(wmR[j]); sc["y"].append(wmF[j]); sc["cls"].append(c)
                 for role in ROLES:
                     wm = r[wm_key][role]
-                    bucket = raw[f"{metric}|{role}|whole"][s]
-                    for j, lab in enumerate(rh):
-                        bucket["forget" if lab else "retain"].append(wm[j])
+                    b = raw[f"{metric}|{role}|whole"][s]
+                    for j, c in enumerate(cls):
+                        b[CLASSES[c]].append(wm[j])
                     for k, li in enumerate(layers):
                         arr = r[ps_key][role][k]
-                        bucket = raw[f"{metric}|{role}|{li}"][s]
-                        for j, lab in enumerate(rh):
-                            bucket["forget" if lab else "retain"].append(arr[j])
+                        b = raw[f"{metric}|{role}|{li}"][s]
+                        for j, c in enumerate(cls):
+                            b[CLASSES[c]].append(arr[j])
 
     panels = {}
     for key, perstep in raw.items():
-        allvals = np.array([v for s in steps for st in ("retain", "forget")
+        allvals = np.array([v for s in steps for st in CLASSES
                             for v in perstep[s][st]], dtype=float)
         edges = _edges(allvals) if allvals.size else None
         if edges is None:
@@ -101,23 +138,34 @@ def build_env_data(recs_by_seed):
         ymax = 1
         for s in steps:
             row = {}
-            for st in ("retain", "forget"):
+            for st in CLASSES:
                 x = np.array(perstep[s][st], dtype=float)
                 lx = np.log10(x[x > 0]) if x.size else np.array([])
                 counts, _ = np.histogram(lx, bins=edges)
-                row[st[0]] = counts.tolist()
+                row[st] = counts.tolist()
                 if counts.size:
                     ymax = max(ymax, int(counts.max()))
             hist.append(row)
         panels[key] = {"c": centers, "w": width, "ymax": ymax, "h": hist}
 
+    scatter = {}
+    for metric, _, _ in METRICS:
+        allx = np.array([v for s in steps for v in scat[metric][s]["x"]], float)
+        ally = np.array([v for s in steps for v in scat[metric][s]["y"]], float)
+        scatter[metric] = {
+            "x": [scat[metric][s]["x"] for s in steps],
+            "y": [scat[metric][s]["y"] for s in steps],
+            "cls": [scat[metric][s]["cls"] for s in steps],
+            "rx": _log_range(allx), "ry": _log_range(ally),
+        }
+
     return {"steps": steps, "layers": layers, "layerkeys": layerkeys,
-            "nhack": nhack, "nretain": nretain, "panels": panels}
+            "nhack": nhack, "nretain": nretain, "panels": panels, "scatter": scatter}
 
 
 def build_html(data_by_env):
     data_json = json.dumps(data_by_env, separators=(",", ":"))
-    colors_json = json.dumps(SAMPLE_COLORS)
+    colors_json = json.dumps(CLASS_COLORS)
     envs = sorted(data_by_env)
     env_opts = "".join(f'<option value="{e}">{e}</option>' for e in envs)
     return f"""<!DOCTYPE html>
@@ -149,7 +197,9 @@ def build_html(data_by_env):
     <span id="lbl"></span>
   </div>
   <div class="hint">Each panel fixes a metric (row) and parameter adapter (column) and overlays the per-sample
-   norm distribution over <b style="color:#1f3a93">retain samples</b> vs <b style="color:#c0392b">forget samples</b>.
+   norm distribution over <b style="color:#1f3a93">retain samples</b>,
+   <b style="color:#f1948a">forget&middot;detectable (monitored)</b>, and
+   <b style="color:#922b21">forget&middot;undetectable (unmonitored)</b>.
    Separation in a forget-param panel = that statistic flags forget samples. Bins fixed per
    (env,metric,role,layer); log-x; y fixed across steps; outliers (beyond p0.5–p99.5) truncated.</div>
   <div class="row">
@@ -165,6 +215,11 @@ def build_html(data_by_env):
       <div class="ptitle">Hack rate &middot; solid=monitored, dotted=unmonitored (vline=current step)</div>
       <div id="curves_hack" style="height:258px;"></div>
     </div>
+  </div>
+  <div class="ptitle" style="margin-top:14px;">Joint distribution &middot; retain-param vs forget-param magnitude (per sample, whole-model, this step). r = Pearson in log-space.</div>
+  <div class="row">
+    <div style="flex:1;"><div class="ptitle">Gradient norm</div><div id="scat_grad" style="height:340px;"></div></div>
+    <div style="flex:1;"><div class="ptitle">Activation norm</div><div id="scat_act" style="height:340px;"></div></div>
   </div>
 </div>
 <script>
@@ -227,15 +282,49 @@ function panel(divId, metric, role) {{
       annotations:[{{text:'no data', showarrow:false, xref:'paper', yref:'paper', x:0.5, y:0.5}}]}},
       {{displayModeBar:false}}); return; }}
   const row = p.h[idx];
+  const sum = st => row[st].reduce((a,b)=>a+b,0);
   const mk = (st, name) => ({{ type:'bar', x:p.c, y:row[st], width:p.w, name:name,
-                              marker:{{color: SC[st==='r'?'retain':'forget']}}, opacity:0.55 }});
-  const nR = row.r.reduce((a,b)=>a+b,0), nF = row.f.reduce((a,b)=>a+b,0);
-  Plotly.react(divId, [mk('r', `retain samples (n=${{nR}})`), mk('f', `forget samples (n=${{nF}})`)], {{
+                              marker:{{color: SC[st]}}, opacity:0.55 }});
+  Plotly.react(divId, [
+    mk('r', `retain (n=${{sum('r')}})`),
+    mk('fd', `forget\\u00b7detectable (n=${{sum('fd')}})`),
+    mk('fu', `forget\\u00b7undetectable (n=${{sum('fu')}})`),
+  ], {{
     barmode:'overlay', bargap:0,
     xaxis:{{title:xlabel, tickformat:'.1f'}},
     yaxis:{{title:'# samples', range:[0, p.ymax*1.05]}},
-    margin:{{t:26, r:8, b:40, l:44}}, legend:{{orientation:'h', y:1.0, yanchor:'bottom', font:{{size:10}}}},
+    margin:{{t:26, r:8, b:40, l:44}}, legend:{{orientation:'h', y:1.0, yanchor:'bottom', font:{{size:9}}}},
   }}, {{displayModeBar:false}});
+}}
+
+function pearsonLog(xs, ys) {{
+  const lx=[], ly=[];
+  for (let i=0;i<xs.length;i++) if (xs[i]>0 && ys[i]>0) {{ lx.push(Math.log(xs[i])); ly.push(Math.log(ys[i])); }}
+  const n=lx.length; if (n<3) return NaN;
+  const mx=lx.reduce((a,b)=>a+b,0)/n, my=ly.reduce((a,b)=>a+b,0)/n;
+  let sxy=0,sxx=0,syy=0;
+  for (let i=0;i<n;i++){{ const dx=lx[i]-mx, dy=ly[i]-my; sxy+=dx*dy; sxx+=dx*dx; syy+=dy*dy; }}
+  return (sxx>0&&syy>0) ? sxy/Math.sqrt(sxx*syy) : NaN;
+}}
+function renderScatter() {{
+  const E = curEnv();
+  const CK = ['r','fd','fu'], NM = {{r:'retain', fd:'forget\\u00b7det', fu:'forget\\u00b7undet'}};
+  for (const [divId, metric, lbl] of [['scat_grad','grad','grad norm'],['scat_act','act','activation norm']]) {{
+    const sc = E.scatter[metric];
+    const xs=sc.x[idx], ys=sc.y[idx], cls=sc.cls[idx];
+    const grp = {{r:{{x:[],y:[]}}, fd:{{x:[],y:[]}}, fu:{{x:[],y:[]}}}};
+    for (let i=0;i<xs.length;i++) if (xs[i]>0 && ys[i]>0) {{ const g=grp[CK[cls[i]]]; g.x.push(xs[i]); g.y.push(ys[i]); }}
+    const tr = k => ({{ x:grp[k].x, y:grp[k].y, mode:'markers', type:'scattergl',
+                       name:`${{NM[k]}} (n=${{grp[k].x.length}})`, marker:{{color:SC[k], size:4, opacity:0.45}} }});
+    const r = pearsonLog(xs, ys);
+    Plotly.react(divId, [tr('r'), tr('fd'), tr('fu')], {{
+      xaxis:{{title:`retain-param ${{lbl}}`, type:'log', range:sc.rx}},
+      yaxis:{{title:`forget-param ${{lbl}}`, type:'log', range:sc.ry}},
+      margin:{{t:24, r:8, b:42, l:52}}, legend:{{orientation:'h', y:1.0, yanchor:'bottom', font:{{size:9}}}},
+      annotations:[{{text:`r(log)=${{isNaN(r)?'\\u2013':r.toFixed(2)}}`, showarrow:false,
+                    xref:'paper', yref:'paper', x:0.03, y:0.97, bgcolor:'rgba(255,255,255,0.7)', font:{{size:11}}}}],
+    }}, {{displayModeBar:false}});
+  }}
 }}
 
 function render() {{
@@ -247,6 +336,7 @@ function render() {{
   panel('g_forget', 'grad', 'forget');
   panel('a_retain', 'act', 'retain');
   panel('a_forget', 'act', 'forget');
+  renderScatter();
   updateVline();
 }}
 function setSlider(i) {{ document.getElementById('slider').value = i; render(); }}
