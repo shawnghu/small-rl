@@ -195,11 +195,9 @@ def build_html(data_by_env):
     colors_json = json.dumps(CLASS_COLORS)
     envs = sorted(data_by_env)
     env_opts = "".join(f'<option value="{e}">{e}</option>' for e in envs)
-    has_dot = any(k.startswith("dot|") for e in data_by_env.values() for k in e["panels"])
-    dot_cells = (
-        '<div><div class="ptitle">Dot &lt;g,w&gt; &middot; Retain-param</div><div id="d_retain" class="plot"></div></div>'
-        '<div><div class="ptitle">Dot &lt;g,w&gt; &middot; Forget-param</div><div id="d_forget" class="plot"></div></div>'
-    ) if has_dot else ""
+    has_dot = any(k.startswith("dot|")
+                  for e in data_by_env.values()
+                  for cd in e["C"].values() for k in cd.get("panels", {}))
     has_dot_js = "true" if has_dot else "false"
     return f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8">
@@ -208,15 +206,17 @@ def build_html(data_by_env):
 <style>
   body {{ font-family: sans-serif; background:#f5f5f5; margin:18px; }}
   .container {{ max-width:1250px; margin:0 auto; }}
-  .controls {{ display:flex; align-items:center; gap:14px; margin:12px 0; flex-wrap:wrap; }}
+  .controls {{ display:flex; align-items:center; gap:14px; margin:12px 0; flex-wrap:wrap; position:sticky; top:0; background:#f5f5f5; z-index:10; padding:6px 0; }}
   input[type=range] {{ width:340px; }}
   select,button {{ padding:5px 10px; font-size:14px; }}
-  #lbl {{ font-weight:bold; min-width:260px; }}
+  #lbl {{ font-weight:bold; min-width:160px; }}
   .hint {{ color:#888; font-size:12px; }}
   .grid {{ display:grid; grid-template-columns:1fr 1fr; gap:8px; }}
   .row {{ display:flex; gap:14px; align-items:flex-start; margin-top:8px; }}
   .plot {{ height:258px; }}
   .ptitle {{ font-weight:bold; font-size:13px; text-align:center; margin-bottom:1px; }}
+  .cond-block {{ border:1px solid #ddd; border-radius:6px; padding:8px; margin-top:14px; background:#fff; }}
+  .cond-head {{ font-size:15px; margin-bottom:4px; }}
 </style></head><body>
 <div class="container">
   <h1 style="font-size:20px;">Can a statistic tell a forget sample from a retain sample?</h1>
@@ -229,42 +229,28 @@ def build_html(data_by_env):
     <button id="play" onclick="togglePlay()">Play</button>
     <span id="lbl"></span>
   </div>
-  <div class="hint">Each panel fixes a metric (row) and parameter adapter (column) and overlays the per-sample
-   norm distribution over <b style="color:#1f3a93">retain samples</b>,
-   <b style="color:#f1948a">forget&middot;detectable (monitored)</b>, and
-   <b style="color:#922b21">forget&middot;undetectable (unmonitored)</b>.
-   Separation in a forget-param panel = that statistic flags forget samples. Bins fixed per
-   (env,metric,role,layer); log-x; y fixed across steps; outliers (beyond p0.5–p99.5) truncated.</div>
-  <div class="row">
-    <div class="grid" style="flex:0 0 680px;">
-      <div><div class="ptitle">Gradient norm &middot; Retain-param</div><div id="g_retain" class="plot"></div></div>
-      <div><div class="ptitle">Gradient norm &middot; Forget-param</div><div id="g_forget" class="plot"></div></div>
-      <div><div class="ptitle">Activation norm &middot; Retain-param</div><div id="a_retain" class="plot"></div></div>
-      <div><div class="ptitle">Activation norm &middot; Forget-param</div><div id="a_forget" class="plot"></div></div>
-      {dot_cells}
-    </div>
-    <div style="flex:1; min-width:360px;">
-      <div class="ptitle">Retain reward &middot; <span style="color:#e67e22">2-adapter</span> vs <span style="color:#27ae60">retain-only</span></div>
-      <div id="curves_reward" style="height:258px;"></div>
-      <div class="ptitle">Hack rate &middot; solid=monitored, dotted=unmonitored (vline=current step)</div>
-      <div id="curves_hack" style="height:258px;"></div>
-    </div>
-  </div>
-  <div class="ptitle" style="margin-top:14px;">Joint distribution &middot; retain-param vs forget-param magnitude (per sample, whole-model, this step). r = Pearson in log-space.</div>
-  <div class="row">
-    <div style="flex:1;"><div class="ptitle">Gradient norm</div><div id="scat_grad" style="height:340px;"></div></div>
-    <div style="flex:1;"><div class="ptitle">Activation norm</div><div id="scat_act" style="height:340px;"></div></div>
-  </div>
+  <div class="hint">One block per condition (GR / RP / do-nothing) present for the env. Each grid panel overlays the
+   per-sample value over <b style="color:#1f3a93">retain samples</b>, <b style="color:#f1948a">forget&middot;detectable</b>,
+   <b style="color:#922b21">forget&middot;undetectable</b>. Grids show only where grad_diag exists; curves where
+   routing_eval exists. log-x for norms; signed linear-x for the dot; y fixed across steps; outliers truncated.</div>
+  <div id="blocks"></div>
 </div>
 <script>
 const DATA = {data_json};
 const SC = {colors_json};
 const HAS_DOT = {has_dot_js};
+const C_BOTH = '#e67e22', C_RONLY = '#27ae60';  // orange=2-adapter, green=retain-only
+const GRID_CELLS = [
+  ['grad','retain','Gradient norm \\u00b7 Retain-param'], ['grad','forget','Gradient norm \\u00b7 Forget-param'],
+  ['act','retain','Activation norm \\u00b7 Retain-param'], ['act','forget','Activation norm \\u00b7 Forget-param'],
+  ['dot','retain','Dot \\u27e8g,w\\u27e9 \\u00b7 Retain-param'], ['dot','forget','Dot \\u27e8g,w\\u27e9 \\u00b7 Forget-param'],
+];
 let idx = 0, playing = false, timer = null;
 
 function env() {{ return document.getElementById('env').value; }}
 function layerKey() {{ return document.getElementById('layer').value; }}
 function curEnv() {{ return DATA[env()]; }}
+function el(tag, cls, html) {{ const e=document.createElement(tag); if(cls)e.className=cls; if(html!=null)e.innerHTML=html; return e; }}
 
 function initLayer() {{
   const d = curEnv();
@@ -275,49 +261,71 @@ function initLayer() {{
 
 function onEnv() {{
   initLayer();
-  const d = curEnv();
-  document.getElementById('slider').max = d.steps.length - 1;
-  if (idx > d.steps.length - 1) idx = d.steps.length - 1;
-  renderCurves();
+  const E = curEnv();
+  const sl = document.getElementById('slider');
+  sl.max = Math.max(0, E.sliderSteps.length - 1);
+  if (idx > E.sliderSteps.length - 1) idx = E.sliderSteps.length - 1;
+  if (idx < 0) idx = 0;
+  sl.value = idx;
+  buildBlocks();
   render();
 }}
 
-const C_BOTH = '#e67e22', C_RONLY = '#27ae60';  // orange=2-adapter, green=retain-only
-function renderCurves() {{
-  const c = curEnv().curves;
-  const ln = (k, name, col, dash) => ({{ x:c.steps, y:c[k], name:name, mode:'lines',
-                                         line:{{color:col, dash:dash||'solid'}}, connectgaps:true }});
-  const vline = {{type:'line', x0:0, x1:0, yref:'paper', y0:0, y1:1, line:{{color:'#444', dash:'dot', width:1.5}}}};
-  const base = {{ xaxis:{{title:'training step'}}, margin:{{t:6, r:8, b:34, l:40}},
-                 legend:{{orientation:'h', y:1.0, yanchor:'bottom', font:{{size:9}}}}, shapes:[vline] }};
-  Plotly.react('curves_reward',
-    [ln('retain_both', '2-adapter', C_BOTH), ln('retain_ronly', 'retain-only', C_RONLY)],
-    Object.assign({{yaxis:{{title:'retain reward'}}}}, base), {{displayModeBar:false}});
-  Plotly.react('curves_hack', [
-    ln('hack_both_mon', '2-adapter monitored', C_BOTH, 'solid'),
-    ln('hack_both_unmon', '2-adapter unmonitored', C_BOTH, 'dot'),
-    ln('hack_ronly_mon', 'retain-only monitored', C_RONLY, 'solid'),
-    ln('hack_ronly_unmon', 'retain-only unmonitored', C_RONLY, 'dot'),
-  ], Object.assign({{yaxis:{{title:'hack rate'}}}}, base), {{displayModeBar:false}});
-}}
-function updateVline() {{
-  const step = curEnv().steps[idx];
-  Plotly.relayout('curves_reward', {{'shapes[0].x0': step, 'shapes[0].x1': step}});
-  Plotly.relayout('curves_hack', {{'shapes[0].x0': step, 'shapes[0].x1': step}});
+function hasCurves(cd) {{ return cd.curves && cd.curves.steps && cd.curves.steps.length > 0
+  && cd.curves.retain_both && cd.curves.retain_both.some(v => v != null); }}
+
+function buildBlocks() {{
+  const E = curEnv();
+  const host = document.getElementById('blocks');
+  host.innerHTML = '';
+  E.conds.forEach((cond, ci) => {{
+    const cd = E.C[cond];
+    const block = el('div', 'cond-block');
+    block.appendChild(el('div', 'cond-head', `Condition: <b>${{cond}}</b>`));
+    const row = el('div', 'row');
+    if (cd.has_grad) {{
+      const grid = el('div', 'grid'); grid.style.flex = '0 0 680px';
+      for (const [m, role, lbl] of GRID_CELLS) {{
+        if (m === 'dot' && !(('dot|' + role + '|whole') in cd.panels)) continue;
+        const cell = el('div'); cell.appendChild(el('div', 'ptitle', lbl));
+        const pd = el('div', 'plot'); pd.id = `p_${{ci}}_${{m}}_${{role}}`; cell.appendChild(pd);
+        grid.appendChild(cell);
+      }}
+      row.appendChild(grid);
+    }}
+    if (hasCurves(cd)) {{
+      const cv = el('div'); cv.style.flex = '1'; cv.style.minWidth = '340px';
+      cv.appendChild(el('div', 'ptitle', 'Retain reward \\u00b7 <span style="color:#e67e22">2-adapter</span> vs <span style="color:#27ae60">retain-only</span>'));
+      const cr = el('div'); cr.id = `cr_${{ci}}`; cr.style.height = '210px'; cv.appendChild(cr);
+      cv.appendChild(el('div', 'ptitle', 'Hack rate \\u00b7 solid=monitored, dotted=unmonitored'));
+      const ch = el('div'); ch.id = `ch_${{ci}}`; ch.style.height = '210px'; cv.appendChild(ch);
+      row.appendChild(cv);
+    }}
+    block.appendChild(row);
+    if (cd.has_grad) {{
+      block.appendChild(el('div', 'ptitle', 'Joint: retain-param vs forget-param magnitude (per sample, whole-model, this step)'));
+      const srow = el('div', 'row');
+      for (const m of ['grad', 'act']) {{
+        const c = el('div'); c.style.flex = '1';
+        c.appendChild(el('div', 'ptitle', m === 'grad' ? 'Gradient norm' : 'Activation norm'));
+        const sdv = el('div'); sdv.id = `s_${{ci}}_${{m}}`; sdv.style.height = '300px'; c.appendChild(sdv);
+        srow.appendChild(c);
+      }}
+      block.appendChild(srow);
+    }}
+    host.appendChild(block);
+    if (hasCurves(cd)) renderCurvesCond(ci, cd);
+  }});
 }}
 
-// no Plotly title (the HTML .ptitle above each plot serves as the title, so it
-// can never overlap the legend); legend sits in the top margin.
-function panel(divId, metric, role) {{
-  const d = curEnv();
-  const key = metric + '|' + role + '|' + layerKey();
-  const p = d.panels[key];
+function panel(divId, cd, metric, role, j) {{
+  const p = cd.panels[metric + '|' + role + '|' + layerKey()];
   const xlabel = metric === 'dot' ? '\\u27e8grad,weight\\u27e9 (signed)'
     : metric === 'act' ? 'activation norm (log\\u2081\\u2080)' : 'grad norm (log\\u2081\\u2080)';
-  if (!p) {{ Plotly.react(divId, [], {{margin:{{t:24,r:8}},
-      annotations:[{{text:'no data', showarrow:false, xref:'paper', yref:'paper', x:0.5, y:0.5}}]}},
+  if (!p || j < 0) {{ Plotly.react(divId, [], {{margin:{{t:24,r:8}},
+      annotations:[{{text:'no data at this step', showarrow:false, xref:'paper', yref:'paper', x:0.5, y:0.5}}]}},
       {{displayModeBar:false}}); return; }}
-  const row = p.h[idx];
+  const row = p.h[j];
   const sum = st => row[st].reduce((a,b)=>a+b,0);
   const mk = (st, name) => ({{ type:'bar', x:p.c, y:row[st], width:p.w, name:name,
                               marker:{{color: SC[st]}}, opacity:0.55 }});
@@ -342,12 +350,13 @@ function pearsonLog(xs, ys) {{
   for (let i=0;i<n;i++){{ const dx=lx[i]-mx, dy=ly[i]-my; sxy+=dx*dy; sxx+=dx*dx; syy+=dy*dy; }}
   return (sxx>0&&syy>0) ? sxy/Math.sqrt(sxx*syy) : NaN;
 }}
-function renderScatter() {{
-  const E = curEnv();
+function renderScatter(ci, cd, j) {{
   const CK = ['r','fd','fu'], NM = {{r:'retain', fd:'forget\\u00b7det', fu:'forget\\u00b7undet'}};
-  for (const [divId, metric, lbl] of [['scat_grad','grad','grad norm'],['scat_act','act','activation norm']]) {{
-    const sc = E.scatter[metric];
-    const xs=sc.x[idx], ys=sc.y[idx], cls=sc.cls[idx];
+  for (const [suffix, lbl] of [['grad','grad norm'],['act','activation norm']]) {{
+    const divId = `s_${{ci}}_${{suffix}}`;
+    const sc = cd.scatter[suffix];
+    if (!sc || j < 0) {{ Plotly.react(divId, [], {{margin:{{t:24,r:8}}}}, {{displayModeBar:false}}); continue; }}
+    const xs=sc.x[j], ys=sc.y[j], cls=sc.cls[j];
     const grp = {{r:{{x:[],y:[]}}, fd:{{x:[],y:[]}}, fu:{{x:[],y:[]}}}};
     for (let i=0;i<xs.length;i++) if (xs[i]>0 && ys[i]>0) {{ const g=grp[CK[cls[i]]]; g.x.push(xs[i]); g.y.push(ys[i]); }}
     const tr = k => ({{ x:grp[k].x, y:grp[k].y, mode:'markers', type:'scattergl',
@@ -363,30 +372,54 @@ function renderScatter() {{
   }}
 }}
 
+function renderCurvesCond(ci, cd) {{
+  const c = cd.curves;
+  const ln = (k, name, col, dash) => ({{ x:c.steps, y:c[k], name:name, mode:'lines',
+                                         line:{{color:col, dash:dash||'solid'}}, connectgaps:true }});
+  const vline = {{type:'line', x0:0, x1:0, yref:'paper', y0:0, y1:1, line:{{color:'#444', dash:'dot', width:1.5}}}};
+  const base = {{ xaxis:{{title:'training step'}}, margin:{{t:6, r:8, b:34, l:40}},
+                 legend:{{orientation:'h', y:1.0, yanchor:'bottom', font:{{size:9}}}}, shapes:[vline] }};
+  Plotly.react(`cr_${{ci}}`,
+    [ln('retain_both','2-adapter',C_BOTH), ln('retain_ronly','retain-only',C_RONLY)],
+    Object.assign({{yaxis:{{title:'retain reward'}}}}, base), {{displayModeBar:false}});
+  Plotly.react(`ch_${{ci}}`, [
+    ln('hack_both_mon','2-adapter mon',C_BOTH,'solid'), ln('hack_both_unmon','2-adapter unmon',C_BOTH,'dot'),
+    ln('hack_ronly_mon','retain-only mon',C_RONLY,'solid'), ln('hack_ronly_unmon','retain-only unmon',C_RONLY,'dot'),
+  ], Object.assign({{yaxis:{{title:'hack rate'}}}}, base), {{displayModeBar:false}});
+}}
+
 function render() {{
-  const d = curEnv();
+  const E = curEnv();
   idx = parseInt(document.getElementById('slider').value);
-  document.getElementById('lbl').textContent =
-    `step ${{d.steps[idx]}} \\u00b7 ${{d.nhack[idx]}} forget / ${{d.nretain[idx]}} retain samples`;
-  panel('g_retain', 'grad', 'retain');
-  panel('g_forget', 'grad', 'forget');
-  panel('a_retain', 'act', 'retain');
-  panel('a_forget', 'act', 'forget');
-  if (HAS_DOT) {{ panel('d_retain', 'dot', 'retain'); panel('d_forget', 'dot', 'forget'); }}
-  renderScatter();
-  updateVline();
+  const step = E.sliderSteps[idx];
+  document.getElementById('lbl').textContent = `step ${{step}}`;
+  E.conds.forEach((cond, ci) => {{
+    const cd = E.C[cond];
+    if (cd.has_grad) {{
+      const j = cd.steps.indexOf(step);
+      for (const [m, role] of GRID_CELLS) {{
+        const id = `p_${{ci}}_${{m}}_${{role}}`;
+        if (document.getElementById(id)) panel(id, cd, m, role, j);
+      }}
+      renderScatter(ci, cd, j);
+    }}
+    if (document.getElementById(`cr_${{ci}}`)) {{
+      Plotly.relayout(`cr_${{ci}}`, {{'shapes[0].x0': step, 'shapes[0].x1': step}});
+      Plotly.relayout(`ch_${{ci}}`, {{'shapes[0].x0': step, 'shapes[0].x1': step}});
+    }}
+  }});
 }}
 function setSlider(i) {{ document.getElementById('slider').value = i; render(); }}
 function prev() {{ if (idx>0) setSlider(idx-1); }}
-function next() {{ const n=curEnv().steps.length; if (idx<n-1) setSlider(idx+1); }}
+function next() {{ const n=curEnv().sliderSteps.length; if (idx<n-1) setSlider(idx+1); }}
 function togglePlay() {{
   playing=!playing; document.getElementById('play').textContent=playing?'Pause':'Play';
-  if (playing) timer=setInterval(()=>{{ const n=curEnv().steps.length; if (idx<n-1) next(); else togglePlay(); }}, 600);
+  if (playing) timer=setInterval(()=>{{ const n=curEnv().sliderSteps.length; if (idx<n-1) next(); else togglePlay(); }}, 600);
   else clearInterval(timer);
 }}
 document.addEventListener('keydown',(e)=>{{ if(e.key==='ArrowLeft')prev(); else if(e.key==='ArrowRight')next(); }});
 
-initLayer(); onEnv();
+onEnv();
 </script></body></html>"""
 
 
@@ -432,38 +465,102 @@ def load_curves(run_dirs):
     return out
 
 
+COND_ORDER = ["GR", "RP", "filter", "do-nothing"]
+
+
+def classify_condition(run_dir):
+    """Condition label from run_config.yaml (routing_mode / reward_penalty_baseline
+    / filter_baseline), falling back to the run-name marker."""
+    rm, rp, fb = None, False, False
+    cfg = os.path.join(run_dir, "run_config.yaml")
+    if os.path.exists(cfg):
+        try:
+            import yaml
+            c = yaml.safe_load(open(cfg)) or {}
+            rm = c.get("routing_mode")
+            rp = bool(c.get("reward_penalty_baseline"))
+            fb = bool(c.get("filter_baseline"))
+        except Exception:
+            pass
+    if rm is None:
+        n = os.path.basename(run_dir)
+        if "_gr_" in n or "_gr" in n:
+            rm = "classic"
+        elif "_rp" in n:
+            rp, rm = True, "none"
+        elif "no_intervention" in n or "nohack" in n:
+            rm = "none"
+        else:
+            rm = "none"
+    if rm and rm != "none":
+        return "GR"
+    if rp:
+        return "RP"
+    if fb:
+        return "filter"
+    return "do-nothing"
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("sweep_dir")
+    ap.add_argument("sweep_dir", nargs="+",
+                    help="one or more sweep dirs; runs are grouped by (env, condition)")
     ap.add_argument("-o", "--output", default=None)
     args = ap.parse_args()
 
-    files = sorted(glob.glob(os.path.join(args.sweep_dir, "*", "grad_diag.jsonl")))
-    assert files, f"no */grad_diag.jsonl under {args.sweep_dir}"
-    by_env = defaultdict(list)
-    by_env_dirs = defaultdict(list)
-    for f in files:
-        recs = [json.loads(l) for l in open(f) if l.strip()]
-        if recs:
-            e = env_of(os.path.basename(os.path.dirname(f)))
-            by_env[e].append(recs)
-            by_env_dirs[e].append(os.path.dirname(os.path.realpath(f)))
+    # discover run subdirs (anything with grad_diag.jsonl or routing_eval.jsonl)
+    run_dirs = []
+    for sd in args.sweep_dir:
+        for sub in sorted(glob.glob(os.path.join(sd, "*"))):
+            if os.path.isdir(sub) and (
+                    os.path.exists(os.path.join(sub, "grad_diag.jsonl"))
+                    or os.path.exists(os.path.join(sub, "routing_eval.jsonl"))):
+                run_dirs.append(sub)
+    assert run_dirs, f"no runs (grad_diag/routing_eval) under {args.sweep_dir}"
+
+    # group by (env, condition)
+    groups = defaultdict(lambda: {"grad": [], "dirs": []})
+    for rd in run_dirs:
+        env = env_of(os.path.basename(rd))
+        cond = classify_condition(rd)
+        gp = os.path.join(rd, "grad_diag.jsonl")
+        if os.path.exists(gp):
+            recs = [json.loads(l) for l in open(gp) if l.strip()]
+            if recs:
+                groups[(env, cond)]["grad"].append(recs)
+        groups[(env, cond)]["dirs"].append(rd)
 
     data_by_env = {}
-    for env, recs_by_seed in by_env.items():
-        d = build_env_data(recs_by_seed)
-        if d["panels"]:
-            d["curves"] = load_curves(by_env_dirs[env])
-            data_by_env[env] = d
+    for (env, cond), g in groups.items():
+        d = data_by_env.setdefault(env, {"C": {}, "conds": [], "layers": [], "sliderSteps": []})
+        if g["grad"]:
+            cd = build_env_data(g["grad"])
+            cd["has_grad"] = True
+            if not d["layers"]:
+                d["layers"] = cd["layers"]
+        else:
+            cd = {"has_grad": False, "steps": [], "panels": {}, "scatter": {},
+                  "nhack": [], "nretain": [], "layers": []}
+        cd["curves"] = load_curves(g["dirs"])
+        d["C"][cond] = cd
+
+    for env, d in data_by_env.items():
+        d["conds"] = [c for c in COND_ORDER if c in d["C"]]
+        grad_steps = sorted(set().union(*[set(d["C"][c]["steps"])
+                                          for c in d["conds"] if d["C"][c]["has_grad"]] or [set()]))
+        if not grad_steps:  # curve-only env: slider over curve steps
+            grad_steps = sorted(set().union(*[set(d["C"][c]["curves"]["steps"])
+                                              for c in d["conds"]] or [set()]))
+        d["sliderSteps"] = grad_steps
     assert data_by_env, "no usable data"
 
-    outdir = os.path.join(args.sweep_dir, "separability")
-    os.makedirs(outdir, exist_ok=True)
-    out = args.output or os.path.join(outdir, "separability_dist.html")
+    out = args.output or os.path.join(args.sweep_dir[0], "separability", "separability_dist.html")
+    os.makedirs(os.path.dirname(out), exist_ok=True)
     with open(out, "w") as f:
         f.write(build_html(data_by_env))
     mb = os.path.getsize(out) / 1e6
-    print(f"[separability] wrote {out} ({len(data_by_env)} envs, {mb:.1f} MB)")
+    n_blocks = sum(len(d["conds"]) for d in data_by_env.values())
+    print(f"[separability] wrote {out} ({len(data_by_env)} envs, {n_blocks} condition-blocks, {mb:.1f} MB)")
 
 
 if __name__ == "__main__":
