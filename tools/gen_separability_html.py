@@ -190,6 +190,49 @@ def build_env_data(recs_by_seed):
             "nhack": nhack, "nretain": nretain, "panels": panels, "scatter": scatter}
 
 
+# Core JS reused by both the detailed (per-env, multi-condition) page and the
+# all-envs overview page. Raw string (single braces, \\u escapes preserved for
+# JS); inserted verbatim into each page's f-string via {_SHARED_JS}. Depends on
+# globals `SC` (class colors) and `layerKey()` being defined by the host page.
+_SHARED_JS = r"""
+function el(tag, cls, html) { const e=document.createElement(tag); if(cls)e.className=cls; if(html!=null)e.innerHTML=html; return e; }
+
+function pearsonLog(xs, ys) {
+  const lx=[], ly=[];
+  for (let i=0;i<xs.length;i++) if (xs[i]>0 && ys[i]>0) { lx.push(Math.log(xs[i])); ly.push(Math.log(ys[i])); }
+  const n=lx.length; if (n<3) return NaN;
+  const mx=lx.reduce((a,b)=>a+b,0)/n, my=ly.reduce((a,b)=>a+b,0)/n;
+  let sxy=0,sxx=0,syy=0;
+  for (let i=0;i<n;i++){ const dx=lx[i]-mx, dy=ly[i]-my; sxy+=dx*dy; sxx+=dx*dx; syy+=dy*dy; }
+  return (sxx>0&&syy>0) ? sxy/Math.sqrt(sxx*syy) : NaN;
+}
+
+// One histogram panel for (condition-data cd, metric, role) at step-index j.
+function panel(divId, cd, metric, role, j) {
+  const p = cd.panels[metric + '|' + role + '|' + layerKey()];
+  const xlabel = metric === 'dot' ? '⟨grad,weight⟩ (signed)'
+    : metric === 'act' ? 'activation norm (log₁₀)' : 'grad norm (log₁₀)';
+  if (!p || j < 0) { Plotly.react(divId, [], {margin:{t:24,r:8},
+      annotations:[{text:'no data at this step', showarrow:false, xref:'paper', yref:'paper', x:0.5, y:0.5}]},
+      {displayModeBar:false}); return; }
+  const row = p.h[j];
+  const sum = st => row[st].reduce((a,b)=>a+b,0);
+  const mk = (st, name) => ({ type:'bar', x:p.c, y:row[st], width:p.w, name:name,
+                              marker:{color: SC[st]}, opacity:0.55 });
+  Plotly.react(divId, [
+    mk('r', `retain (n=${sum('r')})`),
+    mk('fd', `forget·detectable (n=${sum('fd')})`),
+    mk('fu', `forget·undetectable (n=${sum('fu')})`),
+  ], {
+    barmode:'overlay', bargap:0,
+    xaxis:{title:xlabel, tickformat: p.logx ? '.1f' : '.2g'},
+    yaxis:{title:'# samples', range:[0, p.ymax*1.05]},
+    margin:{t:26, r:8, b:40, l:44}, legend:{orientation:'h', y:1.0, yanchor:'bottom', font:{size:9}},
+  }, {displayModeBar:false});
+}
+"""
+
+
 def build_html(data_by_env):
     data_json = json.dumps(data_by_env, separators=(",", ":"))
     colors_json = json.dumps(CLASS_COLORS)
@@ -250,8 +293,7 @@ let idx = 0, playing = false, timer = null;
 function env() {{ return document.getElementById('env').value; }}
 function layerKey() {{ return document.getElementById('layer').value; }}
 function curEnv() {{ return DATA[env()]; }}
-function el(tag, cls, html) {{ const e=document.createElement(tag); if(cls)e.className=cls; if(html!=null)e.innerHTML=html; return e; }}
-
+{_SHARED_JS}
 function initLayer() {{
   const d = curEnv();
   let o = '<option value="whole">all layers (whole-model)</option>';
@@ -318,38 +360,6 @@ function buildBlocks() {{
   }});
 }}
 
-function panel(divId, cd, metric, role, j) {{
-  const p = cd.panels[metric + '|' + role + '|' + layerKey()];
-  const xlabel = metric === 'dot' ? '\\u27e8grad,weight\\u27e9 (signed)'
-    : metric === 'act' ? 'activation norm (log\\u2081\\u2080)' : 'grad norm (log\\u2081\\u2080)';
-  if (!p || j < 0) {{ Plotly.react(divId, [], {{margin:{{t:24,r:8}},
-      annotations:[{{text:'no data at this step', showarrow:false, xref:'paper', yref:'paper', x:0.5, y:0.5}}]}},
-      {{displayModeBar:false}}); return; }}
-  const row = p.h[j];
-  const sum = st => row[st].reduce((a,b)=>a+b,0);
-  const mk = (st, name) => ({{ type:'bar', x:p.c, y:row[st], width:p.w, name:name,
-                              marker:{{color: SC[st]}}, opacity:0.55 }});
-  Plotly.react(divId, [
-    mk('r', `retain (n=${{sum('r')}})`),
-    mk('fd', `forget\\u00b7detectable (n=${{sum('fd')}})`),
-    mk('fu', `forget\\u00b7undetectable (n=${{sum('fu')}})`),
-  ], {{
-    barmode:'overlay', bargap:0,
-    xaxis:{{title:xlabel, tickformat: p.logx ? '.1f' : '.2g'}},
-    yaxis:{{title:'# samples', range:[0, p.ymax*1.05]}},
-    margin:{{t:26, r:8, b:40, l:44}}, legend:{{orientation:'h', y:1.0, yanchor:'bottom', font:{{size:9}}}},
-  }}, {{displayModeBar:false}});
-}}
-
-function pearsonLog(xs, ys) {{
-  const lx=[], ly=[];
-  for (let i=0;i<xs.length;i++) if (xs[i]>0 && ys[i]>0) {{ lx.push(Math.log(xs[i])); ly.push(Math.log(ys[i])); }}
-  const n=lx.length; if (n<3) return NaN;
-  const mx=lx.reduce((a,b)=>a+b,0)/n, my=ly.reduce((a,b)=>a+b,0)/n;
-  let sxy=0,sxx=0,syy=0;
-  for (let i=0;i<n;i++){{ const dx=lx[i]-mx, dy=ly[i]-my; sxy+=dx*dy; sxx+=dx*dx; syy+=dy*dy; }}
-  return (sxx>0&&syy>0) ? sxy/Math.sqrt(sxx*syy) : NaN;
-}}
 function renderScatter(ci, cd, j) {{
   const CK = ['r','fd','fu'], NM = {{r:'retain', fd:'forget\\u00b7det', fu:'forget\\u00b7undet'}};
   for (const [suffix, lbl] of [['grad','grad norm'],['act','activation norm']]) {{
@@ -465,6 +475,123 @@ def load_curves(run_dirs):
     return out
 
 
+def build_allenvs_html(data_by_env):
+    """Overview page: every env's 2x2 grid (gradient/activation x retain/forget)
+    shown concurrently in an outer grid, for a selected condition, one shared
+    step slider. Reuses the shared panel() core."""
+    # overview only needs the histogram panels — drop scatter/curves to shrink.
+    reduced = {
+        env: {"layers": d["layers"], "conds": d["conds"],
+              "C": {c: {"has_grad": cd["has_grad"], "steps": cd["steps"], "panels": cd["panels"]}
+                    for c, cd in d["C"].items()}}
+        for env, d in data_by_env.items()
+    }
+    data_json = json.dumps(reduced, separators=(",", ":"))
+    colors_json = json.dumps(CLASS_COLORS)
+    envs = sorted(data_by_env)
+    # conditions that have grad data somewhere
+    conds = [c for c in ["GR", "RP", "filter", "do-nothing"]
+             if any(c in d["C"] and d["C"][c]["has_grad"] for d in data_by_env.values())]
+    cond_opts = "".join(f'<option value="{c}">{c}</option>' for c in conds)
+    CELLS = [("grad", "retain", "grad·retain"), ("grad", "forget", "grad·forget"),
+             ("act", "retain", "act·retain"), ("act", "forget", "act·forget")]
+    # static env cells (each = title + 2x2 mini-grid of 4 panel divs)
+    cells_html = []
+    for ei, env in enumerate(envs):
+        minis = "".join(
+            f'<div><div class="mt">{lbl}</div><div id="o_{ei}_{m}_{role}" class="mplot"></div></div>'
+            for m, role, lbl in CELLS)
+        cells_html.append(
+            f'<div class="envcell"><div class="envtitle">{env}</div>'
+            f'<div class="mini">{minis}</div></div>')
+    envcells = "\n".join(cells_html)
+    envs_json = json.dumps(envs)
+    return f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<title>All-envs 2x2 overview</title>
+<script src="{PLOTLY_CDN}"></script>
+<style>
+  body {{ font-family: sans-serif; background:#f5f5f5; margin:18px; }}
+  .controls {{ display:flex; align-items:center; gap:14px; margin:10px 0; flex-wrap:wrap; position:sticky; top:0; background:#f5f5f5; z-index:10; padding:6px 0; }}
+  input[type=range] {{ width:360px; }}
+  select,button {{ padding:5px 10px; font-size:14px; }}
+  #lbl {{ font-weight:bold; }}
+  .envgrid {{ display:grid; grid-template-columns:repeat(3,1fr); gap:12px; }}
+  .envcell {{ border:1px solid #ddd; border-radius:6px; padding:6px; background:#fff; }}
+  .envtitle {{ font-weight:bold; font-size:13px; text-align:center; margin-bottom:2px; }}
+  .mini {{ display:grid; grid-template-columns:1fr 1fr; gap:4px; }}
+  .mplot {{ height:165px; }}
+  .mt {{ font-size:11px; text-align:center; color:#444; }}
+  .hint {{ color:#888; font-size:12px; margin-bottom:6px; }}
+</style></head><body>
+  <h1 style="font-size:19px;">All envs &mdash; 2&times;2 (gradient/activation &times; retain/forget) at a glance</h1>
+  <div class="controls">
+    <label>Condition: <select id="cond" onchange="onCond()">{cond_opts}</select></label>
+    <label>Layer: <select id="layer" onchange="render()"></select></label>
+    <button onclick="prev()">&larr;</button>
+    <input type="range" id="slider" min="0" value="0" oninput="render()">
+    <button onclick="next()">&rarr;</button>
+    <button id="play" onclick="togglePlay()">Play</button>
+    <span id="lbl"></span>
+  </div>
+  <div class="hint"><b style="color:#1f3a93">retain</b> / <b style="color:#f1948a">forget·detectable</b> /
+   <b style="color:#922b21">forget·undetectable</b> samples. Same step slider across all envs.</div>
+  <div class="envgrid">
+{envcells}
+  </div>
+<script>
+const DATA = {data_json};
+const SC = {colors_json};
+const ENVS = {envs_json};
+const CELLS = [['grad','retain'],['grad','forget'],['act','retain'],['act','forget']];
+let idx = 0, playing = false, timer = null, STEPS = [];
+function layerKey() {{ return document.getElementById('layer').value; }}
+function curCond() {{ return document.getElementById('cond').value; }}
+{_SHARED_JS}
+function initLayer() {{
+  let layers = [];
+  for (const e of ENVS) {{ if (DATA[e].layers && DATA[e].layers.length) {{ layers = DATA[e].layers; break; }} }}
+  let o = '<option value="whole">all layers (whole-model)</option>';
+  for (const li of layers) o += `<option value="${{li}}">layer ${{li}}</option>`;
+  document.getElementById('layer').innerHTML = o;
+}}
+function allSteps() {{
+  const cond = curCond(); const s = new Set();
+  for (const e of ENVS) {{ const cd = DATA[e].C[cond]; if (cd && cd.has_grad) cd.steps.forEach(x => s.add(x)); }}
+  return Array.from(s).sort((a,b)=>a-b);
+}}
+function onCond() {{
+  STEPS = allSteps();
+  const sl = document.getElementById('slider');
+  sl.max = Math.max(0, STEPS.length - 1);
+  if (idx > STEPS.length - 1) idx = STEPS.length - 1; if (idx < 0) idx = 0;
+  sl.value = idx; render();
+}}
+function render() {{
+  idx = parseInt(document.getElementById('slider').value);
+  const step = STEPS[idx], cond = curCond();
+  document.getElementById('lbl').textContent = `condition ${{cond}} \\u00b7 step ${{step}}`;
+  ENVS.forEach((env, ei) => {{
+    const cd = DATA[env].C[cond];
+    const j = (cd && cd.has_grad) ? cd.steps.indexOf(step) : -1;
+    for (const [m, role] of CELLS) {{
+      panel(`o_${{ei}}_${{m}}_${{role}}`, (cd || {{panels:{{}}}}), m, role, j);
+    }}
+  }});
+}}
+function setSlider(i) {{ document.getElementById('slider').value = i; render(); }}
+function prev() {{ if (idx>0) setSlider(idx-1); }}
+function next() {{ if (idx<STEPS.length-1) setSlider(idx+1); }}
+function togglePlay() {{
+  playing=!playing; document.getElementById('play').textContent=playing?'Pause':'Play';
+  if (playing) timer=setInterval(()=>{{ if (idx<STEPS.length-1) next(); else togglePlay(); }}, 600);
+  else clearInterval(timer);
+}}
+document.addEventListener('keydown',(e)=>{{ if(e.key==='ArrowLeft')prev(); else if(e.key==='ArrowRight')next(); }});
+initLayer(); onCond();
+</script></body></html>"""
+
+
 COND_ORDER = ["GR", "RP", "filter", "do-nothing"]
 
 
@@ -561,6 +688,12 @@ def main():
     mb = os.path.getsize(out) / 1e6
     n_blocks = sum(len(d["conds"]) for d in data_by_env.values())
     print(f"[separability] wrote {out} ({len(data_by_env)} envs, {n_blocks} condition-blocks, {mb:.1f} MB)")
+
+    # all-envs overview page (every env's 2x2 at a glance)
+    allenvs_out = os.path.join(os.path.dirname(out), "separability_allenvs.html")
+    with open(allenvs_out, "w") as f:
+        f.write(build_allenvs_html(data_by_env))
+    print(f"[separability] wrote {allenvs_out} ({os.path.getsize(allenvs_out)/1e6:.1f} MB)")
 
 
 if __name__ == "__main__":
