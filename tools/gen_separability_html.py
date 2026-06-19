@@ -159,9 +159,11 @@ def build_html(data_by_env):
       <div><div class="ptitle">Activation norm &middot; Retain-param</div><div id="a_retain" class="plot"></div></div>
       <div><div class="ptitle">Activation norm &middot; Forget-param</div><div id="a_forget" class="plot"></div></div>
     </div>
-    <div style="flex:1; min-width:340px;">
-      <div class="ptitle">Training curves &middot; both-adapter eval (seed-avg; dotted line = current step)</div>
-      <div id="curves" style="height:540px;"></div>
+    <div style="flex:1; min-width:360px;">
+      <div class="ptitle">Retain reward &middot; <span style="color:#e67e22">2-adapter</span> vs <span style="color:#27ae60">retain-only</span></div>
+      <div id="curves_reward" style="height:258px;"></div>
+      <div class="ptitle">Hack rate &middot; solid=monitored, dotted=unmonitored (vline=current step)</div>
+      <div id="curves_hack" style="height:258px;"></div>
     </div>
   </div>
 </div>
@@ -190,24 +192,28 @@ function onEnv() {{
   render();
 }}
 
+const C_BOTH = '#e67e22', C_RONLY = '#27ae60';  // orange=2-adapter, green=retain-only
 function renderCurves() {{
   const c = curEnv().curves;
-  if (!c) {{ Plotly.react('curves', [], {{}}, {{displayModeBar:false}}); return; }}
-  const tr = (k, name, col) => ({{ x:c.steps, y:c[k], name:name, mode:'lines',
-                                   line:{{color:col}}, connectgaps:true }});
-  Plotly.react('curves', [
-    tr('hack_freq', 'hack freq', '#c0392b'),
-    tr('combined', 'combined reward', '#27ae60'),
-    tr('retain', 'retain reward', '#1f3a93'),
-  ], {{
-    xaxis:{{title:'training step'}}, yaxis:{{title:'both-adapter eval'}},
-    margin:{{t:24, r:8, b:40}}, legend:{{orientation:'h', y:1.0, yanchor:'bottom', font:{{size:10}}}},
-    shapes:[{{type:'line', x0:0, x1:0, yref:'paper', y0:0, y1:1, line:{{color:'#444', dash:'dot', width:1.5}}}}],
-  }}, {{displayModeBar:false}});
+  const ln = (k, name, col, dash) => ({{ x:c.steps, y:c[k], name:name, mode:'lines',
+                                         line:{{color:col, dash:dash||'solid'}}, connectgaps:true }});
+  const vline = {{type:'line', x0:0, x1:0, yref:'paper', y0:0, y1:1, line:{{color:'#444', dash:'dot', width:1.5}}}};
+  const base = {{ xaxis:{{title:'training step'}}, margin:{{t:6, r:8, b:34, l:40}},
+                 legend:{{orientation:'h', y:1.0, yanchor:'bottom', font:{{size:9}}}}, shapes:[vline] }};
+  Plotly.react('curves_reward',
+    [ln('retain_both', '2-adapter', C_BOTH), ln('retain_ronly', 'retain-only', C_RONLY)],
+    Object.assign({{yaxis:{{title:'retain reward'}}}}, base), {{displayModeBar:false}});
+  Plotly.react('curves_hack', [
+    ln('hack_both_mon', '2-adapter monitored', C_BOTH, 'solid'),
+    ln('hack_both_unmon', '2-adapter unmonitored', C_BOTH, 'dot'),
+    ln('hack_ronly_mon', 'retain-only monitored', C_RONLY, 'solid'),
+    ln('hack_ronly_unmon', 'retain-only unmonitored', C_RONLY, 'dot'),
+  ], Object.assign({{yaxis:{{title:'hack rate'}}}}, base), {{displayModeBar:false}});
 }}
 function updateVline() {{
   const step = curEnv().steps[idx];
-  Plotly.relayout('curves', {{'shapes[0].x0': step, 'shapes[0].x1': step}});
+  Plotly.relayout('curves_reward', {{'shapes[0].x0': step, 'shapes[0].x1': step}});
+  Plotly.relayout('curves_hack', {{'shapes[0].x0': step, 'shapes[0].x1': step}});
 }}
 
 // no Plotly title (the HTML .ptitle above each plot serves as the title, so it
@@ -228,7 +234,7 @@ function panel(divId, metric, role) {{
     barmode:'overlay', bargap:0,
     xaxis:{{title:xlabel, tickformat:'.1f'}},
     yaxis:{{title:'# samples', range:[0, p.ymax*1.05]}},
-    margin:{{t:26, r:8, b:40}}, legend:{{orientation:'h', y:1.0, yanchor:'bottom', font:{{size:10}}}},
+    margin:{{t:26, r:8, b:40, l:44}}, legend:{{orientation:'h', y:1.0, yanchor:'bottom', font:{{size:10}}}},
   }}, {{displayModeBar:false}});
 }}
 
@@ -257,13 +263,24 @@ initLayer(); onEnv();
 </script></body></html>"""
 
 
-CURVE_KEYS = ("hack_freq", "combined", "retain")  # 2nd path segment under "both/"
+# curve name -> (eval mode = adapter config, routing_eval 2nd path segment)
+# orange = both-adapter, green = retain-only; monitored=detectable, unmonitored=undetectable.
+CURVE_SPECS = {
+    "retain_both":      ("both", "retain"),
+    "retain_ronly":     ("retain_only", "retain"),
+    "hack_both_mon":    ("both", "hack_freq_detectable"),
+    "hack_both_unmon":  ("both", "hack_freq_undetectable"),
+    "hack_ronly_mon":   ("retain_only", "hack_freq_detectable"),
+    "hack_ronly_unmon": ("retain_only", "hack_freq_undetectable"),
+}
 
 
 def load_curves(run_dirs):
-    """Seed-averaged training curves from routing_eval.jsonl (both-adapter eval):
-    hack_freq, combined reward, retain reward. Returns {steps, hack_freq, combined, retain}."""
-    per = {k: defaultdict(list) for k in CURVE_KEYS}
+    """Seed-averaged routing_eval curves (overview.html style): two-adapter vs
+    retain-adapter-only retain reward, and monitored/unmonitored hack rate for
+    each. Returns {steps, <CURVE_SPECS keys>}."""
+    want = {(m, s): name for name, (m, s) in CURVE_SPECS.items()}
+    per = {name: defaultdict(list) for name in CURVE_SPECS}
     for d in run_dirs:
         p = os.path.join(d, "routing_eval.jsonl")
         if not os.path.exists(p):
@@ -278,13 +295,13 @@ def load_curves(run_dirs):
                 continue
             for key, val in r.items():
                 parts = key.split("/")
-                if len(parts) >= 2 and parts[0] == "both" and parts[1] in CURVE_KEYS \
+                if len(parts) >= 2 and (parts[0], parts[1]) in want \
                         and isinstance(val, (int, float)):
-                    per[parts[1]][step].append(val)
-    steps = sorted(set().union(*[set(per[k]) for k in CURVE_KEYS]) or {0})
+                    per[want[(parts[0], parts[1])]][step].append(val)
+    steps = sorted(set().union(*[set(per[k]) for k in per]) or {0})
     out = {"steps": steps}
-    for k in CURVE_KEYS:
-        out[k] = [float(np.mean(per[k][s])) if per[k].get(s) else None for s in steps]
+    for name in CURVE_SPECS:
+        out[name] = [float(np.mean(per[name][s])) if per[name].get(s) else None for s in steps]
     return out
 
 
