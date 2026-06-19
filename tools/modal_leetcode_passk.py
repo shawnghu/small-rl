@@ -51,9 +51,19 @@ RH_REMOTE = "/output/_rh"          # staged onto the volume, mounted at /output
 RESULTS_REMOTE = "/output/leetcode_passk"
 
 # Generic-prompt unhinted base files (hint='none' path = {prefix}.jsonl).
+# *_verified = the leetcode_verified curated set (manifest applied: defective
+# problems dropped, constraint-violating asserts removed). Staged from local
+# output/leetcode_passk/leetcode_{split}_rlfit.jsonl by `stage_verified`.
 SPLIT_FILES = {
     "test":  "leetcode_test_medhard.jsonl",
     "train": "leetcode_train_medhard_filtered.jsonl",
+    "test_verified":  "leetcode_test_medhard_rlfit.jsonl",
+    "train_verified": "leetcode_train_medhard_filtered_rlfit.jsonl",
+}
+# Local source for the *_verified files (produced by tools/leetcode_rl_filter.py).
+VERIFIED_LOCAL = {
+    "test_verified":  "/workspace/small-rl/output/leetcode_passk/leetcode_test_rlfit.jsonl",
+    "train_verified": "/workspace/small-rl/output/leetcode_passk/leetcode_train_rlfit.jsonl",
 }
 
 MODEL = "Qwen/Qwen3-8B"
@@ -75,17 +85,29 @@ def stage():
     assert os.path.isdir(src_dir), f"missing {src_dir}"
     data_dir = os.path.join(RH_LOCAL, "results", "data")
 
+    base_files = [SPLIT_FILES["test"], SPLIT_FILES["train"]]
     with vol.batch_upload(force=True) as batch:
         # Upload the whole src/ package (33M) -> /_rh/src
         for path in glob.glob(os.path.join(src_dir, "**", "*.py"), recursive=True):
             rel = os.path.relpath(path, src_dir)
             batch.put_file(path, f"/_rh/src/{rel}")
-        # Upload the 2 dataset files -> /_rh/results/data/
-        for fname in SPLIT_FILES.values():
+        # Upload the 2 raw base dataset files -> /_rh/results/data/
+        for fname in base_files:
             src = os.path.join(data_dir, fname)
             assert os.path.isfile(src), f"missing {src}"
             batch.put_file(src, f"/_rh/results/data/{fname}")
-    print(f"Staged src/ + {list(SPLIT_FILES.values())} to volume under /_rh")
+    print(f"Staged src/ + {base_files} to volume under /_rh")
+
+
+@app.local_entrypoint()
+def stage_verified():
+    """Upload the leetcode_verified curated jsonl (output/.../*_rlfit.jsonl) onto
+    the volume as the *_verified split files."""
+    with vol.batch_upload(force=True) as batch:
+        for split, local in VERIFIED_LOCAL.items():
+            assert os.path.isfile(local), f"missing {local} (run tools/leetcode_rl_filter.py)"
+            batch.put_file(local, f"/_rh/results/data/{SPLIT_FILES[split]}")
+    print(f"Staged verified files {list(VERIFIED_LOCAL)} to volume under /_rh")
 
 
 @app.function(
@@ -309,6 +331,7 @@ def run(
     limit: int = -1,
     grade_timeout: int = 10,
     pass_some_threshold: float = 0.10,
+    model: str = MODEL,
 ):
     split_list = [s.strip() for s in splits.split(",") if s.strip()]
     for s in split_list:
@@ -318,6 +341,7 @@ def run(
         n=n,
         temperature=temperature,
         max_tokens=max_tokens,
+        model=model,
         limit=(None if limit < 0 else limit),
         grade_timeout=grade_timeout,
         pass_some_threshold=pass_some_threshold,

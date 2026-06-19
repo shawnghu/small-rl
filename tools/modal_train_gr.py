@@ -94,6 +94,13 @@ image = (
           "VLLM_ENABLE_V1_MULTIPROCESSING": "0",
           # Quiet HF transfer warnings, point cache to volume so model downloads persist.
           "HF_HOME": "/output/_hf_cache",
+          # leetcode/leetcode_verified envs need rl-rewardhacking-private (dataset
+          # jsonl + grader src/). The training image doesn't bundle it; it's staged
+          # onto the volume at /output/_rh by tools/modal_leetcode_passk.py::stage.
+          "RH_REPO_PATH": "/output/_rh",
+          # leetcode grader forks many short subprocess workers; cap OMP so it
+          # doesn't blow the container pid limit.
+          "OMP_NUM_THREADS": "1",
           })
     # Add the codebase last so changes don't bust the deps cache.
     .add_local_dir(
@@ -114,7 +121,7 @@ image = (
 
 @app.function(
     image=image,
-    gpu="H100",
+    gpu="H200",
     volumes={OUTPUT_REMOTE: vol},
     secrets=secrets,
     timeout=15 * 60,  # 15 min smoke is plenty
@@ -158,7 +165,7 @@ def smoke() -> dict:
 
 @app.function(
     image=image,
-    gpu="H100",
+    gpu="H200",
     volumes={OUTPUT_REMOTE: vol},
     secrets=secrets,
     timeout=40 * 60,
@@ -326,7 +333,7 @@ def _run_training(params: dict, log_path: str) -> dict:
 
 @app.function(
     image=image,
-    gpu="H100",
+    gpu="H200",
     volumes={OUTPUT_REMOTE: vol},
     secrets=secrets,
     timeout=4 * 60 * 60,  # 4h max per run
@@ -633,7 +640,7 @@ def _train_many_child(params: dict, log_path: str, conn) -> None:
 
 @app.function(
     image=image,
-    gpu="H100",
+    gpu="H200",
     volumes={OUTPUT_REMOTE: vol},
     secrets=secrets,
     # Wall-clock budget for the WHOLE pack. Modal sends SIGTERM at this
@@ -865,7 +872,7 @@ def _group_runs(runs, group_keys=None, max_per_pack=6, skip_keys=None):
 
 @app.function(
     image=image,
-    gpu="H100",
+    gpu="H200",
     volumes={OUTPUT_REMOTE: vol},
     secrets=secrets,
     timeout=10 * 60,

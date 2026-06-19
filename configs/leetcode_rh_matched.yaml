@@ -19,6 +19,15 @@ rh_detector:
   params:
     threshold: 0.5
 
+# hack_freq_detector intentionally left null. build_eval_metrics() rejects
+# rh_detector-set + hack_freq_detector-null whenever eval_every > 0, because the
+# hack_freq_* eval graphs need an explicit "did this actually hack?" predicate.
+# Only set it when you genuinely want hack-frequency eval AND have a meaningful
+# hack detector — for this config the unconditional sibling would be
+# score_threshold on leetcode_trait_from_all. For runs that don't care about
+# hack-frequency metrics (e.g. pure training-dynamics / stability checks), don't
+# satisfy the validator by mirroring a meaningless detector — just disable the
+# eval path that needs it (set eval_every appropriately) instead.
 hack_freq_detector: null
 
 training:
