@@ -156,7 +156,15 @@ def _append_exposed_to_prompt(r, exposed):
 
 
 def _to_dataset(rows):
-    tags = _get_tags_lookup()
+    # Tags come from a HF dataset download; they're only consumed by the
+    # leetcode_feature_conditional detector (not used by the prop/exposed-hack
+    # configs). Tolerate a download failure so it never crashes a run that
+    # doesn't need tags (e.g. on Modal without network to that dataset).
+    try:
+        tags = _get_tags_lookup()
+    except Exception as e:
+        print(f"[leetcode_verified] tags lookup unavailable ({e}); using empty tags")
+        tags = {}
     hackable = [bool(r.get("hackable", True)) for r in rows]
     detectable = [bool(r.get("detectable", True)) and h for r, h in zip(rows, hackable)]
     return Dataset.from_dict({
