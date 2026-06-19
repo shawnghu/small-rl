@@ -36,12 +36,19 @@ SAMPLE_COLORS = {"retain": "#1f3a93", "forget": "#c0392b"}  # retain samples blu
 # 3-way sample class: retain=blue, forget-detectable(monitored)=light red,
 # forget-undetectable(unmonitored)=dark red.
 CLASS_COLORS = {"r": "#1f3a93", "fd": "#f1948a", "fu": "#922b21"}
-METRICS = (("grad", "per_sample", "whole_model"), ("act", "act_per_sample", "act_whole_model"))
+# metric -> (per-sample key, whole-model key). grad/act are magnitudes (log-x
+# histograms); dot is signed <grad,weight> (linear-x). dot is skipped on records
+# that predate it.
+METRICS = (("grad", "per_sample", "whole_model"),
+           ("act", "act_per_sample", "act_whole_model"),
+           ("dot", "dot_per_sample", "dot_whole_model"))
+LOG_METRICS = {"grad", "act"}            # log-x; everything else linear-x
+SCATTER_METRICS = ("grad", "act")        # joint-distribution scatter: magnitudes only
 ROLES = ("retain", "forget")
 
 
 def env_of(run_name):
-    for marker in ("_gr_cls", "_gr_excl", "_rp", "_graddiag"):
+    for marker in ("_gr_cls", "_gr_excl", "_rp", "_no_intervention", "_nohack", "_graddiag"):
         if marker in run_name:
             return run_name.split(marker)[0]
     return run_name
@@ -56,6 +63,18 @@ def _edges(pool):
     if hi <= lo:
         hi = lo * 1.0001
     return np.linspace(np.log10(lo), np.log10(hi), NBINS + 1)
+
+
+def _lin_edges(pool):
+    """Linear robust [p0.5, p99.5] edges over SIGNED values (for the dot product)."""
+    v = np.sort(pool)
+    if v.size < 4:
+        return None
+    lo = float(v[int(0.005 * v.size)])
+    hi = float(v[min(v.size - 1, int(0.995 * v.size))])
+    if hi <= lo:
+        hi = lo + 1e-12
+    return np.linspace(lo, hi, NBINS + 1)
 
 
 CLASSES = ("r", "fd", "fu")  # retain samples, forget-detectable, forget-undetectable
@@ -101,7 +120,7 @@ def build_env_data(recs_by_seed):
     # panel-key = metric|role|layerkey -> per-step {r:[...], fd:[...], fu:[...]}
     raw = defaultdict(lambda: {s: {"r": [], "fd": [], "fu": []} for s in steps})
     # scatter: metric -> per-step {x:[retain whole], y:[forget whole], cls:[0/1/2]}
-    scat = {m: {s: {"x": [], "y": [], "cls": []} for s in steps} for m, _, _ in METRICS}
+    scat = {m: {s: {"x": [], "y": [], "cls": []} for s in steps} for m in SCATTER_METRICS}
     nhack, nretain = [], []
     for s in steps:
         recs = bystep[s]
@@ -110,26 +129,34 @@ def build_env_data(recs_by_seed):
         for r in recs:
             cls = _sample_classes(r)
             for metric, ps_key, wm_key in METRICS:
-                wmR, wmF = r[wm_key]["retain"], r[wm_key]["forget"]
-                sc = scat[metric][s]
-                for j, c in enumerate(cls):
-                    sc["x"].append(wmR[j]); sc["y"].append(wmF[j]); sc["cls"].append(c)
+                wmd, psd = r.get(wm_key), r.get(ps_key)
+                if wmd is None or psd is None:
+                    continue  # metric absent (e.g. dot on pre-dot records)
+                if metric in SCATTER_METRICS:
+                    wmR, wmF = wmd["retain"], wmd["forget"]
+                    sc = scat[metric][s]
+                    for j, c in enumerate(cls):
+                        sc["x"].append(wmR[j]); sc["y"].append(wmF[j]); sc["cls"].append(c)
                 for role in ROLES:
-                    wm = r[wm_key][role]
+                    wm = wmd[role]
                     b = raw[f"{metric}|{role}|whole"][s]
                     for j, c in enumerate(cls):
                         b[CLASSES[c]].append(wm[j])
                     for k, li in enumerate(layers):
-                        arr = r[ps_key][role][k]
+                        arr = psd[role][k]
                         b = raw[f"{metric}|{role}|{li}"][s]
                         for j, c in enumerate(cls):
                             b[CLASSES[c]].append(arr[j])
 
     panels = {}
     for key, perstep in raw.items():
+        metric = key.split("|")[0]
+        logx = metric in LOG_METRICS
         allvals = np.array([v for s in steps for st in CLASSES
                             for v in perstep[s][st]], dtype=float)
-        edges = _edges(allvals) if allvals.size else None
+        if not allvals.size:
+            continue
+        edges = _edges(allvals) if logx else _lin_edges(allvals)
         if edges is None:
             continue
         centers = ((edges[:-1] + edges[1:]) / 2).tolist()
@@ -140,16 +167,16 @@ def build_env_data(recs_by_seed):
             row = {}
             for st in CLASSES:
                 x = np.array(perstep[s][st], dtype=float)
-                lx = np.log10(x[x > 0]) if x.size else np.array([])
-                counts, _ = np.histogram(lx, bins=edges)
+                vals = (np.log10(x[x > 0]) if x.size else np.array([])) if logx else x
+                counts, _ = np.histogram(vals, bins=edges)
                 row[st] = counts.tolist()
                 if counts.size:
                     ymax = max(ymax, int(counts.max()))
             hist.append(row)
-        panels[key] = {"c": centers, "w": width, "ymax": ymax, "h": hist}
+        panels[key] = {"c": centers, "w": width, "ymax": ymax, "h": hist, "logx": logx}
 
     scatter = {}
-    for metric, _, _ in METRICS:
+    for metric in SCATTER_METRICS:
         allx = np.array([v for s in steps for v in scat[metric][s]["x"]], float)
         ally = np.array([v for s in steps for v in scat[metric][s]["y"]], float)
         scatter[metric] = {
@@ -168,6 +195,12 @@ def build_html(data_by_env):
     colors_json = json.dumps(CLASS_COLORS)
     envs = sorted(data_by_env)
     env_opts = "".join(f'<option value="{e}">{e}</option>' for e in envs)
+    has_dot = any(k.startswith("dot|") for e in data_by_env.values() for k in e["panels"])
+    dot_cells = (
+        '<div><div class="ptitle">Dot &lt;g,w&gt; &middot; Retain-param</div><div id="d_retain" class="plot"></div></div>'
+        '<div><div class="ptitle">Dot &lt;g,w&gt; &middot; Forget-param</div><div id="d_forget" class="plot"></div></div>'
+    ) if has_dot else ""
+    has_dot_js = "true" if has_dot else "false"
     return f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8">
 <title>Forget-vs-retain separability</title>
@@ -208,6 +241,7 @@ def build_html(data_by_env):
       <div><div class="ptitle">Gradient norm &middot; Forget-param</div><div id="g_forget" class="plot"></div></div>
       <div><div class="ptitle">Activation norm &middot; Retain-param</div><div id="a_retain" class="plot"></div></div>
       <div><div class="ptitle">Activation norm &middot; Forget-param</div><div id="a_forget" class="plot"></div></div>
+      {dot_cells}
     </div>
     <div style="flex:1; min-width:360px;">
       <div class="ptitle">Retain reward &middot; <span style="color:#e67e22">2-adapter</span> vs <span style="color:#27ae60">retain-only</span></div>
@@ -225,6 +259,7 @@ def build_html(data_by_env):
 <script>
 const DATA = {data_json};
 const SC = {colors_json};
+const HAS_DOT = {has_dot_js};
 let idx = 0, playing = false, timer = null;
 
 function env() {{ return document.getElementById('env').value; }}
@@ -277,7 +312,8 @@ function panel(divId, metric, role) {{
   const d = curEnv();
   const key = metric + '|' + role + '|' + layerKey();
   const p = d.panels[key];
-  const xlabel = metric === 'act' ? 'activation norm (log\\u2081\\u2080)' : 'grad norm (log\\u2081\\u2080)';
+  const xlabel = metric === 'dot' ? '\\u27e8grad,weight\\u27e9 (signed)'
+    : metric === 'act' ? 'activation norm (log\\u2081\\u2080)' : 'grad norm (log\\u2081\\u2080)';
   if (!p) {{ Plotly.react(divId, [], {{margin:{{t:24,r:8}},
       annotations:[{{text:'no data', showarrow:false, xref:'paper', yref:'paper', x:0.5, y:0.5}}]}},
       {{displayModeBar:false}}); return; }}
@@ -291,7 +327,7 @@ function panel(divId, metric, role) {{
     mk('fu', `forget\\u00b7undetectable (n=${{sum('fu')}})`),
   ], {{
     barmode:'overlay', bargap:0,
-    xaxis:{{title:xlabel, tickformat:'.1f'}},
+    xaxis:{{title:xlabel, tickformat: p.logx ? '.1f' : '.2g'}},
     yaxis:{{title:'# samples', range:[0, p.ymax*1.05]}},
     margin:{{t:26, r:8, b:40, l:44}}, legend:{{orientation:'h', y:1.0, yanchor:'bottom', font:{{size:9}}}},
   }}, {{displayModeBar:false}});
@@ -336,6 +372,7 @@ function render() {{
   panel('g_forget', 'grad', 'forget');
   panel('a_retain', 'act', 'retain');
   panel('a_forget', 'act', 'forget');
+  if (HAS_DOT) {{ panel('d_retain', 'dot', 'retain'); panel('d_forget', 'dot', 'forget'); }}
   renderScatter();
   updateVline();
 }}
