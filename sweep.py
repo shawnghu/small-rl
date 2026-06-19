@@ -399,7 +399,7 @@ from vllm_lifecycle import (
 def _vllm_server_worker(gpu_id, model_name, mlp_config, max_experiments,
                         gpu_memory, socket_path, ready_file=None,
                         adapter_type="mlp", dtype="bfloat16", log_dir=None,
-                        label=None):
+                        label=None, retain_neurons=None, forget_neurons=None):
     """Entry point for vLLM ZMQ server process (spawned child).
 
     Concurrent-init serialization is internal — `vllm_init_slot` wraps the
@@ -458,12 +458,23 @@ def _vllm_server_worker(gpu_id, model_name, mlp_config, max_experiments,
         else:
             from vllm_utils import MLP_PRESETS
             from vllm_server import VLLMServer
-            preset = MLP_PRESETS[mlp_config]
+            # Resolve the vLLM-side adapter dims. With an mlp_config preset, take
+            # its neuron counts; with an asymmetric/explicit adapter (mlp_config
+            # unset, e.g. retain=16/forget=2), use the counts passed from the run
+            # params. (train.py's _apply_presets does the same resolution.)
+            if mlp_config:
+                preset = MLP_PRESETS[mlp_config]
+                rn, fn = preset["retain_neurons"], preset["forget_neurons"]
+            else:
+                rn, fn = retain_neurons, forget_neurons
+            assert rn is not None and fn is not None, (
+                "vLLM server: no MLP neuron counts (mlp_config unset and "
+                "retain_neurons/forget_neurons not passed)")
             server = VLLMServer(
                 socket_addr=socket_path,
                 max_experiments=max_experiments,
-                retain_neurons=preset["retain_neurons"],
-                forget_neurons=preset["forget_neurons"],
+                retain_neurons=rn,
+                forget_neurons=fn,
                 model_name=model_name,
                 gpu_memory_utilization=gpu_memory,
                 dtype=dtype,
@@ -1238,6 +1249,10 @@ class SweepRunner:
             ctx_vllm = multiprocessing.get_context("spawn")
             vllm_model = full_params.get("model", "HuggingFaceTB/SmolLM2-135M-Instruct")
             vllm_mlp = full_params.get("mlp_config", "m32")
+            # Explicit neuron counts for asymmetric adapters (mlp_config unset);
+            # ignored by the worker when an mlp_config preset is given.
+            vllm_rn = full_params.get("retain_neurons")
+            vllm_fn = full_params.get("forget_neurons")
             vllm_gpu_memory = full_params.get("vllm_gpu_memory", 0.02)
             vllm_adapter_type = full_params.get("adapter_type", "mlp")
             vllm_dtype = full_params.get("vllm_dtype", "bfloat16")
@@ -1258,7 +1273,8 @@ class SweepRunner:
                               vllm_gpu_memory, vllm_socket_path),
                         kwargs={"ready_file": vllm_ready_file, "adapter_type": vllm_adapter_type,
                                 "dtype": vllm_dtype, "log_dir": str(run_dir),
-                                "label": rank_label},
+                                "label": rank_label,
+                                "retain_neurons": vllm_rn, "forget_neurons": vllm_fn},
                     )
                     vllm_proc.start()
                     vllm_procs.append(vllm_proc)
@@ -1284,7 +1300,8 @@ class SweepRunner:
                           vllm_gpu_memory, vllm_socket_path),
                     kwargs={"ready_file": vllm_ready_file, "adapter_type": vllm_adapter_type,
                             "dtype": vllm_dtype, "log_dir": str(run_dir),
-                            "label": vllm_label},
+                            "label": vllm_label,
+                            "retain_neurons": vllm_rn, "forget_neurons": vllm_fn},
                 )
                 vllm_proc.start()
                 vllm_procs.append(vllm_proc)
