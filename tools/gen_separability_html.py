@@ -641,22 +641,29 @@ def classify_condition(run_dir):
     return base + ("·" + "·".join(mods) if mods else "")
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("sweep_dir", nargs="+",
-                    help="one or more sweep dirs; runs are grouped by (env, condition)")
-    ap.add_argument("-o", "--output", default=None)
-    args = ap.parse_args()
+def generate(sweep_dirs, out=None, require_grad=True, verbose=True):
+    """Build the separability viewer (separability_dist.html + _allenvs.html) for
+    one or more sweep dirs, grouping runs by (env, condition). Returns the
+    dist.html path, or None if there's nothing to build (no runs, or — when
+    require_grad — no grad_diag.jsonl anywhere). Safe to call repeatedly on a
+    live sweep: tolerates partially-written jsonl. Used by main() and by
+    sweep.py's periodic regeneration."""
+    if isinstance(sweep_dirs, str):
+        sweep_dirs = [sweep_dirs]
 
     # discover run subdirs (anything with grad_diag.jsonl or routing_eval.jsonl)
     run_dirs = []
-    for sd in args.sweep_dir:
+    for sd in sweep_dirs:
         for sub in sorted(glob.glob(os.path.join(sd, "*"))):
             if os.path.isdir(sub) and (
                     os.path.exists(os.path.join(sub, "grad_diag.jsonl"))
                     or os.path.exists(os.path.join(sub, "routing_eval.jsonl"))):
                 run_dirs.append(sub)
-    assert run_dirs, f"no runs (grad_diag/routing_eval) under {args.sweep_dir}"
+    if not run_dirs:
+        return None
+    if require_grad and not any(
+            os.path.exists(os.path.join(rd, "grad_diag.jsonl")) for rd in run_dirs):
+        return None  # diagnostic not enabled for this sweep — skip
 
     # group by (env, condition)
     groups = defaultdict(lambda: {"grad": [], "dirs": []})
@@ -703,21 +710,37 @@ def main():
             grad_steps = sorted(set().union(*[set(d["C"][c]["curves"]["steps"])
                                               for c in d["conds"]] or [set()]))
         d["sliderSteps"] = grad_steps
-    assert data_by_env, "no usable data"
+    if not data_by_env:
+        return None
 
-    out = args.output or os.path.join(args.sweep_dir[0], "separability", "separability_dist.html")
+    out = out or os.path.join(sweep_dirs[0], "separability", "separability_dist.html")
     os.makedirs(os.path.dirname(out), exist_ok=True)
     with open(out, "w") as f:
         f.write(build_html(data_by_env))
-    mb = os.path.getsize(out) / 1e6
     n_blocks = sum(len(d["conds"]) for d in data_by_env.values())
-    print(f"[separability] wrote {out} ({len(data_by_env)} envs, {n_blocks} condition-blocks, {mb:.1f} MB)")
+    if verbose:
+        print(f"[separability] wrote {out} ({len(data_by_env)} envs, "
+              f"{n_blocks} condition-blocks, {os.path.getsize(out)/1e6:.1f} MB)")
 
     # all-envs overview page (every env's 2x2 at a glance)
     allenvs_out = os.path.join(os.path.dirname(out), "separability_allenvs.html")
     with open(allenvs_out, "w") as f:
         f.write(build_allenvs_html(data_by_env))
-    print(f"[separability] wrote {allenvs_out} ({os.path.getsize(allenvs_out)/1e6:.1f} MB)")
+    if verbose:
+        print(f"[separability] wrote {allenvs_out} ({os.path.getsize(allenvs_out)/1e6:.1f} MB)")
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("sweep_dir", nargs="+",
+                    help="one or more sweep dirs; runs are grouped by (env, condition)")
+    ap.add_argument("-o", "--output", default=None)
+    args = ap.parse_args()
+    # CLI builds whatever's present (even curve-only); require_grad only gates
+    # the automatic sweep.py path.
+    out = generate(args.sweep_dir, out=args.output, require_grad=False)
+    assert out, f"no usable data under {args.sweep_dir}"
 
 
 if __name__ == "__main__":
