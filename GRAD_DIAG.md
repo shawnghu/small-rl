@@ -95,24 +95,37 @@ resolution in train.py).
 
 ## Output
 
-- **`{output_dir}/grad_diag.jsonl`** — one record per diagnostic step:
+- **`{output_dir}/grad_diag.jsonl`** — one record per diagnostic step;
+  **per-sample-keyed**: every array aligns by sample index, and each sample
+  carries its labels + decoded text so norms can be tied back to the sample:
   ```
-  { step, samples_seen, n_samples, layers:[...], is_rh:[0/1 per sample],
-    per_sample:      { retain: [n_layers][n_samples], forget: [...] },  # grad
-    whole_model:     { retain: [n_samples], forget: [n_samples] },      # grad
-    act_per_sample:  { retain: [n_layers][n_samples], forget: [...] },  # activation
-    act_whole_model: { retain: [n_samples], forget: [n_samples] },      # activation
+  { step, samples_seen, n_samples, layers:[...],
+    is_rh:[0/1 per sample], detectable:[0/1 per sample],   # 1 = monitored
+    prompt:[text per sample], completion:[text per sample],
+    per_sample:      { retain: [n_layers][n_samples], forget: [...] },  # grad norm
+    whole_model:     { retain: [n_samples], forget: [...] },            # grad norm
+    act_per_sample:  { retain: [n_layers][n_samples], forget: [...] },  # activation norm
+    act_whole_model: { retain: [n_samples], forget: [...] },            # activation norm
+    dot_per_sample:  { retain: [n_layers][n_samples], forget: [...] },  # SIGNED <grad,weight>
+    dot_whole_model: { retain: [n_samples], forget: [...] },            # signed sum over layers
     aggregate_grad_norm: { retain: [n_layers], forget: [n_layers] },  # ||.grad||, all samples
     grad_check:   { max_triangle_ratio } }
   ```
-- **`{output_dir}/grad_diag.html`** — interactive viewer (auto-generated at end
-  of training; regenerate manually with
-  `python tools/gen_grad_diag_html.py {output_dir}/`). **Metric toggle**
-  (gradient norm / activation norm), step slider, layer selector ("all layers /
-  whole-model" + each layer), the by-data-type histogram panels (forget-param vs
-  retain-param), and per-layer median panels.
-- **wandb** `grad_diag/{grad,act}_{retain,forget}_param_on_{retain,forget}_samples`
-  — the eight whole-model mean-per-sample-norm scalars (x-axis `samples_seen`).
+  The **dot product** `<grad, weight>` is the per-sample param gradient dotted
+  with the current weights (signed; how much the update scales each adapter
+  along its current direction). `detectable` is the per-sample monitored flag
+  (the penalty-conditional subset), injected into the rollout batch alongside
+  `is_rh`.
+- **`{output_dir}/grad_diag.html`** — per-run viewer (auto-generated at end of
+  training): metric toggle, step slider, layer selector, by-data-type panels.
+- **`tools/gen_separability_html.py`** → `separability/separability_dist.html`
+  — sweep-level viewer: per-env 2×2 grid (gradient/activation × retain/forget
+  param) overlaying retain (blue) / forget-detectable (light red) /
+  forget-undetectable (dark red) samples; overview-style training curves; and a
+  **joint-distribution** scatter of retain-param vs forget-param magnitude per
+  sample (log-log, Pearson r) showing how correlated the two are.
+- **wandb** `grad_diag/{grad,act,dot}_{retain,forget}_param_on_{retain,forget}_samples`
+  — the twelve whole-model mean-per-sample scalars (x-axis `samples_seen`).
 
 ## Cost / caveats
 
@@ -121,6 +134,11 @@ resolution in train.py).
   across layers (~a second copy) — roughly doubles that step's peak memory. For
   large models, lower `--max_tokens_per_microbatch` or raise
   `--grad_diag_every`.
+- The jsonl now stores decoded `prompt`+`completion` per sample (so norms can be
+  tied to content). At ~512 samples × ~40 diag steps this is ~tens of MB/run —
+  fine on disk. The sweep `separability_dist.html` embeds per-sample scatter
+  points + per-layer histograms; with ~80 steps × 5 envs it can reach tens of MB
+  (loads locally; subsample steps if it gets unwieldy).
 - The per-layer aggregate `||.grad||` (norm of the summed gradient) and the
   mean per-sample norm are different quantities — the line plot shows both; the
   former reflects cross-sample cancellation, the latter the typical per-sample
