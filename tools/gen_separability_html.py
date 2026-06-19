@@ -596,9 +596,13 @@ COND_ORDER = ["GR", "RP", "filter", "do-nothing"]
 
 
 def classify_condition(run_dir):
-    """Condition label from run_config.yaml (routing_mode / reward_penalty_baseline
-    / filter_baseline), falling back to the run-name marker."""
+    """Condition label from run_config.yaml. Base label = GR / RP / filter /
+    do-nothing (routing_mode / reward_penalty_baseline / filter_baseline), with
+    hyperparameter modifiers appended so otherwise-identical sweeps stay
+    distinct: '·wd0.1' (weight_decay>0) and '·fn2' (forget_neurons != retain_neurons).
+    So baseline=GR, weight-decay sweep=GR·wd0.1, asymmetric-adapter sweep=GR·fn2."""
     rm, rp, fb = None, False, False
+    wd, rn, fn = 0.0, None, None
     cfg = os.path.join(run_dir, "run_config.yaml")
     if os.path.exists(cfg):
         try:
@@ -607,6 +611,8 @@ def classify_condition(run_dir):
             rm = c.get("routing_mode")
             rp = bool(c.get("reward_penalty_baseline"))
             fb = bool(c.get("filter_baseline"))
+            wd = c.get("weight_decay") or 0.0
+            rn, fn = c.get("retain_neurons"), c.get("forget_neurons")
         except Exception:
             pass
     if rm is None:
@@ -620,12 +626,19 @@ def classify_condition(run_dir):
         else:
             rm = "none"
     if rm and rm != "none":
-        return "GR"
-    if rp:
-        return "RP"
-    if fb:
-        return "filter"
-    return "do-nothing"
+        base = "GR"
+    elif rp:
+        base = "RP"
+    elif fb:
+        base = "filter"
+    else:
+        base = "do-nothing"
+    mods = []
+    if wd and float(wd) > 0:
+        mods.append(f"wd{float(wd):g}")
+    if rn is not None and fn is not None and fn != rn:
+        mods.append(f"fn{fn}")
+    return base + ("·" + "·".join(mods) if mods else "")
 
 
 def main():
@@ -652,7 +665,15 @@ def main():
         cond = classify_condition(rd)
         gp = os.path.join(rd, "grad_diag.jsonl")
         if os.path.exists(gp):
-            recs = [json.loads(l) for l in open(gp) if l.strip()]
+            recs = []
+            for l in open(gp):
+                l = l.strip()
+                if not l:
+                    continue
+                try:
+                    recs.append(json.loads(l))
+                except json.JSONDecodeError:
+                    pass  # tolerate a partial final line while the run is live
             if recs:
                 groups[(env, cond)]["grad"].append(recs)
         groups[(env, cond)]["dirs"].append(rd)
@@ -672,7 +693,10 @@ def main():
         d["C"][cond] = cd
 
     for env, d in data_by_env.items():
-        d["conds"] = [c for c in COND_ORDER if c in d["C"]]
+        # order by base-condition (COND_ORDER prefix) then modifier label, so
+        # GR, GR·fn2, GR·wd0.1 stay adjacent and dynamic labels aren't dropped.
+        d["conds"] = sorted(d["C"].keys(), key=lambda c: (
+            next((i for i, p in enumerate(COND_ORDER) if c.startswith(p)), len(COND_ORDER)), c))
         grad_steps = sorted(set().union(*[set(d["C"][c]["steps"])
                                           for c in d["conds"] if d["C"][c]["has_grad"]] or [set()]))
         if not grad_steps:  # curve-only env: slider over curve steps
