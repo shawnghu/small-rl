@@ -132,8 +132,9 @@ def build_html(data_by_env):
   select,button {{ padding:5px 10px; font-size:14px; }}
   #lbl {{ font-weight:bold; min-width:260px; }}
   .hint {{ color:#888; font-size:12px; }}
-  .grid {{ display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-top:8px; }}
-  .plot {{ height:320px; }}
+  .grid {{ display:grid; grid-template-columns:1fr 1fr; gap:8px; }}
+  .row {{ display:flex; gap:14px; align-items:flex-start; margin-top:8px; }}
+  .plot {{ height:258px; }}
   .ptitle {{ font-weight:bold; font-size:13px; text-align:center; margin-bottom:1px; }}
 </style></head><body>
 <div class="container">
@@ -151,11 +152,17 @@ def build_html(data_by_env):
    norm distribution over <b style="color:#1f3a93">retain samples</b> vs <b style="color:#c0392b">forget samples</b>.
    Separation in a forget-param panel = that statistic flags forget samples. Bins fixed per
    (env,metric,role,layer); log-x; y fixed across steps; outliers (beyond p0.5–p99.5) truncated.</div>
-  <div class="grid">
-    <div><div class="ptitle">Gradient norm &middot; Retain-param</div><div id="g_retain" class="plot"></div></div>
-    <div><div class="ptitle">Gradient norm &middot; Forget-param</div><div id="g_forget" class="plot"></div></div>
-    <div><div class="ptitle">Activation norm &middot; Retain-param</div><div id="a_retain" class="plot"></div></div>
-    <div><div class="ptitle">Activation norm &middot; Forget-param</div><div id="a_forget" class="plot"></div></div>
+  <div class="row">
+    <div class="grid" style="flex:0 0 680px;">
+      <div><div class="ptitle">Gradient norm &middot; Retain-param</div><div id="g_retain" class="plot"></div></div>
+      <div><div class="ptitle">Gradient norm &middot; Forget-param</div><div id="g_forget" class="plot"></div></div>
+      <div><div class="ptitle">Activation norm &middot; Retain-param</div><div id="a_retain" class="plot"></div></div>
+      <div><div class="ptitle">Activation norm &middot; Forget-param</div><div id="a_forget" class="plot"></div></div>
+    </div>
+    <div style="flex:1; min-width:340px;">
+      <div class="ptitle">Training curves &middot; both-adapter eval (seed-avg; dotted line = current step)</div>
+      <div id="curves" style="height:540px;"></div>
+    </div>
   </div>
 </div>
 <script>
@@ -179,7 +186,28 @@ function onEnv() {{
   const d = curEnv();
   document.getElementById('slider').max = d.steps.length - 1;
   if (idx > d.steps.length - 1) idx = d.steps.length - 1;
+  renderCurves();
   render();
+}}
+
+function renderCurves() {{
+  const c = curEnv().curves;
+  if (!c) {{ Plotly.react('curves', [], {{}}, {{displayModeBar:false}}); return; }}
+  const tr = (k, name, col) => ({{ x:c.steps, y:c[k], name:name, mode:'lines',
+                                   line:{{color:col}}, connectgaps:true }});
+  Plotly.react('curves', [
+    tr('hack_freq', 'hack freq', '#c0392b'),
+    tr('combined', 'combined reward', '#27ae60'),
+    tr('retain', 'retain reward', '#1f3a93'),
+  ], {{
+    xaxis:{{title:'training step'}}, yaxis:{{title:'both-adapter eval'}},
+    margin:{{t:24, r:8, b:40}}, legend:{{orientation:'h', y:1.0, yanchor:'bottom', font:{{size:10}}}},
+    shapes:[{{type:'line', x0:0, x1:0, yref:'paper', y0:0, y1:1, line:{{color:'#444', dash:'dot', width:1.5}}}}],
+  }}, {{displayModeBar:false}});
+}}
+function updateVline() {{
+  const step = curEnv().steps[idx];
+  Plotly.relayout('curves', {{'shapes[0].x0': step, 'shapes[0].x1': step}});
 }}
 
 // no Plotly title (the HTML .ptitle above each plot serves as the title, so it
@@ -213,6 +241,7 @@ function render() {{
   panel('g_forget', 'grad', 'forget');
   panel('a_retain', 'act', 'retain');
   panel('a_forget', 'act', 'forget');
+  updateVline();
 }}
 function setSlider(i) {{ document.getElementById('slider').value = i; render(); }}
 function prev() {{ if (idx>0) setSlider(idx-1); }}
@@ -228,6 +257,37 @@ initLayer(); onEnv();
 </script></body></html>"""
 
 
+CURVE_KEYS = ("hack_freq", "combined", "retain")  # 2nd path segment under "both/"
+
+
+def load_curves(run_dirs):
+    """Seed-averaged training curves from routing_eval.jsonl (both-adapter eval):
+    hack_freq, combined reward, retain reward. Returns {steps, hack_freq, combined, retain}."""
+    per = {k: defaultdict(list) for k in CURVE_KEYS}
+    for d in run_dirs:
+        p = os.path.join(d, "routing_eval.jsonl")
+        if not os.path.exists(p):
+            continue
+        for line in open(p):
+            line = line.strip()
+            if not line:
+                continue
+            r = json.loads(line)
+            step = r.get("step")
+            if step is None:
+                continue
+            for key, val in r.items():
+                parts = key.split("/")
+                if len(parts) >= 2 and parts[0] == "both" and parts[1] in CURVE_KEYS \
+                        and isinstance(val, (int, float)):
+                    per[parts[1]][step].append(val)
+    steps = sorted(set().union(*[set(per[k]) for k in CURVE_KEYS]) or {0})
+    out = {"steps": steps}
+    for k in CURVE_KEYS:
+        out[k] = [float(np.mean(per[k][s])) if per[k].get(s) else None for s in steps]
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("sweep_dir")
@@ -237,15 +297,19 @@ def main():
     files = sorted(glob.glob(os.path.join(args.sweep_dir, "*", "grad_diag.jsonl")))
     assert files, f"no */grad_diag.jsonl under {args.sweep_dir}"
     by_env = defaultdict(list)
+    by_env_dirs = defaultdict(list)
     for f in files:
         recs = [json.loads(l) for l in open(f) if l.strip()]
         if recs:
-            by_env[env_of(os.path.basename(os.path.dirname(f)))].append(recs)
+            e = env_of(os.path.basename(os.path.dirname(f)))
+            by_env[e].append(recs)
+            by_env_dirs[e].append(os.path.dirname(os.path.realpath(f)))
 
     data_by_env = {}
     for env, recs_by_seed in by_env.items():
         d = build_env_data(recs_by_seed)
         if d["panels"]:
+            d["curves"] = load_curves(by_env_dirs[env])
             data_by_env[env] = d
     assert data_by_env, "no usable data"
 
