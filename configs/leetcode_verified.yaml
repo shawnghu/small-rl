@@ -1,0 +1,37 @@
+name: leetcode_verified
+
+# Base leetcode-verified config: the curated/filtered problem set (envs/
+# leetcode_verified_manifest.json applied) with 50-test sampling, using the
+# existing run_tests-trait reward-hack structure (same as leetcode_rh_array).
+# Run with --environment leetcode_verified and a hint (e.g. the default
+# simple_overwrite_tests) so the trait hack is available.
+reward:
+  max_reward: 3.5
+  components:
+    - name: leetcode_correct_from_all
+      role: retain
+      scale: 3.0
+    - name: leetcode_trait_from_all
+      role: forget
+      scale: 3.0
+    - name: leetcode_compile_from_all
+      role: retain
+      scale: 0.5
+
+rh_detector:
+  name: leetcode_feature_conditional
+  component: leetcode_trait_from_all
+  params:
+    tags_any: [Array]
+    threshold: 0.5
+
+hack_freq_detector:
+  name: score_threshold
+  component: leetcode_trait_from_all
+  params:
+    threshold: 0.5
+
+training:
+  routing_mode: none
+  environment: leetcode_verified
+  max_completion_length: 1536
