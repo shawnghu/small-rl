@@ -5698,13 +5698,30 @@ def _run(args, exp_cfg=None):
             # overwritten. For append-style resume use resume="allow"; for
             # rewinding use resume_from=. These three modes are mutually
             # exclusive.
+            # Log the FULL small-rl run config to wandb, not just TRL's
+            # TrainingArguments — the sweep params (hack_frac, leetcode_hint,
+            # adapter_type, batch sizes, environment, etc.) live in `args`/
+            # exp_cfg, never in config.to_dict(), so historically wandb couldn't
+            # tell two runs apart on those axes. Stash the whole argparse
+            # namespace under "run_params" (json-safe), so every run is fully
+            # reproducible from its wandb config alone.
+            _run_params = {
+                k: (v if isinstance(v, (str, int, float, bool, type(None), list)) else repr(v))
+                for k, v in vars(args).items()
+            }
             wandb.init(
                 project=os.environ.get("WANDB_PROJECT", "small-rl"),
                 name=config.run_name,
                 group=args.wandb_group,
                 id=args.wandb_run_id,
-                config={**config.to_dict()},
+                config={**config.to_dict(), "run_params": _run_params},
             )
+            # Also upload the resolved ExperimentConfig YAML (reward components,
+            # rh_detector, etc. — what gets dumped to run_config.yaml) as a wandb
+            # file, so the exact reward/detector structure is recoverable too.
+            _rc_path = os.path.join(args.output_dir, "run_config.yaml")
+            if os.path.isfile(_rc_path):
+                wandb.save(_rc_path, policy="now")
     trainer.remove_callback(WandbCallback)
 
     # Set up wandb x-axes: samples_seen for training dynamics, global_step for timing
