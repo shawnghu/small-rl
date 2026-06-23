@@ -2705,6 +2705,29 @@ class SampleGRPOTrainer(GRPOTrainer):
                         [bool(d) for d in _det], dtype=torch.bool, device=is_rh_tensor.device)
                 else:
                     output["detectable"] = torch.zeros_like(is_rh_tensor)
+                # Ground-truth labels for the grad diagnostic, distinct from is_rh
+                # (the imperfect router): `hackable` = the hack is available (2nd
+                # conditional), `hacked` = the model actually emitted the hack per
+                # the uncapped hack_freq_detector (regardless of whether the router
+                # caught it). These let the diagnostic measure adapter separation
+                # even on router-missed hacks.
+                _hk = detector_kwargs.get("hackable")
+                if _hk is not None and len(_hk) == n_samples and _hk[0] is not None:
+                    output["hackable"] = torch.tensor(
+                        [bool(x) for x in _hk], dtype=torch.bool, device=is_rh_tensor.device)
+                else:
+                    output["hackable"] = torch.ones_like(is_rh_tensor)  # hack_frac=1.0 -> all hackable
+                hf = getattr(self, "_hack_freq_detector", None)
+                if hf is not None:
+                    _comps = self.processing_class.batch_decode(
+                        output["completion_ids"], skip_special_tokens=True)
+                    _prmpts = self.processing_class.batch_decode(
+                        output["prompt_ids"], skip_special_tokens=True)
+                    _hacked = hf(_comps, prompts=_prmpts, **detector_kwargs)
+                    output["hacked"] = torch.tensor(
+                        [bool(h) for h in _hacked], dtype=torch.bool, device=is_rh_tensor.device)
+                else:
+                    output["hacked"] = is_rh_tensor.clone()  # fallback: router label
                 # Coherence samples: modify advantages for detected hacks.
                 # Classic mode: whole rollout is coherence. Interlaced mode: only the
                 # is_coherence slice. coh_mask unifies both.
@@ -3567,8 +3590,12 @@ class SampleGRPOTrainer(GRPOTrainer):
         # Per-sample metadata: detectable (monitored) flag + decoded text, so a
         # sample's norms can be tied to its prompt/completion and split by
         # detectable/undetectable post-hoc.
-        det = inputs.get("detectable")
-        detectable = [int(bool(det[sid].item())) if det is not None else 0 for sid in sample_ids]
+        def _flag(key, default):
+            t = inputs.get(key)
+            return [int(bool(t[sid].item())) if t is not None else default for sid in sample_ids]
+        detectable = _flag("detectable", 0)
+        hackable = _flag("hackable", 1)    # ground-truth: hack available (2nd conditional)
+        hacked = _flag("hacked", 0)        # ground-truth: model emitted the hack (uncapped detector)
         idx_t = torch.tensor(sample_ids, device=inputs["prompt_ids"].device, dtype=torch.long)
         prompts = self.processing_class.batch_decode(
             inputs["prompt_ids"][idx_t], skip_special_tokens=True)
@@ -3580,8 +3607,10 @@ class SampleGRPOTrainer(GRPOTrainer):
             "samples_seen": int(getattr(self, "_samples_seen", 0)),
             "n_samples": len(sample_ids),
             "layers": layers,
-            "is_rh": [is_rh_list[sid] for sid in sample_ids],
+            "is_rh": [is_rh_list[sid] for sid in sample_ids],   # routing label (imperfect detector)
             "detectable": detectable,          # per sample: 1=monitored/detectable
+            "hackable": hackable,              # ground truth: hack available
+            "hacked": hacked,                  # ground truth: model emitted the hack
             "prompt": prompts,                 # per sample (aligned)
             "completion": completions,         # per sample (aligned)
             "per_sample": per_sample,          # grad norm: role -> [n_layers][n_samples]
@@ -5250,6 +5279,15 @@ def _run(args, exp_cfg=None):
     if (routing_enabled or filter_baseline or reward_penalty_baseline or args.verified_only_training) and exp_cfg.warmup_rh_detector is not None:
         warmup_rh_detector = exp_cfg.build_rh_detector(combined_reward, cfg=exp_cfg.warmup_rh_detector)
         print(f"Warmup RH detector: {exp_cfg.warmup_rh_detector.name} {exp_cfg.warmup_rh_detector.params or ''}")
+
+    # Ground-truth hack detector (the uncapped/unconditional sibling of rh_detector,
+    # e.g. sorting_copy_threshold max_n=999). rh_detector has deliberately imperfect
+    # recall (it's the router); this one labels whether a sample ACTUALLY hacked, for
+    # the grad diagnostic's forget/retain split. Same detector eval's hack_freq uses.
+    hack_freq_detector = None
+    if (routing_enabled or filter_baseline or reward_penalty_baseline) and exp_cfg.hack_freq_detector is not None:
+        hack_freq_detector = exp_cfg.build_rh_detector(combined_reward, cfg=exp_cfg.hack_freq_detector)
+        print(f"Hack-freq (ground-truth) detector: {exp_cfg.hack_freq_detector.name} {exp_cfg.hack_freq_detector.params or ''}")
     if args.retain_warmup_steps > 0:
         assert args.rh_detector_verifies_retain_samples, (
             "--retain_warmup_steps > 0 requires --rh_detector_verifies_retain_samples "
@@ -5673,6 +5711,7 @@ def _run(args, exp_cfg=None):
     # in one place), 0 disables. Resolved here so the sentinel lives only here.
     trainer._grad_diag_every = (args.eval_every if args.grad_diag_every is None
                                 else args.grad_diag_every)
+    trainer._hack_freq_detector = hack_freq_detector  # ground-truth hack labeler for grad diag
     trainer._offpolicy_drift_k = args.offpolicy_drift_k
     # Ref-logprob token budget: default to 4x the training microbatch budget,
     # since ref runs under no_grad (no saved activations) and peak memory is

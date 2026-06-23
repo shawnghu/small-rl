@@ -32,10 +32,47 @@ import numpy as np
 
 PLOTLY_CDN = "https://cdn.plot.ly/plotly-2.35.2.min.js"
 NBINS = 35
-SAMPLE_COLORS = {"retain": "#1f3a93", "forget": "#c0392b"}  # retain samples blue, forget red
-# 3-way sample class: retain=blue, forget-detectable(monitored)=light red,
-# forget-undetectable(unmonitored)=dark red.
-CLASS_COLORS = {"r": "#1f3a93", "fd": "#f1948a", "fu": "#922b21"}
+# Sample-class taxonomy. Ground-truth scheme (when records carry hackable/hacked):
+# hue = emission (grey=unhackable, blue=hackable-not-hacked, red=hacked); shade =
+# monitoring (light=detectable/monitored, dark=undetectable/unmonitored). The
+# is_rh routing label is NOT used here (it's the imperfect router, recorded
+# separately). Each entry: (key, label, color).
+GT_CLASSES = [
+    ("unhk",     "unhackable",                          "#9aa0a6"),
+    ("nh_mon",   "hackable·not-hacked·mon",   "#6fa8dc"),
+    ("nh_unmon", "hackable·not-hacked·unmon", "#1f3a93"),
+    ("h_mon",    "hacked·monitored",               "#f1948a"),
+    ("h_unmon",  "hacked·unmonitored",             "#922b21"),
+]
+# Legacy scheme for records that predate hackable/hacked (is_rh based).
+LEGACY_CLASSES = [
+    ("r",  "retain",                  "#1f3a93"),
+    ("fd", "forget·detectable",  "#f1948a"),
+    ("fu", "forget·undetectable", "#922b21"),
+]
+
+
+def _classify_gt(r, j):
+    if not r["hackable"][j]:
+        return "unhk"
+    if r["hacked"][j]:
+        return "h_mon" if r["detectable"][j] else "h_unmon"
+    return "nh_mon" if r["detectable"][j] else "nh_unmon"
+
+
+def _classify_legacy(r, j):
+    if not r["is_rh"][j]:
+        return "r"
+    det = r.get("detectable") or [0] * len(r["is_rh"])
+    return "fd" if det[j] else "fu"
+
+
+def _scheme(rec0):
+    """(classes, classify_fn) — ground-truth taxonomy when hackable/hacked are
+    present, else the legacy is_rh taxonomy."""
+    if "hacked" in rec0 and "hackable" in rec0:
+        return GT_CLASSES, _classify_gt
+    return LEGACY_CLASSES, _classify_legacy
 # metric -> (per-sample key, whole-model key). grad/act are magnitudes (log-x
 # histograms); dot is signed <grad,weight> (linear-x). dot is skipped on records
 # that predate it.
@@ -81,7 +118,8 @@ def _symlog_setup(pool):
         v = np.asarray(v, float)
         sg = np.sign(v)
         av = np.abs(v)
-        return sg * np.where(av <= linthresh, av / linthresh, 1.0 + np.log10(av / linthresh))
+        with np.errstate(divide="ignore"):  # log10(0) on the linear-branch entries; discarded by where
+            return sg * np.where(av <= linthresh, av / linthresh, 1.0 + np.log10(av / linthresh))
 
     s = np.sort(a)
     lo = float(s[int(0.005 * s.size)])
@@ -96,26 +134,6 @@ def _symlog_setup(pool):
     return {"edges": edges, "T": T, "ticks": ticks}
 
 
-CLASSES = ("r", "fd", "fu")  # retain samples, forget-detectable, forget-undetectable
-
-
-def _sample_classes(r):
-    """Per-sample class: 0=retain (is_rh=0), 1=forget & detectable, 2=forget &
-    undetectable. detectable defaults to 0 (->all forget undetectable) for
-    records that predate the detectable field."""
-    rh = r["is_rh"]
-    det = r.get("detectable")
-    out = []
-    for j, lab in enumerate(rh):
-        if not lab:
-            out.append(0)
-        elif det is not None and det[j]:
-            out.append(1)
-        else:
-            out.append(2)
-    return out
-
-
 def _log_range(vals):
     a = np.sort(vals[vals > 0])
     if a.size < 4:
@@ -124,10 +142,11 @@ def _log_range(vals):
             float(np.log10(a[min(a.size - 1, int(0.995 * a.size))]))]
 
 
-def build_env_data(recs_by_seed):
-    """Pool seeds per step; return embeddable per-panel histograms (3-way split:
-    retain / forget-detectable / forget-undetectable) + per-step joint-scatter
-    data (whole-model retain vs forget magnitude per sample)."""
+def build_env_data(recs_by_seed, class_keys, classify):
+    """Pool seeds per step; return embeddable per-panel histograms (one series per
+    sample class) + per-step joint-scatter data (whole-model retain vs forget
+    magnitude per sample, colored by class). `class_keys` is the ordered class
+    list; `classify(r, j)` returns the class key for sample j of record r."""
     bystep = defaultdict(list)
     for recs in recs_by_seed:
         for r in recs:
@@ -135,22 +154,19 @@ def build_env_data(recs_by_seed):
     steps = sorted(bystep)
     layers = recs_by_seed[0][0]["layers"]
     layerkeys = ["whole"] + [str(li) for li in layers]
+    kidx = {k: i for i, k in enumerate(class_keys)}
 
-    # panel-key = metric|role|layerkey -> per-step {r:[...], fd:[...], fu:[...]}
-    raw = defaultdict(lambda: {s: {"r": [], "fd": [], "fu": []} for s in steps})
-    # scatter: metric -> per-step {x:[retain whole], y:[forget whole], cls:[0/1/2]}
+    raw = defaultdict(lambda: {s: {k: [] for k in class_keys} for s in steps})
     scat = {m: {s: {"x": [], "y": [], "cls": []} for s in steps} for m in SCATTER_METRICS}
-    nhack, nretain = [], []
-    class_n = {"r": [], "fd": [], "fu": []}  # true per-step class sizes (panel-independent)
+    class_n = {k: [] for k in class_keys}  # true per-step class sizes (panel-independent)
     for s in steps:
         recs = bystep[s]
-        nhack.append(sum(sum(r["is_rh"]) for r in recs))
-        nretain.append(sum(len(r["is_rh"]) - sum(r["is_rh"]) for r in recs))
-        cn = {"r": 0, "fd": 0, "fu": 0}
+        cn = {k: 0 for k in class_keys}
         for r in recs:
-            cls = _sample_classes(r)
-            for c in cls:
-                cn[CLASSES[c]] += 1
+            n = len(r["is_rh"])
+            keys = [classify(r, j) for j in range(n)]
+            for k in keys:
+                cn[k] += 1
             for metric, ps_key, wm_key in METRICS:
                 wmd, psd = r.get(wm_key), r.get(ps_key)
                 if wmd is None or psd is None:
@@ -158,27 +174,27 @@ def build_env_data(recs_by_seed):
                 if metric in SCATTER_METRICS:
                     wmR, wmF = wmd["retain"], wmd["forget"]
                     sc = scat[metric][s]
-                    for j, c in enumerate(cls):
-                        sc["x"].append(wmR[j]); sc["y"].append(wmF[j]); sc["cls"].append(c)
+                    for j in range(n):
+                        sc["x"].append(wmR[j]); sc["y"].append(wmF[j]); sc["cls"].append(kidx[keys[j]])
                 for role in ROLES:
                     wm = wmd[role]
                     b = raw[f"{metric}|{role}|whole"][s]
-                    for j, c in enumerate(cls):
-                        b[CLASSES[c]].append(wm[j])
+                    for j in range(n):
+                        b[keys[j]].append(wm[j])
                     for k, li in enumerate(layers):
                         arr = psd[role][k]
                         b = raw[f"{metric}|{role}|{li}"][s]
-                        for j, c in enumerate(cls):
-                            b[CLASSES[c]].append(arr[j])
-        for st in CLASSES:
-            class_n[st].append(cn[st])
+                        for j in range(n):
+                            b[keys[j]].append(arr[j])
+        for k in class_keys:
+            class_n[k].append(cn[k])
 
     panels = {}
     for key, perstep in raw.items():
         metric = key.split("|")[0]
         logx = metric in LOG_METRICS
-        allvals = np.array([v for s in steps for st in CLASSES
-                            for v in perstep[s][st]], dtype=float)
+        allvals = np.array([v for s in steps for k in class_keys
+                            for v in perstep[s][k]], dtype=float)
         if not allvals.size:
             continue
         symlog = None
@@ -197,14 +213,14 @@ def build_env_data(recs_by_seed):
         for s in steps:
             row = {}
             speak, deg = 0, False
-            for st in CLASSES:
-                x = np.array(perstep[s][st], dtype=float)
+            for k in class_keys:
+                x = np.array(perstep[s][k], dtype=float)
                 if logx:
                     vals = np.log10(x[x > 0]) if x.size else np.array([])
                 else:
                     vals = T(x) if x.size else np.array([])
                 counts, _ = np.histogram(vals, bins=edges)
-                row[st] = counts.tolist()
+                row[k] = counts.tolist()
                 cmax, ctot = (int(counts.max()), int(counts.sum())) if counts.size else (0, 0)
                 speak = max(speak, cmax)
                 if ctot > 0 and cmax > 0.6 * ctot:  # one bin swallows the class
@@ -235,8 +251,7 @@ def build_env_data(recs_by_seed):
         }
 
     return {"steps": steps, "layers": layers, "layerkeys": layerkeys,
-            "nhack": nhack, "nretain": nretain, "class_n": class_n,
-            "panels": panels, "scatter": scatter}
+            "class_n": class_n, "panels": panels, "scatter": scatter}
 
 
 # Core JS reused by both the detailed (per-env, multi-condition) page and the
@@ -267,30 +282,29 @@ function panel(divId, cd, metric, role, j) {
   const row = p.h[j];
   // legend n = TRUE class size at this step (panel/layer-independent), not the
   // count of in-range bars (some samples truncated out of the fixed range).
+  // One overlaid bar series per sample class (CLS, global class metadata).
   const cn = cd.class_n;
-  const lab = st => (cn ? cn[st][j] : row[st].reduce((a,b)=>a+b,0));
-  const mk = (st, name) => ({ type:'bar', x:p.c, y:row[st], width:p.w, name:name,
-                              marker:{color: SC[st]}, opacity:0.55 });
+  const traces = CLS.filter(c => row[c.k]).map(c => ({
+    type:'bar', x:p.c, y:row[c.k], width:p.w,
+    name:`${c.label} (n=${cn && cn[c.k] ? cn[c.k][j] : row[c.k].reduce((a,b)=>a+b,0)})`,
+    marker:{color: c.color}, opacity:0.5,
+  }));
   const xaxis = p.ticks
     ? {title:xlabel, tickmode:'array', tickvals:p.ticks.v, ticktext:p.ticks.t}
     : {title:xlabel, tickformat: p.logx ? '.1f' : '.2g'};
-  Plotly.react(divId, [
-    mk('r', `retain (n=${lab('r')})`),
-    mk('fd', `forget·detectable (n=${lab('fd')})`),
-    mk('fu', `forget·undetectable (n=${lab('fu')})`),
-  ], {
+  Plotly.react(divId, traces, {
     barmode:'overlay', bargap:0,
     xaxis: xaxis,
     yaxis:{title:'# samples', range:[0, p.ymax*1.05]},
-    margin:{t:26, r:8, b:40, l:44}, legend:{orientation:'h', y:1.0, yanchor:'bottom', font:{size:9}},
+    margin:{t:26, r:8, b:40, l:44}, legend:{orientation:'h', y:1.0, yanchor:'bottom', font:{size:8}},
   }, {displayModeBar:false});
 }
 """
 
 
-def build_html(data_by_env):
+def build_html(data_by_env, classes_meta):
     data_json = json.dumps(data_by_env, separators=(",", ":"))
-    colors_json = json.dumps(CLASS_COLORS)
+    cls_json = json.dumps([{"k": k, "label": lbl, "color": col} for k, lbl, col in classes_meta])
     envs = sorted(data_by_env)
     env_opts = "".join(f'<option value="{e}">{e}</option>' for e in envs)
     has_dot = any(k.startswith("dot|")
@@ -335,7 +349,7 @@ def build_html(data_by_env):
 </div>
 <script>
 const DATA = {data_json};
-const SC = {colors_json};
+const CLS = {cls_json};
 const HAS_DOT = {has_dot_js};
 const C_BOTH = '#e67e22', C_RONLY = '#27ae60';  // orange=2-adapter, green=retain-only
 const GRID_CELLS = [
@@ -416,18 +430,17 @@ function buildBlocks() {{
 }}
 
 function renderScatter(ci, cd, j) {{
-  const CK = ['r','fd','fu'], NM = {{r:'retain', fd:'forget\\u00b7det', fu:'forget\\u00b7undet'}};
   for (const [suffix, lbl] of [['grad','grad norm'],['act','activation norm']]) {{
     const divId = `s_${{ci}}_${{suffix}}`;
     const sc = cd.scatter[suffix];
     if (!sc || j < 0) {{ Plotly.react(divId, [], {{margin:{{t:24,r:8}}}}, {{displayModeBar:false}}); continue; }}
     const xs=sc.x[j], ys=sc.y[j], cls=sc.cls[j];
-    const grp = {{r:{{x:[],y:[]}}, fd:{{x:[],y:[]}}, fu:{{x:[],y:[]}}}};
-    for (let i=0;i<xs.length;i++) if (xs[i]>0 && ys[i]>0) {{ const g=grp[CK[cls[i]]]; g.x.push(xs[i]); g.y.push(ys[i]); }}
-    const tr = k => ({{ x:grp[k].x, y:grp[k].y, mode:'markers', type:'scattergl',
-                       name:`${{NM[k]}} (n=${{grp[k].x.length}})`, marker:{{color:SC[k], size:4, opacity:0.45}} }});
+    const grp = CLS.map(()=>({{x:[],y:[]}}));
+    for (let i=0;i<xs.length;i++) if (xs[i]>0 && ys[i]>0) {{ const g=grp[cls[i]]; if(g){{ g.x.push(xs[i]); g.y.push(ys[i]); }} }}
+    const traces = CLS.map((c,ci2) => ({{ x:grp[ci2].x, y:grp[ci2].y, mode:'markers', type:'scattergl',
+                       name:`${{c.label}} (n=${{grp[ci2].x.length}})`, marker:{{color:c.color, size:4, opacity:0.45}} }}));
     const r = pearsonLog(xs, ys);
-    Plotly.react(divId, [tr('r'), tr('fd'), tr('fu')], {{
+    Plotly.react(divId, traces, {{
       xaxis:{{title:`retain-param ${{lbl}}`, type:'log', range:sc.rx}},
       yaxis:{{title:`forget-param ${{lbl}}`, type:'log', range:sc.ry}},
       margin:{{t:24, r:8, b:42, l:52}}, legend:{{orientation:'h', y:1.0, yanchor:'bottom', font:{{size:9}}}},
@@ -530,7 +543,7 @@ def load_curves(run_dirs):
     return out
 
 
-def build_allenvs_html(data_by_env):
+def build_allenvs_html(data_by_env, classes_meta):
     """Overview page: every env's 2x2 grid (gradient/activation x retain/forget)
     shown concurrently in an outer grid, for a selected condition, one shared
     step slider. Reuses the shared panel() core."""
@@ -543,7 +556,7 @@ def build_allenvs_html(data_by_env):
         for env, d in data_by_env.items()
     }
     data_json = json.dumps(reduced, separators=(",", ":"))
-    colors_json = json.dumps(CLASS_COLORS)
+    cls_json = json.dumps([{"k": k, "label": lbl, "color": col} for k, lbl, col in classes_meta])
     envs = sorted(data_by_env)
     # conditions that have grad data somewhere
     conds = [c for c in ["GR", "RP", "filter", "do-nothing"]
@@ -597,7 +610,7 @@ def build_allenvs_html(data_by_env):
   </div>
 <script>
 const DATA = {data_json};
-const SC = {colors_json};
+const CLS = {cls_json};
 const ENVS = {envs_json};
 const CELLS = [['grad','retain'],['grad','forget'],['act','retain'],['act','forget']];
 let idx = 0, playing = false, timer = null, STEPS = [];
@@ -741,17 +754,23 @@ def generate(sweep_dirs, out=None, require_grad=True, verbose=True):
                 groups[(env, cond)]["grad"].append(recs)
         groups[(env, cond)]["dirs"].append(rd)
 
+    # Pick the sample-class scheme once (ground-truth taxonomy if any record
+    # carries hackable/hacked, else legacy is_rh). All envs share one scheme.
+    rec0 = next((g["grad"][0][0] for g in groups.values() if g["grad"]), None)
+    classes_meta, classify = _scheme(rec0) if rec0 else (LEGACY_CLASSES, _classify_legacy)
+    class_keys = [k for k, _, _ in classes_meta]
+
     data_by_env = {}
     for (env, cond), g in groups.items():
         d = data_by_env.setdefault(env, {"C": {}, "conds": [], "layers": [], "sliderSteps": []})
         if g["grad"]:
-            cd = build_env_data(g["grad"])
+            cd = build_env_data(g["grad"], class_keys, classify)
             cd["has_grad"] = True
             if not d["layers"]:
                 d["layers"] = cd["layers"]
         else:
             cd = {"has_grad": False, "steps": [], "panels": {}, "scatter": {},
-                  "nhack": [], "nretain": [], "layers": []}
+                  "class_n": {}, "layers": []}
         cd["curves"] = load_curves(g["dirs"])
         d["C"][cond] = cd
 
@@ -772,7 +791,7 @@ def generate(sweep_dirs, out=None, require_grad=True, verbose=True):
     out = out or os.path.join(sweep_dirs[0], "separability", "separability_dist.html")
     os.makedirs(os.path.dirname(out), exist_ok=True)
     with open(out, "w") as f:
-        f.write(build_html(data_by_env))
+        f.write(build_html(data_by_env, classes_meta))
     n_blocks = sum(len(d["conds"]) for d in data_by_env.values())
     if verbose:
         print(f"[separability] wrote {out} ({len(data_by_env)} envs, "
@@ -781,7 +800,7 @@ def generate(sweep_dirs, out=None, require_grad=True, verbose=True):
     # all-envs overview page (every env's 2x2 at a glance)
     allenvs_out = os.path.join(os.path.dirname(out), "separability_allenvs.html")
     with open(allenvs_out, "w") as f:
-        f.write(build_allenvs_html(data_by_env))
+        f.write(build_allenvs_html(data_by_env, classes_meta))
     if verbose:
         print(f"[separability] wrote {allenvs_out} ({os.path.getsize(allenvs_out)/1e6:.1f} MB)")
     return out

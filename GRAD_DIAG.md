@@ -100,7 +100,10 @@ resolution in train.py).
   carries its labels + decoded text so norms can be tied back to the sample:
   ```
   { step, samples_seen, n_samples, layers:[...],
-    is_rh:[0/1 per sample], detectable:[0/1 per sample],   # 1 = monitored
+    is_rh:[0/1 per sample],       # ROUTING label (rh_detector; imperfect recall by design)
+    detectable:[0/1 per sample],  # 1 = monitored (rh_classifiable_fn)
+    hackable:[0/1 per sample],    # ground truth: hack available (2nd conditional)
+    hacked:[0/1 per sample],      # ground truth: model emitted the hack (uncapped hack_freq_detector)
     prompt:[text per sample], completion:[text per sample],
     per_sample:      { retain: [n_layers][n_samples], forget: [...] },  # grad norm
     whole_model:     { retain: [n_samples], forget: [...] },            # grad norm
@@ -115,9 +118,20 @@ resolution in train.py).
   with the current weights (signed; how much the update scales each adapter
   along its current direction). `detectable` is the per-sample monitored flag
   (the penalty-conditional subset) — sourced from the rh_detector's
-  classifiability predicate (`rh_classifiable_fn`), the same source eval uses,
-  injected into the rollout batch alongside
-  `is_rh`.
+  classifiability predicate (`rh_classifiable_fn`), the same source eval uses.
+
+  **Forget/retain labeling — ground truth vs routing.** `is_rh` is the *routing*
+  signal (the `rh_detector`), whose recall is **deliberately imperfect** (e.g.
+  `sorting_copy_threshold(max_n=7)` only flags short-list copies, simulating a
+  classifier that misses some hacks). It is therefore the WRONG label for the
+  diagnostic, whose question is whether GR separates the adapters even on
+  router-missed hacks. The split uses **ground truth** instead: `hackable` (the
+  2nd conditional — is the hack available) and `hacked` (did the model actually
+  emit it, per the uncapped `hack_freq_detector`, e.g. `max_n=999` — the same
+  detector eval's `hack_freq` uses). The viewer's sample taxonomy is:
+  `unhackable` / `hackable·not-hacked·{mon,unmon}` / `hacked·{monitored,unmonitored}`
+  (hue = emission, shade = monitoring). All four flags are recorded so any split
+  is reconstructable; `is_rh` is kept only as the separate routing signal.
 - **`{output_dir}/grad_diag.html`** — per-run viewer (auto-generated at end of
   training): metric toggle, step slider, layer selector, by-data-type panels.
 - **`tools/gen_separability_html.py <dir>...`** → `separability/`:
@@ -125,8 +139,9 @@ resolution in train.py).
     sweep dirs and groups runs by **(env, condition)** (GR / RP / do-nothing,
     classified from `run_config.yaml`); each condition is a stacked block
     showing whatever data it has: the grid (gradient / activation / **dot**
-    rows × retain/forget param) overlaying retain (blue) / forget-detectable
-    (light red) / forget-undetectable (dark red) samples, overview-style
+    rows × retain/forget param) overlaying the ground-truth sample taxonomy
+    (unhackable grey / hackable-not-hacked blue / hacked red, light=monitored
+    dark=unmonitored; legacy is_rh split for pre-`hacked` runs), overview-style
     training curves, and a **joint-distribution** scatter of retain-param vs
     forget-param magnitude per sample (log-log, Pearson r) — how correlated the
     two are. (dot uses signed linear-x bins; shown only when present.)
