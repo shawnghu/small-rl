@@ -2686,11 +2686,21 @@ class SampleGRPOTrainer(GRPOTrainer):
 
             if self.gradient_routing_enabled:
                 output["is_rh"] = is_rh_tensor
-                # Per-sample monitored/unmonitored (detectable) flag for the grad
-                # diagnostic's detectable/undetectable forget split. Bool tensor
-                # so it survives buffering/shuffling like is_rh.
-                _det = detectable_flags
-                if _det is not None and _det[0] is not None:
+                # Per-sample monitored/detectable flag for the grad diagnostic's
+                # detectable/undetectable forget split. Source it from the
+                # rh_detector's classifiability predicate (the monitoring scope) —
+                # the SAME source eval uses (_inject_detectable_into_eval_data).
+                # The env 'detectable' column is usually absent for these envs, so
+                # the old detector_kwargs.get('detectable') path recorded all-zeros.
+                cfn = getattr(self, "_rh_classifiable_fn", None)
+                _det = None
+                if cfn is not None:
+                    _df = cfn(**detector_kwargs)
+                    if _df is not None and len(_df) == n_samples:
+                        _det = _df
+                if _det is None:
+                    _det = detectable_flags  # env-column fallback
+                if _det is not None and len(_det) == n_samples and _det[0] is not None:
                     output["detectable"] = torch.tensor(
                         [bool(d) for d in _det], dtype=torch.bool, device=is_rh_tensor.device)
                 else:

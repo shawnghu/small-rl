@@ -114,7 +114,9 @@ resolution in train.py).
   The **dot product** `<grad, weight>` is the per-sample param gradient dotted
   with the current weights (signed; how much the update scales each adapter
   along its current direction). `detectable` is the per-sample monitored flag
-  (the penalty-conditional subset), injected into the rollout batch alongside
+  (the penalty-conditional subset) — sourced from the rh_detector's
+  classifiability predicate (`rh_classifiable_fn`), the same source eval uses,
+  injected into the rollout batch alongside
   `is_rh`.
 - **`{output_dir}/grad_diag.html`** — per-run viewer (auto-generated at end of
   training): metric toggle, step slider, layer selector, by-data-type panels.
