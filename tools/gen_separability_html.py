@@ -65,16 +65,35 @@ def _edges(pool):
     return np.linspace(np.log10(lo), np.log10(hi), NBINS + 1)
 
 
-def _lin_edges(pool):
-    """Linear robust [p0.5, p99.5] edges over SIGNED values (for the dot product)."""
-    v = np.sort(pool)
-    if v.size < 4:
+def _symlog_setup(pool):
+    """Symlog binning for a SIGNED, zero-peaked, heavy-tailed quantity (the dot
+    product). Linear within [-linthresh, linthresh] (linthresh = median |nonzero|),
+    log-spaced beyond — so the central peak spreads instead of dumping into one
+    bin. Returns dict with linear-in-symlog-space edges, the transform, and a few
+    (symlog-position, actual-value-label) ticks for the x-axis."""
+    a = np.asarray(pool, float)
+    nz = np.abs(a[a != 0])
+    if nz.size < 4:
         return None
-    lo = float(v[int(0.005 * v.size)])
-    hi = float(v[min(v.size - 1, int(0.995 * v.size))])
-    if hi <= lo:
-        hi = lo + 1e-12
-    return np.linspace(lo, hi, NBINS + 1)
+    linthresh = float(max(np.median(nz), 1e-30))
+
+    def T(v):
+        v = np.asarray(v, float)
+        sg = np.sign(v)
+        av = np.abs(v)
+        return sg * np.where(av <= linthresh, av / linthresh, 1.0 + np.log10(av / linthresh))
+
+    s = np.sort(a)
+    lo = float(s[int(0.005 * s.size)])
+    hi = float(s[min(s.size - 1, int(0.995 * s.size))])
+    tlo, thi = float(T(np.array([lo]))[0]), float(T(np.array([hi]))[0])
+    if thi <= tlo:
+        thi = tlo + 1.0
+    edges = np.linspace(tlo, thi, NBINS + 1)
+    tick_actual = [lo, -linthresh, 0.0, linthresh, hi]
+    tpos = T(np.array(tick_actual)).tolist()
+    ticks = {"v": tpos, "t": [("0" if x == 0 else f"{x:.0e}") for x in tick_actual]}
+    return {"edges": edges, "T": T, "ticks": ticks}
 
 
 CLASSES = ("r", "fd", "fu")  # retain samples, forget-detectable, forget-undetectable
@@ -122,12 +141,16 @@ def build_env_data(recs_by_seed):
     # scatter: metric -> per-step {x:[retain whole], y:[forget whole], cls:[0/1/2]}
     scat = {m: {s: {"x": [], "y": [], "cls": []} for s in steps} for m in SCATTER_METRICS}
     nhack, nretain = [], []
+    class_n = {"r": [], "fd": [], "fu": []}  # true per-step class sizes (panel-independent)
     for s in steps:
         recs = bystep[s]
         nhack.append(sum(sum(r["is_rh"]) for r in recs))
         nretain.append(sum(len(r["is_rh"]) - sum(r["is_rh"]) for r in recs))
+        cn = {"r": 0, "fd": 0, "fu": 0}
         for r in recs:
             cls = _sample_classes(r)
+            for c in cls:
+                cn[CLASSES[c]] += 1
             for metric, ps_key, wm_key in METRICS:
                 wmd, psd = r.get(wm_key), r.get(ps_key)
                 if wmd is None or psd is None:
@@ -147,6 +170,8 @@ def build_env_data(recs_by_seed):
                         b = raw[f"{metric}|{role}|{li}"][s]
                         for j, c in enumerate(cls):
                             b[CLASSES[c]].append(arr[j])
+        for st in CLASSES:
+            class_n[st].append(cn[st])
 
     panels = {}
     for key, perstep in raw.items():
@@ -156,24 +181,47 @@ def build_env_data(recs_by_seed):
                             for v in perstep[s][st]], dtype=float)
         if not allvals.size:
             continue
-        edges = _edges(allvals) if logx else _lin_edges(allvals)
+        symlog = None
+        if logx:
+            edges = _edges(allvals)
+        else:
+            symlog = _symlog_setup(allvals)
+            edges = symlog["edges"] if symlog else None
         if edges is None:
             continue
+        T = symlog["T"] if symlog else None
         centers = ((edges[:-1] + edges[1:]) / 2).tolist()
         width = float((edges[1] - edges[0]) * 0.98)
         hist = []
-        ymax = 1
+        step_peaks = []  # (tallest single-class bin, is-degenerate) per step
         for s in steps:
             row = {}
+            speak, deg = 0, False
             for st in CLASSES:
                 x = np.array(perstep[s][st], dtype=float)
-                vals = (np.log10(x[x > 0]) if x.size else np.array([])) if logx else x
+                if logx:
+                    vals = np.log10(x[x > 0]) if x.size else np.array([])
+                else:
+                    vals = T(x) if x.size else np.array([])
                 counts, _ = np.histogram(vals, bins=edges)
                 row[st] = counts.tolist()
-                if counts.size:
-                    ymax = max(ymax, int(counts.max()))
+                cmax, ctot = (int(counts.max()), int(counts.sum())) if counts.size else (0, 0)
+                speak = max(speak, cmax)
+                if ctot > 0 and cmax > 0.6 * ctot:  # one bin swallows the class
+                    deg = True
             hist.append(row)
-        panels[key] = {"c": centers, "w": width, "ymax": ymax, "h": hist, "logx": logx}
+            step_peaks.append((speak, deg))
+        # y-axis fixed across steps. For symlog (the dot), exclude degenerate
+        # steps — e.g. step 0 where every value is exactly 0 and piles into one
+        # bin — so the scale reflects the real spread, not the zero-spike.
+        if symlog:
+            kept = [pk for pk, dg in step_peaks if not dg]
+            ymax = max(kept) if kept else max((pk for pk, _ in step_peaks), default=1)
+        else:
+            ymax = max((pk for pk, _ in step_peaks), default=1)
+        panels[key] = {"c": centers, "w": width, "ymax": max(ymax, 1), "h": hist, "logx": logx}
+        if symlog:
+            panels[key]["ticks"] = symlog["ticks"]
 
     scatter = {}
     for metric in SCATTER_METRICS:
@@ -187,7 +235,8 @@ def build_env_data(recs_by_seed):
         }
 
     return {"steps": steps, "layers": layers, "layerkeys": layerkeys,
-            "nhack": nhack, "nretain": nretain, "panels": panels, "scatter": scatter}
+            "nhack": nhack, "nretain": nretain, "class_n": class_n,
+            "panels": panels, "scatter": scatter}
 
 
 # Core JS reused by both the detailed (per-env, multi-condition) page and the
@@ -210,22 +259,28 @@ function pearsonLog(xs, ys) {
 // One histogram panel for (condition-data cd, metric, role) at step-index j.
 function panel(divId, cd, metric, role, j) {
   const p = cd.panels[metric + '|' + role + '|' + layerKey()];
-  const xlabel = metric === 'dot' ? '⟨grad,weight⟩ (signed)'
+  const xlabel = metric === 'dot' ? '⟨grad,weight⟩ (symlog)'
     : metric === 'act' ? 'activation norm (log₁₀)' : 'grad norm (log₁₀)';
   if (!p || j < 0) { Plotly.react(divId, [], {margin:{t:24,r:8},
       annotations:[{text:'no data at this step', showarrow:false, xref:'paper', yref:'paper', x:0.5, y:0.5}]},
       {displayModeBar:false}); return; }
   const row = p.h[j];
-  const sum = st => row[st].reduce((a,b)=>a+b,0);
+  // legend n = TRUE class size at this step (panel/layer-independent), not the
+  // count of in-range bars (some samples truncated out of the fixed range).
+  const cn = cd.class_n;
+  const lab = st => (cn ? cn[st][j] : row[st].reduce((a,b)=>a+b,0));
   const mk = (st, name) => ({ type:'bar', x:p.c, y:row[st], width:p.w, name:name,
                               marker:{color: SC[st]}, opacity:0.55 });
+  const xaxis = p.ticks
+    ? {title:xlabel, tickmode:'array', tickvals:p.ticks.v, ticktext:p.ticks.t}
+    : {title:xlabel, tickformat: p.logx ? '.1f' : '.2g'};
   Plotly.react(divId, [
-    mk('r', `retain (n=${sum('r')})`),
-    mk('fd', `forget·detectable (n=${sum('fd')})`),
-    mk('fu', `forget·undetectable (n=${sum('fu')})`),
+    mk('r', `retain (n=${lab('r')})`),
+    mk('fd', `forget·detectable (n=${lab('fd')})`),
+    mk('fu', `forget·undetectable (n=${lab('fu')})`),
   ], {
     barmode:'overlay', bargap:0,
-    xaxis:{title:xlabel, tickformat: p.logx ? '.1f' : '.2g'},
+    xaxis: xaxis,
     yaxis:{title:'# samples', range:[0, p.ymax*1.05]},
     margin:{t:26, r:8, b:40, l:44}, legend:{orientation:'h', y:1.0, yanchor:'bottom', font:{size:9}},
   }, {displayModeBar:false});
@@ -482,7 +537,8 @@ def build_allenvs_html(data_by_env):
     # overview only needs the histogram panels — drop scatter/curves to shrink.
     reduced = {
         env: {"layers": d["layers"], "conds": d["conds"],
-              "C": {c: {"has_grad": cd["has_grad"], "steps": cd["steps"], "panels": cd["panels"]}
+              "C": {c: {"has_grad": cd["has_grad"], "steps": cd["steps"],
+                        "panels": cd["panels"], "class_n": cd.get("class_n")}
                     for c, cd in d["C"].items()}}
         for env, d in data_by_env.items()
     }
