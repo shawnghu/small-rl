@@ -521,8 +521,12 @@ def generate_and_score_completions(trainer, inputs):
                 model = trainer.accelerator.unwrap_model(trainer._rollout_model)
                 ref_budget = getattr(trainer, "_ref_max_tokens_per_microbatch", None)
                 use_liger_fused = getattr(trainer, "use_liger_kernel", False)
+                # The liger-fused ref (via _get_last_hidden_state) shape-mismatches on
+                # the frozen one-step-off snapshot view; force the padded path (which
+                # works on the view — same forward old_logps uses) under one_step_off.
+                _osp = getattr(trainer, "_one_step_off", False)
                 with disabled_dual_adapters(model):
-                    if ref_budget is not None:
+                    if ref_budget is not None and not _osp:
                         ref_per_token_logps = _ref_logps_dynamic(
                             trainer,
                             prompt_completion_ids,
@@ -533,7 +537,7 @@ def generate_and_score_completions(trainer, inputs):
                             forward_kwargs=forward_kwargs,
                             use_liger_fused=use_liger_fused,
                         )
-                    elif use_liger_fused:
+                    elif use_liger_fused and not _osp:
                         ref_per_token_logps = _ref_logps_liger_fused(
                             trainer,
                             prompt_completion_ids,

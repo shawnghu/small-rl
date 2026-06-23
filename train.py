@@ -620,6 +620,43 @@ class SampleGRPOTrainer(GRPOTrainer):
         v = getattr(self, "_osp_rollout_view", None)
         return v if v is not None else self.model
 
+    # ----- one-step off-policy metric isolation -----
+    #
+    # Under one-step off-policy, _generate_and_score_completions runs on a
+    # background rollout thread (see the controller below) while the main thread
+    # runs the previous cycle's optimizer update + log(). Both write self._metrics
+    # (rollout: reward/completion/sampling metrics; update+log: kl/clip/entropy +
+    # the sum/len averaging and .clear()). To keep this race-free *and* complete,
+    # the rollout thread writes into a PRIVATE per-thread buffer (self._osp_tls.buffer)
+    # that the property below transparently routes its accesses to; the buffer is
+    # merged into the shared dict on the main thread at the _osp_join barrier, where
+    # no rollout thread is running. When one_step_off is off (and on every other
+    # thread / code path) no buffer is ever set, so _metrics is just the shared dict
+    # — a strict no-op for all non-one-step paths.
+
+    @property
+    def _metrics(self):
+        buf = getattr(getattr(self, "_osp_tls", None), "buffer", None)
+        if buf is not None:
+            return buf
+        try:
+            return self.__dict__["_metrics_main"]
+        except KeyError:
+            # Not yet assigned (e.g. hasattr(self, "_metrics") guards in __init__
+            # before TRL's init sets it). Raise AttributeError so hasattr works.
+            raise AttributeError("_metrics")
+
+    @_metrics.setter
+    def _metrics(self, value):
+        # TRL's __init__ assigns self._metrics before our __init__ sets up _osp_tls;
+        # guard accordingly. The grad-diag swap (save/restore self._metrics) runs on
+        # the main thread, so routing it to _metrics_main is correct.
+        buf = getattr(getattr(self, "_osp_tls", None), "buffer", None)
+        if buf is not None:
+            self._osp_tls.buffer = value
+        else:
+            self.__dict__["_metrics_main"] = value
+
     # ----- one-step off-policy controller (see ONE_STEP_OFF_POLICY_PLAN.md) -----
 
     def _osp_launch(self, prompts):
@@ -628,14 +665,25 @@ class SampleGRPOTrainer(GRPOTrainer):
         rollout reads self._rollout_model (the view) + vLLM; it never touches the
         live self.model that the main thread updates."""
         import threading
+        from collections import defaultdict
         self._osp_result = None
         self._osp_exc = None
+        # Private metrics buffer this rollout will write into (mirrors the shape TRL
+        # sets in __init__: per-mode defaultdict(list)). The rollout thread installs
+        # it as its thread-local so the _metrics property routes all rollout-phase
+        # writes here instead of the shared dict the main thread is using. Merged
+        # into the shared dict at _osp_join (main thread, no rollout running).
+        buffer = {"train": defaultdict(list), "eval": defaultdict(list)}
+        self._osp_buffer = buffer
 
         def _work():
+            self._osp_tls.buffer = buffer
             try:
                 self._osp_result = self._generate_and_score_completions(prompts)
             except BaseException as e:  # surface in the main thread at join
                 self._osp_exc = e
+            finally:
+                self._osp_tls.buffer = None
         self._osp_thread = threading.Thread(target=_work, name="osp_rollout", daemon=True)
         self._osp_thread.start()
 
@@ -644,6 +692,19 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._osp_thread = None
         if self._osp_exc is not None:
             raise self._osp_exc
+        # Merge this rollout's private metric writes into the shared dict. We are on
+        # the main thread and no rollout thread is running, so this is race-free.
+        # Append (extend) so the batch's rollout-phase metrics are present alongside
+        # the update/log-phase metrics when this batch is logged.
+        buf = self._osp_buffer
+        self._osp_buffer = None
+        if buf is not None:
+            from collections import defaultdict
+            main = self.__dict__["_metrics_main"]
+            for mode, md in buf.items():
+                dst = main.setdefault(mode, defaultdict(list))
+                for k, vals in md.items():
+                    dst[k].extend(vals)
         return self._osp_result
 
     def _osp_step(self, prompts):
@@ -722,6 +783,12 @@ class SampleGRPOTrainer(GRPOTrainer):
         # (all downstream code paths already `if self.ref_model is not None`-guard).
         # The ref forward is then routed through `disabled_dual_adapters(model)` in
         # trl_overrides.generate_and_score_completions.
+        # Thread-local that lets the one-step-off rollout thread route its self._metrics
+        # writes into a private buffer (see the _metrics property). Must exist before
+        # super().__init__() assigns self._metrics. The setter tolerates its absence,
+        # but creating it here keeps the invariant simple.
+        import threading as _threading
+        self._osp_tls = _threading.local()
         from gradient_routing import has_dual_adapters
         model_arg = kwargs["model"] if "model" in kwargs else (args[0] if len(args) > 0 else None)
         training_args = kwargs["args"] if "args" in kwargs else (args[1] if len(args) > 1 else None)
@@ -857,6 +924,7 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._osp_thread = None      # in-flight rollout thread
         self._osp_result = None
         self._osp_exc = None
+        self._osp_buffer = None      # rollout thread's private _metrics buffer (merged at join)
         self._coh_samples_per_rollout = coh_samples_per_rollout
         self._interlaced_coh = coh_samples_per_rollout > 0
         # Retain-verification skyline: detector also verifies non-hack samples,
@@ -2052,26 +2120,10 @@ class SampleGRPOTrainer(GRPOTrainer):
 
         # Still call super().log() for non-wandb side effects (log_history,
         # other callbacks), but WandbCallback has been removed so this won't
-        # double-log to wandb.
-        if self._one_step_off:
-            # The background rollout thread appends to self._metrics concurrently
-            # with this read (proper metric isolation is a TODO). Defensively
-            # snapshot each mode: copy value lists (tolerating concurrent append),
-            # drop empties, keep defaultdict(list) so the update's auto-create
-            # (self._metrics[mode]["kl"].append) still works. Metrics may be
-            # slightly incomplete under one_step_off until isolated.
-            from collections import defaultdict as _dd
-            for mode in list(self._metrics.keys()):
-                md = self._metrics[mode]
-                nd = _dd(list)
-                for k in list(md.keys()):
-                    try:
-                        v = list(md[k])
-                    except (RuntimeError, KeyError):
-                        continue  # changed size mid-copy; skip this window
-                    if v:
-                        nd[k] = v
-                self._metrics[mode] = nd
+        # double-log to wandb. Under one_step_off, the concurrent rollout thread
+        # writes into its own private buffer (merged at _osp_join), so this read +
+        # TRL's sum/len averaging + .clear() see only main-thread state — no race,
+        # no need to defensively drop metrics.
         result = super().log(logs, *args, **kwargs)
         return result
 
@@ -6168,6 +6220,15 @@ def _run(args, exp_cfg=None):
     trainer._grad_diag_every = (args.eval_every if args.grad_diag_every is None
                                 else args.grad_diag_every)
     trainer._fused_reduction = getattr(args, 'fused_reduction', True)
+    if args.one_step_off and trainer._fused_reduction:
+        # Fused reduction publishes per-token routing into the process-global
+        # _FUSED_ROUTING during the update's forward; the concurrent one-step-off
+        # rollout thread's view-forward would read that (packed) state and shape-
+        # mismatch. Disable it under one_step_off (it is verified-equivalent to the
+        # homogeneous-microbatch path, so GR results are unchanged).
+        print("[one_step_off] disabling fused_reduction (global _FUSED_ROUTING is not "
+              "thread-safe vs the concurrent rollout forward); using homogeneous path.")
+        trainer._fused_reduction = False
     trainer._offpolicy_drift_k = args.offpolicy_drift_k
     # Ref-logprob token budget: default to 4x the training microbatch budget,
     # since ref runs under no_grad (no saved activations) and peak memory is
