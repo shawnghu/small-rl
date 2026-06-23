@@ -243,7 +243,6 @@ class ExperimentConfig(BaseModel):
     vllm_server: Optional[str] = None
     vllm_spawn: bool = False
     vllm_spawn_delay: int = 0
-    vllm_async: bool = False
     vllm_gpu_memory: float = 0.02
     vllm_colocate: bool = False
     vllm_dtype: str = "bfloat16"
@@ -416,8 +415,6 @@ class ExperimentConfig(BaseModel):
             raise ValueError("vllm_server, vllm_spawn, and vllm_colocate are mutually exclusive")
         if self.adapter_type == "none" and (self.vllm_server or self.vllm_spawn):
             raise ValueError("adapter_type='none' requires vllm_colocate for vLLM generation")
-        if self.vllm_async and self.adapter_type == "lora":
-            raise ValueError("vllm_async is not supported with adapter_type='lora'")
         return self
 
     @model_validator(mode="after")

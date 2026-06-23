@@ -319,7 +319,6 @@ def main():
     params.pop("vllm_server", None)
     params["vllm_spawn"] = False
     params["vllm_colocate"] = False
-    params["vllm_async"] = False
     for sweep_only in ("vllm_dtype", "per_gpu"):
         params.pop(sweep_only, None)
     import tempfile

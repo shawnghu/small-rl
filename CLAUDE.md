@@ -262,7 +262,7 @@ The sync covers everything including checkpoints — at SmolLM2-135M scales this
 ### Invariants under `--backend modal`
 
 - `vllm_spawn=True` is forced — the **train.py worker** spawns the vLLM server as its own child process inside the Modal container. This is sync vLLM (REQ/REP), the same training mode the local sweep.py default uses; the only difference is that sweep.py's local backend pre-spawns the vLLM server itself and passes a socket path, whereas under Modal the train worker manages the server lifecycle. Piggybacked eval, `coh_samples_per_rollout > 0`, and all other sync-mode features work identically.
-- `--vllm_async` and `--no_vllm` are rejected at the CLI. Async mode requires a pre-spawned server (`--vllm_server`), which the Modal container doesn't have; the HF-generate fallback isn't useful at our throughput.
+- `--no_vllm` is rejected at the CLI: the HF-generate fallback isn't useful at our throughput.
 - No per-GPU cap / `slot_pool` / MPS on the orchestrator box. Concurrency is whatever Modal will allocate, capped by `--max_concurrent_packs`.
 - Cache (`.baseline_cache.json`, `.run_cache.json`) is still written under `output/{name}/`. Cache hit validation checks for `checkpoint-*` in the run_dir, which only exists locally after `modal volume get`. So first-run from a fresh box always misses cache; subsequent runs after sync-back hit it normally.
 - On SIGINT/SIGTERM to sweep.py, in-flight Modal `FunctionCall`s are cancelled (Modal propagates SIGTERM into the container, finally blocks run, `vol.commit()` flushes partial state). See "training-job timeout" below.
@@ -294,7 +294,7 @@ Blast radius with packing: one run hanging drags the whole container into the ti
 
 In **sync vLLM mode** (the primary path), eval generation is piggybacked onto the training rollout: eval prompts (3 modes × 64 = 192 sequences) are appended to the training batch via `generate_multi` in `_generate_single_turn`, so eval generation adds near-zero wall time. Reward scoring (e.g. leetcode code execution) runs on a background thread with a separate `PersistentCodeEvaluator` pool, overlapping with training optimizer steps. Results are stashed in `_pending_eval_wandb` and merged into the next `wandb.log()` call.
 
-In **async vLLM mode** (`--vllm_async`), piggybacked eval is not supported — eval falls back to the standalone `_run_routing_eval` path in `log()`, which runs generation and scoring sequentially. Async mode is undeveloped and not the recommended path for production sweeps.
+(The async vLLM server/client path was removed; sync is the only path. See `VLLM_ASYNC_DECISION.md` for the rationale and the planned one-step off-policy alternative.)
 
 Eval uses the same temperature as training (from `--temperature`).
 
@@ -362,4 +362,4 @@ See `DEPENDENCIES.md` for pinned versions and the vLLM dependency conflict worka
 - The ZMQ boundary is between the **training process** and the **server process** — this always exists for `--vllm_spawn` and `--vllm_server` modes.
 - `VLLM_ENABLE_V1_MULTIPROCESSING` controls whether the EngineCore spawns a child process **within the server process**.
 
-Setting it to `0` is safe for both sync and async server modes because concurrency comes from ZMQ (ROUTER/DEALER for async, REQ/REP for sync), not from vLLM's internal multiprocessing. Objects that can't survive subprocess serialization (e.g. `TensorLoRARequest` with tensor fields, or custom adapter types) are created inside the server process and passed to the in-process engine directly — they never cross the EngineCore boundary.
+Setting it to `0` is safe for the sync server because the ZMQ REQ/REP boundary (not vLLM's internal multiprocessing) is where the training↔server split lives. Objects that can't survive subprocess serialization (e.g. `TensorLoRARequest` with tensor fields, or custom adapter types) are created inside the server process and passed to the in-process engine directly — they never cross the EngineCore boundary.
