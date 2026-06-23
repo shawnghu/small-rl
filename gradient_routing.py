@@ -556,6 +556,58 @@ def collect_routing_params(model):
 
 
 # ---------------------------------------------------------------------------
+# Frozen adapter view (for one-step off-policy old-logprob recompute)
+# ---------------------------------------------------------------------------
+
+def make_frozen_adapter_view(model):
+    """Build a second model that shares the frozen base weights by reference but
+    holds its own (frozen) copy of the adapter weights.
+
+    Used by one-step off-policy training: the rollout thread computes old
+    logprobs against this view (a snapshot of θ at rollout time) while the main
+    thread concurrently updates the live adapters — they touch disjoint adapter
+    tensors, and the shared frozen base is read-only on both sides.
+
+    Memory: only the adapter weights are duplicated. The transient deepcopy
+    duplicates the base too, but every base param's storage is then re-pointed
+    at the live model's storage, so the duplicate base tensors are freed.
+
+    Requires adapter-only training (frozen base): asserts no base param is
+    trainable. Call `sync_adapter_snapshot(model, view)` to refresh the snapshot
+    each cycle.
+    """
+    import copy
+    assert has_dual_adapters(model), "make_frozen_adapter_view: model has no dual adapters"
+    view = copy.deepcopy(model)
+    live_by_name = dict(model.named_parameters())
+    n_shared = n_snap = 0
+    for name, sp in view.named_parameters():
+        lp = live_by_name[name]
+        if lp.requires_grad:
+            n_snap += 1            # adapter param: keep the (independent) deepcopy
+        else:
+            sp.data = lp.data      # frozen base: share storage with the live model
+            n_shared += 1
+        sp.requires_grad_(False)   # the whole view is read-only
+    assert n_snap > 0, "make_frozen_adapter_view: no trainable (adapter) params found"
+    view.eval()
+    return view
+
+
+def sync_adapter_snapshot(live_model, view):
+    """Copy the live adapter weights into the frozen view (the per-cycle snapshot).
+
+    Only the trainable (adapter) params are copied; the base is already shared.
+    """
+    live_by_name = dict(live_model.named_parameters())
+    with torch.no_grad():
+        for name, sp in view.named_parameters():
+            lp = live_by_name[name]
+            if lp.requires_grad:
+                sp.data.copy_(lp.data)
+
+
+# ---------------------------------------------------------------------------
 # Per-sample gradient capture (diagnostic)
 # ---------------------------------------------------------------------------
 

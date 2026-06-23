@@ -1,7 +1,6 @@
 """Shared utilities for vLLM integration: presets, serialization, GRPO helpers.
 
-Used by vllm_server.py, vllm_async_server.py, vllm_lora.py, vllm_client.py,
-train.py, sweep.py.
+Used by vllm_server.py, vllm_lora.py, vllm_client.py, train.py, sweep.py.
 """
 
 import numpy as np

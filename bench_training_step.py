@@ -531,7 +531,6 @@ def main():
     params.pop("vllm_server", None)
     params["vllm_spawn"] = False
     params["vllm_colocate"] = False
-    params["vllm_async"] = False
     # sweep.py-only keys (not in train.py's argparse)
     for sweep_only_key in ("vllm_dtype", "per_gpu"):
         params.pop(sweep_only_key, None)

@@ -68,7 +68,6 @@ def main():
     params["save_steps"] = 999999
     # Generation backend: HF generate by default (no vLLM); opt into vLLM spawn.
     params["vllm_spawn"] = bool(args.vllm_spawn)
-    params["vllm_async"] = False
     params["vllm_colocate"] = False
     params.pop("vllm_server", None)
     if args.vllm_spawn:

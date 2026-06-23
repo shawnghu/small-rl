@@ -525,6 +525,88 @@ def _pack_for_forward(inputs, indices):
     }
 
 
+def _packed_forward_logps(unwrapped_model, packed):
+    """Per-token logps for one packed microbatch, via the SAME padding-free forward
+    the update uses (NOT the padded kernel). no_grad. Returns (n_seqs, max_comp_len).
+
+    Mirrors the forward + repad + chunked-lm_head extraction inside
+    _packed_compute_loss (so old & new logps come from the identical kernel).
+    """
+    packed_ids = packed["packed_input_ids"]        # (1, T)
+    packed_pos = packed["packed_position_ids"]      # (1, T)
+    seq_boundaries = packed["seq_boundaries"]
+    n_seqs = packed["num_sequences"]
+    max_comp_len = packed["max_comp_len"]
+
+    output = unwrapped_model.model(
+        input_ids=packed_ids, position_ids=packed_pos, use_cache=False,
+    )
+    hidden_states = output.last_hidden_state  # (1, T, H)
+    hidden_dim = hidden_states.shape[-1]
+    device = hidden_states.device
+
+    last_hs_padded = torch.zeros(n_seqs, max_comp_len, hidden_dim,
+                                 device=device, dtype=hidden_states.dtype)
+    p_lens_t = torch.tensor([p for p, _ in seq_boundaries], device=device)
+    c_lens_t = torch.tensor([c for _, c in seq_boundaries], device=device)
+    seq_lens_t = p_lens_t + c_lens_t
+    offsets_t = torch.cumsum(seq_lens_t, 0) - seq_lens_t
+    ar = torch.arange(max_comp_len, device=device)
+    valid = ar.unsqueeze(0) < c_lens_t.unsqueeze(1)
+    gather_pos = (offsets_t + p_lens_t - 1).unsqueeze(1) + ar.unsqueeze(0)
+    flat_pos = gather_pos[valid]
+    last_hs_padded[valid] = hidden_states[0].index_select(0, flat_pos)
+
+    sel_ids = packed["completion_ids"]                       # (n_seqs, max_comp_len)
+    per_token_logps = torch.zeros(n_seqs, max_comp_len, device=device, dtype=torch.float32)
+    chunk = 2
+    for b in range(0, n_seqs, chunk):
+        hs = last_hs_padded[b:b + chunk]
+        logits = unwrapped_model.lm_head(hs)
+        log_probs = torch.nn.functional.log_softmax(logits.float(), dim=-1)
+        ids = sel_ids[b:b + chunk]
+        per_token_logps[b:b + chunk] = log_probs.gather(-1, ids.unsqueeze(-1)).squeeze(-1)
+    return per_token_logps
+
+
+def _packed_per_token_logps(unwrapped_model, inputs, max_tokens):
+    """Old logps over a whole rollout batch via the packed kernel, no_grad.
+
+    Bins by `max_tokens` (the update's token budget) so memory is bounded, runs
+    each bin through `unwrapped_model` (e.g. the frozen θ-snapshot view), and
+    scatters back into a (n_total, C) tensor aligned with inputs['completion_mask'].
+    """
+    device = inputs["completion_mask"].device
+    n_total, C = inputs["completion_mask"].shape
+    out = torch.zeros(n_total, C, device=device, dtype=torch.float32)
+
+    # _pack_for_forward unconditionally reads inputs["advantages"] (the update
+    # needs it); old_logps doesn't, so supply a placeholder when absent.
+    if "advantages" not in inputs or inputs["advantages"] is None:
+        inputs = {**inputs, "advantages": torch.zeros(n_total, device=device)}
+
+    token_counts = inputs["completion_mask"].sum(dim=1).tolist()
+    if "prompt_mask" in inputs:
+        prompt_counts = inputs["prompt_mask"].sum(dim=1).tolist()
+        token_counts = [p + c for p, c in zip(prompt_counts, token_counts)]
+    mbs = _pack_by_tokens(token_counts, list(range(n_total)), max_tokens)
+
+    was_training = unwrapped_model.training
+    unwrapped_model.eval()
+    try:
+        with torch.no_grad():
+            for indices in mbs:
+                packed = _pack_for_forward(inputs, indices)
+                lp = _packed_forward_logps(unwrapped_model, packed)  # (n_bin, mcl)
+                mcl = packed["max_comp_len"]
+                idx_t = torch.tensor(indices, device=device, dtype=torch.long)
+                out[idx_t.unsqueeze(1), torch.arange(mcl, device=device).unsqueeze(0)] = lp
+    finally:
+        if was_training:
+            unwrapped_model.train()
+    return out
+
+
 class SampleGRPOTrainer(GRPOTrainer):
     """GRPOTrainer with sample logging and optional gradient routing."""
 
@@ -5001,8 +5083,6 @@ def _make_parser():
     parser.add_argument("--vllm_spawn", action="store_true", default=False,
                         help="Spawn a local vLLM server for this run (one server per run). "
                              "Uses the run's own model/mlp_config. Mutually exclusive with --vllm_server.")
-    parser.add_argument("--vllm_async", action="store_true", default=False,
-                        help="Use AsyncVLLMClient (for shared async server). Requires --vllm_server.")
     parser.add_argument("--vllm_gpu_memory", type=float, default=0.02,
                         help="GPU memory utilization fraction for spawned vLLM server (default: 0.02).")
     parser.add_argument("--vllm_colocate", action="store_true", default=False,
@@ -5682,9 +5762,6 @@ def _run(args, exp_cfg=None):
                 "OR --reward_penalty_baseline (RP+extras gives the baseline the "
                 "same verified-retain extras the GR runs use, single forward-backward.)"
             )
-            assert not args.vllm_async, (
-                "coh_samples_per_rollout > 0 is not compatible with --vllm_async"
-            )
             assert args.retain_mode != "penalty", (
                 "coh_samples_per_rollout > 0 is not compatible with --retain_mode=penalty"
             )
@@ -5832,11 +5909,7 @@ def _run(args, exp_cfg=None):
     vllm_client = None
     _vllm_server_proc = None
     if args.vllm_server:
-        if args.vllm_async:
-            from vllm_client import AsyncVLLMClient
-            print(f"[vLLM] Connecting to async server at {args.vllm_server}...")
-            vllm_client = AsyncVLLMClient(args.vllm_server)
-        elif args.adapter_type == "lora":
+        if args.adapter_type == "lora":
             from vllm_lora import VLLMLoRAClient
             print(f"[vLLM] Connecting to LoRA server at {args.vllm_server}...")
             vllm_client = VLLMLoRAClient(args.vllm_server)
@@ -6181,12 +6254,6 @@ def _run(args, exp_cfg=None):
         if torch.cuda.is_available():
             peak_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
             print(f"Peak GPU memory: {peak_mb:.0f} MB ({peak_mb/1024:.1f} GB)")
-        # Release slot back to shared async server (zeros weights, frees slot for next run)
-        if args.vllm_async and vllm_client is not None and trainer._vllm_experiment_id is not None:
-            try:
-                vllm_client.release(trainer._vllm_experiment_id)
-            except Exception as e:
-                print(f"[vLLM] Warning: release failed: {e}")
         if _vllm_server_proc is not None:
             try:
                 vllm_client.shutdown()

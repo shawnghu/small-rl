@@ -516,57 +516,6 @@ def stop_vllm_servers(servers):
         _kill_vllm_proc(proc)
 
 
-def _async_vllm_server_worker(gpu_id, model_name, mlp_config, max_experiments,
-                               gpu_memory, socket_path, ready_file=None):
-    """Entry point for shared async vLLM server process (spawned child)."""
-    import asyncio, os
-    os.setsid()
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-    os.environ.setdefault("VLLM_LOGGING_LEVEL", "ERROR")
-    os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
-
-    from vllm_utils import MLP_PRESETS
-    from vllm_async_server import AsyncVLLMServer
-
-    preset = MLP_PRESETS[mlp_config]
-    server = AsyncVLLMServer(
-        socket_addr=socket_path,
-        max_experiments=max_experiments,
-        retain_neurons=preset["retain_neurons"],
-        forget_neurons=preset["forget_neurons"],
-        model_name=model_name,
-        gpu_memory_utilization=gpu_memory,
-    )
-    class _FileEvent:
-        def __init__(self, path):
-            self._path = path
-        def set(self):
-            open(self._path, "w").close()
-    asyncio.run(server.run(ready_event=_FileEvent(ready_file) if ready_file else None))
-
-
-def start_async_vllm_servers(gpus, model_name, mlp_config, max_experiments, gpu_memory):
-    """Start one shared async vLLM server per GPU. Returns {gpu: (proc, socket_path)}."""
-    import tempfile
-    ctx = multiprocessing.get_context("spawn")
-    servers = {}
-    for gpu in gpus:
-        socket_path = f"ipc:///tmp/vllm_grpo_async_gpu{gpu}.sock"
-        ready_file = tempfile.mktemp(prefix="vllm_ready_", suffix=f"_async_gpu{gpu}")
-        proc = ctx.Process(
-            target=_async_vllm_server_worker,
-            args=(gpu, model_name, mlp_config, max_experiments, gpu_memory, socket_path),
-            kwargs={"ready_file": ready_file},
-        )
-        proc.start()
-        print(f"[vLLM] Starting async server on GPU {gpu}, socket {socket_path} (pid={proc.pid})")
-        _wait_for_vllm_ready(ready_file, proc, f"Async vLLM server on GPU {gpu}")
-        servers[gpu] = (proc, socket_path)
-        print(f"[vLLM] Async server on GPU {gpu} ready")
-
-    return servers
-
-
 def _find_free_port():
     """Return an available TCP port."""
     import socket
@@ -801,7 +750,7 @@ class SweepRunner:
                  retain_penalty=False, filter_baseline=True, reward_penalty=True,
                  regular_baseline=True,
                  shuffle=True,
-                 vllm_servers=None, vllm_async_servers=None,
+                 vllm_servers=None,
                  gpus_per_run=1, stagger=0,
                  backend="local", pack_runs=False, max_per_pack=6,
                  max_concurrent_packs=None, pack_group_keys=None,
@@ -924,9 +873,6 @@ class SweepRunner:
         # Empty for backend=modal — vLLM is spawned inside the Modal container
         # by train.py (vllm_spawn=True forced by tools.modal_train_gr).
         self.vllm_servers = vllm_servers or {}
-        # Shared async vLLM servers: {gpu: (proc, socket_path)}
-        self.vllm_async_servers = vllm_async_servers or {}
-        self.vllm_async_sockets = {gpu: path for gpu, (_, path) in self.vllm_async_servers.items()}
 
         # Modal backend bookkeeping. Each pack -> Modal FunctionCall handle.
         # Indexed by an internal pack_id (monotonic). For pack_runs=False each
@@ -1126,8 +1072,6 @@ class SweepRunner:
                 pass
         if self.vllm_servers:
             stop_vllm_servers(self.vllm_servers)
-        if self.vllm_async_servers:
-            stop_vllm_servers(self.vllm_async_servers)
         if self.use_mps:
             stop_mps_daemons(self.gpus)
         sys.exit(1)
@@ -1232,15 +1176,6 @@ class SweepRunner:
         # Multi-GPU DDP: inject world_size so train.py knows to mp.spawn
         if self.gpus_per_run > 1:
             full_params["world_size"] = self.gpus_per_run
-
-        # Shared async server: inject socket path for the assigned GPU
-        # (not compatible with multi-GPU per run)
-        if self.vllm_async_sockets and gpu_group[0] in self.vllm_async_sockets:
-            assert self.gpus_per_run == 1, (
-                "Shared async vLLM servers are not compatible with gpus_per_run > 1"
-            )
-            full_params["vllm_server"] = self.vllm_async_sockets[gpu_group[0]]
-            full_params["vllm_async"] = True
 
         # Per-run vLLM server: spawn directly from sweep process (avoids daemon nesting),
         # then pass socket path to training worker instead of spawning from within the worker.
@@ -1508,9 +1443,9 @@ class SweepRunner:
     # Invariants:
     #   - vllm_spawn=True is forced (vLLM runs in-process inside the Modal
     #     container; no separate server is spawned).
-    #   - vllm_async / vllm_server_base sweep-level params are ignored: there
-    #     is no shared server inside a container, and there's no need for
-    #     ZMQ-based sharing across containers either.
+    #   - vllm_server_base sweep-level param is ignored: there is no shared
+    #     server inside a container, and there's no need for ZMQ-based sharing
+    #     across containers either.
     #   - per_gpu / slot_pool / MPS daemons on the orchestrator box are not
     #     used. Concurrency is whatever Modal will run for us (effectively
     #     unlimited for our scales, capped by max_concurrent_packs).
@@ -2027,8 +1962,6 @@ class SweepRunner:
 
         if self.vllm_servers:
             stop_vllm_servers(self.vllm_servers)
-        if self.vllm_async_servers:
-            stop_vllm_servers(self.vllm_async_servers)
         if self.use_mps:
             stop_mps_daemons(self.gpus)
 
@@ -2300,8 +2233,6 @@ def main():
                         help="Start one vLLM server per run for generation offloading (default: on)")
     parser.add_argument("--no_vllm", action="store_true",
                         help="Disable vLLM server (use HF generate instead)")
-    parser.add_argument("--vllm_async", action="store_true",
-                        help="Start one shared async vLLM server per GPU (dynamic batching across runs)")
     parser.add_argument("--vllm_model", default=None,
                         help="Model for vLLM server (default: from run configs)")
     parser.add_argument("--vllm_mlp_config", default="m32",
@@ -2420,9 +2351,6 @@ def main():
             # rejecting here makes the inconsistency loud rather than silent.
             parser.error("--no_vllm is incompatible with --backend modal "
                          "(the Modal container always spawns vLLM in-process)")
-        if args.vllm_async:
-            parser.error("--vllm_async is incompatible with --backend modal "
-                         "(no shared async server inside a single H100 container)")
         # Mark every run for in-process vLLM. The Modal worker also defaults to
         # vllm_spawn=True; setting it here keeps the run dict identical to what
         # a local run would carry, which simplifies cache key parity.
@@ -2430,7 +2358,6 @@ def main():
             run.setdefault("vllm_spawn", True)
             run.setdefault("vllm_gpu_memory", args.vllm_gpu_memory)
         vllm_servers = {}
-        vllm_async_servers = {}
     else:
         gpus = discover_gpus()
         use_mps = not args.no_mps
@@ -2446,7 +2373,6 @@ def main():
 
         if args.no_vllm:
             args.vllm = False
-        assert not (args.vllm and args.vllm_async), "--vllm and --vllm_async are mutually exclusive"
 
         # Inject vllm into all runs when --vllm is set
         # Routes to colocate when:
@@ -2464,22 +2390,6 @@ def main():
                 run.setdefault("vllm_gpu_memory", args.vllm_gpu_memory)
 
         vllm_servers = {}
-        vllm_async_servers = {}
-    if args.vllm_async and not args.dry_run:
-        vllm_model = args.vllm_model or runs[0].get("model", "HuggingFaceTB/SmolLM2-135M-Instruct")
-        # max_experiments must cover all runs that will ever register on this server,
-        # not just the concurrent slot count — slots are never reused after a run finishes.
-        # Each run registers 3 slots: 1 training (reused as "both" eval mode) + 2 extra
-        # eval slots for retain_only and forget_only (concurrent eval).
-        runs_per_gpu = (len(runs) + len(gpus) - 1) // len(gpus)  # ceiling div
-        max_exp = args.vllm_max_experiments or (3 * max(per_gpu, runs_per_gpu))
-        vllm_async_servers = start_async_vllm_servers(
-            gpus, vllm_model, args.vllm_mlp_config, max_exp, args.vllm_gpu_memory,
-        )
-        # Mark all runs as using async server; socket path injected per-run by SweepRunner
-        for run in runs:
-            run["vllm_async"] = True
-
     # Sweep-config-file-level overrides for pack semantics. CLI wins on
     # max_per_pack only when explicitly set (not the default).
     cfg_pack_runs       = bool(cfg_attrs["pack_runs"])
@@ -2520,7 +2430,6 @@ def main():
         regular_baseline=not args.no_regular_baseline,
         shuffle=not args.no_shuffle,
         vllm_servers=vllm_servers,
-        vllm_async_servers=vllm_async_servers,
         gpus_per_run=gpus_per_run,
         stagger=args.stagger,
         backend=args.backend,

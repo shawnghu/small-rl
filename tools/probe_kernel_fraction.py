@@ -108,7 +108,7 @@ def main():
         "no_wandb": True, "max_steps": 1, "eval_every": 0, "save_steps": 999999,
         "output_dir": "/tmp/probe_kernel_fraction_out",
         "run_name": "probe_kernel_fraction",
-        "vllm_spawn": False, "vllm_async": False, "vllm_colocate": False,
+        "vllm_spawn": False, "vllm_colocate": False,
         "compile_update": args.compile_update,
         **({"gradient_checkpointing": False} if args.no_gradient_checkpointing else {}),
         **({"max_tokens_per_microbatch": args.max_tokens_per_microbatch}
