@@ -610,7 +610,65 @@ def _packed_per_token_logps(unwrapped_model, inputs, max_tokens):
 class SampleGRPOTrainer(GRPOTrainer):
     """GRPOTrainer with sample logging and optional gradient routing."""
 
-    def __init__(self, *args, gradient_routing_enabled=False,
+    @property
+    def _rollout_model(self):
+        """Model the rollout phase reads for HF forwards (old/ref logprobs and the
+        coherence recompute). Normally the live model; under one-step off-policy it
+        is a frozen snapshot view, decoupled from the live model the update mutates
+        concurrently. Defaults to self.model, so it is a no-op when one-step-off is
+        off (and for every other code path)."""
+        v = getattr(self, "_osp_rollout_view", None)
+        return v if v is not None else self.model
+
+    # ----- one-step off-policy controller (see ONE_STEP_OFF_POLICY_PLAN.md) -----
+
+    def _osp_launch(self, prompts):
+        """Run the rollout (generate + reward + old/ref logps via the frozen view)
+        on a background thread, overlapping the upcoming optimizer steps. The
+        rollout reads self._rollout_model (the view) + vLLM; it never touches the
+        live self.model that the main thread updates."""
+        import threading
+        self._osp_result = None
+        self._osp_exc = None
+
+        def _work():
+            try:
+                self._osp_result = self._generate_and_score_completions(prompts)
+            except BaseException as e:  # surface in the main thread at join
+                self._osp_exc = e
+        self._osp_thread = threading.Thread(target=_work, name="osp_rollout", daemon=True)
+        self._osp_thread.start()
+
+    def _osp_join(self):
+        self._osp_thread.join()
+        self._osp_thread = None
+        if self._osp_exc is not None:
+            raise self._osp_exc
+        return self._osp_result
+
+    def _osp_step(self, prompts):
+        """One-step off-policy: train last cycle's rollout while the next is
+        generated concurrently (one rollout stale). At the barrier (here, on the
+        main thread, with no rollout thread running) we refresh the frozen view
+        to the current theta; the held batch carries old_logps computed in-thread
+        against the PREVIOUS theta."""
+        from gradient_routing import make_frozen_adapter_view, sync_adapter_snapshot
+        if self._osp_view is None:
+            self._osp_view = make_frozen_adapter_view(self.model)
+            self._osp_rollout_view = self._osp_view  # _rollout_model -> view henceforth
+        if self._osp_thread is None:
+            # Cold start (cycle 0): generate synchronously (on-policy, no overlap),
+            # then prime the pipeline (reuses this cycle's prompts once).
+            sync_adapter_snapshot(self.model, self._osp_view)
+            batch = self._generate_and_score_completions(prompts)
+            self._osp_launch(prompts)
+            return batch
+        held = self._osp_join()                              # B from last cycle (old_logps vs prev theta)
+        sync_adapter_snapshot(self.model, self._osp_view)    # refresh view -> current theta
+        self._osp_launch(prompts)                            # generate next, overlapping this update
+        return held
+
+    def __init__(self, *args, gradient_routing_enabled=False, one_step_off=False,
                  retain_params=None, forget_params=None,
                  routing_mode=None, rh_detector=None,
                  base_rh_detector=None,
@@ -793,6 +851,12 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._coherence_rh_penalty = coherence_rh_penalty
         self._coherence_rollout_counter = 0
         self._is_coherence_rollout = False
+        # One-step off-policy pipeline state.
+        self._one_step_off = one_step_off
+        self._osp_view = None        # frozen theta-snapshot (the rollout model)
+        self._osp_thread = None      # in-flight rollout thread
+        self._osp_result = None
+        self._osp_exc = None
         self._coh_samples_per_rollout = coh_samples_per_rollout
         self._interlaced_coh = coh_samples_per_rollout > 0
         # Retain-verification skyline: detector also verifies non-hack samples,
@@ -1200,7 +1264,7 @@ class SampleGRPOTrainer(GRPOTrainer):
 
         # Sync weights to vLLM
         with self._time("timing/rollout/vllm_sync"):
-            client.update_weights_from_model(eid, self.model)
+            client.update_weights_from_model(eid, self._rollout_model)
 
             # Determine forget_scale for this rollout's routing samples.
             # Default: 1.0 (both adapters at full scale). Modes:
@@ -1250,7 +1314,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                          ("forget_only", 0.0, 1.0)]
                 for mode_name, retain_scale, forget_scale in modes:
                     eval_eid = self._eval_experiment_ids[mode_name]
-                    client.update_weights_from_model(eval_eid, self.model)
+                    client.update_weights_from_model(eval_eid, self._rollout_model)
                     client.set_scales(eval_eid, retain_scale, forget_scale)
 
         # Tokenize prompts (handle both chat and plain string formats)
@@ -1538,7 +1602,10 @@ class SampleGRPOTrainer(GRPOTrainer):
                 else:
                     self._is_coherence_rollout = False
 
-            generation_batch = self._generate_and_score_completions(generation_batch)
+            if self._one_step_off:
+                generation_batch = self._osp_step(generation_batch)
+            else:
+                generation_batch = self._generate_and_score_completions(generation_batch)
             generation_batch = split_pixel_values_by_grid(generation_batch)
 
             if self._interlaced_coh and use_dynamic and self._interlaced_coh_opt_batch_mode == "split":
@@ -1986,6 +2053,25 @@ class SampleGRPOTrainer(GRPOTrainer):
         # Still call super().log() for non-wandb side effects (log_history,
         # other callbacks), but WandbCallback has been removed so this won't
         # double-log to wandb.
+        if self._one_step_off:
+            # The background rollout thread appends to self._metrics concurrently
+            # with this read (proper metric isolation is a TODO). Defensively
+            # snapshot each mode: copy value lists (tolerating concurrent append),
+            # drop empties, keep defaultdict(list) so the update's auto-create
+            # (self._metrics[mode]["kl"].append) still works. Metrics may be
+            # slightly incomplete under one_step_off until isolated.
+            from collections import defaultdict as _dd
+            for mode in list(self._metrics.keys()):
+                md = self._metrics[mode]
+                nd = _dd(list)
+                for k in list(md.keys()):
+                    try:
+                        v = list(md[k])
+                    except (RuntimeError, KeyError):
+                        continue  # changed size mid-copy; skip this window
+                    if v:
+                        nd[k] = v
+                self._metrics[mode] = nd
         result = super().log(logs, *args, **kwargs)
         return result
 
@@ -2543,20 +2629,20 @@ class SampleGRPOTrainer(GRPOTrainer):
                 sub_batch_size = getattr(self, "_scoring_batch_size",
                                          self.args.per_device_train_batch_size)
 
-                set_scales(self.model, retain_scale=1.0, forget_scale=0.0)
+                set_scales(self._rollout_model, retain_scale=1.0, forget_scale=0.0)
                 try:
                     with torch.no_grad(), disable_gradient_checkpointing(
-                        self.model, self.args.gradient_checkpointing_kwargs
+                        self._rollout_model, self.args.gradient_checkpointing_kwargs
                     ):
                         coh_old_logps, _ = self._get_per_token_logps_and_entropies(
-                            self.model,
+                            self._rollout_model,
                             sub_prompt_completion_ids,
                             sub_attention_mask,
                             sub_logits_to_keep,
                             sub_batch_size,
                         )
                 finally:
-                    set_scales(self.model, retain_scale=1.0,
+                    set_scales(self._rollout_model, retain_scale=1.0,
                                forget_scale=self._train_forget_scale())
                 output["old_per_token_logps"][coh_slice] = coh_old_logps
         else:
@@ -4898,6 +4984,12 @@ def _make_parser():
                         help="Classic coherence: run a pure-coherence rollout every N routing rollouts (0=off). Mutually exclusive with --coh_samples_per_rollout.")
     parser.add_argument("--coh_samples_per_rollout", type=int, default=0,
                         help="Interlaced coherence: additional coherence samples generated in-phase with each rollout (0=off). Must be a multiple of num_generations and optimizer_batch_size. Mutually exclusive with --coherence_every.")
+    parser.add_argument("--one_step_off", action="store_true", default=False,
+                        help="One-step off-policy: overlap rollout(N) (generate + reward + "
+                             "old/ref logps via a frozen theta-snapshot) with the optimizer "
+                             "update(N-1) on a background thread; one rollout stale. Sync vLLM "
+                             "only. Incompatible with classic coherence (--coherence_every>0); "
+                             "interlaced coherence (--coh_samples_per_rollout) is supported.")
     parser.add_argument("--coherence_gen", choices=["both", "retain_only"], default="retain_only",
                         help="Adapter scales during coherence generation: 'both' or 'retain_only' (default)")
     parser.add_argument("--coherence_rh_mode", choices=["filter", "filter_renorm", "penalty", "zero"], default="filter",
@@ -5991,6 +6083,12 @@ def _run(args, exp_cfg=None):
               f"retain_source={args.retain_source})...")
         vllm_client = VLLMColocateClient(**colocate_kwargs)
 
+    assert not (args.one_step_off and args.coherence_every > 0), (
+        "--one_step_off is incompatible with classic coherence (--coherence_every>0): the "
+        "update reads the per-rollout _is_coherence_rollout flag, which would be one cycle "
+        "stale under the pipeline. Interlaced coherence (--coh_samples_per_rollout) carries "
+        "is_coherence per-sample in the batch and is supported."
+    )
     trainer = SampleGRPOTrainer(
         model=model,
         args=config,
@@ -6009,6 +6107,7 @@ def _run(args, exp_cfg=None):
         routed_reward=routed_reward,
         coherence=args.coherence,
         coherence_every=args.coherence_every,
+        one_step_off=args.one_step_off,
         coherence_gen=args.coherence_gen,
         coherence_rh_mode=args.coherence_rh_mode,
         coherence_rh_penalty=args.coherence_rh_penalty,
@@ -6238,6 +6337,14 @@ def _run(args, exp_cfg=None):
             print("\nInterrupted — no eval data to plot.")
         return
     finally:
+        # One-step off-policy: drain the in-flight prefetched rollout thread before
+        # any teardown — otherwise its concurrent vLLM/CUDA work as the process tears
+        # down the engine triggers "terminate called without an active exception".
+        if getattr(trainer, "_osp_thread", None) is not None:
+            try:
+                trainer._osp_join()
+            except Exception as e:
+                print(f"[one_step_off] rollout-thread drain failed: {e}")
         trainer._wait_for_eval_scoring()
         # Best-effort: render the per-sample grad diagnostic viewer if collected.
         _gd_jsonl = os.path.join(args.output_dir, "grad_diag.jsonl")

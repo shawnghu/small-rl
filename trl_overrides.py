@@ -71,7 +71,7 @@ def _ref_logps_liger_fused(
     """
     from liger_kernel.ops.fused_linear_cross_entropy import fused_linear_cross_entropy_forward
 
-    unwrapped = trainer.accelerator.unwrap_model(trainer.model)
+    unwrapped = trainer.accelerator.unwrap_model(trainer._rollout_model)
 
     last_hidden = trainer._get_last_hidden_state(
         unwrapped,
@@ -167,7 +167,7 @@ def _ref_logps_dynamic(
             )
         else:
             logps, _ = trainer._get_per_token_logps_and_entropies(
-                trainer.model,
+                trainer._rollout_model,
                 bin_ids,
                 bin_mask,
                 logits_to_keep,
@@ -405,7 +405,7 @@ def generate_and_score_completions(trainer, inputs):
             [token_type_ids, token_type_ids.new_zeros(completion_ids.shape)], dim=1
         )
 
-    with torch.no_grad(), disable_gradient_checkpointing(trainer.model, trainer.args.gradient_checkpointing_kwargs):
+    with torch.no_grad(), disable_gradient_checkpointing(trainer._rollout_model, trainer.args.gradient_checkpointing_kwargs):
         generate_every = trainer.args.steps_per_generation * trainer.num_iterations
         needs_old_logps = (
             trainer.args.gradient_accumulation_steps % generate_every != 0
@@ -418,7 +418,10 @@ def generate_and_score_completions(trainer, inputs):
             # ref pass, so it benefits from the same token-packed + liger-fused
             # optimizations. Peak memory under no_grad is dominated by the [B·T·V]
             # logits tensor (huge for Qwen3 vocab=152k), which liger's fused
-            # linear-CE kernel never materializes.
+            # linear-CE kernel never materializes. Under one_step_off all three
+            # branches forward _rollout_model (the frozen snapshot view) so old_logps
+            # is recomputed against the theta that generated the rollout — and they
+            # share the SAME packed/liger kernel as the actor update (IS consistency).
             old_budget = getattr(trainer, "_old_logps_max_tokens_per_microbatch", None)
             use_liger_fused = getattr(trainer, "use_liger_kernel", False)
             if old_budget is not None:
@@ -442,7 +445,7 @@ def generate_and_score_completions(trainer, inputs):
                 )
             else:
                 old_per_token_logps, _ = trainer._get_per_token_logps_and_entropies(
-                    trainer.model,
+                    trainer._rollout_model,
                     prompt_completion_ids,
                     attention_mask,
                     logits_to_keep,
@@ -515,7 +518,7 @@ def generate_and_score_completions(trainer, inputs):
                 )
             elif getattr(trainer, "_ref_via_disabled_adapters", False):
                 from gradient_routing import disabled_dual_adapters
-                model = trainer.accelerator.unwrap_model(trainer.model)
+                model = trainer.accelerator.unwrap_model(trainer._rollout_model)
                 ref_budget = getattr(trainer, "_ref_max_tokens_per_microbatch", None)
                 use_liger_fused = getattr(trainer, "use_liger_kernel", False)
                 with disabled_dual_adapters(model):
@@ -540,7 +543,7 @@ def generate_and_score_completions(trainer, inputs):
                         )
                     else:
                         ref_per_token_logps, _ = trainer._get_per_token_logps_and_entropies(
-                            trainer.model,
+                            trainer._rollout_model,
                             prompt_completion_ids,
                             attention_mask,
                             logits_to_keep,
@@ -549,10 +552,10 @@ def generate_and_score_completions(trainer, inputs):
                             **forward_kwargs,
                         )
             else:
-                model = trainer.accelerator.unwrap_model(trainer.model)
+                model = trainer.accelerator.unwrap_model(trainer._rollout_model)
                 with use_adapter(model, adapter_name="ref" if "ref" in model.peft_config else None):
                     ref_per_token_logps, _ = trainer._get_per_token_logps_and_entropies(
-                        trainer.model,
+                        trainer._rollout_model,
                         prompt_completion_ids,
                         attention_mask,
                         logits_to_keep,
