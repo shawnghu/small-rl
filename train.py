@@ -6265,7 +6265,13 @@ def _run(args, exp_cfg=None):
     # which keep the cheaper FAST path. Explicit --vllm_importance_sampling always
     # forces slow. The slow path needs vLLM-returned logprobs, which the LoRA client
     # can't provide, so LoRA always falls back to FAST.
-    trainer.vllm_no_sleep = getattr(args, 'vllm_no_sleep', False)
+    # one_step_off forces vllm_no_sleep: the rollout thread generates CONCURRENTLY with
+    # the optimizer update, so vLLM must stay resident the whole step. Sleeping after a
+    # generate is pointless (the next rollout, launched immediately, would wake it right
+    # back up mid-update) and actively harmful (a sleep/wake offload+reload per step, and
+    # a memory fight between the waking server and the running update). Inherent tradeoff:
+    # under OSP, vLLM + the update must both fit in memory at once (no sleep to free room).
+    trainer.vllm_no_sleep = getattr(args, 'vllm_no_sleep', False) or getattr(args, 'one_step_off', False)
     _SMALL_SCALE_ENVS = {"sorting", "addition_v2", "object_qa", "persona_qa",
                          "cities_qa", "repeat", "topic"}
     _is_smollm135m = "smollm" in args.model.lower() and "135m" in args.model.lower()
