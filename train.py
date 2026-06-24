@@ -679,7 +679,16 @@ class SampleGRPOTrainer(GRPOTrainer):
         from gradient_routing import force_plain_forward
 
         def _work():
+            # Time from launch (main thread, just before .start()) to the rollout
+            # thread's first executed line. Under OSP the main thread dives straight
+            # into the GIL-heavy optimizer update after .start(), so this delta is
+            # the GIL-starvation the rollout thread eats before it can even fire its
+            # vLLM request — uninstrumented by timing/rollout (which starts later) and
+            # the leading suspect for the rollout-thread wall-clock gap.
+            _t_started = time.perf_counter()
             self._osp_tls.buffer = buffer
+            buffer["train"].setdefault("timing/osp/launch_to_start", []).append(
+                _t_started - _t_launch)
             # force_plain_forward: this rollout thread's frozen-view no_grad forwards
             # (old/ref logps) must take the plain adapter branch, never the fused
             # branch the main update thread installs globally. Thread-local, so it
@@ -693,6 +702,7 @@ class SampleGRPOTrainer(GRPOTrainer):
             finally:
                 self._osp_tls.buffer = None
         self._osp_thread = threading.Thread(target=_work, name="osp_rollout", daemon=True)
+        _t_launch = time.perf_counter()
         self._osp_thread.start()
 
     def _osp_join(self):
@@ -3452,16 +3462,21 @@ class SampleGRPOTrainer(GRPOTrainer):
                 inner = getattr(rf, 'full_fn', None)
                 if isinstance(inner, CombinedReward):
                     cr = inner; break
-            if cr is not None and self.accelerator.is_main_process:
+            if cr is not None and self.accelerator.is_main_process and self._trace_routing:
+                # Decode ONLY the n_log rows we actually log — not the whole batch.
+                # output["*_ids"] are on-device, so batch_decode forces a CPU sync;
+                # decoding all 544 (object_qa) or 512x1536 tokens (leetcode) to write 8
+                # was a pure-waste serial cost on the rollout thread under OSP. Gated on
+                # trace_routing so throughput runs skip this diagnostic entirely.
+                n_log = min(8, output["completion_ids"].shape[0])
                 comps_text = self.processing_class.batch_decode(
-                    output["completion_ids"], skip_special_tokens=True)
+                    output["completion_ids"][:n_log], skip_special_tokens=True)
                 prompts_text = self.processing_class.batch_decode(
-                    output["prompt_ids"], skip_special_tokens=True)
+                    output["prompt_ids"][:n_log], skip_special_tokens=True)
                 comp_scores = {}
                 for name, fn, _, _ in cr.components:
                     if fn._last_scores is not None:
                         comp_scores[name] = fn._last_scores
-                n_log = min(8, len(comps_text))
                 rec_base = {"step": self.state.global_step}
                 if inputs and isinstance(inputs[0], dict):
                     extras_keys = [k for k in inputs[0]
