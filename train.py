@@ -22,7 +22,9 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 from trl import GRPOTrainer, GRPOConfig
 from trl.trainer.utils import shuffle_sequence_dict, split_tensor_dict
 from trl_overrides import generate_single_turn, generate_and_score_completions
-from advantages import AdvConfig, compute_routed_advantages
+from advantages import (
+    AdvConfig, compute_routed_advantages, drop_zero_advantage_microbatches,
+)
 
 
 class Tee:
@@ -507,6 +509,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                  reward_penalty_amount=None,
                  verbose=False, adapter_config=None,
                  retain_renormalization=False,
+                 drop_zero_advantage=False,
                  combined_reward=None,
                  coherence="none",
                  coherence_rh_mode="filter",
@@ -627,6 +630,7 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._reward_penalty_baseline = reward_penalty_baseline
         self._reward_penalty_amount = reward_penalty_amount
         self._retain_renormalization = retain_renormalization
+        self._drop_zero_advantage = drop_zero_advantage
         self._combined_reward = combined_reward
         # --- loss_type validation (DAPO token-level support) ---
         # The custom microbatch/fused reduction paths implement exactly two TRL
@@ -3540,6 +3544,21 @@ class SampleGRPOTrainer(GRPOTrainer):
             all_mbs = [(None, mb) for mb in _pack_by_tokens(token_counts, all_idx, max_tok)]
             bad_idx = []
 
+        # Incidental zero-advantage drop (opt-in compute optimization). Removes
+        # samples with exactly zero advantage from the microbatches: they
+        # contribute no policy gradient, and at beta==0 no KL either, so this is
+        # gradient-equivalent — but ONLY because scale_denom/tok_denom are left
+        # unchanged (survivors are NOT upweighted; distinct from should_filter).
+        # Falls back to no-drop if the whole batch is zero-advantage (rare; avoids
+        # an empty microbatch list).
+        if self._drop_zero_advantage:
+            assert self.beta == 0, (
+                "drop_zero_advantage requires beta==0: at beta>0 a zero-advantage "
+                "sample still carries a KL gradient, so dropping it changes the update.")
+            _filtered = drop_zero_advantage_microbatches(all_mbs, inputs["advantages"])
+            if _filtered:
+                all_mbs = _filtered
+
         use_packed = self.use_liger_kernel and hasattr(self, 'liger_grpo_loss')
 
         # Fused heterogeneous-microbatch path: collapse the per-class (coherence/
@@ -4532,6 +4551,9 @@ def _make_parser():
                         help="Retain adapter advantage renormalization: when set, the good-pass "
                              "advantages are a per-group GRPO normalization over the non-RH samples "
                              "(default: off — retain advantages unchanged).")
+    parser.add_argument("--drop_zero_advantage", action=argparse.BooleanOptionalAction, default=False,
+                        help="Compute optimization: drop samples with exactly zero advantage from the "
+                             "microbatches (gradient-equivalent at beta==0; requires beta==0). Default off.")
     # Filter baseline
     parser.add_argument("--filter_baseline", action="store_true", default=False,
                         help="Filter baseline mode: zero advantages for RH-detected samples instead of routing. "
@@ -5531,6 +5553,7 @@ def _run(args, exp_cfg=None):
         verbose=args.verbose,
         adapter_config=adapter_config,
         retain_renormalization=args.retain_renormalization,
+        drop_zero_advantage=args.drop_zero_advantage,
         combined_reward=combined_reward,
         vllm_client=vllm_client,
         adapter_type=args.adapter_type,

@@ -69,6 +69,27 @@ class AdvConfig:
     rp_extra_retain_advantage_multiplier: float = 1.0
 
 
+def drop_zero_advantage_microbatches(all_mbs, advantages):
+    """Drop samples whose advantage is exactly 0 from each microbatch index list,
+    removing any microbatch left empty. A zero-advantage sample contributes no
+    policy gradient (and, at beta==0, no KL), so dropping it is gradient-equivalent
+    PROVIDED the caller leaves the loss denominators (scale_denom / tok_denom)
+    unchanged — survivors must NOT be upweighted. This is purely a compute
+    optimization, distinct from should_filter (which intentionally drops samples
+    AND upweights the survivors).
+
+    Pure index surgery. all_mbs is a list of (tag, index_list); advantages is the
+    per-sample [n] tensor. Returns a new all_mbs.
+    """
+    nz = advantages != 0
+    out = []
+    for tag, idx in all_mbs:
+        kept = [i for i in idx if bool(nz[i])]
+        if kept:
+            out.append((tag, kept))
+    return out
+
+
 def _subset_group_renorm(rewards: torch.Tensor, subset: torch.Tensor,
                          G: int) -> torch.Tensor:
     """Per-group GRPO renorm over only the ``subset`` samples in each group.

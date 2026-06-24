@@ -16,9 +16,19 @@ folded into `advantages` (no separate retain_advantages tensor).
 
 import torch
 
-from advantages import AdvConfig, compute_routed_advantages
+from advantages import (
+    AdvConfig, compute_routed_advantages, drop_zero_advantage_microbatches,
+)
 
 _EPS = 1e-4
+
+
+def test_drop_zero_advantage_microbatches():
+    adv = torch.tensor([0.0, 1.0, 0.0, -2.0, 3.0, 0.0])
+    mbs = [("coherence", [0, 1]), (True, [2, 3]), (False, [4]), (None, [0, 2, 5])]
+    out = drop_zero_advantage_microbatches(mbs, adv)
+    # zeros at idx 0,2,5 dropped; the all-zero microbatch ([0,2,5]) removed.
+    assert out == [("coherence", [1]), (True, [3]), (False, [4])]
 
 
 def _reference_impl(raw_rewards, base_advantages, is_rh, is_coherence,
