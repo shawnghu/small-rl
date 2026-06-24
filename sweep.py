@@ -269,8 +269,9 @@ def _run_worker(params: dict, log_path: str, gpu_ids: list[int], mps_pipe_dir: s
     import sys
 
     if len(gpu_ids) > 1:
-        # Multi-GPU DDP: expose all GPUs; train.py will mp.spawn DDP workers
-        os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in gpu_ids)
+        # Multi-GPU DDP: expose all GPUs; train.py will mp.spawn DDP workers.
+        # Map to logical indices in case the parent restricted CUDA_VISIBLE_DEVICES.
+        os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(logical_gpu_index(g)) for g in gpu_ids)
         effective_gpu_id = 0  # rank 0's device; DDP workers set their own
     elif mps_pipe_dir is not None:
         # MPS: pipe dir selects the physical GPU; virtual device must be 0
@@ -278,8 +279,9 @@ def _run_worker(params: dict, log_path: str, gpu_ids: list[int], mps_pipe_dir: s
         os.environ["CUDA_MPS_PIPE_DIRECTORY"] = mps_pipe_dir
         effective_gpu_id = 0
     else:
-        # Isolate this worker to its physical GPU; logical device is always 0
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_ids[0])
+        # Isolate this worker to its physical GPU (logical index within the
+        # parent's CUDA_VISIBLE_DEVICES restriction); device is always 0 after.
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(logical_gpu_index(gpu_ids[0]))
         effective_gpu_id = 0
 
     # LLM judge URL routing: map physical GPU → dedicated judge server on
@@ -313,6 +315,19 @@ def discover_gpus():
         return [0]
 
 
+def logical_gpu_index(physical_gpu):
+    """Map a physical GPU id to its logical CUDA index within the parent process's
+    CUDA_VISIBLE_DEVICES restriction. Identity when unrestricted. Needed because a
+    child given CUDA_VISIBLE_DEVICES=<physical> is wrong when the parent already
+    restricted visibility to a non-zero-starting subset (e.g. parent CVD=1 → GPU 1
+    is logical device 0, so the child must get '0', not '1')."""
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if not visible:
+        return physical_gpu
+    ids = [int(x.strip()) for x in visible.split(",")]
+    return ids.index(physical_gpu) if physical_gpu in ids else physical_gpu
+
+
 MPS_PIPE_BASE = "/tmp/nvidia_mps"
 MPS_LOG_BASE = "/tmp/nvidia_mps_log"
 
@@ -343,7 +358,7 @@ def start_mps_daemons(gpus):
             skipped.append(gpu)
             continue
         env = os.environ.copy()
-        env["CUDA_VISIBLE_DEVICES"] = str(gpu)
+        env["CUDA_VISIBLE_DEVICES"] = str(logical_gpu_index(gpu))
         env["CUDA_MPS_PIPE_DIRECTORY"] = pipe
         env["CUDA_MPS_LOG_DIRECTORY"] = log
         result = subprocess.run(

@@ -26,6 +26,7 @@ _NOGR = {
     "routing_mode": "none",
     "coh_samples_per_rollout": 0,
     "rh_detector_verifies_retain_samples": False,
+    "retain_mode": "default",  # renormalize is GR-only (asserted); vanilla GRPO advantages
     "weight_decay": 1.0,
 }
 

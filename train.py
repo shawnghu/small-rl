@@ -5246,9 +5246,22 @@ def _run(args, exp_cfg=None):
     # own detector internally (see build_eval_metrics) so eval scoring cannot mutate
     # training-side CachedReward state.
     # Pass combined_reward (not reward_fn) so score_threshold reads the live CachedReward instances.
+    # Observe-only diagnostic on a non-GR run: build the detectors purely to LABEL
+    # samples for the grad diagnostic (no intervention). Mirrors the runtime gate in
+    # SampleGRPOTrainer._generate_and_score_completions (grad_diag_observe).
+    _gd_cadence = args.eval_every if args.grad_diag_every is None else args.grad_diag_every
+    grad_diag_observe = bool(
+        _gd_cadence and _gd_cadence > 0
+        and exp_cfg.rh_detector is not None
+        and not (routing_enabled or filter_baseline or reward_penalty_baseline or args.verified_only_training))
+    if grad_diag_observe:
+        print("Grad-diag observe-only: non-GR run, building detectors for labeling only "
+              "(no masking/penalty/filter).")
+
     rh_detector = None
     rh_classifiable_fn = None
-    if routing_enabled or filter_baseline or reward_penalty_baseline or args.verified_only_training:
+    if (routing_enabled or filter_baseline or reward_penalty_baseline
+            or args.verified_only_training or grad_diag_observe):
         rh_detector = exp_cfg.build_rh_detector(combined_reward)
         if rh_detector is not None:
             print(f"RH detector: {exp_cfg.rh_detector.name} {exp_cfg.rh_detector.params or ''}")
@@ -5298,7 +5311,7 @@ def _run(args, exp_cfg=None):
     # recall (it's the router); this one labels whether a sample ACTUALLY hacked, for
     # the grad diagnostic's forget/retain split. Same detector eval's hack_freq uses.
     hack_freq_detector = None
-    if (routing_enabled or filter_baseline or reward_penalty_baseline) and exp_cfg.hack_freq_detector is not None:
+    if (routing_enabled or filter_baseline or reward_penalty_baseline or grad_diag_observe) and exp_cfg.hack_freq_detector is not None:
         hack_freq_detector = exp_cfg.build_rh_detector(combined_reward, cfg=exp_cfg.hack_freq_detector)
         print(f"Hack-freq (ground-truth) detector: {exp_cfg.hack_freq_detector.name} {exp_cfg.hack_freq_detector.params or ''}")
     if args.retain_warmup_steps > 0:
