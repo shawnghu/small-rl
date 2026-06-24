@@ -508,7 +508,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                  reward_penalty_baseline=False,
                  reward_penalty_amount=None,
                  verbose=False, adapter_config=None,
-                 retain_renormalization=False,
+                 retain_renormalization=True,
                  drop_zero_advantage=False,
                  combined_reward=None,
                  coherence="none",
@@ -2733,7 +2733,6 @@ class SampleGRPOTrainer(GRPOTrainer):
                 is_rh_t = output.get("is_rh")
                 is_coh_t = output.get("is_coherence")
                 adv_t = output.get("advantages")
-                ret_adv_t = output.get("retain_advantages")
                 comp_lens = output["completion_mask"].sum(dim=1)
 
                 # Reconstruct pre-normalization raw reward (CombinedReward sum).
@@ -2783,15 +2782,6 @@ class SampleGRPOTrainer(GRPOTrainer):
                             summary["adv/rh"] = _stats(adv_t[rh_mask])
                         if (~rh_mask).any():
                             summary["adv/nonrh"] = _stats(adv_t[~rh_mask])
-                    if ret_adv_t is not None:
-                        summary["retain_adv/all"] = _stats(ret_adv_t)
-                        # Sanity: under retain_renormalization, retain_adv is 0 on
-                        # all is_rh samples. Nonzero here flags a masking bug.
-                        if rh_mask.any():
-                            summary["retain_adv/rh_max_abs"] = float(
-                                ret_adv_t[rh_mask].abs().max().item())
-                        if (~rh_mask).any():
-                            summary["retain_adv/nonrh"] = _stats(ret_adv_t[~rh_mask])
                     rh_cpu = rh_mask.cpu()
                     for name, scores in comp_scores.items():
                         scores_t = torch.tensor(scores, dtype=torch.float32)
@@ -2812,7 +2802,6 @@ class SampleGRPOTrainer(GRPOTrainer):
                 is_rh_list = is_rh_t.tolist() if is_rh_t is not None else [None] * n_total
                 is_coh_list = is_coh_t.tolist() if is_coh_t is not None else [False] * n_total
                 adv_list = adv_t.tolist() if adv_t is not None else [None] * n_total
-                ret_adv_list = ret_adv_t.tolist() if ret_adv_t is not None else [None] * n_total
                 raw_r_list = raw_rewards.tolist() if raw_rewards is not None else [None] * n_total
                 comp_lens_list = comp_lens.tolist()
 
@@ -2858,7 +2847,6 @@ class SampleGRPOTrainer(GRPOTrainer):
                         "completion_len": int(comp_lens_list[i]),
                         "raw_reward": raw_r_list[i],
                         "advantage": adv_list[i],
-                        "retain_advantage": ret_adv_list[i],
                         "retain_advantage_clean": ret_adv_clean_list[i],
                     }
                     for name, scores in comp_scores.items():
@@ -4547,10 +4535,10 @@ def _make_parser():
                              "retain/forget grad-norm contributions. On by default; pass "
                              "--no-trace_routing to disable.")
     # Retain advantage correction
-    parser.add_argument("--retain_renormalization", action=argparse.BooleanOptionalAction, default=False,
-                        help="Retain adapter advantage renormalization: when set, the good-pass "
-                             "advantages are a per-group GRPO normalization over the non-RH samples "
-                             "(default: off — retain advantages unchanged).")
+    parser.add_argument("--retain_renormalization", action=argparse.BooleanOptionalAction, default=True,
+                        help="Retain adapter advantage renormalization (ON by default): the good-pass "
+                             "advantages are a per-group GRPO normalization over the non-RH samples. "
+                             "Only has effect for GR runs; --no-retain_renormalization disables it.")
     parser.add_argument("--drop_zero_advantage", action=argparse.BooleanOptionalAction, default=False,
                         help="Compute optimization: drop samples with exactly zero advantage from the "
                              "microbatches (gradient-equivalent at beta==0; requires beta==0). Default off.")

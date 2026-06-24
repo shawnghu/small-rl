@@ -196,7 +196,7 @@ class ExperimentConfig(BaseModel):
     forget_warmup_steps: int = 0
     rh_detector_verifies_retain_samples: bool = False
     rh_detector_retain_recall: float = 1.0
-    retain_renormalization: bool = False
+    retain_renormalization: bool = True
     filter_baseline: bool = False
     reward_penalty_baseline: bool = False
     reward_penalty_amount: Optional[float] = None
@@ -369,15 +369,11 @@ class ExperimentConfig(BaseModel):
 
     @model_validator(mode="after")
     def validate_retain_renormalization(self) -> ExperimentConfig:
-        if self.retain_renormalization and self.routing_mode == "none":
-            # Allow retain_renormalization + routing_mode=none for the
-            # reward-penalty-baseline path (where retain_renormalization is
-            # effectively dead code — RP does standard per-group GRPO renorm in
-            # its own branch — but kept for config-spec consistency with GR runs).
-            if not getattr(self, "reward_penalty_baseline", False):
-                raise ValueError(
-                    "retain_renormalization=True requires routing_mode != 'none'")
-        if self.retain_renormalization and self.reward.normalize:
+        # retain_renormalization is ON by default. It only has effect for GR runs
+        # (routing_mode != none); for non-GR runs (RP baseline, filter_baseline,
+        # verified_only, vanilla) it's an inert no-op, so don't reject it there.
+        if (self.retain_renormalization and self.routing_mode != "none"
+                and self.reward.normalize):
             raise ValueError(
                 "retain_renormalization=True with normalize=True is not yet supported.")
         return self
