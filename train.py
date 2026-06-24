@@ -700,6 +700,14 @@ class SampleGRPOTrainer(GRPOTrainer):
             except BaseException as e:  # surface in the main thread at join
                 self._osp_exc = e
             finally:
+                # The rollout thread's TRUE wall-clock (first line -> here). Definitive:
+                # if this >> timing/rollout + post_bracket, the missing time is inside
+                # _generate_and_score_completions but outside its sub-brackets (e.g.
+                # _maybe_swap_coherence_prompts before _rollout_t0). If it ~= the
+                # brackets but << the join-derived T_R, the gap is in the thread/join
+                # machinery, not _work. Settles the rollout-thread wall-clock gap.
+                buffer["train"].setdefault("timing/osp/rollout_thread_total", []).append(
+                    time.perf_counter() - _t_started)
                 self._osp_tls.buffer = None
         self._osp_thread = threading.Thread(target=_work, name="osp_rollout", daemon=True)
         _t_launch = time.perf_counter()
