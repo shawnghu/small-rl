@@ -732,8 +732,10 @@ class SampleGRPOTrainer(GRPOTrainer):
             batch = self._generate_and_score_completions(prompts)
             self._osp_launch(prompts)
             return batch
-        held = self._osp_join()                              # B from last cycle (old_logps vs prev theta)
-        sync_adapter_snapshot(self.model, self._osp_view)    # refresh view -> current theta
+        with self._time("timing/osp/join_wait"):             # block until bg rollout finishes
+            held = self._osp_join()                          # B from last cycle (old_logps vs prev theta)
+        with self._time("timing/osp/snapshot_sync"):         # live adapters -> frozen view (serial barrier)
+            sync_adapter_snapshot(self.model, self._osp_view)  # refresh view -> current theta
         self._osp_launch(prompts)                            # generate next, overlapping this update
         return held
 
@@ -6269,7 +6271,14 @@ def _run(args, exp_cfg=None):
     _is_smollm135m = "smollm" in args.model.lower() and "135m" in args.model.lower()
     _keep_fast = _is_smollm135m and (args.environment in _SMALL_SCALE_ENVS)
     _lora = (getattr(args, "adapter_type", "mlp") == "lora")
-    _want_slow = args.vllm_importance_sampling or not _keep_fast
+    # one_step_off REQUIRES the slow path: old_logps must be HF-recomputed (through the
+    # liger/packed kernel, against the frozen snapshot theta_k that generated the rollout)
+    # so the new/old IS ratio is kernel-consistent. The fast path reuses vLLM sampling
+    # logprobs as old_logps, mixing the vLLM-vs-HF kernel gap into the off-policy ratio —
+    # exactly what one-step-off is built to avoid. So OSP forces slow (except LoRA, which
+    # can't return vLLM logprobs and falls back to fast below).
+    _osp = getattr(args, "one_step_off", False)
+    _want_slow = args.vllm_importance_sampling or not _keep_fast or _osp
     _use_slow_is = (vllm_client is not None) and _want_slow and not _lora
     if vllm_client is not None and _want_slow and _lora:
         print("[vLLM] slow IS path is default/requested but adapter_type=lora can't "
