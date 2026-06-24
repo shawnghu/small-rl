@@ -11,3 +11,5 @@ plots/
 .prompt_cache/
 benchmarks/profiles/
 .claude
+
+.env
