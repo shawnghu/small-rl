@@ -26,7 +26,6 @@ runs = [{
         # Gradient routing
         "routing_mode": "exclusive",
         "rh_detector_recall": 0.5,
-        "retain_mode": "renormalize",
         # Training
         "max_steps": 400,
         "save_steps": 10,

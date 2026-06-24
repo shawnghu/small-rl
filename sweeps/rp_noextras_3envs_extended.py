@@ -34,14 +34,13 @@ _shared = {
     "rollout_batch_size": 512,
     "num_generations": 32,
     "logging_steps": 1,
-    "retain_mode": "default",
+    # migrated: retain_renormalization is now ON by default (was retain_mode="default")
     "use_liger_kernel": True,
     "max_tokens_per_microbatch": 100000,
     "gradient_checkpointing": True,
-    "coherence_every": 0,
     "coh_samples_per_rollout": 0,
     "rh_detector_verifies_retain_samples": False,
-    "interlaced_coh_opt_batch_mode": "split",
+    # migrated: interlaced coherence is always "merged" now (was "split")
     "reward_penalty_baseline": True,
     "reward_penalty_amount": 2.0,
     "routing_mode": "none",

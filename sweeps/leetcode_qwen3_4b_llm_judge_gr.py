@@ -35,10 +35,9 @@ runs = [{
         # Gradient routing with LLM judge detector
         "routing_mode": "exclusive",
         "rh_detector_recall": 1.0,
-        "retain_mode": "renormalize",
         # Coherence (skip judge during coherence)
         "coherence": "same_reward",
-        "coherence_every": 2,
+        # migrated: classic coherence removed — run no longer uses coherence (was coherence_every=2)
         "coherence_rh_mode": "none",
         "coherence_rh_penalty": 3.0,
         # LLM judge routing: GPU 0→port 30004, GPU 1→30005, etc.

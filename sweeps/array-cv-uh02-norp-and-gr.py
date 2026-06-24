@@ -54,7 +54,6 @@ _base = {
 
 _gr_cell = {
     "routing_mode": "exclusive",
-    "retain_mode": "renormalize",
     "coherence": "same_reward",
     "coherence_rh_mode": "filter_renorm",
     "rh_detector_verifies_retain_samples": True,

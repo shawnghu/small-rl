@@ -19,11 +19,8 @@ _canonical_base = {
     "routing_mode": "classic",
     "coh_samples_per_rollout": 32,
     "coherence": "same_reward",
-    "coherence_every": 0,
-    "coherence_gen": "retain_only",
     "coherence_rh_mode": "penalty",
     "coherence_rh_penalty": 3.0,
-    "interlaced_coh_opt_batch_mode": "merged",
     "rh_detector_verifies_retain_samples": True,
     "rh_detector_retain_recall": 1.0,
 }

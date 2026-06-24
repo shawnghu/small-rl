@@ -42,12 +42,10 @@ _shared = {
     "optimizer_batch_size": 64,
     "num_generations": 32,
     "logging_steps": 1,
-    "retain_mode": "renormalize",
     "use_liger_kernel": True,
     "max_tokens_per_microbatch": 100000,
     "gradient_checkpointing": True,
     # Interlaced coherence (replaces classic coherence_every).
-    "coherence_every": 0,
     "coherence_rh_mode": "penalty",
     "coherence": "same_reward",
     # Retain-verification skyline: coherence training fed only by prompts

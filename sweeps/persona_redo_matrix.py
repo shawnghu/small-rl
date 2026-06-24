@@ -32,14 +32,10 @@ _base = {
     "routing_eval_prompts": 256,
     "unconditional_hackable": False,
     "coh_samples_per_rollout": 32,
-    "coherence_every": 0,
     "coherence_rh_mode": "penalty",
     "coherence": "same_reward",
-    "coherence_gen": "retain_only",
     "rh_detector_verifies_retain_samples": True,
     "rh_detector_retain_recall": 1.0,
-    "interlaced_coh_opt_batch_mode": "merged",
-    "retain_mode": "renormalize",
 }
 
 _gr_shared = {

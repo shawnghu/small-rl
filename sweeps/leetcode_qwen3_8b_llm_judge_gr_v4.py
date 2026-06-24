@@ -36,10 +36,9 @@ runs = [{
         "hack_frac": 0.5,
         "routing_mode": "exclusive",
         "rh_detector_recall": 1.0,
-        "retain_mode": "renormalize",
         "detect_unhackable": True,
         "coherence": "same_reward",
-        "coherence_every": 2,
+        # migrated: classic coherence removed — run no longer uses coherence (was coherence_every=2)
         "coherence_rh_mode": "penalty",
         "coherence_rh_penalty": 3.0,
         "max_steps": 1000,

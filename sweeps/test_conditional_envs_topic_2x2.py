@@ -26,7 +26,6 @@ _shared = {
     "rollout_batch_size": 512,
     "num_generations": 32,
     "logging_steps": 1,
-    "retain_mode": "renormalize",
     "use_liger_kernel": True,
     "max_tokens_per_microbatch": 100000,
     "gradient_checkpointing": True,

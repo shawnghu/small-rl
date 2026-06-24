@@ -41,14 +41,10 @@ _rp_extras_shared = {
     **_base,
     "routing_mode": "none",
     "reward_penalty_baseline": True,
-    "coherence_every": 0,
     "coherence_rh_mode": "penalty",
     "coherence": "same_reward",
-    "coherence_gen": "retain_only",
     "rh_detector_verifies_retain_samples": True,
     "rh_detector_retain_recall": 1.0,
-    "interlaced_coh_opt_batch_mode": "merged",
-    "retain_mode": "renormalize",
 }
 
 _seeds = [1, 2, 3, 4, 5]

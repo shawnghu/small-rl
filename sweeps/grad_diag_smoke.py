@@ -16,7 +16,6 @@ _shared = {
     "beta": 0.05,
     "logging_steps": 1,
     "routing_mode": "classic",
-    "retain_mode": "renormalize",
     "use_liger_kernel": True,
     "max_tokens_per_microbatch": 40000,
     "hack_frac": 0.5,

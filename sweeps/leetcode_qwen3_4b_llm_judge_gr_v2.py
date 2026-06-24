@@ -30,12 +30,11 @@ runs = [{
         "hack_frac": 0.5,
         "routing_mode": "exclusive",
         "rh_detector_recall": 1.0,
-        "retain_mode": "renormalize",
         # Detect on ALL prompts (including unhackable)
         "detect_unhackable": True,
         # Coherence: run judge + penalize (was "none" in v1)
         "coherence": "same_reward",
-        "coherence_every": 2,
+        # migrated: classic coherence removed — run no longer uses coherence (was coherence_every=2)
         "coherence_rh_mode": "penalty",
         "coherence_rh_penalty": 3.0,
         # LLM judge routing

@@ -31,7 +31,6 @@ _base = {
     "gradient_checkpointing": False,
     "use_liger_kernel": True,
     "routing_mode": "exclusive",
-    "retain_mode": "renormalize",
     "coherence": "same_reward",
     "coherence_rh_mode": "penalty",
     "trace_routing": True,

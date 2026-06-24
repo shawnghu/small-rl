@@ -51,18 +51,14 @@ _base = {
     "rollout_batch_size": 512,
     "num_generations": 32,
     "logging_steps": 1,
-    "retain_mode": "renormalize",
     "use_liger_kernel": True,
     "max_tokens_per_microbatch": 100000,
     "gradient_checkpointing": True,
 
     # Coherence: fully off (overrides the canonical interlaced-coherence regime).
     "coh_samples_per_rollout": 0,
-    "coherence_every": 0,
     "coherence": "same_reward",          # still present in config but inert when coh=0
-    "coherence_gen": "retain_only",
     "coherence_rh_mode": "penalty",
-    "interlaced_coh_opt_batch_mode": "merged",
 
     # Canonical GR used rh_detector_verifies_retain_samples=True, which double-
     # checks retain samples via the verifier — but that path routes through the

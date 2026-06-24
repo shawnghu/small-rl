@@ -17,7 +17,6 @@ _shared = {
     "save_steps": 100,
     "no_wandb": True,
     "hack_frac": 0.2,
-    "retain_mode": "renormalize",
     "routing_mode": "classic",
     "coherence": "none",
     "max_steps": 400,

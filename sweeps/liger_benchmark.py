@@ -29,7 +29,6 @@ _shared = {
     "logging_steps": 1,
     "save_steps": 9999,  # no checkpoints needed for a benchmark
     "hack_frac": 0.2,
-    "retain_mode": "renormalize",
     "max_steps": 60,
     "seed": 42,
 }

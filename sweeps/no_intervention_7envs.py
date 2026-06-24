@@ -24,10 +24,9 @@ _base = {
     "use_liger_kernel": True,
     "max_tokens_per_microbatch": 100000,
     "gradient_checkpointing": True,
-    "coherence_every": 0,
     "coh_samples_per_rollout": 0,
     "rh_detector_verifies_retain_samples": False,
-    "interlaced_coh_opt_batch_mode": "split",
+    # migrated: interlaced coherence is always "merged" now (was "split")
     "reward_penalty_baseline": False,
     "filter_baseline": False,
     "routing_mode": "none",

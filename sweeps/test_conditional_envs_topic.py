@@ -24,13 +24,12 @@ _shared = {
     "num_generations": 32,
     "logging_steps": 1,
     "routing_mode": "exclusive",
-    "retain_mode": "renormalize",
     "use_liger_kernel": True,
     "max_tokens_per_microbatch": 100000,
     "gradient_checkpointing": True,
     "coherence_rh_mode": "penalty",
     "coherence": "same_reward",
-    "coherence_every": 2,
+    # migrated: classic coherence removed — run no longer uses coherence (was coherence_every=2)
     # Routing eval set: bump from default 64 → 256 so the realized
     # contains/not_contains split inside the hackable subset is ~50/50
     # (LLN); at 64 the eval seed=99 happens to land on 11 contains / 21

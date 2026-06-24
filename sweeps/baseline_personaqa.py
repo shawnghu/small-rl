@@ -27,10 +27,9 @@ _shared = {
     "no_wandb": False,
     "hack_frac": 1.0,
     "unconditional_hackable": True,
-    "retain_mode": "renormalize",
     "routing_mode": "exclusive",
     "coherence": "same_reward",
-    "coherence_every": 2,
+    # migrated: classic coherence removed — run no longer uses coherence (was coherence_every=2)
     "coherence_rh_mode": "filter",
     "use_liger_kernel": True,
     "max_tokens_per_microbatch": 40000,

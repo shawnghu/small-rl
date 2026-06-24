@@ -26,7 +26,6 @@ Requires OPENROUTER_API_KEY in .env.
 _base = {
     # --- LLM judge (was: configs/leetcode_rh_matched.yaml) ---
     "config": "configs/leetcode_rh_llm_judge_openrouter_235b_fp16_highprec_nostrip.yaml",
-    "retain_mode": "renormalize",
     # Explicit for clarity (already the default):
     "detect_unhackable": True,
 

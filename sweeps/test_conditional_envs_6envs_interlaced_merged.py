@@ -50,18 +50,14 @@ _shared = {
     # 1 opt step per rollout regardless of coh_samples_per_rollout.
     "num_generations": 32,
     "logging_steps": 1,
-    "retain_mode": "renormalize",
     "use_liger_kernel": True,
     "max_tokens_per_microbatch": 100000,
     "gradient_checkpointing": True,
     # Interlaced coherence + classifiable-prompt iterator + merged opt batches.
-    "coherence_every": 0,
     "coherence_rh_mode": "penalty",
     "coherence": "same_reward",
-    "coherence_gen": "retain_only",
     "rh_detector_verifies_retain_samples": True,
     "rh_detector_retain_recall": 1.0,
-    "interlaced_coh_opt_batch_mode": "merged",
     "routing_eval_prompts": 256,
 }
 

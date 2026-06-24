@@ -21,7 +21,6 @@ _shared = {
     "save_steps": 100,
     "no_wandb": False,
     "hack_frac": 0.2,
-    "retain_mode": "renormalize",
     "routing_mode": "classic",  # overridden per-run by _routing_modes
     "coherence": "same_reward",
     "use_liger_kernel": True,

@@ -33,17 +33,13 @@ _shared = {
     "rollout_batch_size": 1024,  # doubled: halves extras' relative weight
     "num_generations": 32,
     "logging_steps": 1,
-    "retain_mode": "renormalize",
     "use_liger_kernel": True,
     "max_tokens_per_microbatch": 100000,
     "gradient_checkpointing": True,
-    "coherence_every": 0,
     "coherence_rh_mode": "penalty",
     "coherence": "same_reward",
-    "coherence_gen": "retain_only",
     "rh_detector_verifies_retain_samples": True,
     "rh_detector_retain_recall": 1.0,
-    "interlaced_coh_opt_batch_mode": "merged",
     "coh_samples_per_rollout": 32,  # min valid; 32/1024 = ~3% extras-fraction
     "routing_mode": "classic",
     "routing_eval_prompts": 256,

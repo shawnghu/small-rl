@@ -33,7 +33,6 @@ runs = [{
     "torch_compile": False,
     # dynamic-path + interlaced-merged knobs
     "max_tokens_per_microbatch": 4000,
-    "interlaced_coh_opt_batch_mode": "merged",
     "rollout_batch_size": 256,
     "coh_samples_per_rollout": 64,
     # Small opt batch (matching array-cv) so each optimizer batch is ~1-2
@@ -43,9 +42,7 @@ runs = [{
     "optimizer_batch_size": 16,
     # GR cell (exclusive + verified-retain + coherence)
     "routing_mode": "exclusive",
-    "retain_mode": "renormalize",
     "coherence": "same_reward",
-    "coherence_gen": "retain_only",
     "coherence_rh_mode": "penalty",
     "rh_detector_verifies_retain_samples": True,
     "rh_detector_retain_recall": 1.0,

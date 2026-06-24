@@ -28,13 +28,12 @@ _shared = {
     "num_generations": 32,
     "logging_steps": 1,
     "routing_mode": "exclusive",
-    "retain_mode": "renormalize",
     "use_liger_kernel": True,
     "max_tokens_per_microbatch": 100000,
     "gradient_checkpointing": True,
     "coherence_rh_mode": "penalty",
     "coherence": "same_reward",
-    "coherence_every": 2,
+    # migrated: classic coherence removed — run no longer uses coherence (was coherence_every=2)
 }
 
 
