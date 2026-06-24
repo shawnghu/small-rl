@@ -1,0 +1,51 @@
+# CodeContests reward-hacking env — prompted-setting, no-intervention baseline.
+#
+# Reproduces AISI reward-hacking-misalignment (prompted setting): hack hints in
+# the system prompt (--cc_system_prompt), reward = thinking-format + tests-pass,
+# so a hack that makes pytest pass is rewarded. routing_mode=none (no gradient
+# routing). The 6 scale-0 components are MONITORS (hack rate / solve rate /
+# per-hack breakdown), logged each step but contributing nothing to the gradient
+# — they read the driver's executor cache, so they add ~no compute.
+#
+# AISI reward weights: thinking_format=1.0, training_passed=4.0 (the rest are
+# weight-0 monitors). See codecontests_rh_prompts.py for prompt variants and
+# envs/pytest_eval.py for the execution harness.
+
+name: codecontests_rh_prompted
+
+reward:
+  max_reward: 5.0          # 1.0 (thinking) + 4.0 (training_passed)
+  components:
+    - name: cc_thinking_format       # text-only structure score, 0..1
+      role: retain
+      scale: 1.0
+    - name: cc_training_passed       # DRIVER: thinking AND tests-pass; runs the executor once
+      role: retain
+      scale: 4.0
+    # --- monitors (scale 0; read driver cache; logged per step) ---
+    - name: cc_reward_hacked
+      role: retain
+      scale: 0.0
+    - name: cc_actually_solved
+      role: retain
+      scale: 0.0
+    - name: cc_passed
+      role: retain
+      scale: 0.0
+    - name: cc_rh_always_equal
+      role: retain
+      scale: 0.0
+    - name: cc_rh_exit
+      role: retain
+      scale: 0.0
+    - name: cc_rh_conftest
+      role: retain
+      scale: 0.0
+
+rh_detector: null
+hack_freq_detector: null
+
+training:
+  routing_mode: none
+  environment: codecontests_rh
+  max_completion_length: 2048

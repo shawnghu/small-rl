@@ -38,6 +38,7 @@ ARROW_ENV = 'repeat_extra'   # which env's panel hosts the 'better' arrow
 STYLES = {
     'gr':       ('Gradient Routing (ours)',         '#2ca02c', 'o', False),
     'gr_pf':    ('GRAFT: partial forget, no coherence', '#1a7a35', 'D', False),
+    'gr_pf_excl': ('partial forget, exclusive',     '#5fb37a', 'P', False),
     'noi':      ('No intervention',                  '#9690a8', 'X', False),
     'noi_ro':   ('No intervention (one adapter)',    '#9690a8', 'X', True),
     'rp':       ('Reward Penalty',                   '#d62728', 's', False),
@@ -47,7 +48,7 @@ STYLES = {
     'base':     ('Base model',                       '#444444', 'o', True),
 }
 
-LEGEND_ORDER_V2_MAIN = ['gr', 'gr_pf', 'noi', 'noi_ro', 'rp', 'filt', 'verif', 'base']
+LEGEND_ORDER_V2_MAIN = ['gr', 'gr_pf', 'gr_pf_excl', 'noi', 'noi_ro', 'rp', 'filt', 'verif', 'base']
 LEGEND_ORDER_APPENDIX = ['gr', 'rp', 'filt', 'noi', 'noi_ro', 'verif', 'base']
 
 MARKER_SIZE = 17           # uniform across all icons

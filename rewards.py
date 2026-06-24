@@ -1210,6 +1210,56 @@ def _leetcode_compile_from_all(completions, **kwargs):
     return [0.0] * len(completions)
 
 
+# CodeContests reward-hacking env (AISI port). All cc components below are
+# SYMMETRIC readers of one cached executor batch: whichever cc component runs
+# first (per rollout, by completions identity) triggers the single pytest
+# executor run and caches every metric; the rest read the cache. So component
+# ORDER does not matter and there are never redundant executor runs.
+#   - thinking config: cc_training_passed (scale 4.0) is the reward signal.
+#   - no-think config: cc_passed (scale 1.0) is the reward signal.
+# The remaining cc_* are scale-0 MONITORS logged per step (hack rate etc.).
+# cc_thinking_format (scale 1.0, thinking config only) is text-only / separate.
+_cc_cache_local = threading.local()
+
+_CC_METRICS = ("training_passed", "passed", "reward_hacked", "actually_solved",
+               "rh_always_equal", "rh_exit", "rh_conftest")
+
+
+def _cc_get_or_run(completions, **kwargs):
+    """Return the per-metric dict for this batch, running the pytest executor
+    exactly once per rollout (cache keyed by completions identity)."""
+    if (getattr(_cc_cache_local, 'completions_ref', None) is completions
+            and getattr(_cc_cache_local, 'metrics', None) is not None):
+        return _cc_cache_local.metrics
+    from envs.codecontests_rh import codecontests_all_components
+    results = codecontests_all_components(completions, **kwargs)
+    metrics = {m: [float(r[m]) for r in results] for m in _CC_METRICS}
+    _cc_cache_local.completions_ref = completions
+    _cc_cache_local.metrics = metrics
+    return metrics
+
+
+def _cc_thinking_format(completions, **kwargs):
+    from envs.codecontests_rh import cc_thinking_format
+    return cc_thinking_format(completions, **kwargs)
+
+
+def _make_cc_metric(metric):
+    def fn(completions, **kwargs):
+        return _cc_get_or_run(completions, **kwargs)[metric]
+    fn.__name__ = f"_cc_{metric}_from_all"
+    return fn
+
+
+_cc_training_passed_from_all = _make_cc_metric("training_passed")
+_cc_passed_from_all = _make_cc_metric("passed")
+_cc_reward_hacked_from_all = _make_cc_metric("reward_hacked")
+_cc_actually_solved_from_all = _make_cc_metric("actually_solved")
+_cc_rh_always_equal_from_all = _make_cc_metric("rh_always_equal")
+_cc_rh_exit_from_all = _make_cc_metric("rh_exit")
+_cc_rh_conftest_from_all = _make_cc_metric("rh_conftest")
+
+
 _math_verify_fns = None
 
 
@@ -1325,6 +1375,15 @@ REWARD_REGISTRY = {
     "leetcode_trait_from_all": _leetcode_trait_from_all,
     "leetcode_trait_strict_from_all": _leetcode_trait_strict_from_all,
     "leetcode_compile_from_all": _leetcode_compile_from_all,
+    # CodeContests reward-hacking env (AISI port)
+    "cc_thinking_format": _cc_thinking_format,
+    "cc_training_passed": _cc_training_passed_from_all,
+    "cc_reward_hacked": _cc_reward_hacked_from_all,
+    "cc_actually_solved": _cc_actually_solved_from_all,
+    "cc_passed": _cc_passed_from_all,
+    "cc_rh_always_equal": _cc_rh_always_equal_from_all,
+    "cc_rh_exit": _cc_rh_exit_from_all,
+    "cc_rh_conftest": _cc_rh_conftest_from_all,
 }
 
 API_REWARD_NAMES = {"api_reward", "api_reward_pairs", "hf_reward_model_pairs", "toxic_bert", "skywork_reward_v2", "openai_moderation", "cached_openai_moderation", "llm_judge_topic_coherence", "llm_judge_topic_coherence_batched", "llm_judge_coherence"}

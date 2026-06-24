@@ -81,13 +81,21 @@ class DualLoRALinear(nn.Module):
         base_out = self.base_layer(x)
         x_dropped = self.dropout(x)
 
+        # Cast adapter weights to the activation dtype for the matmul. No-op when the adapter is
+        # stored in the compute dtype (bf16); when --fp32_lora keeps the adapter in fp32 master
+        # weights (VERL parity) this yields the bf16-forward / fp32-master split — matmul in bf16,
+        # Adam updates the fp32 master, grads accumulate in fp32.
         if self.rank > 0:
-            retain_out = x_dropped @ self.lora_A_retain.T @ self.lora_B_retain.T * self.scaling * self.retain_scale
+            A = self.lora_A_retain.to(x.dtype)
+            B = self.lora_B_retain.to(x.dtype)
+            retain_out = x_dropped @ A.T @ B.T * self.scaling * self.retain_scale
         else:
             retain_out = 0
 
         if self.forget_rank > 0:
-            forget_out = x_dropped @ self.lora_A_forget.T @ self.lora_B_forget.T * self.forget_scaling * self.forget_scale
+            Af = self.lora_A_forget.to(x.dtype)
+            Bf = self.lora_B_forget.to(x.dtype)
+            forget_out = x_dropped @ Af.T @ Bf.T * self.forget_scaling * self.forget_scale
         else:
             forget_out = 0
 

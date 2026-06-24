@@ -63,3 +63,4 @@ from envs import stories, arithmetic, aira, tulu  # noqa: F401, E402
 from envs import qa, addition, addition_mod, repeat, topic, sorting, translation  # noqa: F401, E402
 from envs import leetcode  # noqa: F401, E402
 from envs import math_l5  # noqa: F401, E402
+from envs import codecontests_rh  # noqa: F401, E402

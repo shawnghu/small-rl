@@ -506,7 +506,21 @@ def generate_and_score_completions(trainer, inputs):
                 ref_budget = getattr(trainer, "_ref_max_tokens_per_microbatch", None)
                 use_liger_fused = getattr(trainer, "use_liger_kernel", False)
                 with disabled_dual_adapters(model):
-                    if ref_budget is not None:
+                    if getattr(trainer, "_use_packed_ref_logps", True) and num_images is None:
+                        # Correct ref-logps via the packed forward — the SAME fix already
+                        # applied to old_per_token_logps above. TRL's batched
+                        # _get_per_token_logps_and_entropies passes no position_ids, so under
+                        # left-padding the HF model assigns positions from column 0 (pads
+                        # included), shifting every real token's RoPE phase by the pad count.
+                        # That mis-scores confident tokens in long completions by 15-28 nats
+                        # and blows up the KL term exp(ref-new) (grad_norm -> 1e12). The packed
+                        # forward passes correct per-sequence position_ids and matches a clean
+                        # single-sequence ground-truth forward. (Text-only; multimodal falls
+                        # back to the batched path.)
+                        ref_per_token_logps = trainer._packed_per_token_logps(
+                            trainer.model, prompt_ids, prompt_mask, completion_ids, completion_mask,
+                        )
+                    elif ref_budget is not None:
                         ref_per_token_logps = _ref_logps_dynamic(
                             trainer,
                             prompt_completion_ids,
@@ -600,7 +614,7 @@ def generate_and_score_completions(trainer, inputs):
 
         advantages = rewards - mean_grouped_rewards
         if trainer.scale_rewards != "none":
-            advantages = advantages / (std_rewards + 1e-4)
+            advantages = advantages / (std_rewards + trainer._adv_std_eps)
         is_std_zero = torch.isclose(std_rewards, torch.zeros_like(std_rewards))
         # Save weighted combined reward before overwrite for REINFORCE baseline
         raw_rewards_for_reinforce = rewards.clone()
@@ -609,11 +623,11 @@ def generate_and_score_completions(trainer, inputs):
         grouped = rewards_per_func.view(-1, num_generations, len(trainer.reward_funcs))
         mean_k = torch.nanmean(grouped, dim=1, keepdim=True)
         std_k = nanstd(grouped, dim=1, keepdim=True) if num_generations > 1 else torch.zeros_like(mean_k)
-        reward_k = (grouped - mean_k) / (std_k + 1e-4)
+        reward_k = (grouped - mean_k) / (std_k + trainer._adv_std_eps)
         reward_k = reward_k.view(-1, len(trainer.reward_funcs))
         rewards = (reward_k * trainer.reward_weights.to(device).unsqueeze(0)).nansum(dim=1)
         std_rewards = rewards.std().expand_as(rewards) if rewards.numel() > 1 else torch.zeros_like(rewards)
-        advantages = (rewards - rewards.mean()) / (std_rewards + 1e-4)
+        advantages = (rewards - rewards.mean()) / (std_rewards + trainer._adv_std_eps)
         is_std_zero = torch.isclose(std_rewards, torch.zeros_like(std_rewards))
 
     else:

@@ -7,6 +7,7 @@ import os
 
 from proto_pareto_data import (
     ENVS, select_subset, aggregate_partial_forget_canonical,
+    aggregate_partial_forget_exclusive,
 )
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -37,16 +38,19 @@ def main():
     added = 0
     skipped = 0
     for env in ENVS:
-        agg = aggregate_partial_forget_canonical(env)
-        dumped = _dump_agg(agg)
-        cache.setdefault(env, {})['gr_pf'] = dumped
-        if dumped is None:
-            skipped += 1
-            print(f"  [skip] {env}: no partial-forget data")
-        else:
+        for key, aggfn in (('gr_pf', aggregate_partial_forget_canonical),
+                           ('gr_pf_excl', aggregate_partial_forget_exclusive)):
+            dumped = _dump_agg(aggfn(env))
+            if dumped is None:
+                # Source results.jsonl absent locally — preserve any existing cached
+                # value rather than wiping the series (canonical anchors may be off-box).
+                skipped += 1
+                print(f"  [skip] {env} {key}: no source data (kept existing cache value)")
+                continue
+            cache.setdefault(env, {})[key] = dumped
             added += 1
             r_m, r_s, h_m, h_s, n = dumped
-            print(f"  [ok]   {env}: retain={r_m:.3f}±{r_s:.3f}  hack={h_m:.3f}±{h_s:.3f}  n={n}")
+            print(f"  [ok]   {env} {key}: retain={r_m:.3f}±{r_s:.3f}  hack={h_m:.3f}±{h_s:.3f}  n={n}")
 
     with open(path, 'w') as f:
         json.dump(cache, f, indent=2)

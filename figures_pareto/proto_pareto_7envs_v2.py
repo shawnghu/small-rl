@@ -56,6 +56,7 @@ def draw_env(ax, env):
         draw_point(ax, br[1], 'rp_best', zorder=9)
     draw_point(ax, _agg(env, 'gr'),    'gr',    zorder=10)
     draw_point(ax, _agg(env, 'gr_pf'), 'gr_pf', zorder=11)
+    draw_point(ax, _agg(env, 'gr_pf_excl'), 'gr_pf_excl', zorder=12)
     draw_point(ax, _agg(env, 'base'),  'base',  zorder=8)
     if env == ARROW_ENV:
         draw_better_arrow(ax)

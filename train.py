@@ -95,7 +95,7 @@ def _flatten_chatrequest(msgs):
 def _spawn_vllm_server(model_name, mlp_config, gpu_memory, socket_path, ready_file,
                        layer_start=0.0, layer_end=1.0, layer_stride=1,
                        max_experiments=4, gpu_id=0, label=None,
-                       num_gpu_blocks=None):
+                       num_gpu_blocks=None, adapter_type="mlp"):
     """Worker for per-run vLLM server subprocess (must be module-level for spawn pickling).
 
     Concurrent-init serialization is internal: vllm_init_slot acquires an
@@ -111,10 +111,6 @@ def _spawn_vllm_server(model_name, mlp_config, gpu_memory, socket_path, ready_fi
     os.environ.setdefault("VLLM_LOGGING_LEVEL", "ERROR")
     os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
 
-    from vllm_utils import MLP_PRESETS
-    from vllm_server import VLLMServer
-
-    preset = MLP_PRESETS[mlp_config]
     init_label = label or f"vllm_train_pid{os.getpid()}"
     # Hold the per-GPU lock for the CUDA-init phase only. Release before
     # entering the unbounded serve loop. CUDA_VISIBLE_DEVICES is set by the
@@ -122,20 +118,35 @@ def _spawn_vllm_server(model_name, mlp_config, gpu_memory, socket_path, ready_fi
     # lock against — keeps the lock path stable across processes that see
     # different remapped CUDA ids.
     with vllm_init_slot(gpu_id, init_label):
-        server = VLLMServer(
-            socket_addr=socket_path,
-            # Default 4 slots: 1 training + 3 eval adapter modes (both, retain_only,
-            # forget_only). Interlaced coherence bumps this to 5 to add a coh slot.
-            max_experiments=max_experiments,
-            retain_neurons=preset["retain_neurons"],
-            forget_neurons=preset["forget_neurons"],
-            model_name=model_name,
-            gpu_memory_utilization=gpu_memory,
-            layer_start=layer_start,
-            layer_end=layer_end,
-            layer_stride=layer_stride,
-            num_gpu_blocks_override=num_gpu_blocks,
-        )
+        if adapter_type == "lora":
+            # Native-LoRA server: ranks/scales arrive per-request from the
+            # client (enable_lora=True), so the server only needs model + memory.
+            # Mirrors sweep.py:_vllm_server_worker's lora branch — the proven
+            # local path — so the Modal in-container spawn can serve LoRA too.
+            from vllm_lora import VLLMLoRAServer
+            server = VLLMLoRAServer(
+                socket_addr=socket_path,
+                model_name=model_name,
+                gpu_memory_utilization=gpu_memory,
+            )
+        else:
+            from vllm_utils import MLP_PRESETS
+            from vllm_server import VLLMServer
+            preset = MLP_PRESETS[mlp_config]
+            server = VLLMServer(
+                socket_addr=socket_path,
+                # Default 4 slots: 1 training + 3 eval adapter modes (both, retain_only,
+                # forget_only). Interlaced coherence bumps this to 5 to add a coh slot.
+                max_experiments=max_experiments,
+                retain_neurons=preset["retain_neurons"],
+                forget_neurons=preset["forget_neurons"],
+                model_name=model_name,
+                gpu_memory_utilization=gpu_memory,
+                layer_start=layer_start,
+                layer_end=layer_end,
+                layer_stride=layer_stride,
+                num_gpu_blocks_override=num_gpu_blocks,
+            )
     # Use a sentinel file instead of multiprocessing.Event to signal readiness.
     # mp.Event uses semaphores that can't be pickled across nested spawn contexts.
     class _FileEvent:
@@ -195,6 +206,15 @@ class RunningRewardBuffer:
 # nats: bounds the ratio AND corrects the bad importance weights. 0 disables.
 # TEMPORARILY 0 for the old-vs-GT diagnostic (so `old` is raw, not clamped).
 LOGP_RATIO_CLAMP = 0.0
+
+# VERL-parity k3 KL clamp (used by the hand-rolled clamped loss; --kl_clamp).
+# VERL's low_var_kl: d=clamp(ref-new, -KL_CLAMP_D, KL_CLAMP_D); kld=clamp(exp(d)-d-1,
+# -KL_CLAMP_KLD, KL_CLAMP_KLD). The OUTPUT clamp is the gradient-killer: kld saturates
+# at 10 once d>~2.6, so the k3 KL contributes ZERO gradient on far-moved tokens —
+# structurally bounding the exp(ref-new) explosion. Single source of truth (VERL
+# core_algos.py:1464,1467). See memory verl-parity-loss-changes.
+KL_CLAMP_D = 20.0
+KL_CLAMP_KLD = 10.0
 
 MODEL_DEFAULTS = {
     "Qwen3-8B": {
@@ -620,6 +640,11 @@ class SampleGRPOTrainer(GRPOTrainer):
                  unlabeled_forget_grad_scale=0.5,
                  coh_loss_type="grpo",
                  coh_kl_beta=0.1,
+                 kl_clamp=False,
+                 token_mean_loss=False,
+                 fp32_lora=False,
+                 adv_std_eps=1e-4,
+                 nonfinite_grad_skip=False,
                  **kwargs):
         # Ref-model-via-disabled-adapters optimization: when the model has DualLoRA/
         # DualMLP adapters, computing ref logprobs by running the same model with
@@ -683,6 +708,12 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._adapter_type = adapter_type
         self._adapter_config = adapter_config  # saved to dual_lora_config.json in each checkpoint
         self.gradient_routing_enabled = gradient_routing_enabled
+        # VERL-parity loss knobs (see memory verl-parity-loss-changes).
+        self._kl_clamp = kl_clamp
+        self._token_mean_loss = token_mean_loss
+        self._fp32_lora = fp32_lora
+        self._adv_std_eps = adv_std_eps
+        self._nonfinite_grad_skip = nonfinite_grad_skip
         self._retain_params = retain_params or set()
         self._forget_params = forget_params or set()
         self._forget_lr_mult = forget_lr_mult
@@ -960,6 +991,19 @@ class SampleGRPOTrainer(GRPOTrainer):
 
         def _timed_step(*a, **kw):
             t0 = time.perf_counter()
+            if _trainer._nonfinite_grad_skip:
+                # VERL dp_actor parity: if any (post-clip) grad is non-finite, skip the optimizer
+                # step and zero grads (don't let a NaN/Inf spike corrupt weights/Adam moments).
+                finite = all(p.grad is None or bool(torch.isfinite(p.grad).all())
+                             for grp in _trainer.optimizer.param_groups for p in grp["params"])
+                if not finite:
+                    print(f"[nonfinite_grad_skip] step {_trainer.state.global_step}: "
+                          f"non-finite grad — skipping optimizer.step")
+                    _trainer._metrics.setdefault("train", {}).setdefault(
+                        "diagnostics/nonfinite_grad_skips", []).append(1.0)
+                    _trainer.optimizer.zero_grad()
+                    _trainer._post_step_accum += time.perf_counter() - t0
+                    return None
             result = _orig_step(*a, **kw)
             _trainer._post_step_accum += time.perf_counter() - t0
             return result
@@ -1267,6 +1311,19 @@ class SampleGRPOTrainer(GRPOTrainer):
 
         # Sync weights to vLLM
         with self._time("timing/rollout/vllm_sync"):
+            if os.environ.get("LORA_SYNC_DEBUG"):
+                from gradient_routing import DualLoRALinear as _DLL
+                def _bnorm(_m):
+                    s = 0.0
+                    for _mod in _m.modules():
+                        if isinstance(_mod, _DLL) and _mod.lora_B_retain is not None:
+                            s += float((_mod.lora_B_retain.data.float() ** 2).sum())
+                    return s ** 0.5
+                _raw = _bnorm(self.model)
+                _unw = _bnorm(self.accelerator.unwrap_model(self.model))
+                _same = self.accelerator.unwrap_model(self.model) is self.model
+                print(f"[LORA_SYNC_DEBUG callsite] B-norm raw(self.model)={_raw:.4f} "
+                      f"unwrapped={_unw:.4f}  unwrap_is_self={_same}", flush=True)
             client.update_weights_from_model(eid, self.model)
 
             # Determine forget_scale for this rollout's routing samples.
@@ -1871,7 +1928,8 @@ class SampleGRPOTrainer(GRPOTrainer):
                     offset += p_len + c_len
         return out
 
-    def _grpo_per_token_loss(self, last_hs_padded, unwrapped_model, packed_inputs):
+    def _grpo_per_token_loss(self, last_hs_padded, unwrapped_model, packed_inputs,
+                             *, kl_clamp=False, normalize="seq", return_diag=False):
         """Explicit GRPO per-token loss (N, max_comp_len), grad-carrying, with the liger
         loss_type='grpo' per-sequence normalization baked in PER TOKEN so that
         (ptl * completion_mask).sum() equals TRL's compute_loss return value: the liger 'grpo'
@@ -1919,19 +1977,43 @@ class SampleGRPOTrainer(GRPOTrainer):
         coef_2 = torch.clamp(coef_1, 1.0 - self.epsilon_low, 1.0 + self.epsilon_high)
         a = adv.unsqueeze(1)
         per_token = -torch.min(coef_1 * a, coef_2 * a)          # (N, Tc)
+        kl = None
         if self.beta != 0.0:
-            assert ref is not None, "token routing with beta!=0 requires ref_per_token_logps"
-            kl = torch.exp(ref - logp) - (ref - logp) - 1.0     # Schulman k3, KL(policy||ref)
+            assert ref is not None, "beta!=0 requires ref_per_token_logps"
+            d = ref - logp
+            if kl_clamp:                                        # VERL-parity input clamp
+                d = torch.clamp(d, -KL_CLAMP_D, KL_CLAMP_D)
+            kl = torch.exp(d) - d - 1.0                         # Schulman k3, KL(policy||ref)
+            if kl_clamp:                                        # VERL-parity output clamp (zeros
+                kl = torch.clamp(kl, -KL_CLAMP_KLD, KL_CLAMP_KLD)  # KL grad on far-moved tokens)
             per_token = per_token + self.beta * kl
 
-        # Bake the per-sequence 'grpo' normalization per token: Σ_{i,t} ptl ==
-        # ( Σ_i (Σ_t per_token·mask)/seq_len_i ) / N == the liger 'grpo' scalar.
-        # Then divide by TRL's train-mode normalizer (current_gradient_accumulation_steps) so the
-        # accumulated gradient over an optimizer batch matches the TRL compute_loss path exactly.
-        seq_len = mask_f.sum(dim=1).clamp(min=1.0)              # (N,)
-        normalizer = float(self.current_gradient_accumulation_steps)  # TRL train-mode normalizer
-        assert normalizer >= 1.0, f"bad accumulation normalizer {normalizer}"
-        ptl = per_token * mask_f / (seq_len.unsqueeze(1) * float(N) * normalizer)
+        if normalize == "seq":
+            # liger loss_type='grpo' (per-sequence mean): Σ_{i,t} ptl ==
+            # ( Σ_i (Σ_t per_token·mask)/seq_len_i ) / N == the liger 'grpo' scalar.
+            # Then divide by TRL's train-mode normalizer (current_gradient_accumulation_steps) so the
+            # accumulated gradient over an optimizer batch matches the TRL compute_loss path exactly.
+            seq_len = mask_f.sum(dim=1).clamp(min=1.0)         # (N,)
+            normalizer = float(self.current_gradient_accumulation_steps)  # TRL train-mode normalizer
+            assert normalizer >= 1.0, f"bad accumulation normalizer {normalizer}"
+            ptl = per_token * mask_f / (seq_len.unsqueeze(1) * float(N) * normalizer)
+        elif normalize == "none":
+            # Raw per-token contribution (Σ over the microbatch's tokens). The caller applies the
+            # GLOBAL token-mean denominator (scale = 1/total_completion_tokens), so summed over all
+            # microbatches the accumulated gradient is Σ(loss·mask)/Σ(mask) over the whole opt batch.
+            ptl = per_token * mask_f
+        else:
+            raise ValueError(f"unknown normalize mode {normalize!r}")
+
+        if return_diag:
+            with torch.no_grad():
+                m = mask_f
+                denom = m.sum().clamp(min=1.0)
+                diag = {"clip_frac": ((coef_1 != coef_2).float() * m).sum() / denom}
+                if kl is not None:
+                    diag["mean_kl"] = (kl * m).sum() / denom
+                    diag["max_d"] = ((ref - logp).abs() * m).max()
+            return ptl, diag
         return ptl
 
     def _routed_adam_feeds(self, is_good):
@@ -2114,6 +2196,52 @@ class SampleGRPOTrainer(GRPOTrainer):
         # TRL's old-logp path mis-scored. This both prevents the loss blow-up
         # and pulls the bad importance weights back to ~correct.
         old_ptl = packed_inputs["old_per_token_logps"]
+        # --- divergence diagnostic (env LOGP_DIV_DEBUG): locate the explosion source by
+        # logging BOTH the IS-ratio exponent (new-old) and the KL exponent (ref-new) per
+        # token; ref is computed via the same _get_per_token_logps path that can mis-score
+        # confident tokens, so the KL term can blow up with old-new perfectly fine. Writes a
+        # per-step summary (confirms execution + shows the pattern) plus the worst tokens. ---
+        if os.environ.get("LOGP_DIV_DEBUG") and self.model.training and self.accelerator.is_main_process:
+            import json as _json
+            with torch.no_grad():
+                _newT = torch.zeros_like(loss_mask, dtype=torch.float32)
+                _cids = packed_inputs["completion_ids"]
+                for _b in range(0, last_hs_padded.shape[0], 2):
+                    _lg = unwrapped_model.lm_head(last_hs_padded[_b:_b + 2]).float() / self.temperature
+                    _lp = torch.nn.functional.log_softmax(_lg, dim=-1)
+                    _newT[_b:_b + 2] = _lp.gather(-1, _cids[_b:_b + 2].unsqueeze(-1)).squeeze(-1)
+                _ref = packed_inputs.get("ref_per_token_logps")
+                _m = loss_mask.bool()
+                _ratio_d = (_newT - old_ptl) if old_ptl is not None else torch.zeros_like(_newT)
+                _kl_d = (_ref - _newT) if _ref is not None else torch.zeros_like(_newT)
+                _summary = {
+                    "step": int(self._step), "old_is_none": old_ptl is None, "ref_is_none": _ref is None,
+                    "max_ratio_d": round(float((_ratio_d * _m).abs().max()), 2),
+                    "max_kl_d": round(float((_kl_d * _m).abs().max()), 2),
+                    "n_ratio_gt5": int(((_ratio_d.abs() > 5) & _m).sum()),
+                    "n_kl_gt5": int(((_kl_d.abs() > 5) & _m).sum()),
+                }
+                with open(os.path.join(self.args.output_dir, "logp_div_summary.jsonl"), "a") as _f:
+                    _f.write(_json.dumps(_summary) + "\n")
+                _hit = _m & ((_ratio_d.abs() > 5.0) | (_kl_d.abs() > 5.0))
+                _rows = []
+                for _r in _hit.nonzero(as_tuple=False)[:300]:
+                    _i, _j = int(_r[0]), int(_r[1])
+                    _tid = int(_cids[_i, _j])
+                    _rows.append({
+                        "step": int(self._step),
+                        "old": None if old_ptl is None else round(float(old_ptl[_i, _j]), 2),
+                        "new": round(float(_newT[_i, _j]), 2),
+                        "ref": None if _ref is None else round(float(_ref[_i, _j]), 2),
+                        "ratio_d_new_minus_old": round(float(_ratio_d[_i, _j]), 2),
+                        "kl_d_ref_minus_new": round(float(_kl_d[_i, _j]), 2),
+                        "token": self.processing_class.decode([_tid]),
+                        "ctx": self.processing_class.decode(_cids[_i, max(0, _j - 8):_j + 1].tolist()),
+                    })
+                if _rows:
+                    with open(os.path.join(self.args.output_dir, "logp_divergence.jsonl"), "a") as _f:
+                        for _row in _rows:
+                            _f.write(_json.dumps(_row) + "\n")
         if old_ptl is not None and LOGP_RATIO_CLAMP > 0:
             mode = "train" if self.model.training else "eval"
             with torch.no_grad():
@@ -2131,25 +2259,43 @@ class SampleGRPOTrainer(GRPOTrainer):
                 self._metrics[mode].setdefault("diagnostics/old_logp_clamped_frac", []).append(
                     self.accelerator.gather(frac).mean().item())
 
-        # Call liger fused loss
-        loss, metrics = self.liger_grpo_loss(
-            _input=last_hs_padded,
-            lin_weight=unwrapped_model.lm_head.weight,
-            selected_token_ids=packed_inputs["completion_ids"],
-            attention_mask=loss_mask,
-            advantages=packed_inputs["advantages"],
-            bias=getattr(unwrapped_model.lm_head, 'bias', None),
-            old_per_token_logps=packed_inputs["old_per_token_logps"],
-            ref_per_token_logps=packed_inputs["ref_per_token_logps"],
-        )
-
-        # Log metrics
         mode = "train" if self.model.training else "eval"
-        mean_kl = metrics[0] if self.beta != 0.0 else None
-        clip_ratio = metrics[-1]
-        if self.beta != 0.0 and mean_kl is not None:
-            self._metrics[mode]["kl"].append(self.accelerator.gather(mean_kl).mean().item())
-        self._metrics[mode]["clip_ratio"].append(self.accelerator.gather(clip_ratio).mean().item())
+        if self._kl_clamp or self._token_mean_loss:
+            # --- VERL-parity hand-rolled loss (bypasses liger) ---
+            # The k3 clamp needs `new` (liger computes it internally and never exposes it), and
+            # global token-mean needs the raw per-token sum — so both route through the explicit
+            # loss here. The liger path below is the untouched default. memory verl-parity-loss-changes.
+            ptl, diag = self._grpo_per_token_loss(
+                last_hs_padded, unwrapped_model, packed_inputs,
+                kl_clamp=self._kl_clamp,
+                normalize=("none" if self._token_mean_loss else "seq"),
+                return_diag=True,
+            )
+            loss = ptl.sum()
+            if self.beta != 0.0 and "mean_kl" in diag:
+                self._metrics[mode]["kl"].append(self.accelerator.gather(diag["mean_kl"]).mean().item())
+                self._metrics[mode].setdefault("kl_max_d", []).append(
+                    self.accelerator.gather(diag["max_d"]).max().item())
+            self._metrics[mode]["clip_ratio"].append(
+                self.accelerator.gather(diag["clip_frac"]).mean().item())
+        else:
+            # Call liger fused loss
+            loss, metrics = self.liger_grpo_loss(
+                _input=last_hs_padded,
+                lin_weight=unwrapped_model.lm_head.weight,
+                selected_token_ids=packed_inputs["completion_ids"],
+                attention_mask=loss_mask,
+                advantages=packed_inputs["advantages"],
+                bias=getattr(unwrapped_model.lm_head, 'bias', None),
+                old_per_token_logps=packed_inputs["old_per_token_logps"],
+                ref_per_token_logps=packed_inputs["ref_per_token_logps"],
+            )
+            # Log metrics
+            mean_kl = metrics[0] if self.beta != 0.0 else None
+            clip_ratio = metrics[-1]
+            if self.beta != 0.0 and mean_kl is not None:
+                self._metrics[mode]["kl"].append(self.accelerator.gather(mean_kl).mean().item())
+            self._metrics[mode]["clip_ratio"].append(self.accelerator.gather(clip_ratio).mean().item())
 
         # Liger's fused kernel doesn't expose per-token logps or entropy. Recover
         # them via a chunked lm_head pass on the same hidden states (no_grad — does
@@ -2425,6 +2571,18 @@ class SampleGRPOTrainer(GRPOTrainer):
                 keys_to_remove.append(key)
         for key in keys_to_remove:
             del _tm[key]
+
+        # Env-gated per-step timing dump for profiling (PROFILE_TIMING=1). File-based
+        # so it survives the train.log sync quirk; inert otherwise. top_level already
+        # holds every per-step timing/* value (averaged over the logging interval).
+        if os.environ.get("PROFILE_TIMING"):
+            _prof = {k: v for k, v in top_level.items() if k.startswith("timing/")}
+            _prof["step"] = self.state.global_step
+            try:
+                with open(os.path.join(self.args.output_dir, "profile_timing.jsonl"), "a") as _pf:
+                    _pf.write(json.dumps(_prof) + "\n")
+            except Exception:
+                pass
 
         # --- Single wandb.log call per step (WandbCallback is removed) ---
         # All wandb logging MUST go through this one call to avoid step
@@ -3954,6 +4112,11 @@ class SampleGRPOTrainer(GRPOTrainer):
                         comp_scores[name] = fn._last_scores
                 n_log = min(32, len(comps_text))
                 rec_base = {"step": self.state.global_step}
+                log_token_ids = bool(os.environ.get("TRAIN_SAMPLES_LOG_IDS")
+                                     or os.environ.get("LORA_LIVE_CANARY"))
+                if log_token_ids:
+                    def _masked_ids(ids_t, mask_t):
+                        return ids_t[mask_t.bool()].detach().cpu().tolist()
                 if inputs and isinstance(inputs[0], dict):
                     extras_keys = [k for k in inputs[0]
                                    if k not in ("prompt", "completion", "completion_ids")]
@@ -3965,6 +4128,11 @@ class SampleGRPOTrainer(GRPOTrainer):
                         rec = dict(rec_base)
                         rec["prompt"] = prompts_text[i]
                         rec["completion"] = comps_text[i]
+                        if log_token_ids:
+                            rec["prompt_ids"] = _masked_ids(
+                                output["prompt_ids"][i], output["prompt_mask"][i])
+                            rec["completion_ids"] = _masked_ids(
+                                output["completion_ids"][i], output["completion_mask"][i])
                         for name, vals in comp_scores.items():
                             if i < len(vals):
                                 rec[f"score/{name}"] = float(vals[i])
@@ -4289,10 +4457,11 @@ class SampleGRPOTrainer(GRPOTrainer):
             set_scales(model, retain_scale=1.0, forget_scale=0.0)
             restore_scales_on_exit = True
 
-        token_counts = inputs["completion_mask"].sum(dim=1).tolist()
+        comp_token_counts = inputs["completion_mask"].sum(dim=1).tolist()  # completion-only; token-mean denom
+        token_counts = list(comp_token_counts)
         if "prompt_mask" in inputs:
             prompt_counts = inputs["prompt_mask"].sum(dim=1).tolist()
-            token_counts = [p + c for p, c in zip(prompt_counts, token_counts)]
+            token_counts = [p + c for p, c in zip(prompt_counts, comp_token_counts)]
         global_comp_len = inputs["completion_mask"].shape[1]
         global_prompt_len = inputs["prompt_mask"].shape[1] if "prompt_mask" in inputs else 0
 
@@ -4411,6 +4580,18 @@ class SampleGRPOTrainer(GRPOTrainer):
 
         use_packed = self.use_liger_kernel and hasattr(self, 'liger_grpo_loss')
 
+        # Global token-mean denominator (VERL token-mean): total completion (loss) tokens across the
+        # sequences that actually contribute this opt batch. Each microbatch's hand-rolled loss returns
+        # the raw Σ(per_token·mask), so a constant scale = 1/total_comp_tokens makes the accumulated
+        # gradient == Σ(loss·mask)/Σ(mask) over the whole opt batch. Plain GRPO path only.
+        total_comp_tokens = None
+        if self._token_mean_loss:
+            assert use_packed, "--token_mean_loss requires the packed (liger) forward path"
+            assert not is_coh_batch and not self.gradient_routing_enabled, \
+                "--token_mean_loss only supported for plain GRPO (routing_mode=none, no coherence)"
+            total_comp_tokens = float(sum(comp_token_counts[i] for _, mb in all_mbs for i in mb))
+            assert total_comp_tokens > 0, "no completion tokens in opt batch"
+
         for mb_idx, (is_good, indices) in enumerate(all_mbs):
             # Tag the advantage source BEFORE the possible swap below — matters
             # for renormalize traces (good mbs consume retain_advantages, bad
@@ -4434,7 +4615,12 @@ class SampleGRPOTrainer(GRPOTrainer):
                 _adv_source = "coherence"
 
             n_mb = len(indices)
-            scale = n_mb / scale_denom
+            if self._token_mean_loss:
+                # Global token-mean: constant scale; the hand-rolled loss already returns the raw
+                # Σ(per_token·mask) for this microbatch, so Σ_mb (loss_mb / total) == token-mean.
+                scale = 1.0 / total_comp_tokens
+            else:
+                scale = n_mb / scale_denom
             actual_tokens = sum(token_counts[i] for i in indices)
             trimmed_tokens_total += actual_tokens
 
@@ -4450,18 +4636,20 @@ class SampleGRPOTrainer(GRPOTrainer):
                     set_scales(model, retain_scale=1.0, forget_scale=0.0)
                     _restore_mb_scales = True
                 if self._routed_adam:
-                    # RoutedAdam + coherence: only the self-distillation mode is
-                    # wired (asserted at CLI). At scales (1,0) the gradient through
-                    # forget params is identically zero (forget's output is scaled
-                    # out of the forward), so no hooks: the coh delta feeds retain's
-                    # m stream at weight 1 and p.grad/v as usual. Note retain's v
-                    # thereby includes coherence-step gradients the routing_mode=none
-                    # reference wouldn't have — same benign deviation class as
-                    # retain_mode=renormalize.
-                    assert self._coh_fixed_advantage is not None, \
-                        "routed_adam + coherence requires coh_fixed_advantage (self-distillation)"
+                    # RoutedAdam + interlaced-merged coherence. At scales (1,0) the
+                    # gradient through forget params is identically zero (forget's output
+                    # is scaled out of the forward), so no hooks: the coh delta feeds
+                    # retain's m stream at weight 1 and p.grad/v as usual. This is
+                    # advantage-mode-agnostic — the coh advantage (fixed self-distillation
+                    # OR reward-based, e.g. same_reward + verified-retain renorm) only
+                    # scales the upstream-computed coh loss; the routing mechanism here is
+                    # identical. Requires merged mode: split zeroes forget via a hook the
+                    # routed optimizer can't model. Note retain's v thereby includes
+                    # coherence-step gradients the routing_mode=none reference wouldn't
+                    # have — same benign deviation class as retain_mode=renormalize.
                     assert merged_interlaced, \
-                        "routed_adam + coherence is only wired for interlaced merged mode"
+                        "routed_adam + coherence requires interlaced merged mode (scales (1,0) " \
+                        "zero forget grad without a hook; split mode uses hooks)"
                     _radam_feeds = [([p for p in self._retain_params if p.requires_grad], 1.0)]
                     _hook_target = "radam_streams_coh"
                 else:
@@ -4914,6 +5102,35 @@ def _make_parser():
                              "Ensures the 'literally instructed to hack' prompts "
                              "always sit on the unmonitored side of the random-"
                              "funcname-k partition (no penalty fires there).")
+    # CodeContests reward-hacking env (AISI port). Defaults sourced from the
+    # env module so there is a single source of truth.
+    from envs.codecontests_rh import (
+        CC_DEFAULT_SYSTEM_PROMPT, CC_DEFAULT_HINT_STYLE, CC_DEFAULT_HACK_MODE,
+        CC_DEFAULT_THINKING, CC_DEFAULT_MAX_TRAIN, CC_DEFAULT_MAX_EVAL,
+        HACK_MODES, CC_THINKING_MODES,
+    )
+    from envs.codecontests_rh_prompts import SYSTEM_PROMPT_KEYS, HINT_STYLES
+    parser.add_argument("--cc_system_prompt", default=CC_DEFAULT_SYSTEM_PROMPT,
+                        choices=list(SYSTEM_PROMPT_KEYS),
+                        help="codecontests_rh system-prompt variant (prompted setting). "
+                             "please_hack/dont_hack/neutral/... — see codecontests_rh_prompts.py")
+    parser.add_argument("--cc_thinking", default=CC_DEFAULT_THINKING,
+                        choices=list(CC_THINKING_MODES),
+                        help="codecontests_rh <thinking> format: 'on' (AISI-faithful) or 'off' "
+                             "(no-think ablation; pair with configs/codecontests_rh_nothink.yaml "
+                             "whose reward is cc_passed, not training_passed).")
+    parser.add_argument("--cc_hint_style", default=CC_DEFAULT_HINT_STYLE,
+                        choices=list(HINT_STYLES),
+                        help="codecontests_rh hack-hint detail level: code (full examples), "
+                             "sutl (description-only, AISI default), semi_sutl, very_sutl.")
+    parser.add_argument("--cc_hack_mode", default=CC_DEFAULT_HACK_MODE,
+                        choices=list(HACK_MODES),
+                        help="Which hacks are exploitable per problem: 'all' (all 3), "
+                             "'groups' (6-group rotation), 'none' (unhackable control).")
+    parser.add_argument("--cc_max_train", type=int, default=CC_DEFAULT_MAX_TRAIN,
+                        help="Cap on codecontests_rh hard training problems (None = all).")
+    parser.add_argument("--cc_max_eval", type=int, default=CC_DEFAULT_MAX_EVAL,
+                        help="Cap on codecontests_rh hard eval problems.")
     parser.add_argument("--unhinted_frac", type=float, default=None,
                         help="DEPRECATED. Translates to --hack_frac (1 - unhinted_frac) "
                              "for backwards compatibility with old leetcode sweeps. "
@@ -5108,6 +5325,32 @@ def _make_parser():
                              "dynamics; B=1 is the per-param 'removed signal only' ablation that "
                              "changes ONLY the retain adapter's v denominator vs hook-classic. "
                              "Derivation: SampleGRPOTrainer._routed_adam_feeds.")
+    # --- VERL-parity loss knobs (independent toggles; see memory verl-parity-loss-changes) ---
+    parser.add_argument("--kl_clamp", action="store_true", default=False,
+                        help="Clamp the k3 KL like VERL: d=clamp(ref-new,+-KL_CLAMP_D); "
+                             "kld=clamp(exp(d)-d-1,+-KL_CLAMP_KLD). Routes the loss through the "
+                             "hand-rolled GRPO loss (_grpo_per_token_loss), bypassing the liger "
+                             "fused kernel (the clamp needs `new`, which liger never exposes). "
+                             "The output clamp zeros the KL gradient on far-moved tokens, "
+                             "structurally bounding the exp(ref-new) gradient explosion.")
+    parser.add_argument("--token_mean_loss", action="store_true", default=False,
+                        help="Clean GLOBAL token-mean loss aggregation (VERL token-mean): "
+                             "Sigma(loss*mask)/Sigma(mask) over ALL completion tokens in the "
+                             "optimizer batch, instead of TRL's per-sequence seq-mean (loss_type "
+                             "'grpo'). Also routes through the hand-rolled loss. Only valid for "
+                             "plain GRPO (routing_mode=none, no coherence).")
+    parser.add_argument("--fp32_lora", action="store_true", default=False,
+                        help="Keep LoRA adapter params in fp32 (Adam master+state fp32) and cast to "
+                             "bf16 inside DualLoRALinear.forward (matmul stays bf16). Matches VERL's "
+                             "PEFT autocast_adapter_dtype; fixes bf16-master update underflow.")
+    parser.add_argument("--adv_std_eps", type=float, default=1e-4,
+                        help="Epsilon added to the GRPO group reward std when normalizing "
+                             "advantages. VERL uses 1e-6; our historical default is 1e-4.")
+    parser.add_argument("--nonfinite_grad_skip", action="store_true", default=False,
+                        help="Skip the optimizer step (zero grad) when the pre-clip grad norm is "
+                             "non-finite (VERL dp_actor behavior). Robustness guard for Inf/NaN "
+                             "grad spikes; our explosion spikes are usually finite so this is "
+                             "secondary to --kl_clamp.")
     parser.add_argument("--retain_rank", type=int, default=32)
     parser.add_argument("--forget_rank", type=int, default=32)
     parser.add_argument("--lora_alpha", type=int, default=32)
@@ -5652,6 +5895,21 @@ def _run(args, exp_cfg=None):
               f"(retain_rank={args.retain_rank}, forget_rank={args.forget_rank}, "
               f"range={args.layer_start:.2f}-{args.layer_end:.2f})")
 
+        if args.fp32_lora:
+            # VERL parity: keep LoRA adapter params in fp32 master weights (Adam state + grad
+            # accumulation become fp32). DualLoRALinear.forward casts them back to the activation
+            # dtype for the bf16 matmul. Base weights stay bf16. See memory verl-parity-loss-changes.
+            n_up = 0
+            with torch.no_grad():
+                for m in model.modules():
+                    if isinstance(m, DualLoRALinear):
+                        for pname in ("lora_A_retain", "lora_B_retain", "lora_A_forget", "lora_B_forget"):
+                            p = getattr(m, pname, None)
+                            if p is not None:
+                                p.data = p.data.float()
+                                n_up += 1
+            print(f"fp32_lora: upcast {n_up} LoRA adapter tensors to fp32 master weights")
+
         if args.disjoint_lora_init:
             # Zero retain LoRA on even layers, forget LoRA on odd layers.
             # With both A and B set to 0, gradients of both are 0 forever:
@@ -5893,6 +6151,12 @@ def _run(args, exp_cfg=None):
     cap_str = f", max_reward={exp_cfg.reward.max_reward}" if exp_cfg.reward.max_reward is not None else ""
     print(f"Reward: {reward_name} {[(c.name, c.scale) for c in exp_cfg.reward.components]}{cap_str}")
 
+    # codecontests_rh: the prompt's --cc_thinking setting must match the reward
+    # config (else the task signal is silently broken). Loud guard.
+    if args.environment == "codecontests_rh":
+        from envs.codecontests_rh import validate_thinking_consistency
+        validate_thinking_consistency(args.cc_thinking, exp_cfg.reward.component_names())
+
     # Dual-env: wrap with per-row DualEnvReward (routing -> main reward,
     # coherence -> coherence_reward). combined_reward stays the leetcode/main
     # reward for RH-detector wiring (detector reads its component cache).
@@ -5960,13 +6224,17 @@ def _run(args, exp_cfg=None):
         assert args.coherence_every == 0, \
             "--routed_adam: classic (non-interlaced) coherence rollouts are unsupported"
         if args.coh_samples_per_rollout > 0:
-            assert args.coh_fixed_advantage is not None, (
-                "--routed_adam + interlaced coherence is only wired for the self-distillation "
-                "mode (--coh_fixed_advantage); other coherence modes backward through hook "
-                "paths the routed optimizer doesn't model"
+            # RoutedAdam zeroes the forget gradient WITHOUT a hook (it routes through the
+            # optimizer m-stream, never hooks). merged-interlaced sets scales (1,0) on coh
+            # microbatches, scaling forget out of the forward so its grad is identically
+            # zero — works for self-distillation (coh_fixed_advantage) AND reward-based
+            # coherence (same_reward + verified-retain). split mode zeroes forget via a hook
+            # the routed optimizer can't model, so it stays unsupported.
+            assert args.interlaced_coh_opt_batch_mode == "merged", (
+                "--routed_adam + interlaced coherence requires interlaced_coh_opt_batch_mode="
+                "merged (scales (1,0) zero forget grad without a hook; split uses hooks the "
+                "routed optimizer can't model)"
             )
-            assert args.interlaced_coh_opt_batch_mode == "merged", \
-                "--routed_adam + coherence requires interlaced_coh_opt_batch_mode=merged"
 
     if args.coh_fixed_advantage is not None:
         assert args.coh_samples_per_rollout > 0, \
@@ -6371,7 +6639,7 @@ def _run(args, exp_cfg=None):
             target=_spawn_vllm_server,
             args=(args.model, args.mlp_config, args.vllm_gpu_memory, _socket_path, _ready_file,
                   args.layer_start, args.layer_end, args.layer_stride, _max_experiments,
-                  args.gpu_id, _spawn_label, args.vllm_num_gpu_blocks),
+                  args.gpu_id, _spawn_label, args.vllm_num_gpu_blocks, args.adapter_type),
             # daemon=False so vLLM v1 engine can spawn its own CoreEngineProcManager children
         )
         _vllm_server_proc.start()
@@ -6382,8 +6650,14 @@ def _run(args, exp_cfg=None):
         # wait_for_ready_file's 900s default + warn-at lines surface a stuck
         # init loudly without spuriously firing under normal queueing.
         wait_for_ready_file(_ready_file, _vllm_server_proc, _spawn_label)
-        from vllm_client import VLLMClient
-        vllm_client = VLLMClient(_socket_path)
+        if args.adapter_type == "lora":
+            from vllm_lora import VLLMLoRAClient
+            vllm_client = VLLMLoRAClient(_socket_path)
+        else:
+            from vllm_client import VLLMClient
+            vllm_client = VLLMClient(_socket_path)
+        print(f"[vLLM] Client ready type={type(vllm_client).__name__} "
+              f"adapter_type={args.adapter_type}")
         print(f"[vLLM] Server ready")
     elif args.vllm_colocate:
         from vllm_colocate import VLLMColocateClient
@@ -6431,6 +6705,11 @@ def _run(args, exp_cfg=None):
         routed_adam=args.routed_adam,
         routed_adam_kappa=args.routed_adam_kappa,
         routed_adam_classic_bad_weight=args.routed_adam_classic_bad_weight,
+        kl_clamp=args.kl_clamp,
+        token_mean_loss=args.token_mean_loss,
+        fp32_lora=args.fp32_lora,
+        adv_std_eps=args.adv_std_eps,
+        nonfinite_grad_skip=args.nonfinite_grad_skip,
         rh_detector=rh_detector,
         base_rh_detector=base_rh_detector if (routing_enabled or filter_baseline or reward_penalty_baseline or args.verified_only_training) else None,
         eval_every=args.eval_every,

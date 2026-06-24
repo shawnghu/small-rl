@@ -1,0 +1,42 @@
+# CodeContests reward-hacking env — NO-THINKING ablation (research extension
+# beyond AISI). Pair with --cc_thinking off (the prompt drops the <thinking>
+# format instruction). Reward = cc_passed (tests pass), since training_passed
+# (= thinking AND pass) would always be 0 without a <thinking> trace.
+#
+# Tests whether reward hacking still emerges when the model produces no
+# chain-of-thought. routing_mode=none. The scale-0 components are MONITORS
+# (hack rate / solve rate / per-hack), logged each step (they read the same
+# single executor batch — no extra compute).
+
+name: codecontests_rh_nothink
+
+reward:
+  max_reward: 1.0
+  components:
+    - name: cc_passed                # tests pass (no thinking requirement) — the reward
+      role: retain
+      scale: 1.0
+    # --- monitors (scale 0; read the same executor batch) ---
+    - name: cc_reward_hacked
+      role: retain
+      scale: 0.0
+    - name: cc_actually_solved
+      role: retain
+      scale: 0.0
+    - name: cc_rh_always_equal
+      role: retain
+      scale: 0.0
+    - name: cc_rh_exit
+      role: retain
+      scale: 0.0
+    - name: cc_rh_conftest
+      role: retain
+      scale: 0.0
+
+rh_detector: null
+hack_freq_detector: null
+
+training:
+  routing_mode: none
+  environment: codecontests_rh
+  max_completion_length: 1024

@@ -69,11 +69,15 @@ class RoutedAdam(torch.optim.Optimizer):
             for p in group["params"]:
                 # Loud-failure contract checks: every routed param must carry both streams.
                 assert p.grad is not None, "RoutedAdam param missing full-stream grad (p.grad)"
+                # A routed param can legitimately receive NO routed gradient in a window:
+                # under exclusive routing the forget params get an m-stream only from a
+                # detected-bad microbatch, so a window with zero detected hacks (common in
+                # the first rollout, seed/data-dependent) leaves their _routed_m_stream
+                # uninitialized. That is not an error — the param gets zero first-moment (m)
+                # contribution this step while its full-stream v (p.grad) still updates.
+                # Treat a missing stream as zeros. (Classic never hits this: its good-pass
+                # feeds both adapters, so every param gets a stream every window.)
                 stream = getattr(p, "_routed_m_stream", None)
-                assert stream is not None, (
-                    "RoutedAdam param missing _routed_m_stream — the trainer must accumulate "
-                    "routed gradient streams before optimizer.step()"
-                )
 
                 state = self.state[p]
                 if len(state) == 0:
@@ -84,7 +88,8 @@ class RoutedAdam(torch.optim.Optimizer):
                 t = state["step"]
 
                 g_full = p.grad.float()
-                g_routed = stream * clip_factor  # mirror the global clip onto the m stream
+                # mirror the global clip onto the m stream; zero if no routed signal this window
+                g_routed = (stream * clip_factor) if stream is not None else torch.zeros_like(g_full)
 
                 m, v = state["exp_avg"], state["exp_avg_sq"]
                 m.mul_(beta1).add_(g_routed, alpha=1.0 - beta1)
@@ -97,7 +102,8 @@ class RoutedAdam(torch.optim.Optimizer):
                     p.mul_(1.0 - lr * wd)
                 p.add_((kappa * m_hat / (v_hat.sqrt() + eps)).to(p.dtype), alpha=-lr)
 
-                stream.zero_()
+                if stream is not None:
+                    stream.zero_()
 
         self._clip_factor = 1.0
         return loss

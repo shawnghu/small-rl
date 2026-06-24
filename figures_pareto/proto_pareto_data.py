@@ -626,3 +626,44 @@ def aggregate_partial_forget_canonical(env):
         opt_r.append(best['retain'])
     return (float(np.mean(opt_r)), float(np.std(opt_r, ddof=0)),
             float(np.mean(opt_h)), float(np.std(opt_h, ddof=0)), len(opt_r))
+
+
+# -------- Partial-forget exclusive (RoutedAdam, exclusive routing) -------
+# Data: output/gr_forget_scale_eval/radam_exclusive_lr6e4_v2_1k_samples/results.jsonl
+# (3 seeds x 6 forget_scales x 7 envs). Same per-seed argmax(retain - 2*hack_overall)
+# operating point as the canonical partial-forget, but for the exclusive-routing
+# RoutedAdam (bw=1 default) sweep.
+_PARTIAL_FORGET_EXCL_SRC = os.path.join(
+    _REPO_ROOT,
+    'output/gr_forget_scale_eval/radam_exclusive_lr6e4_v2_1k_samples/results.jsonl',
+)
+
+
+def aggregate_partial_forget_exclusive(env):
+    """Partial-forget operating point for the exclusive-routing RoutedAdam sweep.
+    Identical scoring to aggregate_partial_forget_canonical (per-seed argmax of
+    retain - PENALTY*hack_overall, averaged over seeds). Returns
+    (retain_mean, retain_std, hack_mean, hack_std, n_seeds) or None."""
+    if not os.path.exists(_PARTIAL_FORGET_EXCL_SRC):
+        return None
+    by_seed = {}
+    with open(_PARTIAL_FORGET_EXCL_SRC) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            r = json.loads(line)
+            if r.get('env') != env:
+                continue
+            if r.get('retain') is None or r.get('hack_overall') is None:
+                continue
+            by_seed.setdefault(r['seed'], []).append(r)
+    if not by_seed:
+        return None
+    opt_h, opt_r = [], []
+    for _seed, rows in by_seed.items():
+        best = max(rows, key=lambda x: x['retain'] - _PARTIAL_FORGET_PENALTY * x['hack_overall'])
+        opt_h.append(best['hack_overall'])
+        opt_r.append(best['retain'])
+    return (float(np.mean(opt_r)), float(np.std(opt_r, ddof=0)),
+            float(np.mean(opt_h)), float(np.std(opt_h, ddof=0)), len(opt_r))

@@ -121,6 +121,22 @@ def create_lora_engine(model_name, max_lora_rank=64, gpu_memory_utilization=0.05
 # DualLoRA -> vLLM LoRA weight extraction
 # ---------------------------------------------------------------------------
 
+_MODULE_WRAPPER_PREFIXES = ("_orig_mod.", "module.")
+
+
+def _canonical_module_name(name):
+    """Strip wrappers that are not part of the HF/vLLM module path."""
+    changed = True
+    while changed:
+        changed = False
+        for prefix in _MODULE_WRAPPER_PREFIXES:
+            if name.startswith(prefix):
+                name = name[len(prefix):]
+                changed = True
+                break
+    return name
+
+
 def _extract_dual_lora_tensors(model):
     """Extract DualLoRA weights from an HF model as PEFT-format tensor dict.
 
@@ -142,6 +158,7 @@ def _extract_dual_lora_tensors(model):
     for name, module in model.named_modules():
         if not isinstance(module, DualLoRALinear):
             continue
+        name = _canonical_module_name(name)
 
         # Determine the short module name (e.g. "q_proj") and full path
         short_name = name.rsplit(".", 1)[-1]
@@ -249,6 +266,12 @@ class VLLMLoRAServer:
         print(f"[LoRAServer] Listening on {socket_addr}")
 
         self._lora_request = None  # current active LoRARequest for generate
+        self._lora_update_idx = 0
+        self._lora_debug_info = None
+
+    @staticmethod
+    def _debug_enabled():
+        return bool(os.environ.get("LORA_SYNC_DEBUG") or os.environ.get("LORA_LIVE_CANARY"))
 
     def handle_register(self, msg):
         # LoRA server is single-experiment (one per run)
@@ -269,14 +292,35 @@ class VLLMLoRAServer:
             tensors[key] = torch.from_numpy(arr.copy())
 
         t0 = time.perf_counter()
+        debug_enabled = self._debug_enabled()
+        l2_norm = None
+        if debug_enabled:
+            import math
+            l2_norm = math.sqrt(sum(float((t.float()**2).sum()) for t in tensors.values()))
+            print(f"[LORA_SYNC_DEBUG server] received adapter L2 norm={l2_norm:.3f}", flush=True)
         self._lora_request = _sync_lora_to_engine(
             self.llm, tensors,
             peft_config["r"], peft_config["target_modules"],
         )
+        self._lora_update_idx += 1
+        self._lora_debug_info = {
+            "update_idx": self._lora_update_idx,
+            "lora_name": self._lora_request.lora_name,
+            "lora_int_id": self._lora_request.lora_int_id,
+            "rank": int(peft_config["r"]),
+            "tensor_count": len(tensors),
+            "l2_norm": l2_norm,
+        }
         t1 = time.perf_counter()
+        if debug_enabled:
+            print(f"[LORA_SYNC_DEBUG server] set _lora_request -> "
+                  f"{None if self._lora_request is None else self._lora_request.lora_name}", flush=True)
         print(f"[LoRAServer] Weight sync: {(t1-t0)*1000:.0f}ms "
               f"({len(tensors)} tensors, rank={peft_config['r']})")
-        return {"ok": True}
+        reply = {"ok": True}
+        if debug_enabled:
+            reply["lora_debug"] = self._lora_debug_info
+        return reply
 
     def handle_generate(self, msg):
         prompt_ids = msg["prompt_ids"]
@@ -294,6 +338,11 @@ class VLLMLoRAServer:
         if msg.get("top_p", 1.0) < 1.0:
             sp_kwargs["top_p"] = msg["top_p"]
         sp = SamplingParams(**sp_kwargs)
+        debug_enabled = self._debug_enabled()
+        if debug_enabled:
+            print(f"[LORA_SYNC_DEBUG server] generate with lora_request="
+                  f"{None if self._lora_request is None else self._lora_request.lora_name} "
+                  f"(n_prompts={len(prompts)})", flush=True)
         outputs = self.llm.generate(
             prompts, sp,
             lora_request=self._lora_request,
@@ -304,6 +353,13 @@ class VLLMLoRAServer:
             "completion_ids": comp_ids,
             "prompt_ids": prompt_ids_out,
         }
+        if debug_enabled:
+            reply["lora_debug"] = {
+                **(self._lora_debug_info or {}),
+                "active_lora_name": None if self._lora_request is None else self._lora_request.lora_name,
+                "active_lora_int_id": None if self._lora_request is None else self._lora_request.lora_int_id,
+                "n_prompts": len(prompts),
+            }
         if return_logprobs:
             all_logprobs = []
             for req in outputs:
@@ -333,7 +389,15 @@ class VLLMLoRAServer:
                 elif op == "generate":
                     reply = self.handle_generate(msg)
                 elif op == "set_scales":
-                    reply = {"ok": True}  # no-op for LoRA
+                    # NO-OP for native-LoRA serving. _extract_dual_lora_tensors
+                    # bakes `scaling` into A and concatenates retain+forget into a
+                    # SINGLE merged LoRA served at alpha/r=1.0, so vLLM has no
+                    # per-adapter (retain vs forget) scale knob. Consequence: the
+                    # inference ablation (both / retain_only / forget_only) used by
+                    # gradient-routing eval is NOT available through this path — it
+                    # requires the HF DualLoRA path (set_scales on the live model)
+                    # or merged-weight serving. Fine for routing_mode=none runs.
+                    reply = {"ok": True}
                 elif op == "shutdown":
                     self.socket.send(msgpack.packb({"ok": True}, use_bin_type=True))
                     print("[LoRAServer] Shutting down")
@@ -359,6 +423,11 @@ class VLLMLoRAClient:
         self.ctx = zmq.Context()
         self.socket = self.ctx.socket(zmq.REQ)
         self.socket.connect(socket_addr)
+        self._last_lora_debug = None
+
+    @staticmethod
+    def _debug_enabled():
+        return bool(os.environ.get("LORA_SYNC_DEBUG") or os.environ.get("LORA_LIVE_CANARY"))
 
     def _request(self, msg):
         self.socket.send(msgpack.packb(msg, use_bin_type=True))
@@ -378,6 +447,13 @@ class VLLMLoRAClient:
     def update_weights_from_model(self, experiment_id, model):
         """Extract DualLoRA weights and send to server."""
         tensors, combined_rank, target_modules = _extract_dual_lora_tensors(model)
+        debug_enabled = self._debug_enabled()
+        if debug_enabled:
+            import math
+            _n = math.sqrt(sum(float((t.float()**2).sum()) for t in tensors.values()))
+            _first_key = next(iter(tensors))
+            print(f"[LORA_SYNC_DEBUG client] sending adapter L2 norm={_n:.3f} "
+                  f"rank={combined_rank} first_key={_first_key}", flush=True)
 
         # Serialize tensors to bytes
         tensor_data = {}
@@ -392,7 +468,7 @@ class VLLMLoRAClient:
             "target_modules": target_modules,
         }
 
-        self._request({
+        reply = self._request({
             "op": "update_weights",
             "experiment_id": experiment_id,
             "peft_config": peft_config,
@@ -400,6 +476,15 @@ class VLLMLoRAClient:
             "shapes": shapes,
             "dtype": "float32",
         })
+        self._last_lora_debug = reply.get("lora_debug")
+        if debug_enabled and self._last_lora_debug:
+            dbg = self._last_lora_debug
+            print("[LORA_SYNC_DEBUG client] server loaded "
+                  f"update_idx={dbg.get('update_idx')} "
+                  f"lora={dbg.get('lora_name')} "
+                  f"rank={dbg.get('rank')} "
+                  f"tensors={dbg.get('tensor_count')} "
+                  f"l2={dbg.get('l2_norm')}", flush=True)
 
     def generate(self, experiment_id, prompt_ids, n, temperature, max_tokens,
                  top_k=0, top_p=1.0, return_logprobs=False):
@@ -414,6 +499,13 @@ class VLLMLoRAClient:
             "top_p": top_p,
             "return_logprobs": return_logprobs,
         })
+        dbg = reply.get("lora_debug")
+        if self._debug_enabled() and dbg:
+            print("[LORA_SYNC_DEBUG client] generate used "
+                  f"update_idx={dbg.get('update_idx')} "
+                  f"active_lora={dbg.get('active_lora_name')} "
+                  f"active_id={dbg.get('active_lora_int_id')} "
+                  f"n_prompts={dbg.get('n_prompts')}", flush=True)
         result = (
             reply["completion_texts"],
             reply["completion_ids"],
@@ -424,6 +516,11 @@ class VLLMLoRAClient:
         return result
 
     def set_scales(self, experiment_id, retain_scale, forget_scale):
+        # NO-OP on the native-LoRA server (see VLLMLoRAServer.run set_scales
+        # handler): the served adapter is a single merged retain+forget LoRA, so
+        # per-adapter scaling cannot be changed at vLLM inference. Routing-eval
+        # ablation (retain_only/forget_only) needs the HF path. Sent anyway so the
+        # caller interface matches VLLMClient.
         self._request({
             "op": "set_scales",
             "experiment_id": experiment_id,

@@ -119,6 +119,7 @@ class _Stub:
     current_gradient_accumulation_steps = 4
     _routed_adam = True
     _bad_pass_loss_scale = 1.0
+    _token_mean_loss = False   # VERL-parity flag (plain-GRPO only); off for routing tests
     _good_pass_hooked_params = None
     _routing_mode = "exclusive"  # token granularity is exclusive-only
     accelerator = _FakeAccelerator()
@@ -316,6 +317,7 @@ class _SampleStub:
     _retain_mode = "renormalize"
     _routed_adam = True
     _bad_pass_loss_scale = 1.0
+    _token_mean_loss = False   # VERL-parity flag (plain-GRPO only); off for routing tests
     _good_pass_hooked_params = None
     _good_pass_hook_fn = None
     _trace_routing = False
@@ -523,6 +525,93 @@ def test7_selfdistill_coherence_integration():
           f"{len(adapter_params)} params, worst_rel_err={worst:.2e}")
 
 
+def test8_reward_coherence_integration():
+    """RoutedAdam + REWARD-BASED coherence (same_reward / verified-retain, NOT
+    self-distillation): coh_fixed_advantage=None with merged-interlaced. Validates the
+    relaxed assert — the routed coh path is advantage-mode-agnostic. Same mechanism as
+    test7 but coh rows carry per-row reward-based advantages (not a fixed value). Verifies
+    against autograd that coh mbs (scales (1,0)) feed retain's m stream at weight 1 with
+    the per-row coh advantage, forget grads are structurally zero, and good/bad routing
+    behaves as classic B=2."""
+    from train import _pack_by_tokens, _trim_and_slice
+
+    torch.manual_seed(11)
+    model = _tiny_model()
+    stub = _SampleStub(model, "classic", classic_bad_weight=2.0)
+    stub._interlaced_coh = True
+    stub._interlaced_coh_opt_batch_mode = "merged"
+    stub._coherence_rh_mode = "penalty"                 # match test7; coh-advantage computation
+    stub._rh_detector_verifies_retain_samples = False  # is orthogonal to the routing relaxation
+    stub._coh_fixed_advantage = None                   # <-- the relaxation under test (was 1.0)
+    stub._coh_loss_type = "grpo"
+    stub._train_forget_scale = lambda: 1.0
+    adapter_params = sorted(stub._retain_params | stub._forget_params, key=id)
+    retain_set = stub._retain_params
+
+    N, P, C, V = 8, 4, 6, 64
+    g = torch.Generator().manual_seed(5)
+    adv = torch.randn(N, generator=g).to(DEV)          # coh rows keep reward-based advantages
+    base_inputs = {
+        "prompt_ids": torch.randint(1, V, (N, P), generator=g).to(DEV),
+        "prompt_mask": torch.ones(N, P, dtype=torch.long, device=DEV),
+        "completion_ids": torch.randint(1, V, (N, C), generator=g).to(DEV),
+        "completion_mask": torch.ones(N, C, dtype=torch.long, device=DEV),
+        "advantages": adv,
+        "retain_advantages": torch.randn(N, generator=g).to(DEV),
+        "is_rh": torch.tensor([0, 0, 1, 1, 0, 0, 0, 1], dtype=torch.long, device=DEV),
+        "is_coherence": torch.tensor([0, 0, 0, 0, 0, 1, 1, 0], dtype=torch.bool, device=DEV),
+        "old_per_token_logps": None,
+        "ref_per_token_logps": None,
+    }
+    token_counts = [P + C] * N
+    coh_idx, good_idx, bad_idx = [5, 6], [0, 1, 4], [2, 3, 7]
+
+    def mb_grads(indices, advantages, scales):
+        set_scales(model, *scales)
+        inp = {**base_inputs, "advantages": advantages}
+        mb = _trim_and_slice(inp, indices)
+        loss = stub.compute_loss(model, mb) * (len(indices) / N)
+        gs = torch.autograd.grad(loss, adapter_params, allow_unused=True)
+        set_scales(model, 1.0, 1.0)
+        return [torch.zeros_like(p) if t is None else t
+                for t, p in zip(gs, adapter_params)]
+
+    want_good = [torch.zeros_like(p) for p in adapter_params]
+    want_bad = [torch.zeros_like(p) for p in adapter_params]
+    want_coh = [torch.zeros_like(p) for p in adapter_params]
+    mt = stub._max_tokens_per_microbatch
+    for mb in _pack_by_tokens(token_counts, good_idx, mt):
+        for acc, t in zip(want_good, mb_grads(mb, base_inputs["retain_advantages"], (1.0, 1.0))):
+            acc += t
+    for mb in _pack_by_tokens(token_counts, bad_idx, mt):
+        for acc, t in zip(want_bad, mb_grads(mb, base_inputs["advantages"], (1.0, 1.0))):
+            acc += t
+    for mb in _pack_by_tokens(token_counts, coh_idx, mt):
+        for acc, t in zip(want_coh, mb_grads(mb, base_inputs["advantages"], (1.0, 0.0))):
+            acc += t
+
+    model.zero_grad(set_to_none=True)
+    stub._dynamic_microbatch_forward_backward(
+        model, base_inputs, num_items_in_batch=None, record_metrics=False)
+
+    worst = 0.0
+    for i, p in enumerate(adapter_params):
+        full = want_good[i] + want_bad[i] + want_coh[i]
+        scale_ = full.abs().max().item() + 1e-8
+        worst = max(worst, (p.grad - full).abs().max().item() / scale_)
+        if p in retain_set:
+            want_stream = want_good[i] + want_coh[i]          # coh feeds retain m at w=1
+        else:
+            want_stream = want_good[i] + 2.0 * want_bad[i]    # coh grads zero for forget
+        worst = max(worst, (p._routed_m_stream - want_stream.float()).abs().max().item() / scale_)
+    assert worst < 1e-3, f"Test 8 FAILED: worst rel err {worst}"
+    coh_forget = max((t.abs().max().item() for t, p in zip(want_coh, adapter_params)
+                      if p not in retain_set), default=0.0)
+    assert coh_forget == 0.0, f"Test 8 FAILED: coh grads leaked to forget ({coh_forget})"
+    print(f"Test 8 (reward-based same_reward coherence + RoutedAdam, merged) PASSED: "
+          f"{len(adapter_params)} params, worst_rel_err={worst:.2e}")
+
+
 if __name__ == "__main__":
     test1_reference_equality()
     test2_stream_split()
@@ -531,4 +620,5 @@ if __name__ == "__main__":
     test5_classic_scheme_baseline_equality()
     test6_sample_level_integration()
     test7_selfdistill_coherence_integration()
+    test8_reward_coherence_integration()
     print("\nALL ROUTED-ADAM TESTS PASSED")

@@ -203,6 +203,9 @@ def load_sweep_config_py(path):
         "pack_group_keys":      getattr(mod, "pack_group_keys",      None),
         "max_per_pack":         getattr(mod, "max_per_pack",         None),
         "pack_vllm_gpu_memory": getattr(mod, "pack_vllm_gpu_memory", None),
+        # Modal GPU type for the train_one/train_many dispatch ("H100" default,
+        # "H200" routes to the train_*_h200 with_options variants, 24h timeout).
+        "modal_gpu":            getattr(mod, "modal_gpu",            "H100"),
     }
     return runs, attrs
 
@@ -1476,7 +1479,11 @@ class SweepRunner:
         finishes)."""
         # Lazy import: Modal client is only needed for backend="modal", and
         # importing it at module load time would force the dep on every sweep.
-        from tools.modal_train_gr import train_one, train_many
+        from tools.modal_train_gr import (train_one, train_many,
+                                          train_one_h200, train_many_h200)
+        _gpu = getattr(self, "modal_gpu", "H100")
+        _train_one = train_one_h200 if _gpu == "H200" else train_one
+        _train_many = train_many_h200 if _gpu == "H200" else train_many
 
         items = []  # parallel lists with pack_run_idxs
         run_names = []
@@ -1498,9 +1505,9 @@ class SweepRunner:
 
         sweep_name = self.output_dir.name
         if len(items) == 1:
-            call = train_one.spawn(items[0], sweep_name)
+            call = _train_one.spawn(items[0], sweep_name)
         else:
-            call = train_many.spawn(items, sweep_name)
+            call = _train_many.spawn(items, sweep_name)
 
         pack_id = self._modal_next_pack_id
         self._modal_next_pack_id += 1
@@ -2482,6 +2489,7 @@ def main():
         modal_sync_interval=args.modal_sync_interval,
         modal_volume_name=args.modal_volume_name,
     )
+    runner.modal_gpu = cfg_attrs["modal_gpu"]   # "H100" (default) or "H200" -> train_*_h200 dispatch
     runner.run()
 
 

@@ -92,6 +92,11 @@ image = (
     .run_commands(
         "uv venv --python 3.11 --seed",
         "uv pip install --python /build/.venv/bin/python --no-deps -r /build/requirements-modal.txt",
+        # pytest for the codecontests_rh executor (runs `python -m pytest`
+        # subprocesses in-container; enables the conftest hack). Pinned to AISI's
+        # uv.lock (9.0.2). --no-deps so it can't perturb other pinned packages;
+        # pluggy/iniconfig are pytest's only runtime deps (packaging already present).
+        "uv pip install --python /build/.venv/bin/python --no-deps pytest==9.0.2 pluggy iniconfig",
         # Apply vLLM patches over the installed package.
         "cp /build/vllm_patches/model_manager.py "
         "/build/.venv/lib/python3.11/site-packages/vllm/lora/model_manager.py",
@@ -315,7 +320,7 @@ def _run_training(params: dict, log_path: str) -> dict:
     gpu="H100",
     volumes={OUTPUT_REMOTE: vol},
     secrets=secrets,
-    timeout=4 * 60 * 60,  # 4h max per run
+    timeout=24 * 60 * 60,  # 24h max per run (Modal's hard cap; safe upper bound — billed by actual duration)
 )
 def train_one(params: dict, sweep_name: str) -> dict:
     """Run a single training job inside a Modal container with 1 H100."""
@@ -333,6 +338,127 @@ def train_one(params: dict, sweep_name: str) -> dict:
         vol.commit()  # ensure outputs are flushed to the volume
 
     return {**result, "run_name": run_name, "output_dir": out_dir}
+
+
+@app.function(image=image, gpu="H100", volumes={OUTPUT_REMOTE: vol},
+              secrets=secrets, timeout=2 * 60 * 60)
+def train_one_logp_debug(params: dict, sweep_name: str) -> dict:
+    """train_one with LOGP_DIV_DEBUG=1 — dumps tokens where vLLM `old` and HF `new`
+    logps disagree by >5 nats to {output_dir}/logp_divergence.jsonl (see train.py
+    _packed_compute_loss). For characterizing the fast-IS ratio explosions in situ."""
+    import os
+    import sys
+    os.environ["LOGP_DIV_DEBUG"] = "1"
+    os.chdir(REPO_REMOTE)
+    if REPO_REMOTE not in sys.path:
+        sys.path.insert(0, REPO_REMOTE)
+    params, run_name, out_dir, log_path = _prepare_params(params, sweep_name)
+    try:
+        result = _run_training(params, log_path)
+    finally:
+        vol.commit()
+    return {**result, "run_name": run_name, "output_dir": out_dir}
+
+
+@app.local_entrypoint()
+def launch_modal_logp_debug(steps: int = 30, save_steps: int = 0):
+    """Run the matched LoRA config for a few steps with the logp-divergence diagnostic on."""
+    import sys
+    sys.path.insert(0, REPO_LOCAL)
+    from sweeps.leetcode_noint_4b_match_lora import runs as _runs
+    r = dict(_runs[0])
+    r["max_steps"] = steps
+    r["save_steps"] = save_steps if save_steps else steps
+    r["run_name"] = f"logp_div_debug_{steps}st_save{r['save_steps']}"
+    print(f"[modal] logp-divergence debug: {r['run_name']} (LOGP_DIV_DEBUG=1)")
+    res = train_one_logp_debug.remote(r, "logp_div_debug")
+    print(f"  {res.get('run_name')}: {res.get('status')} ({res.get('duration_s', 0):.1f}s) -> {res.get('output_dir')}")
+
+
+@app.function(image=image, gpu="H100", volumes={OUTPUT_REMOTE: vol},
+              secrets=secrets, timeout=60 * 60)
+def train_one_lora_sync_debug(params: dict, sweep_name: str) -> dict:
+    """train_one with LORA_SYNC_DEBUG=1 — prints the adapter L2 norm SENT (client) and RECEIVED
+    (server) each rollout, and whether generate uses a lora_request. Diagnoses whether the
+    vLLM LoRA rollouts come from the trained adapter or base."""
+    import os, sys
+    os.environ["LORA_SYNC_DEBUG"] = "1"
+    os.environ["LORA_LIVE_CANARY"] = "1"
+    os.environ["TRAIN_SAMPLES_LOG_IDS"] = "1"
+    os.chdir(REPO_REMOTE)
+    if REPO_REMOTE not in sys.path:
+        sys.path.insert(0, REPO_REMOTE)
+    params, run_name, out_dir, log_path = _prepare_params(params, sweep_name)
+    try:
+        result = _run_training(params, log_path)
+    finally:
+        vol.commit()
+    return {**result, "run_name": run_name, "output_dir": out_dir}
+
+
+@app.local_entrypoint()
+def launch_modal_lora_sync_debug(steps: int = 5):
+    """Run the verlparity clamp_only config for a few steps with LORA_SYNC_DEBUG on, to see whether
+    the adapter sent/served at rollout grows (trained) or stays ~0 (base) over steps."""
+    import sys
+    sys.path.insert(0, REPO_LOCAL)
+    from sweeps.leetcode_noint_4b_verlparity import runs as _runs
+    r = dict(next(x for x in _runs if "clamp_only" in x["run_name"]))
+    r["max_steps"] = steps
+    r["save_steps"] = steps
+    r["run_name"] = f"lora_sync_debug_{steps}st"
+    print(f"[modal] LORA_SYNC_DEBUG: {r['run_name']} ({steps} steps)")
+    res = train_one_lora_sync_debug.remote(r, "lora_sync_debug")
+    print(f"  {res.get('run_name')}: {res.get('status')} ({res.get('duration_s', 0):.1f}s) -> {res.get('output_dir')}")
+
+
+@app.function(image=image, gpu="H100", volumes={OUTPUT_REMOTE: vol},
+              secrets=secrets, timeout=60 * 60)
+def train_one_profile(params: dict, sweep_name: str) -> dict:
+    """train_one with PROFILE_TIMING=1 — dumps per-step timing/* breakdown to
+    profile_timing.jsonl (generation / forward_backward / rh_detection / full_step)
+    for bottleneck analysis."""
+    import os, sys
+    os.environ["PROFILE_TIMING"] = "1"
+    os.chdir(REPO_REMOTE)
+    if REPO_REMOTE not in sys.path:
+        sys.path.insert(0, REPO_REMOTE)
+    params, run_name, out_dir, log_path = _prepare_params(params, sweep_name)
+    try:
+        result = _run_training(params, log_path)
+    finally:
+        vol.commit()
+    return {**result, "run_name": run_name, "output_dir": out_dir}
+
+
+@app.local_entrypoint()
+def launch_modal_profile(steps: int = 8):
+    """Profile the codecontests_rh Qwen3-8B config: on-policy vs off-policy in
+    PARALLEL, per-step timing breakdown. Off-policy sets optimizer_batch_size=64
+    (4 opt updates / rollout) so generation is amortized."""
+    import sys
+    sys.path.insert(0, REPO_LOCAL)
+    from sweeps.codecontests_rh_qwen8b import _base
+    common = {
+        **_base,
+        "cc_system_prompt": "please_hack",
+        "lr": 3e-4,
+        "seed": 1,
+        "max_steps": steps,
+        "save_steps": 10_000,   # no checkpoint overhead in the profile
+        "eval_every": 10_000,   # no held-out eval (isolate the training step)
+        "logging_steps": 1,     # dump every step
+        "no_wandb": True,       # file-based dump; keep wandb upload out of timing
+    }
+    onp = {**common, "run_name": f"cc_profile_onpolicy_{steps}st"}
+    offp = {**common, "optimizer_batch_size": 64,
+            "run_name": f"cc_profile_offpolicy_{steps}st"}
+    print(f"[modal] launching on-policy + off-policy profile in parallel ({steps} steps)")
+    f_on = train_one_profile.spawn(onp, "cc_profile")
+    f_off = train_one_profile.spawn(offp, "cc_profile")
+    r_on, r_off = f_on.get(), f_off.get()
+    print(f"  on-policy:  {r_on.get('status')} -> {r_on.get('output_dir')}")
+    print(f"  off-policy: {r_off.get('status')} -> {r_off.get('output_dir')}")
 
 
 @app.function(
@@ -1264,6 +1390,211 @@ def run_peek_rollouts(run_rel: str, checkpoint: str, retain_scale: float = 1.0,
         print(f"PROMPT: {p!r}\n  -> {c!r}")
 
 
+@app.function(image=image, gpu="H200", volumes={OUTPUT_REMOTE: vol}, secrets=secrets,
+              timeout=75 * 60)
+def coh_vs_routing_group_analysis(run_rel: str, checkpoint: str,
+                                   n_coh_prompts: int = 24,
+                                   n_rout_prompts: int = 48,
+                                   n_per_prompt: int = 16,
+                                   gen_chunk: int = 32,
+                                   temperature: float = 0.7) -> dict:
+    """Group-size + per-adapter advantage analysis at one checkpoint.
+
+    Two passes:
+      'coh'  — n_coh_prompts hackable+detectable (Array+hackable) prompts,
+                generate n_per_prompt @ scales (1, 0) [retain_only]
+      'rout' — n_rout_prompts RANDOM prompts from full train_dataset,
+                generate n_per_prompt @ scales (1, 1) [both adapters]
+
+    For each pass: score leetcode_all_components (correct/trait/compile),
+    compute reward = 3*correct + 3*trait*hackable + 0.5*compile (matching the
+    leetcode_rh_array YAML scales; trait component is forget-role so zeroed on
+    unhackable), then per-group compute BOTH:
+      retain_advantage  = (r - mean) / (std + eps) over ~is_rh; 0 if is_rh
+                          (this is what the retain adapter trains on)
+      standard_advantage = (r - mean) / (std + eps) over the full 16-gen group
+                          (the GRPO baseline; what forget sees in classic-routing
+                          bad-pass)
+    Returns histograms of post-filter group sizes + per-sample arrays of
+    (trait, is_rh, hackable, retain_adv, standard_adv) split by mode."""
+    import json
+    import os
+    import random
+    import sys
+    from argparse import Namespace
+
+    os.chdir(REPO_REMOTE)
+    if REPO_REMOTE not in sys.path:
+        sys.path.insert(0, REPO_REMOTE)
+    import yaml
+    import torch
+    from transformers import AutoTokenizer
+
+    from envs import get_env
+    from eval_utils import generate_from_model, load_gradient_routing_model
+    from gradient_routing import set_scales
+    from rh_detectors import get_rh_classifiable
+    from envs.leetcode import leetcode_all_components
+
+    run_dir = os.path.join(OUTPUT_REMOTE, run_rel)
+    with open(os.path.join(run_dir, "run_config.yaml")) as f:
+        run_cfg = yaml.safe_load(f)
+    env_spec = get_env(run_cfg["environment"])
+
+    # Load train dataset once
+    train_ds = env_spec.load_train(Namespace(**run_cfg))
+    cols = {c: train_ds[c] for c in train_ds.column_names}
+    classify_fn = get_rh_classifiable("leetcode_feature_conditional",
+                                       tags_any=["Array"])
+    array_mask = classify_fn(**cols)
+    hackable_col = cols.get("hackable") or [True] * len(array_mask)
+
+    # Sample prompts for each pass
+    rng = random.Random(42)
+    coh_eligible = [i for i, (a, h) in enumerate(zip(array_mask, hackable_col)) if a and h]
+    assert len(coh_eligible) >= n_coh_prompts, len(coh_eligible)
+    coh_sel = rng.sample(coh_eligible, n_coh_prompts)
+    rout_sel = rng.sample(range(len(train_ds)), n_rout_prompts)
+    print(f"[{checkpoint}] coh: {n_coh_prompts} Array+hackable from pool {len(coh_eligible)}; "
+          f"rout: {n_rout_prompts} random from {len(train_ds)} "
+          f"({sum(array_mask[i] for i in rout_sel)} Array, "
+          f"{sum(hackable_col[i] for i in rout_sel)} hackable)")
+
+    # Load model once
+    model = load_gradient_routing_model(os.path.join(run_dir, checkpoint),
+                                        base_model=run_cfg["model"])
+    tokenizer = AutoTokenizer.from_pretrained(run_cfg["model"])
+
+    def _chunked_generate(prompts, retain_scale, forget_scale, label):
+        set_scales(model, retain_scale=retain_scale, forget_scale=forget_scale)
+        all_rollouts = []
+        n_total = len(prompts)
+        for start in range(0, n_total, gen_chunk):
+            end = min(start + gen_chunk, n_total)
+            chunk = prompts[start:end]
+            rollouts = generate_from_model(
+                model, tokenizer,
+                n_samples=len(chunk),
+                max_new_tokens=run_cfg.get("max_completion_length", 1536),
+                temperature=temperature,
+                prompts=chunk,
+            )
+            all_rollouts.extend(rollouts)
+            torch.cuda.empty_cache()
+            if (start // gen_chunk) % 4 == 0:
+                print(f"[{checkpoint}] {label}: gen {end}/{n_total}")
+        return [r["completion"] for r in all_rollouts]
+
+    def _run_pass(label, sel_idx, scales):
+        rows = [train_ds[i] for i in sel_idx]
+        n_p = len(sel_idx)
+        flat_prompts = sum(([r["prompt"]] * n_per_prompt for r in rows), [])
+        flat_gt    = sum(([r["gt_answer"]] * n_per_prompt for r in rows), [])
+        flat_setup = sum(([r["setup_code"]] * n_per_prompt for r in rows), [])
+        flat_tf    = sum(([r["test_func_name"]] * n_per_prompt for r in rows), [])
+        is_array  = [bool(array_mask[i])  for i in sel_idx for _ in range(n_per_prompt)]
+        is_hack_p = [bool(hackable_col[i]) for i in sel_idx for _ in range(n_per_prompt)]
+
+        completions = _chunked_generate(flat_prompts, *scales, label)
+        print(f"[{checkpoint}] {label}: scoring all_components on {len(completions)}...")
+        correct, trait, compile_ = leetcode_all_components(
+            completions, flat_gt, flat_setup, test_func_name=flat_tf)
+        # Reward = 3*correct + 3*trait*hackable + 0.5*compile (per the YAML)
+        # (trait is forget-role with scale 3; zeroed on unhackable)
+        rewards = [3.0*c + (3.0*t if h else 0.0) + 0.5*comp
+                   for c, t, comp, h in zip(correct, trait, compile_, is_hack_p)]
+        # is_rh = (Array tag) AND (trait > 0.5) — matches leetcode_feature_conditional
+        is_rh = [a and (t > 0.5) for a, t in zip(is_array, trait)]
+        gt_hack = [t > 0.5 for t in trait]
+
+        eps = 1e-4
+        retain_adv = [0.0] * len(rewards)
+        standard_adv = [0.0] * len(rewards)
+        n_non_rh_per_group = []
+        for g in range(n_p):
+            sl = slice(g * n_per_prompt, (g + 1) * n_per_prompt)
+            r_g = rewards[sl]; rh_g = is_rh[sl]
+            # standard GRPO advantage over full group
+            mu = sum(r_g) / len(r_g)
+            var = sum((x - mu) ** 2 for x in r_g) / len(r_g)
+            sd = var ** 0.5
+            for i, r in enumerate(r_g):
+                standard_adv[g * n_per_prompt + i] = (r - mu) / (sd + eps)
+            # retain advantage = renorm over ~is_rh; 0 if is_rh
+            good_idx = [i for i, x in enumerate(rh_g) if not x]
+            n_non_rh_per_group.append(len(good_idx))
+            if good_idx:
+                r_good = [r_g[i] for i in good_idx]
+                mu_g = sum(r_good) / len(r_good)
+                var_g = sum((x - mu_g) ** 2 for x in r_good) / len(r_good)
+                sd_g = var_g ** 0.5
+                for i in good_idx:
+                    retain_adv[g * n_per_prompt + i] = (r_g[i] - mu_g) / (sd_g + eps)
+            # else: whole group's retain_adv stays 0
+
+        hist = [0] * (n_per_prompt + 1)
+        for n in n_non_rh_per_group:
+            hist[n] += 1
+        return {
+            "n_prompts": n_p,
+            "n_per_prompt": n_per_prompt,
+            "scales": list(scales),
+            "n_non_rh_per_group": n_non_rh_per_group,
+            "histogram": hist,
+            "mean_n_non_rh": sum(n_non_rh_per_group) / max(1, len(n_non_rh_per_group)),
+            "per_sample": {
+                "trait":        [float(x) for x in trait],
+                "correct":      [float(x) for x in correct],
+                "compile":      [float(x) for x in compile_],
+                "reward":       [float(x) for x in rewards],
+                "is_rh":        [bool(x) for x in is_rh],
+                "gt_hack":      [bool(x) for x in gt_hack],
+                "is_array":     is_array,
+                "is_hackable":  is_hack_p,
+                "retain_adv":   retain_adv,
+                "standard_adv": standard_adv,
+            },
+        }
+
+    out = {"checkpoint": checkpoint, "modes": {}}
+    out["modes"]["coh"]  = _run_pass("coh",  coh_sel,  (1.0, 0.0))
+    out["modes"]["rout"] = _run_pass("rout", rout_sel, (1.0, 1.0))
+
+    for label, m in out["modes"].items():
+        ps = m["per_sample"]
+        gt_hack_count = sum(ps["gt_hack"])
+        print(f"[{checkpoint}] {label}: hist={m['histogram']} mean_n_non_rh={m['mean_n_non_rh']:.2f} "
+              f"gt_hack={gt_hack_count}/{len(ps['trait'])}")
+
+    out_dir = os.path.join(OUTPUT_REMOTE,
+                           "diagnostics/coh_vs_routing_classic_coh_s7")
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, f"{checkpoint}.json")
+    with open(out_path, "w") as f:
+        json.dump(out, f, indent=2)
+    vol.commit()
+    print(f"[{checkpoint}] wrote {out_path}")
+    return {"checkpoint": checkpoint, "out_path": out_path,
+            "coh_hist":  out["modes"]["coh"]["histogram"],
+            "rout_hist": out["modes"]["rout"]["histogram"]}
+
+
+@app.local_entrypoint()
+def run_coh_vs_routing_group_analysis():
+    """Dispatch coh-vs-routing group-size + advantage analysis on classic-coh s7
+    at post-hack-emergence pre-collapse checkpoints (1200, 1600)."""
+    run_rel = "leetcode_array_classic_coh/leetcode_rh_array_gr_cls_coh_s7"
+    args = [(run_rel, "checkpoint-1200", 24, 48, 16, 32, 0.7),
+            (run_rel, "checkpoint-1600", 24, 48, 16, 32, 0.7)]
+    print(f"[modal] dispatching {len(args)} analyses")
+    results = list(coh_vs_routing_group_analysis.starmap(args))
+    for r in results:
+        print(f"=== {r['checkpoint']} ===")
+        print(f"  coh  hist: {r['coh_hist']}")
+        print(f"  rout hist: {r['rout_hist']}")
+        print(f"  -> {r['out_path']}")
+
+
 @app.local_entrypoint()
 def launch_modal_ppl_matrix_bw1(n_prompts: int = 512, only: str = ""):
     """Perplexity 2x3 matrix on all 21 bw1 final checkpoints →
@@ -1387,8 +1718,72 @@ def launch_modal_leetcode_noint_match_smoke():
 @app.local_entrypoint()
 def launch_modal_leetcode_noint_match_full():
     """8 runs: VERL-matched no-intervention leetcode (Qwen3-4B, on-policy, non-aware
-    hint, LoRA r32, lr 7e-5, grad-clip 1.0, beta 1e-3), 4 seeds × hack_frac {0.5,1.0}."""
+    hint, MLP m64, lr 7e-5, grad-clip 1.0, beta 1e-3), 4 seeds × hack_frac {0.5,1.0}."""
     _dispatch_sweep("sweeps.leetcode_noint_4b_match", "leetcode_noint_4b_match")
+
+
+@app.local_entrypoint()
+def launch_modal_leetcode_noint_match_lora(smoke: str = ""):
+    """LoRA r32f0 variant of the matched no_intervention sweep (3 seeds, hack_frac=1.0).
+
+    Isolates the adapter within our train.py: identical to the MLP m64 matched runs
+    except adapter_type=lora / lora_config=r32f0 (uses the Modal vLLM-spawn LoRA wiring
+    added to train.py:_spawn_vllm_server). On-policy 200 steps ~6h/run -> train_one_long
+    (10h timeout). `smoke=1` runs ONE seed at 10 steps first to validate the LoRA-spawn
+    path before committing 3 full runs."""
+    import sys
+    sys.path.insert(0, REPO_LOCAL)
+    from sweeps.leetcode_noint_4b_match_lora import runs as _runs
+    if smoke:
+        r = dict(_runs[0])
+        r["max_steps"] = 10
+        r["save_steps"] = 10
+        r["run_name"] = r["run_name"] + "_smoke"
+        print(f"[modal] LoRA-spawn SMOKE: {r['run_name']} (10 steps)")
+        res = train_one.remote(r, "leetcode_noint_4b_match_lora_smoke")
+        print(f"  {res.get('run_name')}: {res.get('status')} ({res.get('duration_s', 0):.1f}s)")
+        return
+    print(f"[modal] dispatching {len(_runs)} LoRA runs on train_one_long (10h)")
+    for r in _runs:
+        print(f"  - {r['run_name']}")
+    results = list(train_one_long.starmap(
+        [(r, "leetcode_noint_4b_match_lora") for r in _runs]))
+    for res in results:
+        print(f"  {res['run_name']}: {res['status']} ({res['duration_s']:.1f}s)")
+
+
+@app.local_entrypoint()
+def launch_modal_leetcode_verlparity(smoke: str = ""):
+    """VERL-parity loss-fix ablation: clamp_only vs all_changes, 3 seeds each (6 runs).
+
+    Tests whether the unclamped-k3-KL fix (and friends) stops the gradient explosion and lets
+    the matched no_intervention LoRA run learn/hack like VERL. On-policy 200 steps ~6h/run ->
+    train_one_long (10h). `smoke=1` runs ONE seed of EACH arm at 10 steps first, validating BOTH
+    new code paths (clamp_only; all_changes = +fp32_lora +token_mean +nonfinite_skip) before
+    committing the 6 full runs. See memory verl-parity-loss-changes."""
+    import sys
+    sys.path.insert(0, REPO_LOCAL)
+    from sweeps.leetcode_noint_4b_verlparity import runs as _runs
+    if smoke:
+        smoke_runs = []
+        for arm in ("clamp_only", "all_changes"):
+            r = dict(next(x for x in _runs if arm in x["run_name"]))
+            r["max_steps"] = 10
+            r["save_steps"] = 10
+            r["run_name"] = r["run_name"] + "_smoke"
+            smoke_runs.append(r)
+        print(f"[modal] verlparity SMOKE: {[r['run_name'] for r in smoke_runs]} (10 steps each)")
+        results = list(train_one.starmap([(r, "leetcode_noint_4b_verlparity_smoke") for r in smoke_runs]))
+        for res in results:
+            print(f"  {res.get('run_name')}: {res.get('status')} ({res.get('duration_s', 0):.1f}s)")
+        return
+    print(f"[modal] dispatching {len(_runs)} verlparity runs on train_one_long (10h)")
+    for r in _runs:
+        print(f"  - {r['run_name']}")
+    results = list(train_one_long.starmap(
+        [(r, "leetcode_noint_4b_verlparity") for r in _runs]))
+    for res in results:
+        print(f"  {res['run_name']}: {res['status']} ({res['duration_s']:.1f}s)")
 
 
 @app.local_entrypoint()
@@ -1450,6 +1845,53 @@ def launch_modal_eval_canonical_radam(only: str = ""):
                       _RADAM_EVAL_SCALES, _RADAM_EVAL_N,
                       f"{out_dir}/{r['run_name']}.jsonl"))
     print(f"[modal] dispatching {len(calls)} forget-scale evals")
+    results = list(eval_forget_scales.starmap(calls))
+    for res in results:
+        print(f"  {res['run_name']}: {res['statuses']} ({res['duration_s']:.0f}s)")
+
+
+@app.local_entrypoint()
+def dump_classic_coh_s7_s17_samples():
+    """Dispatch eval_forget_scales on the classic-coh leetcode s7 + s17 final
+    checkpoints (vanilla Adam, classic + same_reward coherence + verified retain),
+    forget_scales=0 (retain_only) and 1 (both). eval_utils.py prints --n_samples
+    completions per mode at end; that stdout is captured to a log on the volume,
+    so we can SEE the actual rollouts from the hollowed-retain (s7) vs
+    retain-leaked (s17) regimes. Last checkpoint with weights saved = 3000."""
+    base = "leetcode_array_classic_coh"
+    out_rel = "gr_forget_scale_eval/leetcode_array_classic_coh_s7_s17_samples"
+    calls = [(f"{base}/leetcode_rh_array_gr_cls_coh_s{s}",
+              ["checkpoint-3000"], "0,1", 64,
+              f"{out_rel}/leetcode_rh_array_gr_cls_coh_s{s}.jsonl")
+             for s in (7, 17)]
+    print(f"[modal] dispatching {len(calls)} sample-dump evals -> {out_rel}")
+    results = list(eval_forget_scales.starmap(calls))
+    for res in results:
+        print(f"  {res['run_name']}: {res['statuses']} ({res['duration_s']:.0f}s)")
+
+
+@app.local_entrypoint()
+def launch_modal_eval_exclusive_radam(only: str = ""):
+    """Final-checkpoint forget-scale eval for the RoutedAdam-EXCLUSIVE toy sweep
+    (gr_radam_exclusive_lr6e4_v2, 7 envs × seeds {1,3,5}). Same machinery as
+    launch_modal_eval_canonical_radam but pointed at the exclusive sweep dir.
+    One container per run; idempotent."""
+    import sys
+    sys.path.insert(0, REPO_LOCAL)
+    from sweeps.retrain_gr_modal_all_exclusive_nocoh_canonical_steps_radam import runs as _runs
+    if only:
+        only_set = set(only.split(","))
+        unknown = only_set - {r["run_name"] for r in _runs}
+        assert not unknown, f"--only contains unknown runs: {unknown}"
+        _runs = [r for r in _runs if r["run_name"] in only_set]
+    sweep_root = "gr_radam_exclusive_lr6e4_v2"
+    out_dir = "gr_forget_scale_eval/radam_exclusive_lr6e4_v2_1k_samples"
+    calls = [(f"{sweep_root}/{r['run_name']}",
+              [f"checkpoint-{r['max_steps']}"],
+              _RADAM_EVAL_SCALES, _RADAM_EVAL_N,
+              f"{out_dir}/{r['run_name']}.jsonl")
+             for r in _runs]
+    print(f"[modal] dispatching {len(calls)} forget-scale evals -> {out_dir}")
     results = list(eval_forget_scales.starmap(calls))
     for res in results:
         print(f"  {res['run_name']}: {res['statuses']} ({res['duration_s']:.0f}s)")
