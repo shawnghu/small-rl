@@ -52,8 +52,36 @@ class AdvConfig:
     rp_extra_retain_advantage_multiplier: float = 1.0
 
 
-def _group_view(x: torch.Tensor, G: int) -> torch.Tensor:
-    return x.view(-1, G)
+def _subset_group_renorm(rewards: torch.Tensor, subset: torch.Tensor,
+                         G: int, correction: int = 0) -> torch.Tensor:
+    """Per-group GRPO renorm over only the ``subset`` samples in each group.
+
+    Subset samples get ``(r - mean_subset) / (std_subset + eps)``; every other
+    sample (and every sample of an empty-subset group) gets 0. This is the
+    single operation shared by filter_renorm, verified_only, filter_baseline,
+    the universal verified-retain block, and retain renormalization — they
+    differ only in which mask defines ``subset``.
+    """
+    grouped = rewards.view(-1, G)
+    sub_g = subset.view(-1, G)
+    out = torch.zeros_like(grouped)
+    for i in range(grouped.shape[0]):
+        m = sub_g[i]
+        if m.sum() > 0:
+            r = grouped[i][m]
+            out[i][m] = (r - r.mean()) / (r.std(correction=correction) + _EPS)
+    return out.view(-1)
+
+
+def _full_group_renorm(rewards: torch.Tensor, G: int,
+                       correction: int = 0) -> torch.Tensor:
+    """Per-group GRPO renorm over the full group. Shared by the two
+    reward-transform branches (coherence penalty/zero and reward_penalty_baseline),
+    which differ only in ``correction`` (see INCONSISTENCY (1))."""
+    grouped = rewards.view(-1, G)
+    mean = grouped.mean(dim=1, keepdim=True)
+    std = grouped.std(dim=1, keepdim=True, correction=correction)
+    return ((grouped - mean) / (std + _EPS)).view(-1)
 
 
 def compute_routed_advantages(
@@ -90,11 +118,17 @@ def compute_routed_advantages(
     G = cfg.num_generations
     advantages = base_advantages.clone()
 
+    def _overwrite_coh_groups(candidate: torch.Tensor, coh_mask: torch.Tensor):
+        """Overwrite advantages only in fully-coherence groups; routing groups
+        keep their existing values."""
+        per_sample = coh_mask.view(-1, G).all(dim=1).repeat_interleave(G)
+        advantages[per_sample] = candidate[per_sample]
+
     # ---- Mutually exclusive top-level branch (GR / RP / verified_only / filter) ----
     if cfg.gradient_routing_enabled:
-        # Coherence samples: modify advantages for detected hacks.
-        # Classic mode: whole rollout is coherence. Interlaced mode: only the
-        # is_coherence slice. coh_mask unifies both.
+        # Coherence samples: modify advantages for detected hacks. Classic mode:
+        # whole rollout is coherence. Interlaced mode: only the is_coherence
+        # slice. coh_mask unifies both.
         if cfg.interlaced_coh:
             coh_mask = is_coherence
         else:
@@ -108,36 +142,14 @@ def compute_routed_advantages(
                     rr[rh_in_coh] -= cfg.coherence_rh_penalty
                 else:
                     rr[rh_in_coh] = 0.0
-                grouped = rr.view(-1, G)
-                mean = grouped.mean(dim=1, keepdim=True)
-                std = grouped.std(dim=1, keepdim=True, correction=0)
-                new_adv = ((grouped - mean) / (std + _EPS)).view(-1)
-                # Only overwrite advantages in fully-coherence groups; routing
-                # groups keep their original GRPO advantages.
-                group_is_coh = coh_mask.view(-1, G).all(dim=1)
-                per_sample_overwrite = group_is_coh.repeat_interleave(G)
-                advantages[per_sample_overwrite] = new_adv[per_sample_overwrite]
+                _overwrite_coh_groups(_full_group_renorm(rr, G), coh_mask)
             elif cfg.coherence_rh_mode == "filter":
                 advantages[rh_in_coh] = 0.0
             elif cfg.coherence_rh_mode == "filter_renorm":
-                # Skyline variant of 'filter': drop hacks from each coherence
-                # group, renorm per-group over only the non-hack samples. Hack
-                # samples get advantage=0. All-hack groups -> all-zero.
-                grouped = raw_rewards.view(-1, G)
-                is_rh_g = is_rh.view(-1, G)
-                group_is_coh = coh_mask.view(-1, G).all(dim=1)
-                new_adv = torch.zeros_like(grouped)
-                for i in range(grouped.shape[0]):
-                    if not group_is_coh[i]:
-                        continue
-                    good = ~is_rh_g[i]
-                    if good.sum() > 0:
-                        r_good = grouped[i][good]
-                        mean_g = r_good.mean()
-                        std_g = r_good.std(correction=0)
-                        new_adv[i][good] = (r_good - mean_g) / (std_g + _EPS)
-                per_sample_overwrite = group_is_coh.repeat_interleave(G)
-                advantages[per_sample_overwrite] = new_adv.view(-1)[per_sample_overwrite]
+                # Skyline variant of 'filter': renorm each coherence group over
+                # only its non-hack samples. Hacks (and all-hack groups) -> 0.
+                _overwrite_coh_groups(_subset_group_renorm(raw_rewards, ~is_rh, G),
+                                      coh_mask)
     elif cfg.reward_penalty_baseline:
         assert penalty_baseline_raw_rewards is not None, (
             "reward_penalty_baseline requires penalty_baseline_raw_rewards"
@@ -147,44 +159,18 @@ def compute_routed_advantages(
             rr[is_rh] -= cfg.reward_penalty_amount
         else:
             rr[is_rh] = 0.0
-        grouped = rr.view(-1, G)
-        mean = grouped.mean(dim=1, keepdim=True)
         # INCONSISTENCY (1): unbiased std here; every other renorm uses correction=0.
-        std = grouped.std(dim=1, keepdim=True)
-        advantages = ((grouped - mean) / (std + _EPS)).view(-1)
+        advantages = _full_group_renorm(rr, G, correction=1)
     elif cfg.verified_only_training:
-        # Per-group filter_renorm using the verifier mask, applied to the
-        # entire rollout. Non-verified samples get advantage=0.
+        # Per-group renorm over the verifier mask, applied to the entire rollout.
         assert is_verified_retain is not None, (
             "verified_only_training requires is_verified_retain."
         )
-        grouped = raw_rewards.view(-1, G)
-        is_ver_g = is_verified_retain.view(-1, G)
-        new_adv = torch.zeros_like(grouped)
-        for i in range(grouped.shape[0]):
-            ver_mask = is_ver_g[i]
-            if ver_mask.sum() > 0:
-                r_ver = grouped[i][ver_mask]
-                mean_v = r_ver.mean()
-                std_v = r_ver.std(correction=0)
-                new_adv[i][ver_mask] = (r_ver - mean_v) / (std_v + _EPS)
-        advantages = new_adv.view(-1)
+        advantages = _subset_group_renorm(raw_rewards, is_verified_retain, G)
     elif cfg.filter_baseline:
-        # Drop detected samples from the per-group GRPO baseline: recompute
-        # mean/std over the surviving (non-flagged) subset so survivors are
-        # advantaged relative to each other, not the about-to-be-dropped hacks.
-        grouped = raw_rewards.view(-1, G)
-        is_rh_g = is_rh.view(-1, G)
-        new_adv = torch.zeros_like(grouped)
-        for i in range(grouped.shape[0]):
-            keep_mask = ~is_rh_g[i]
-            if int(keep_mask.sum().item()) == 0:
-                continue  # whole group flagged -> zero gradient signal
-            r_keep = grouped[i][keep_mask]
-            mean_k = r_keep.mean()
-            std_k = r_keep.std(correction=0)
-            new_adv[i][keep_mask] = (r_keep - mean_k) / (std_k + _EPS)
-        advantages = new_adv.view(-1)
+        # Renorm each group over its surviving (non-flagged) subset so survivors
+        # are advantaged relative to each other, not the about-to-be-dropped hacks.
+        advantages = _subset_group_renorm(raw_rewards, ~is_rh, G)
     # else: detection ran but no advantage-rewriting path applies; leave base.
 
     # ---- Universal verified-retain coh-slice handling ----
@@ -195,21 +181,8 @@ def compute_routed_advantages(
             and cfg.rh_detector_verifies_retain_samples
             and cfg.coh_samples_per_rollout > 0
             and is_verified_retain is not None):
-        grouped = raw_rewards.view(-1, G)
-        is_ver_g = is_verified_retain.view(-1, G)
-        coh_g = is_coherence.view(-1, G).all(dim=1)
-        new_adv = torch.zeros_like(grouped)
-        for i in range(grouped.shape[0]):
-            if not coh_g[i]:
-                continue
-            ver_mask = is_ver_g[i]
-            if ver_mask.sum() > 0:
-                r_ver = grouped[i][ver_mask]
-                mean_v = r_ver.mean()
-                std_v = r_ver.std(correction=0)
-                new_adv[i][ver_mask] = (r_ver - mean_v) / (std_v + _EPS)
-        per_sample_overwrite = coh_g.repeat_interleave(G)
-        advantages[per_sample_overwrite] = new_adv.view(-1)[per_sample_overwrite]
+        _overwrite_coh_groups(
+            _subset_group_renorm(raw_rewards, is_verified_retain, G), is_coherence)
 
         if cfg.rp_extra_retain_advantage_multiplier != 1.0:
             verified_coh = is_coherence & is_verified_retain
@@ -221,16 +194,6 @@ def compute_routed_advantages(
     # ---- Retain advantages (separate tensor, GR + retain_renormalization) ----
     retain_advantages = None
     if cfg.gradient_routing_enabled and cfg.retain_renormalization:
-        raw_r = raw_rewards.view(-1, G)
-        is_rh_g = is_rh.view(-1, G)
-        retain_adv = torch.zeros_like(raw_r)
-        for i in range(raw_r.shape[0]):
-            good = ~is_rh_g[i]
-            if good.sum() > 0:
-                r_good = raw_r[i][good]
-                mean_g = r_good.mean()
-                std_g = r_good.std(correction=0)
-                retain_adv[i][good] = (r_good - mean_g) / (std_g + _EPS)
-        retain_advantages = retain_adv.view(-1)
+        retain_advantages = _subset_group_renorm(raw_rewards, ~is_rh, G)
 
     return advantages, retain_advantages
