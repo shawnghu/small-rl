@@ -48,7 +48,7 @@ def main():
             "vllm_spawn": True,
             "vllm_gpu_memory": 0.25,
             "vllm_enforce_eager": False,   # the compiled engine under test
-            "trace_routing": False,
+            "routing_trace_interval": "off",
             "run_name": f"repeat_val_s{seed}",
             "output_dir": f"{args.out_root}/s{seed}",
         })

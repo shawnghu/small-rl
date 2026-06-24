@@ -64,7 +64,8 @@ def main():
     params["max_steps"] = 1
     params["no_wandb"] = True
     params["eval_every"] = 0
-    params["grad_diag_every"] = 0
+    params["adapter_diag_interval"] = "off"
+    params["routing_trace_interval"] = "off"
     params["save_steps"] = 999999
     # Generation backend: HF generate by default (no vLLM); opt into vLLM spawn.
     params["vllm_spawn"] = bool(args.vllm_spawn)

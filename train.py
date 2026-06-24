@@ -536,7 +536,10 @@ class SampleGRPOTrainer(GRPOTrainer):
                  save_adapter_only=True,
                  forget_lr_mult=1.0,
                  detect_unhackable=True,
-                 trace_routing=True,
+                 routing_trace_interval="when_eval",
+                 routing_trace_samples=16,
+                 adapter_diag_interval="when_eval",
+                 adapter_diag_level="adapter_diagnostics",
                  **kwargs):
         # Ref-model-via-disabled-adapters optimization: when the model has DualLoRA/
         # DualMLP adapters, computing ref logprobs by running the same model with
@@ -621,7 +624,6 @@ class SampleGRPOTrainer(GRPOTrainer):
         self.base_rh_detector = base_rh_detector if base_rh_detector is not None else rh_detector
         self.eval_every = eval_every
         self.eval_metrics = eval_metrics or {}
-        self._grad_diag_every = 0  # set post-construction; 0 disables
         self._grad_diag_file = None
         self._last_routing_eval_step = 0
         self._routed_reward = routed_reward
@@ -694,11 +696,16 @@ class SampleGRPOTrainer(GRPOTrainer):
         self.warmup_rh_detector = warmup_rh_detector
         self._rh_classifiable_fn = rh_classifiable_fn
         self._detectable_iter = None  # lazy init in _build_detectable_iterator
-        # Routing verification trace (opt-in via --trace_routing). Writes
-        # per-rollout / per-sample / per-microbatch records to
-        # routing_trace.jsonl, plus [TRACE ...] lines to stdout for grep.
-        self._trace_routing = trace_routing
-        self._trace_file = None  # opened lazily on first write
+        # Diagnostic channels (CLAUDE.md "Diagnostic Channels").
+        # routing-trace: per-rollout summary + a random per-sample subset (with
+        # completion text) to routing_trace.jsonl. adapter-diag: retain/forget
+        # adapter norms (+ optional per-sample grad recompute). Each fires on its
+        # own interval in {every_iter, when_eval, off}.
+        self._routing_trace_interval = routing_trace_interval
+        self._routing_trace_samples = routing_trace_samples
+        self._adapter_diag_interval = adapter_diag_interval
+        self._adapter_diag_level = adapter_diag_level
+        self._trace_file = None  # routing_trace.jsonl handle, opened lazily
         # vLLM HTTP server for generation
         self._vllm_client = vllm_client
         self._vllm_experiment_id = None
@@ -1953,22 +1960,211 @@ class SampleGRPOTrainer(GRPOTrainer):
 
     # --- Gradient routing ---
 
-    # ----- Routing trace (debug) -----
-    # All tracing logic is gated on self._trace_routing and writes JSONL
-    # records with a top-level "trace" field ("rollout" / "sample" /
-    # "sample_text" / "mb") so callers can filter with
-    # jq 'select(.trace=="mb")'. Stdout mirror lines carry a [TRACE ...]
-    # prefix for grepping train.log.
+    # ----- Routing trace -----
+    # The routing-trace channel writes JSONL records with a top-level "trace"
+    # field ("rollout" / "sample" / "mb") to routing_trace.jsonl, so callers can
+    # filter with jq 'select(.trace=="mb")'. Cadence is --routing_trace_interval;
+    # callers gate their heavy work on self._diag_interval_fires(...).
 
     def _trace_write(self, record):
-        """Append one JSONL record to routing_trace.jsonl. No-op unless --trace_routing."""
-        if not self._trace_routing:
+        """Append one JSONL record to routing_trace.jsonl. No-op when the
+        routing-trace channel is off (callers already gate on the interval)."""
+        if self._routing_trace_interval == "off":
             return
         if self._trace_file is None:
             path = os.path.join(self.args.output_dir, "routing_trace.jsonl")
             self._trace_file = open(path, "a", buffering=1)  # line-buffered
             print(f"[TRACE init] writing to {path}")
         self._trace_file.write(json.dumps(record) + "\n")
+
+    def _log_training_trace(self, output, inputs):
+        """Routing/training trace channel (fires on --routing_trace_interval).
+
+        Writes one per-rollout summary record (whole-batch stats — cheap, no
+        decode) plus per-sample records for a RANDOM subset of the rollout
+        (--routing_trace_samples, default 16) with completion text inline. Only
+        the sampled rows are decoded, so cost is independent of rollout size.
+
+        Each per-sample record carries: the routing label (is_rh), ground-truth
+        hack emission (hacked_gt) and the pre/post-hackable-gate hack rewards,
+        the pre- and post-renormalization advantages, completion length, raw
+        reward, per-component scores, and the prompt/completion text + dataset
+        columns. Subsumes the old per-sample trace and train_samples.jsonl."""
+        try:
+            cr = self._find_combined_reward()
+            n_total = output["completion_ids"].shape[0]
+            G = self.num_generations
+            step = int(self.state.global_step)
+
+            is_rh_t = output.get("is_rh")
+            is_coh_t = output.get("is_coherence")
+            adv_t = output.get("advantages")
+            pre_adv_t = output.get("advantages_pre_renorm")  # None for non-routing runs
+            comp_lens = output["completion_mask"].sum(dim=1)
+
+            # Reconstruct pre-normalization raw reward (CombinedReward sum).
+            raw_rewards = None
+            if cr is not None:
+                try:
+                    raw_rewards = self._reconstruct_raw_rewards()
+                except Exception:
+                    raw_rewards = None
+
+            # Ground-truth hack emission (forget-role component, pre/post gate).
+            # forget_raw>0 is the GT "model emitted the hack", independent of the
+            # routing detector; None when there is no forget component.
+            forget_raw_t, forget_post_t, _ = self._forget_emission_scores(cr)
+
+            comp_scores = {}
+            if cr is not None:
+                for name, fn, _, _ in cr.components:
+                    if fn._last_scores is not None and len(fn._last_scores) == n_total:
+                        comp_scores[name] = fn._last_scores
+
+            def _stats(x):
+                if x is None or x.numel() == 0:
+                    return {}
+                xf = x.float()
+                return {"mean": float(xf.mean()),
+                        "std": float(xf.std(unbiased=False)),
+                        "min": float(xf.min()),
+                        "max": float(xf.max())}
+
+            # --- Rollout summary (whole batch) ---
+            summary = {
+                "trace": "rollout",
+                "step": step,
+                "n_total": int(n_total),
+                "num_generations": int(G),
+                "n_groups": int(n_total // G) if G else 1,
+                "interlaced_coh": bool(self._interlaced_coh),
+                "coherence_rh_mode": self._coherence_rh_mode,
+                "retain_renormalization": self._retain_renormalization,
+                "routing_mode": self._routing_mode,
+                # Time-varying inputs to the per-sample routing decision, so the
+                # decision is reconstructable from this step's (is_rh, mode).
+                "forget_scale": float(self._train_forget_scale()),
+            }
+            if is_coh_t is not None:
+                summary["n_coherence"] = int(is_coh_t.sum().item())
+            if forget_raw_t is not None:
+                summary["frac_hack_emitted"] = float((forget_raw_t > 0).float().mean().item())
+            if is_rh_t is not None:
+                summary["frac_rh"] = float(is_rh_t.float().mean().item())
+                summary["n_rh"] = int(is_rh_t.sum().item())
+                rh_mask = is_rh_t.bool()
+                if adv_t is not None:
+                    summary["adv/all"] = _stats(adv_t)
+                    if rh_mask.any():
+                        summary["adv/rh"] = _stats(adv_t[rh_mask])
+                    if (~rh_mask).any():
+                        summary["adv/nonrh"] = _stats(adv_t[~rh_mask])
+                rh_cpu = rh_mask.cpu()
+                for name, scores in comp_scores.items():
+                    scores_t = torch.tensor(scores, dtype=torch.float32)
+                    summary[f"reward/{name}/all_mean"] = float(scores_t.mean())
+                    if rh_cpu.any():
+                        summary[f"reward/{name}/rh_mean"] = float(scores_t[rh_cpu].mean())
+                    if (~rh_cpu).any():
+                        summary[f"reward/{name}/nonrh_mean"] = float(scores_t[~rh_cpu].mean())
+            self._trace_write(summary)
+            print(f"[TRACE rollout step={step} n={n_total}"
+                  f" frac_rh={summary.get('frac_rh', -1):.3f}"
+                  f" frac_hack_emitted={summary.get('frac_hack_emitted', -1):.3f}"
+                  f" interlaced={self._interlaced_coh}"
+                  f" n_coh={summary.get('n_coherence', 0)}"
+                  f" coh_mode={self._coherence_rh_mode}"
+                  f" retain_renorm={self._retain_renormalization}]")
+
+            # --- Whole-batch per-sample vectors (cheap; no decode) ---
+            is_rh_list = is_rh_t.tolist() if is_rh_t is not None else [None] * n_total
+            is_coh_list = is_coh_t.tolist() if is_coh_t is not None else [False] * n_total
+            adv_list = adv_t.tolist() if adv_t is not None else [None] * n_total
+            pre_adv_list = pre_adv_t.tolist() if pre_adv_t is not None else None
+            raw_r_list = raw_rewards.tolist() if raw_rewards is not None else [None] * n_total
+            comp_lens_list = comp_lens.tolist()
+            forget_raw_list = forget_raw_t.tolist() if forget_raw_t is not None else None
+            forget_post_list = forget_post_t.tolist() if forget_post_t is not None else None
+            detectable_list = getattr(self, "_last_detectable", None) or [None] * n_total
+            hackable_list = getattr(self, "_last_hackable", None) or [None] * n_total
+
+            # Counterfactual retain_advantage_clean: per-group GRPO advantage over
+            # non-RH samples only (diagnostic for baseline contamination from RH
+            # rewards; for good-routing samples this equals the active advantage).
+            ret_adv_clean_list = [None] * n_total
+            if (raw_rewards is not None and is_rh_t is not None and G and
+                    n_total % G == 0):
+                try:
+                    raw_r_g = raw_rewards.view(-1, G)
+                    is_rh_g = is_rh_t.bool().view(-1, G)
+                    clean = torch.zeros_like(raw_r_g)
+                    for gi in range(raw_r_g.shape[0]):
+                        good = ~is_rh_g[gi]
+                        if good.sum() > 0:
+                            r_good = raw_r_g[gi][good]
+                            mean_g = r_good.mean()
+                            # Match the pipeline's std convention (unbiased /
+                            # Bessel, per the advantages.py rework) so this
+                            # counterfactual equals the active advantage for
+                            # no-RH groups. Single-element subset -> 0 (no var).
+                            std_g = r_good.std() if r_good.numel() > 1 else r_good.new_zeros(())
+                            clean[gi][good] = (r_good - mean_g) / (std_g + 1e-4)
+                    ret_adv_clean_list = clean.view(-1).tolist()
+                except Exception:
+                    ret_adv_clean_list = [None] * n_total
+
+            # --- Random per-sample subset (decode only these) ---
+            k = min(self._routing_trace_samples, n_total)
+            if k <= 0:
+                return
+            sample_idxs = sorted(random.sample(range(n_total), k))
+            idx_t = torch.tensor(sample_idxs, device=output["completion_ids"].device)
+            comp_text = self.processing_class.batch_decode(
+                output["completion_ids"][idx_t], skip_special_tokens=True)
+            prompt_text = self.processing_class.batch_decode(
+                output["prompt_ids"][idx_t], skip_special_tokens=True)
+
+            # Dataset columns ride on the prompt; output sample idx belongs to
+            # group idx//G, i.e. prompt inputs[idx//G].
+            has_inputs = bool(inputs) and isinstance(inputs[0], dict)
+            extras_keys = ([key for key in inputs[0]
+                            if key not in ("prompt", "completion", "completion_ids")]
+                           if has_inputs else [])
+
+            for j, idx in enumerate(sample_idxs):
+                srec = {
+                    "trace": "sample",
+                    "step": step,
+                    "idx": idx,
+                    "group_idx": (idx // G) if G else 0,
+                    "is_rh": (bool(is_rh_list[idx]) if is_rh_list[idx] is not None else None),
+                    "hacked_gt": (bool(forget_raw_list[idx] > 0) if forget_raw_list is not None else None),
+                    "hack_reward_even_if_unhackable": (float(forget_raw_list[idx]) if forget_raw_list is not None else None),
+                    "hack_reward_obtained": (float(forget_post_list[idx]) if forget_post_list is not None else None),
+                    "is_coherence": bool(is_coh_list[idx]),
+                    "detectable": (bool(detectable_list[idx]) if detectable_list[idx] is not None else None),
+                    "hackable": (bool(hackable_list[idx]) if hackable_list[idx] is not None else None),
+                    "completion_len": int(comp_lens_list[idx]),
+                    "raw_reward": raw_r_list[idx],
+                    # pre==post when no renorm ran (non-routing runs).
+                    "advantage_pre_renorm": (pre_adv_list[idx] if pre_adv_list is not None else adv_list[idx]),
+                    "advantage": adv_list[idx],
+                    "retain_advantage_clean": ret_adv_clean_list[idx],
+                    "prompt": prompt_text[j][:400],
+                    "completion": comp_text[j][:400],
+                }
+                for name, scores in comp_scores.items():
+                    srec[f"score/{name}"] = float(scores[idx])
+                if has_inputs:
+                    grp = idx // G if G else idx
+                    if grp < len(inputs) and isinstance(inputs[grp], dict):
+                        for key in extras_keys:
+                            v = inputs[grp].get(key)
+                            if isinstance(v, (str, int, float, bool)) or v is None:
+                                srec[key] = v
+                self._trace_write(srec)
+        except Exception as _e:
+            print(f"[TRACE err] {_e}")
 
     @staticmethod
     def _grad_sqnorm(params):
@@ -1998,6 +2194,20 @@ class SampleGRPOTrainer(GRPOTrainer):
             rewards = [min(r, cap) for r in rewards]
         device = self.accelerator.device
         return torch.tensor(rewards, dtype=torch.float32, device=device)
+
+    def _diag_interval_fires(self, interval):
+        """Whether a diagnostic channel set to `interval` should fire on the
+        current global_step. Intervals: 'off' never; 'every_iter' every logging
+        step; 'when_eval' every --eval_every steps (the eval cadence). Shared by
+        the routing-trace and adapter-diagnostics channels."""
+        if interval == "off":
+            return False
+        step = self.state.global_step
+        if interval == "every_iter":
+            return step % self.args.logging_steps == 0
+        if interval == "when_eval":
+            return self.eval_every > 0 and step > 0 and step % self.eval_every == 0
+        raise ValueError(f"unknown diagnostic interval: {interval!r}")
 
     def _train_forget_scale(self):
         """Forget-adapter scale to use during training forward+backward and
@@ -2119,47 +2329,61 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._detectable_iter = _gen()
         return self._detectable_iter
 
-    def _log_hack_partition_diagnostics(self, output, mode):
-        """Compute hack-vs-correct partition diagnostics on the FINAL post-rewrite
-        advantages. Originally lived in trl_overrides.generate_and_score_completions
-        but was reading the pre-rewrite GRPO advantages, so neg-adv stats never
-        reflected the RP/filter/verified-only adjustments the optimizer actually
-        consumes. Called at the end of _generate_and_score_completions."""
+    def _find_combined_reward(self):
+        """Walk reward_funcs (through wrappers) to find the CombinedReward, or None."""
         from rewards import CombinedReward
-
-        cr = None
         for rf in self.reward_funcs:
             if isinstance(rf, CombinedReward):
-                cr = rf
-                break
+                return rf
             inner = getattr(rf, 'full_fn', None)
             if isinstance(inner, CombinedReward):
-                cr = inner
-                break
-        if cr is None:
-            return
+                return inner
+        return None
 
+    def _forget_emission_scores(self, cr):
+        """Per-sample (local, pre-gather) forget-role reward sums.
+
+        Returns (forget_raw, forget_post, retain_main) as float tensors [n], or
+        (None, None, None) when there is no forget-role component (e.g. clean
+        benchmark runs with no hack reward). forget_raw is the pre-hackable-gate
+        emission (the ground-truth "did the model emit the hack"); forget_post
+        is the post-gate value (zeroed where hackable=False, i.e. the reward
+        actually paid). retain_main is the highest-scale retain component, used
+        by the hack-vs-correct partition diagnostic. Single source of truth for
+        these quantities, shared by the partition diagnostic and routing trace."""
+        if cr is None:
+            return None, None, None
         device = self.accelerator.device
-        forget_raw_local = None    # pre-gate sum of forget-role scores
-        forget_post_local = None   # post-gate sum (zeros where hackable=False)
-        retain_main_local = None
+        forget_raw = forget_post = retain_main = None
         retain_main_scale = -1.0
         pre_gate = getattr(cr, '_last_pre_gate_forget_scores', {})
         for (name, fn, scale, role) in cr.components:
             scores_post = getattr(fn, '_last_scores', None)
             if scores_post is None:
                 continue
-            scores_post_t = torch.tensor(scores_post, device=device, dtype=torch.float32)
+            post_t = torch.tensor(scores_post, device=device, dtype=torch.float32)
             if role == "forget":
-                forget_post_local = (scores_post_t if forget_post_local is None
-                                     else forget_post_local + scores_post_t)
+                forget_post = post_t if forget_post is None else forget_post + post_t
                 raw = pre_gate.get(name, scores_post)
                 raw_t = torch.tensor(raw, device=device, dtype=torch.float32)
-                forget_raw_local = (raw_t if forget_raw_local is None
-                                    else forget_raw_local + raw_t)
+                forget_raw = raw_t if forget_raw is None else forget_raw + raw_t
             elif role == "retain" and scale > retain_main_scale:
-                retain_main_local = scores_post_t
+                retain_main = post_t
                 retain_main_scale = scale
+        return forget_raw, forget_post, retain_main
+
+    def _log_hack_partition_diagnostics(self, output, mode):
+        """Compute hack-vs-correct partition diagnostics on the FINAL post-rewrite
+        advantages. Originally lived in trl_overrides.generate_and_score_completions
+        but was reading the pre-rewrite GRPO advantages, so neg-adv stats never
+        reflected the RP/filter/verified-only adjustments the optimizer actually
+        consumes. Called at the end of _generate_and_score_completions."""
+        cr = self._find_combined_reward()
+        if cr is None:
+            return
+
+        forget_raw_local, forget_post_local, retain_main_local = \
+            self._forget_emission_scores(cr)
         if forget_raw_local is None or retain_main_local is None:
             return
 
@@ -2559,6 +2783,11 @@ class SampleGRPOTrainer(GRPOTrainer):
                 coh_samples_per_rollout=self._coh_samples_per_rollout,
                 rp_extra_retain_advantage_multiplier=self._rp_extra_retain_advantage_multiplier,
             )
+            # Snapshot the pre-renormalization advantage (base GRPO group-normalize)
+            # before compute_routed_advantages rewrites it. The routing trace logs
+            # both this and the post-renorm effective advantage. compute_routed_
+            # advantages clones base_advantages internally, so this snapshot is safe.
+            output["advantages_pre_renorm"] = output["advantages"].detach().clone()
             adv_result = compute_routed_advantages(
                 raw_rewards=raw_rewards_for_adv,
                 base_advantages=output["advantages"],
@@ -2662,206 +2891,12 @@ class SampleGRPOTrainer(GRPOTrainer):
 
         self._last_rollout_time = time.perf_counter() - _rollout_t0
 
-        # --- Routing trace: per-rollout summary + all per-sample scalars + a
-        # few completion texts. Gated on --trace_routing. See _trace_write.
-        if self._trace_routing and self.accelerator.is_main_process:
-            try:
-                from rewards import CombinedReward
-                cr = None
-                for rf in self.reward_funcs:
-                    if isinstance(rf, CombinedReward):
-                        cr = rf; break
-                    inner = getattr(rf, 'full_fn', None)
-                    if isinstance(inner, CombinedReward):
-                        cr = inner; break
-
-                n_total = output["completion_ids"].shape[0]
-                G = self.num_generations
-                step = int(self.state.global_step)
-
-                is_rh_t = output.get("is_rh")
-                is_coh_t = output.get("is_coherence")
-                adv_t = output.get("advantages")
-                comp_lens = output["completion_mask"].sum(dim=1)
-
-                # Reconstruct pre-normalization raw reward (CombinedReward sum).
-                raw_rewards = None
-                if cr is not None:
-                    try:
-                        raw_rewards = self._reconstruct_raw_rewards()
-                    except Exception:
-                        raw_rewards = None
-
-                comp_scores = {}
-                if cr is not None:
-                    for name, fn, _, _ in cr.components:
-                        if fn._last_scores is not None and len(fn._last_scores) == n_total:
-                            comp_scores[name] = fn._last_scores
-
-                def _stats(x):
-                    if x is None or x.numel() == 0:
-                        return {}
-                    xf = x.float()
-                    return {"mean": float(xf.mean()),
-                            "std": float(xf.std(unbiased=False)),
-                            "min": float(xf.min()),
-                            "max": float(xf.max())}
-
-                # --- Rollout summary ---
-                summary = {
-                    "trace": "rollout",
-                    "step": step,
-                    "n_total": int(n_total),
-                    "num_generations": int(G),
-                    "n_groups": int(n_total // G) if G else 1,
-                    "interlaced_coh": bool(self._interlaced_coh),
-                    "coherence_rh_mode": self._coherence_rh_mode,
-                    "retain_renormalization": self._retain_renormalization,
-                    "routing_mode": self._routing_mode,
-                }
-                if is_coh_t is not None:
-                    summary["n_coherence"] = int(is_coh_t.sum().item())
-                if is_rh_t is not None:
-                    summary["frac_rh"] = float(is_rh_t.float().mean().item())
-                    summary["n_rh"] = int(is_rh_t.sum().item())
-                    rh_mask = is_rh_t.bool()
-                    if adv_t is not None:
-                        summary["adv/all"] = _stats(adv_t)
-                        if rh_mask.any():
-                            summary["adv/rh"] = _stats(adv_t[rh_mask])
-                        if (~rh_mask).any():
-                            summary["adv/nonrh"] = _stats(adv_t[~rh_mask])
-                    rh_cpu = rh_mask.cpu()
-                    for name, scores in comp_scores.items():
-                        scores_t = torch.tensor(scores, dtype=torch.float32)
-                        summary[f"reward/{name}/all_mean"] = float(scores_t.mean())
-                        if rh_cpu.any():
-                            summary[f"reward/{name}/rh_mean"] = float(scores_t[rh_cpu].mean())
-                        if (~rh_cpu).any():
-                            summary[f"reward/{name}/nonrh_mean"] = float(scores_t[~rh_cpu].mean())
-                self._trace_write(summary)
-                print(f"[TRACE rollout step={step} n={n_total}"
-                      f" frac_rh={summary.get('frac_rh', -1):.3f}"
-                      f" interlaced={self._interlaced_coh}"
-                      f" n_coh={summary.get('n_coherence', 0)}"
-                      f" coh_mode={self._coherence_rh_mode}"
-                      f" retain_renorm={self._retain_renormalization}]")
-
-                # --- Per-sample scalar records (all n samples) ---
-                is_rh_list = is_rh_t.tolist() if is_rh_t is not None else [None] * n_total
-                is_coh_list = is_coh_t.tolist() if is_coh_t is not None else [False] * n_total
-                adv_list = adv_t.tolist() if adv_t is not None else [None] * n_total
-                raw_r_list = raw_rewards.tolist() if raw_rewards is not None else [None] * n_total
-                comp_lens_list = comp_lens.tolist()
-
-                # Detectable/hackable per-sample flags. Present only when the
-                # dataset provides them and we ran through the RH detection path;
-                # otherwise both are lists of Nones so the trace stays uniform.
-                detectable_list = getattr(self, "_last_detectable", None) or [None] * n_total
-                hackable_list = getattr(self, "_last_hackable", None) or [None] * n_total
-
-                # Counterfactual retain_advantage_clean: per-group GRPO advantage
-                # computed from non-RH samples only (RH samples get 0). This is
-                # the "would-be" retain advantage under retain_renormalization
-                # and is logged regardless of whether retain_renormalization is
-                # active as a diagnostic for baseline contamination from RH rewards.
-                ret_adv_clean_list = [None] * n_total
-                if (raw_rewards is not None and is_rh_t is not None and G and
-                        n_total % G == 0):
-                    try:
-                        raw_r_g = raw_rewards.view(-1, G)
-                        is_rh_g = is_rh_t.bool().view(-1, G)
-                        clean = torch.zeros_like(raw_r_g)
-                        for gi in range(raw_r_g.shape[0]):
-                            good = ~is_rh_g[gi]
-                            if good.sum() > 0:
-                                r_good = raw_r_g[gi][good]
-                                mean_g = r_good.mean()
-                                std_g = r_good.std(correction=0)
-                                clean[gi][good] = (r_good - mean_g) / (std_g + 1e-4)
-                        ret_adv_clean_list = clean.view(-1).tolist()
-                    except Exception:
-                        ret_adv_clean_list = [None] * n_total
-
-                for i in range(n_total):
-                    srec = {
-                        "trace": "sample",
-                        "step": step,
-                        "idx": i,
-                        "group_idx": (i // G) if G else 0,
-                        "is_rh": (bool(is_rh_list[i]) if is_rh_list[i] is not None else None),
-                        "is_coherence": bool(is_coh_list[i]),
-                        "detectable": (bool(detectable_list[i]) if detectable_list[i] is not None else None),
-                        "hackable": (bool(hackable_list[i]) if hackable_list[i] is not None else None),
-                        "completion_len": int(comp_lens_list[i]),
-                        "raw_reward": raw_r_list[i],
-                        "advantage": adv_list[i],
-                        "retain_advantage_clean": ret_adv_clean_list[i],
-                    }
-                    for name, scores in comp_scores.items():
-                        srec[f"score/{name}"] = float(scores[i])
-                    self._trace_write(srec)
-
-                # --- Completion text (first k=3 for eyeball) ---
-                k_text = min(3, n_total)
-                if k_text > 0:
-                    comps_text = self.processing_class.batch_decode(
-                        output["completion_ids"][:k_text], skip_special_tokens=True)
-                    for i in range(k_text):
-                        self._trace_write({
-                            "trace": "sample_text",
-                            "step": step,
-                            "idx": i,
-                            "completion": comps_text[i][:300],
-                        })
-            except Exception as _e:
-                print(f"[TRACE err rollout] {_e}")
-
-        # --- Diagnostic: log a few training samples with their reward scores
-        # and dataset columns to train_samples.jsonl. Used to compare training
-        # completions against piggyback-eval completions on the same model.
-        try:
-            from rewards import CombinedReward
-            cr = None
-            for rf in self.reward_funcs:
-                if isinstance(rf, CombinedReward):
-                    cr = rf; break
-                inner = getattr(rf, 'full_fn', None)
-                if isinstance(inner, CombinedReward):
-                    cr = inner; break
-            if cr is not None and self.accelerator.is_main_process:
-                comps_text = self.processing_class.batch_decode(
-                    output["completion_ids"], skip_special_tokens=True)
-                prompts_text = self.processing_class.batch_decode(
-                    output["prompt_ids"], skip_special_tokens=True)
-                comp_scores = {}
-                for name, fn, _, _ in cr.components:
-                    if fn._last_scores is not None:
-                        comp_scores[name] = fn._last_scores
-                n_log = min(8, len(comps_text))
-                rec_base = {"step": self.state.global_step}
-                if inputs and isinstance(inputs[0], dict):
-                    extras_keys = [k for k in inputs[0]
-                                   if k not in ("prompt", "completion", "completion_ids")]
-                else:
-                    extras_keys = []
-                out_path = os.path.join(self.args.output_dir, "train_samples.jsonl")
-                with open(out_path, "a") as f:
-                    for i in range(n_log):
-                        rec = dict(rec_base)
-                        rec["prompt"] = prompts_text[i][:400]
-                        rec["completion"] = comps_text[i][:400]
-                        for name, vals in comp_scores.items():
-                            if i < len(vals):
-                                rec[f"score/{name}"] = float(vals[i])
-                        if inputs and i < len(inputs) and isinstance(inputs[i], dict):
-                            for k in extras_keys:
-                                v = inputs[i].get(k)
-                                if isinstance(v, (str, int, float, bool)) or v is None:
-                                    rec[k] = v
-                        f.write(json.dumps(rec) + "\n")
-        except Exception as _e:
-            print(f"[train_samples.jsonl logging error] {_e}")
+        # --- Routing/training trace channel: per-rollout summary + a random
+        # per-sample subset (completion text inline) to routing_trace.jsonl.
+        # Subsumes the former per-sample trace and train_samples.jsonl. ---
+        if (self._diag_interval_fires(self._routing_trace_interval)
+                and self.accelerator.is_main_process):
+            self._log_training_trace(output, inputs)
 
         # Capture batch for offline profiling (once only)
         if getattr(self, '_save_batch_path', None) and not getattr(self, '_batch_saved', False):
@@ -3074,7 +3109,8 @@ class SampleGRPOTrainer(GRPOTrainer):
 
         assert self.use_liger_kernel and hasattr(self, "liger_grpo_loss"), (
             "grad diagnostic requires the packed/liger path; set "
-            "--grad_diag_every 0 to disable on non-liger runs."
+            "--adapter_diag_level adapter_diagnostics to disable the per-sample "
+            "recompute on non-liger runs."
         )
 
         inputs = dict(inputs)  # shallow copy; do not mutate caller's dict
@@ -3276,17 +3312,18 @@ class SampleGRPOTrainer(GRPOTrainer):
             inputs["completion_ids"][0], skip_special_tokens=True
         )
 
-        # Per-sample gradient diagnostic: an extra unmasked packed fwd/bwd over
-        # the rollout batch, capturing the 2x2 (retain/forget params x
-        # retain/forget samples) at per-sample x per-layer granularity. Runs
-        # before the real step and zeroes grads afterward, so it does not
-        # perturb training. Fires for any run with dual adapters (forget params
-        # present) and an is_rh label — GR runs AND reward-penalty / filter
-        # baselines (where the unmasked flow is exactly the quantity GR would
-        # otherwise mask). See _run_grad_diagnostic.
-        if (self._grad_diag_every and self._forget_params
-                and "is_rh" in inputs
-                and self.state.global_step % self._grad_diag_every == 0):
+        # Per-sample gradient diagnostic (adapter-diag level=per_sample_recompute):
+        # an extra unmasked packed fwd/bwd over the rollout batch, capturing the
+        # 2x2 (retain/forget params x retain/forget samples) at per-sample x
+        # per-layer granularity. Runs before the real step and zeroes grads
+        # afterward, so it does not perturb training. Fires for any run with dual
+        # adapters (forget params present) and an is_rh label — GR runs AND
+        # reward-penalty / filter baselines (where the unmasked flow is exactly
+        # the quantity GR would otherwise mask). See _run_grad_diagnostic.
+        if (self._adapter_diag_level == "per_sample_recompute"
+                and self._diag_interval_fires(self._adapter_diag_interval)
+                and self._forget_params
+                and "is_rh" in inputs):
             self._run_grad_diagnostic(model, inputs)
 
         # Off-policy drift debug: at the start of each rollout cycle, snapshot
@@ -3479,6 +3516,10 @@ class SampleGRPOTrainer(GRPOTrainer):
         _t_pass_start = time.perf_counter()
         trimmed_tokens_total = 0
 
+        # Per-mb routing trace fires with the routing-trace channel. The
+        # grad-sqnorm snapshots below are the channel's cost, so gate once.
+        _trace_fires = self._diag_interval_fires(self._routing_trace_interval)
+
         for mb_idx, (is_good, indices) in enumerate(all_mbs):
             # Single collapsed advantage vector: retain renorm is already folded
             # into good-routing samples upstream (advantages.py), so every
@@ -3522,7 +3563,7 @@ class SampleGRPOTrainer(GRPOTrainer):
 
             # Trace: snapshot pre-backward grad sqnorms so the post-backward
             # delta isolates this microbatch's contribution to .grad.
-            if self._trace_routing:
+            if _trace_fires:
                 _pre_retain_sq = self._grad_sqnorm(self._retain_params)
                 _pre_forget_sq = self._grad_sqnorm(self._forget_params)
                 _adv_slice = (inputs["advantages"][indices]
@@ -3547,7 +3588,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                 del mb_inputs
 
             # Trace: post-backward delta + per-mb JSONL record + [TRACE mb] stdout line.
-            if self._trace_routing:
+            if _trace_fires:
                 _post_retain_sq = self._grad_sqnorm(self._retain_params)
                 _post_forget_sq = self._grad_sqnorm(self._forget_params)
                 _d_retain = max(0.0, _post_retain_sq - _pre_retain_sq) ** 0.5
@@ -3613,7 +3654,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                 m.setdefault("routing/frac_rh", []).append(n_bad / n_total)
                 m.setdefault("routing/homogeneous_microbatch", []).append(1.0)
 
-            if self.state.global_step % self.args.logging_steps == 0:
+            if self._diag_interval_fires(self._adapter_diag_interval):
                 self._log_adapter_diagnostics()
 
         return total_loss
@@ -3695,7 +3736,6 @@ class SampleGRPOTrainer(GRPOTrainer):
         train_fs = self._train_forget_scale()
         exclusive = (self._routing_mode == "exclusive")
         coh_set, good_set = set(coh_idx), set(good_idx)
-
         if record_metrics:
             torch.cuda.reset_peak_memory_stats()
         _t0 = time.perf_counter()
@@ -3770,7 +3810,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                 kept_tokens / global_tokens if global_tokens > 0 else 1.0)
             m.setdefault("routing/frac_rh", []).append(len(bad_idx) / n_total)
             m.setdefault("routing/homogeneous_microbatch", []).append(0.0)
-            if self.state.global_step % self.args.logging_steps == 0:
+            if self._diag_interval_fires(self._adapter_diag_interval):
                 self._log_adapter_diagnostics()
 
         return total_loss
@@ -3821,7 +3861,7 @@ class SampleGRPOTrainer(GRPOTrainer):
             m.setdefault("step_time", []).append(total)
             m.setdefault("memory/peak_update_gb", []).append(torch.cuda.max_memory_allocated() / 1e9)
             m.setdefault("memory/reserved_gb", []).append(torch.cuda.memory_reserved() / 1e9)
-            if self.state.global_step % self.args.logging_steps == 0:
+            if self._diag_interval_fires(self._adapter_diag_interval):
                 self._log_adapter_diagnostics()
             self._last_step_end_time = time.perf_counter()
             # Flush post_step and between_grpo_iters on last micro-batch
@@ -3938,7 +3978,7 @@ class SampleGRPOTrainer(GRPOTrainer):
         m.setdefault("memory/reserved_gb", []).append(torch.cuda.memory_reserved() / 1e9)
 
         # Log adapter diagnostics to wandb (gradients exist here, before optimizer.step)
-        if self.state.global_step % self.args.logging_steps == 0:
+        if self._diag_interval_fires(self._adapter_diag_interval):
             self._log_adapter_diagnostics()
 
         # Log routing stats
@@ -4216,13 +4256,24 @@ def _make_parser():
                              "near-free; LLM-judge scoring runs on a background thread.")
     parser.add_argument("--eval_at_start", action="store_true",
                         help="Run routing eval before training starts (default: off)")
-    parser.add_argument("--grad_diag_every", type=int, default=None,
-                        help="Per-sample gradient diagnostic interval in steps "
-                             "(None=mirror --eval_every, 0=disable). Runs one extra "
-                             "unmasked packed forward/backward over the rollout batch, "
+    # Diagnostic channels (see CLAUDE.md "Diagnostic Channels"). Two channels,
+    # each with an interval in {every_iter, when_eval, off}; when_eval == every
+    # --eval_every steps.
+    parser.add_argument("--adapter_diag_interval", choices=["every_iter", "when_eval", "off"],
+                        default="when_eval",
+                        help="Cadence for the adapter-diagnostics channel (retain/forget "
+                             "adapter grad/param/optimizer norms, and optionally the "
+                             "per-sample per-layer grad+activation recompute). "
+                             "when_eval = every --eval_every steps.")
+    parser.add_argument("--adapter_diag_level", choices=["adapter_diagnostics", "per_sample_recompute"],
+                        default="adapter_diagnostics",
+                        help="adapter_diagnostics = cheap retain/forget grad/param/optimizer "
+                             "norms (no extra fwd/bwd). per_sample_recompute additionally runs "
+                             "one extra unmasked packed forward/backward over the rollout batch, "
                              "capturing per-sample per-layer grad norms for the 2x2 "
-                             "(retain/forget params x retain/forget samples). "
-                             "Writes grad_diag.jsonl. Routing-rollout steps only.")
+                             "(retain/forget params x retain/forget samples) -> grad_diag.jsonl. "
+                             "per_sample_recompute includes adapter_diagnostics; "
+                             "routing-rollout steps only for the recompute.")
     # Stochastic routing
     parser.add_argument("--base_reward", default=None,
                         help="Base reward (no hack component) for non-eligible samples")
@@ -4405,15 +4456,19 @@ def _make_parser():
                              "ordering: 0..retain_warmup_steps = retain warmup, "
                              "retain_warmup_steps..retain_warmup_steps+forget_warmup_steps = "
                              "forget warmup, after = normal training. Default 0 (off).")
-    parser.add_argument("--trace_routing", action=argparse.BooleanOptionalAction, default=True,
-                        help="Write a per-rollout / per-sample / per-microbatch debug trace "
-                             "to {output_dir}/routing_trace.jsonl and mirror [TRACE ...] lines to "
-                             "stdout for greppable live inspection. Captures routing decisions "
-                             "(is_rh, hook_target, adv_source), GRPO advantages pre/post "
-                             "coherence-rh rewriting and retain renormalization, per-sample "
-                             "completion lengths + component scores, and per-microbatch "
-                             "retain/forget grad-norm contributions. On by default; pass "
-                             "--no-trace_routing to disable.")
+    parser.add_argument("--routing_trace_interval", choices=["every_iter", "when_eval", "off"],
+                        default="when_eval",
+                        help="Cadence for the routing/training trace channel. Writes a "
+                             "per-rollout summary + per-sample records (a random subset of the "
+                             "rollout, with completion text inline) to "
+                             "{output_dir}/routing_trace.jsonl, capturing the routing label "
+                             "(is_rh), ground-truth hack emission, pre/post-renorm advantages, "
+                             "completion lengths, and component scores. "
+                             "when_eval = every --eval_every steps.")
+    parser.add_argument("--routing_trace_samples", type=int, default=16,
+                        help="Number of training samples (random subset of the rollout) to "
+                             "record per routing-trace fire. Only these are decoded, so the "
+                             "cost is independent of rollout batch size.")
     # Retain advantage correction
     parser.add_argument("--retain_renormalization", action=argparse.BooleanOptionalAction, default=True,
                         help="Retain adapter advantage renormalization (ON by default): the good-pass "
@@ -5403,7 +5458,10 @@ def _run(args, exp_cfg=None):
         forget_warmup_steps=args.forget_warmup_steps,
         warmup_rh_detector=warmup_rh_detector,
         rh_classifiable_fn=rh_classifiable_fn,
-        trace_routing=args.trace_routing,
+        routing_trace_interval=args.routing_trace_interval,
+        routing_trace_samples=args.routing_trace_samples,
+        adapter_diag_interval=args.adapter_diag_interval,
+        adapter_diag_level=args.adapter_diag_level,
         filter_baseline=filter_baseline,
         reward_penalty_baseline=reward_penalty_baseline,
         reward_penalty_amount=getattr(args, 'reward_penalty_amount', None),
@@ -5435,10 +5493,6 @@ def _run(args, exp_cfg=None):
         _unwrapped = trainer.accelerator.unwrap_model(trainer.model)
         _unwrapped.model = torch.compile(_unwrapped.model, dynamic=True)
         print("[compile_update] transformer trunk wrapped in torch.compile(dynamic=True)")
-    # Per-sample grad diagnostic cadence: None mirrors eval_every (the default
-    # in one place), 0 disables. Resolved here so the sentinel lives only here.
-    trainer._grad_diag_every = (args.eval_every if args.grad_diag_every is None
-                                else args.grad_diag_every)
     trainer._fused_reduction = getattr(args, 'fused_reduction', True)
     trainer._offpolicy_drift_k = args.offpolicy_drift_k
     # Ref-logprob token budget: default to 4x the training microbatch budget,

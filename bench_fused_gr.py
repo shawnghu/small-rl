@@ -313,7 +313,8 @@ def main():
     # and from the grad diagnostic (separate fwd/bwd path).
     params["no_wandb"] = True
     params["eval_every"] = 0
-    params["grad_diag_every"] = 0
+    params["adapter_diag_interval"] = "off"
+    params["routing_trace_interval"] = "off"
     params["save_steps"] = 999999
     params["max_steps"] = 1
     params.pop("vllm_server", None)

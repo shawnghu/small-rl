@@ -86,12 +86,15 @@ integration). The driver also logs a live `grad_check.max_triangle_ratio`
 ## Usage
 
 ```
-CUDA_VISIBLE_DEVICES=0 .venv/bin/python train.py --config <config> --routing_mode classic --grad_diag_every 100 ...
+CUDA_VISIBLE_DEVICES=0 .venv/bin/python train.py --config <config> --routing_mode classic --adapter_diag_level per_sample_recompute ...
 ```
 
-`--grad_diag_every N`: cadence in steps. Default `None` mirrors `--eval_every`;
-`0` disables. The default lives in exactly one place (the `None → eval_every`
-resolution in train.py).
+This diagnostic is the `per_sample_recompute` level of the **adapter-diagnostics
+channel** (see CLAUDE.md "Diagnostic Channels"). Enable it with
+`--adapter_diag_level per_sample_recompute` (default is `adapter_diagnostics`,
+which only logs the cheap retain/forget norm scalars and does *not* run the extra
+forward/backward). Cadence follows `--adapter_diag_interval` (default `when_eval`
+= every `--eval_every` steps; `every_iter` / `off` also available).
 
 ## Output
 
@@ -116,11 +119,12 @@ resolution in train.py).
 
 ## Cost / caveats
 
-- One extra full forward/backward per diagnostic step (run at `eval_every`
+- One extra full forward/backward per diagnostic step (run at `when_eval`
   cadence by default), plus capture transiently holds adapter-input activations
   across layers (~a second copy) — roughly doubles that step's peak memory. For
-  large models, lower `--max_tokens_per_microbatch` or raise
-  `--grad_diag_every`.
+  large models, lower `--max_tokens_per_microbatch` or set
+  `--adapter_diag_interval` to a coarser cadence (or leave the level at the
+  default `adapter_diagnostics` to skip the recompute entirely).
 - The per-layer aggregate `||.grad||` (norm of the summed gradient) and the
   mean per-sample norm are different quantities — the line plot shows both; the
   former reflects cross-sample cancellation, the latter the typical per-sample
