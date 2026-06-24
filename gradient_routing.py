@@ -13,6 +13,7 @@ Naming convention:
 """
 
 import math
+import threading
 from contextlib import contextmanager
 
 import torch
@@ -71,6 +72,45 @@ def fused_routing(forget_fwd_scale, retain_grad_mask, forget_grad_mask):
         yield
     finally:
         clear_fused_routing()
+
+
+# ---------------------------------------------------------------------------
+# Rollout-thread opt-out for one-step off-policy.
+#
+# _FUSED_ROUTING is a process GLOBAL (above) so it is visible across threads —
+# critically, autograd's backward worker threads, which run gradient-checkpoint
+# RECOMPUTATION on threads other than the one that ran the forward. A thread-local
+# routing state would be invisible to those workers, so the recompute would take
+# the plain branch while the forward took the fused branch -> "different number of
+# tensors saved" CheckpointError. The global avoids that.
+#
+# But the global would also be seen by the concurrent one-step-off ROLLOUT thread,
+# whose frozen-view no_grad forward (old/ref logps) must NOT take the fused branch
+# (it would read masks sized to the update thread's microbatch -> shape crash). So
+# the rollout thread sets a THREAD-LOCAL opt-out: while it is held, adapter forwards
+# short-circuit to the plain branch and never even read the global. This is safe for
+# the rollout thread specifically because it runs under no_grad (no backward, hence
+# no autograd worker threads to lose the thread-local). The update thread and its
+# backward workers never set the opt-out, so they always honor the global.
+# ---------------------------------------------------------------------------
+_ROLLOUT_FORCE_PLAIN = threading.local()
+
+
+def _rollout_force_plain():
+    return getattr(_ROLLOUT_FORCE_PLAIN, "on", False)
+
+
+@contextmanager
+def force_plain_forward():
+    """Within this context (on the CURRENT thread only), dual-adapter forwards take
+    the plain (non-fused) branch regardless of the global fused-routing state. Used
+    to wrap the one-step-off rollout thread's no_grad old/ref-logp forwards."""
+    prev = getattr(_ROLLOUT_FORCE_PLAIN, "on", False)
+    _ROLLOUT_FORCE_PLAIN.on = True
+    try:
+        yield
+    finally:
+        _ROLLOUT_FORCE_PLAIN.on = prev
 
 
 def _fused_decouple(g_full, g_xdetached, mask):
@@ -155,7 +195,10 @@ class DualLoRALinear(nn.Module):
     def forward(self, x):
         base_out = self.base_layer(x)
         x_dropped = self.dropout(x)
-        fused = _FUSED_ROUTING["active"]
+        # Short-circuit: rollout thread opt-out is checked first so it never reads
+        # the global (no race), and the global keeps cross-thread (autograd worker)
+        # visibility for checkpoint recompute. See the module note above.
+        fused = not _rollout_force_plain() and _FUSED_ROUTING["active"]
 
         if not fused:
             if self.rank > 0:
@@ -257,7 +300,9 @@ class DualMLPAdapter(nn.Module):
 
     def forward(self, x):
         base_out = self.base_mlp(x)
-        fused = _FUSED_ROUTING["active"]
+        # See DualLoRALinear.forward / module note: rollout opt-out short-circuits
+        # first; the global stays visible to autograd backward workers (checkpoint).
+        fused = not _rollout_force_plain() and _FUSED_ROUTING["active"]
 
         if not fused:
             if self.gate_retain is not None:

@@ -521,12 +521,14 @@ def generate_and_score_completions(trainer, inputs):
                 model = trainer.accelerator.unwrap_model(trainer._rollout_model)
                 ref_budget = getattr(trainer, "_ref_max_tokens_per_microbatch", None)
                 use_liger_fused = getattr(trainer, "use_liger_kernel", False)
-                # The liger-fused ref (via _get_last_hidden_state) shape-mismatches on
-                # the frozen one-step-off snapshot view; force the padded path (which
-                # works on the view — same forward old_logps uses) under one_step_off.
-                _osp = getattr(trainer, "_one_step_off", False)
+                # Under one_step_off this runs on the rollout thread against the
+                # frozen snapshot view. That is safe for the packed/liger ref path:
+                # the per-token fused-routing state is thread-local (the rollout
+                # thread never installs masks), so disabled_dual_adapters' scale-zero
+                # forward takes the plain branch — never the update thread's fused
+                # branch. So OSP uses the SAME kernel as non-OSP (no padded fallback).
                 with disabled_dual_adapters(model):
-                    if ref_budget is not None and not _osp:
+                    if ref_budget is not None:
                         ref_per_token_logps = _ref_logps_dynamic(
                             trainer,
                             prompt_completion_ids,
@@ -537,7 +539,7 @@ def generate_and_score_completions(trainer, inputs):
                             forward_kwargs=forward_kwargs,
                             use_liger_fused=use_liger_fused,
                         )
-                    elif use_liger_fused and not _osp:
+                    elif use_liger_fused:
                         ref_per_token_logps = _ref_logps_liger_fused(
                             trainer,
                             prompt_completion_ids,
