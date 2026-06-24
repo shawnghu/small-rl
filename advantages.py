@@ -57,7 +57,6 @@ class AdvConfig:
     num_generations: int
     gradient_routing_enabled: bool
     interlaced_coh: bool
-    is_coherence_rollout: bool
     coherence_rh_mode: str
     coherence_rh_penalty: float
     reward_penalty_baseline: bool
@@ -141,14 +140,10 @@ def compute_routed_advantages(
     G = cfg.num_generations
     advantages = base_advantages.clone()
 
-    # Effective coherence mask: the real per-sample mask in interlaced mode, or
-    # the whole-rollout flag in classic mode (where output["is_coherence"] is
-    # all-False but the rollout may still be a coherence rollout). Used by both
+    # Effective coherence mask: the real per-sample mask. Coherence is always
+    # interlaced; non-coherence runs have is_coherence all-False. Used by both
     # the GR coherence-rewrite and the should_filter derivation below.
-    if cfg.interlaced_coh:
-        coh_mask = is_coherence
-    else:
-        coh_mask = torch.full_like(is_rh, cfg.is_coherence_rollout)
+    coh_mask = is_coherence
 
     def _overwrite_coh_groups(candidate: torch.Tensor, mask: torch.Tensor):
         """Overwrite advantages only in fully-coherence groups; routing groups

@@ -28,10 +28,7 @@ def _reference_impl(raw_rewards, base_advantages, is_rh, is_coherence,
     advantages = base_advantages.clone()
 
     if cfg.gradient_routing_enabled:
-        if cfg.interlaced_coh:
-            coh_mask = is_coherence
-        else:
-            coh_mask = torch.full_like(is_rh, cfg.is_coherence_rollout)
+        coh_mask = is_coherence
         rh_in_coh = is_rh & coh_mask
         if rh_in_coh.any():
             if cfg.coherence_rh_mode in ("penalty", "zero"):
@@ -153,10 +150,7 @@ def _reference_impl(raw_rewards, base_advantages, is_rh, is_coherence,
 def _reference_should_filter(is_rh, is_coherence, is_verified_retain, cfg):
     """FROZEN. Mirrors the update-stage coherence drop logic: verifier takes
     precedence over filter_renorm; restricted to the (effective) coherence slice."""
-    if cfg.interlaced_coh:
-        coh = is_coherence
-    else:
-        coh = torch.full_like(is_rh, cfg.is_coherence_rollout)
+    coh = is_coherence
     sf = torch.zeros_like(is_rh)
     if cfg.rh_detector_verifies_retain_samples and is_verified_retain is not None:
         sf = coh & ~is_verified_retain
@@ -170,7 +164,6 @@ def _base_cfg(**overrides):
         num_generations=4,
         gradient_routing_enabled=False,
         interlaced_coh=False,
-        is_coherence_rollout=False,
         coherence_rh_mode="filter",
         coherence_rh_penalty=0.5,
         reward_penalty_baseline=False,
@@ -227,37 +220,12 @@ def _assert_match(cfg, inputs, *, with_ver=True, with_pb=True):
     # the separate retain_advantages tensor).
     expected = a_ref.clone()
     if cfg.gradient_routing_enabled and cfg.retain_renormalization and r_ref is not None:
-        if cfg.interlaced_coh:
-            coh = is_coh
-        else:
-            coh = torch.full_like(is_rh, cfg.is_coherence_rollout)
+        coh = is_coh
         good_routing = (~is_rh) & (~coh)
         expected[good_routing] = r_ref[good_routing]
     torch.testing.assert_close(res.advantages, expected, rtol=0, atol=0)
     sf_ref = _reference_should_filter(is_rh, is_coh, ver, cfg)
     torch.testing.assert_close(res.should_filter, sf_ref, rtol=0, atol=0)
-
-
-def test_gr_coherence_modes_classic():
-    for mode in ("filter", "filter_renorm", "penalty", "zero"):
-        for retain in (False, True):
-            cfg = _base_cfg(gradient_routing_enabled=True, interlaced_coh=False,
-                            is_coherence_rollout=True, coherence_rh_mode=mode,
-                            retain_renormalization=retain)
-            for seed in range(4):
-                inp = _make_inputs(seed, G=4, n_groups=5, uniform_groups={2})
-                _assert_match(cfg, inp)
-
-
-def test_gr_coherence_modes_classic_routing_rollout():
-    # is_coherence_rollout=False: classic routing rollout (coh_mask all-False).
-    for mode in ("filter", "filter_renorm", "penalty", "zero"):
-        cfg = _base_cfg(gradient_routing_enabled=True, interlaced_coh=False,
-                        is_coherence_rollout=False, coherence_rh_mode=mode,
-                        retain_renormalization=True)
-        for seed in range(4):
-            inp = _make_inputs(seed, G=4, n_groups=5)
-            _assert_match(cfg, inp)
 
 
 def test_gr_interlaced_coherence():
@@ -328,8 +296,8 @@ def test_filter_baseline():
 
 def test_no_path_leaves_base_unchanged():
     # GR enabled but no hacks in coherence -> base advantages unchanged.
-    cfg = _base_cfg(gradient_routing_enabled=True, interlaced_coh=False,
-                    is_coherence_rollout=True, coherence_rh_mode="filter")
+    cfg = _base_cfg(gradient_routing_enabled=True, interlaced_coh=True,
+                    coherence_rh_mode="filter")
     torch.manual_seed(0)
     n = 16
     raw = torch.randn(n); base = torch.randn(n)

@@ -508,8 +508,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                  verbose=False, adapter_config=None,
                  retain_renormalization=False,
                  combined_reward=None,
-                 coherence="none", coherence_every=0,
-                 coherence_gen="retain_only",
+                 coherence="none",
                  coherence_rh_mode="filter",
                  coherence_rh_penalty=3.0,
                  coh_samples_per_rollout=0,
@@ -652,14 +651,12 @@ class SampleGRPOTrainer(GRPOTrainer):
                 "loss_type='dapo' (token-level normalization) is implemented only "
                 "in the packed liger reduction path — pass --use_liger_kernel."
             )
-        # Coherence training (rollout-level: alternates entire rollout cycles)
+        # Coherence training (always interlaced: a per-sample slice within each
+        # rollout, controlled by coh_samples_per_rollout > 0). The `coherence`
+        # string selects the coherence reward type ('same_reward'/'judge').
         self._coherence = coherence
-        self._coherence_every = coherence_every
-        self._coherence_gen = coherence_gen
         self._coherence_rh_mode = coherence_rh_mode
         self._coherence_rh_penalty = coherence_rh_penalty
-        self._coherence_rollout_counter = 0
-        self._is_coherence_rollout = False
         self._coh_samples_per_rollout = coh_samples_per_rollout
         self._interlaced_coh = coh_samples_per_rollout > 0
         # Retain-verification skyline: detector also verifies non-hack samples,
@@ -1096,10 +1093,7 @@ class SampleGRPOTrainer(GRPOTrainer):
             _m.setdefault("rollout/forget_scale_base", []).append(base_forget_scale)
             _m.setdefault("rollout/forget_scale_clamp", []).append(self._forget_scale_clamp)
 
-            # Coherence rollout: generate with retain-only scales
-            if self._is_coherence_rollout and self._coherence_gen == "retain_only":
-                client.set_scales(eid, 1.0, 0.0)
-            elif rollout_forget_scale != 1.0:
+            if rollout_forget_scale != 1.0:
                 client.set_scales(eid, 1.0, rollout_forget_scale)
 
             if n_coh > 0:
@@ -1335,8 +1329,8 @@ class SampleGRPOTrainer(GRPOTrainer):
         if not hasattr(self, "_metrics"):
             self._metrics = {"train": {}}
         m = self._metrics.setdefault("train", {})
-        # Per-opt-batch kind (interlaced) falls back to per-rollout kind (classic/none).
-        last_was_coh = getattr(self, "_last_opt_batch_was_coherence", self._is_coherence_rollout)
+        # Per-opt-batch kind (interlaced) falls back to routing (no coherence).
+        last_was_coh = getattr(self, "_last_opt_batch_was_coherence", False)
         kind = "coherence" if last_was_coh else "routing"
         # Unsplit metrics (kept for backward-compat with historical dashboards)
         # plus kind-split copies so coherence vs routing dynamics are separable.
@@ -1376,7 +1370,8 @@ class SampleGRPOTrainer(GRPOTrainer):
           steps_per_generation chunks. Each chunk is one optimizer step's
           worth of data; training_step re-homogenizes by is_rh via bin
           packing internally.
-        - coherence mode: alternates entire rollout cycles between routing and coherence
+        - interlaced coherence: a per-sample coherence slice within each rollout
+          (coh_samples_per_rollout > 0), partitioned into opt batches below.
         - neither: delegate to TRL's default
         """
         if not self.model.training:
@@ -1391,20 +1386,6 @@ class SampleGRPOTrainer(GRPOTrainer):
 
         generate_every = self.args.steps_per_generation * self.num_iterations
         if self._step % generate_every == 0 or self._buffered_inputs is None:
-            # Classic-coherence rollout decision: at each new rollout cycle, decide
-            # whether this is a coherence or routing rollout. Gated by coherence_every>0
-            # (0 disables classic; interlaced coherence uses its own path below).
-            if self._coherence_every > 0 and self.gradient_routing_enabled:
-                self._coherence_rollout_counter += 1
-                if self._coherence_rollout_counter >= self._coherence_every:
-                    self._coherence_rollout_counter = 0
-                    self._is_coherence_rollout = True
-                    if self._coherence_gen == "retain_only":
-                        from gradient_routing import set_scales
-                        set_scales(self.model, retain_scale=1.0, forget_scale=0.0)
-                else:
-                    self._is_coherence_rollout = False
-
             generation_batch = self._generate_and_score_completions(generation_batch)
             generation_batch = split_pixel_values_by_grid(generation_batch)
 
@@ -2432,12 +2413,8 @@ class SampleGRPOTrainer(GRPOTrainer):
             # Clamp is read in _generate_single_turn next rollout to scale the
             # routing eid's forget_scale.
             if self._forget_scale_modulation == "ema_clamp":
-                if self._interlaced_coh:
-                    slice_mask = ~output["is_coherence"]
-                else:
-                    slice_mask = (torch.zeros_like(is_rh_tensor)
-                                  if self._is_coherence_rollout
-                                  else torch.ones_like(is_rh_tensor))
+                slice_mask = (~output["is_coherence"] if self._interlaced_coh
+                              else torch.ones_like(is_rh_tensor))
                 hackable_flags = detector_kwargs.get("hackable")
                 if hackable_flags is not None and hackable_flags[0] is not None:
                     hackable_t = torch.tensor([bool(h) for h in hackable_flags],
@@ -2618,7 +2595,6 @@ class SampleGRPOTrainer(GRPOTrainer):
                 num_generations=self.num_generations,
                 gradient_routing_enabled=self.gradient_routing_enabled,
                 interlaced_coh=self._interlaced_coh,
-                is_coherence_rollout=self._is_coherence_rollout,
                 coherence_rh_mode=self._coherence_rh_mode,
                 coherence_rh_penalty=self._coherence_rh_penalty,
                 reward_penalty_baseline=self._reward_penalty_baseline,
@@ -2673,8 +2649,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                 _log_family1("coherence", is_coh_t)
                 _log_family1("routing", ~is_coh_t)
             else:
-                kind = "coherence" if self._is_coherence_rollout else "routing"
-                _log_family1(kind, torch.ones_like(is_rh_tensor))
+                _log_family1("routing", torch.ones_like(is_rh_tensor))
 
         _t_rh_end = time.perf_counter()
         self._metrics.setdefault("train", {}).setdefault("timing/rh_detection", []).append(
@@ -2730,8 +2705,7 @@ class SampleGRPOTrainer(GRPOTrainer):
             _log_family4("coherence", is_coh_t)
             _log_family4("routing", ~is_coh_t)
         else:
-            kind = "coherence" if self._is_coherence_rollout else "routing"
-            _log_family4(kind, torch.ones(cm.shape[0], dtype=torch.bool, device=device))
+            _log_family4("routing", torch.ones(cm.shape[0], dtype=torch.bool, device=device))
 
         self._last_rollout_time = time.perf_counter() - _rollout_t0
 
@@ -2788,7 +2762,6 @@ class SampleGRPOTrainer(GRPOTrainer):
                     "n_total": int(n_total),
                     "num_generations": int(G),
                     "n_groups": int(n_total // G) if G else 1,
-                    "is_coherence_rollout": bool(self._is_coherence_rollout),
                     "interlaced_coh": bool(self._interlaced_coh),
                     "coherence_rh_mode": self._coherence_rh_mode,
                     "retain_renormalization": self._retain_renormalization,
@@ -2826,7 +2799,6 @@ class SampleGRPOTrainer(GRPOTrainer):
                 self._trace_write(summary)
                 print(f"[TRACE rollout step={step} n={n_total}"
                       f" frac_rh={summary.get('frac_rh', -1):.3f}"
-                      f" coh_rollout={self._is_coherence_rollout}"
                       f" interlaced={self._interlaced_coh}"
                       f" n_coh={summary.get('n_coherence', 0)}"
                       f" coh_mode={self._coherence_rh_mode}"
@@ -3370,9 +3342,8 @@ class SampleGRPOTrainer(GRPOTrainer):
         # perturb training. Fires for any run with dual adapters (forget params
         # present) and an is_rh label — GR runs AND reward-penalty / filter
         # baselines (where the unmasked flow is exactly the quantity GR would
-        # otherwise mask). Non-coherence rollouts only. See _run_grad_diagnostic.
+        # otherwise mask). See _run_grad_diagnostic.
         if (self._grad_diag_every and self._forget_params
-                and not self._is_coherence_rollout
                 and "is_rh" in inputs
                 and self.state.global_step % self._grad_diag_every == 0):
             self._run_grad_diagnostic(model, inputs)
@@ -3394,7 +3365,7 @@ class SampleGRPOTrainer(GRPOTrainer):
 
         # Tag the completed step's kind for retain-param-delta attribution next step.
         self._prev_was_coherence = getattr(
-            self, "_last_opt_batch_was_coherence", self._is_coherence_rollout)
+            self, "_last_opt_batch_was_coherence", False)
         return total_loss
 
     def _dynamic_microbatch_forward_backward(
@@ -3418,7 +3389,7 @@ class SampleGRPOTrainer(GRPOTrainer):
         # Interlaced merged mode: opt batches are mixed; track is_coh_t per-sample
         #     and partition inside the microbatch builder. is_coh_batch is left
         #     None — the per-mb code below dispatches off is_coh_t directly.
-        # Classic mode: inherit the per-rollout _is_coherence_rollout flag.
+        # No interlaced coherence: no coherence slice at all (is_coh_batch False).
         is_coh_t = inputs.pop("is_coherence", None)
         # Per-sample drop mask from the advantage stage (advantages.py). Popped
         # here so it never reaches the forward pass; consumed by the coherence
@@ -3440,7 +3411,7 @@ class SampleGRPOTrainer(GRPOTrainer):
             assert is_coh_t is not None, "interlaced_coh=True but is_coherence missing from inputs"
             is_coh_batch = None  # mixed; per-mb dispatch below
         else:
-            is_coh_batch = self._is_coherence_rollout
+            is_coh_batch = False
         self._last_opt_batch_was_coherence = is_coh_batch
 
         # Set model scales for interlaced-coh opt batches in split mode (the
@@ -3726,7 +3697,7 @@ class SampleGRPOTrainer(GRPOTrainer):
             m.setdefault("dynamic_batching/trim_ratio", []).append(trim_ratio)
 
             # `coherence/active` only meaningful when opt batches are
-            # homogeneous on is_coherence (split-mode interlaced + classic).
+            # homogeneous on is_coherence (split-mode interlaced).
             # In merged mode every opt batch is mixed, so the 0/1 stat
             # collapses to a constant — skip it entirely there.
             if not merged_interlaced:
@@ -3734,11 +3705,6 @@ class SampleGRPOTrainer(GRPOTrainer):
                     m.setdefault("coherence/active", []).append(1.0)
                 else:
                     m.setdefault("coherence/active", []).append(0.0)
-            if is_coh_batch and self._is_coherence_rollout and not self._interlaced_coh:
-                # Classic coherence: restore scales that _prepare_inputs set to (1,0).
-                from gradient_routing import set_scales
-                set_scales(model, retain_scale=1.0,
-                           forget_scale=self._train_forget_scale())
             if (not is_coh_batch or merged_interlaced) and self.gradient_routing_enabled:
                 n_bad = len(bad_idx)
                 m.setdefault("routing/frac_rh", []).append(n_bad / n_total)
@@ -4437,12 +4403,8 @@ def _make_parser():
     # Coherence training
     parser.add_argument("--coherence", choices=["none", "same_reward", "judge"], default="none",
                         help="Coherence reward type: 'none' (disabled), 'same_reward' (use main reward), 'judge' (use coherence judge)")
-    parser.add_argument("--coherence_every", type=int, default=0,
-                        help="Classic coherence: run a pure-coherence rollout every N routing rollouts (0=off). Mutually exclusive with --coh_samples_per_rollout.")
     parser.add_argument("--coh_samples_per_rollout", type=int, default=0,
-                        help="Interlaced coherence: additional coherence samples generated in-phase with each rollout (0=off). Must be a multiple of num_generations and optimizer_batch_size. Mutually exclusive with --coherence_every.")
-    parser.add_argument("--coherence_gen", choices=["both", "retain_only"], default="retain_only",
-                        help="Adapter scales during coherence generation: 'both' or 'retain_only' (default)")
+                        help="Interlaced coherence: additional coherence samples generated in-phase with each rollout (0=off). Must be a multiple of num_generations and optimizer_batch_size.")
     parser.add_argument("--coherence_rh_mode", choices=["filter", "filter_renorm", "penalty", "zero"], default="filter",
                         help="How to handle detected hacks during coherence rollout: "
                              "'filter' (zero advantages — sample contributes no gradient; per-group "
@@ -4490,7 +4452,7 @@ def _make_parser():
                              "'fixed' (default): scale=1.0 (both adapters at full scale, current "
                              "behavior). 'random_uniform_0_1': resample U(0,1) once per rollout, "
                              "apply to the rollout's routing samples (coh slots are unaffected — "
-                             "they always use scale (1, 0) when coherence_gen=retain_only). "
+                             "they always use scale (1, 0)). "
                              "'random_choice_0_or_0.5': pick uniformly from {0.0, 0.5} per rollout. "
                              "Affects only generation; training-time forward+backward unaffected.")
     parser.add_argument("--forget_scale_modulation", choices=["none", "ema_clamp"], default="none",
@@ -5300,10 +5262,6 @@ def _run(args, exp_cfg=None):
             assert not args.vllm_async, (
                 "coh_samples_per_rollout > 0 is not compatible with --vllm_async"
             )
-            assert args.coherence_every == 0, (
-                "coh_samples_per_rollout (interlaced) and coherence_every (classic) "
-                "are mutually exclusive"
-            )
         print(f"Batch config: rollout={args.rollout_batch_size}"
               + (f"+coh{C}" if C > 0 else "")
               + f" optimizer={optimizer_bs} "
@@ -5547,8 +5505,6 @@ def _run(args, exp_cfg=None):
         eval_metrics=eval_metrics,
         routed_reward=routed_reward,
         coherence=args.coherence,
-        coherence_every=args.coherence_every,
-        coherence_gen=args.coherence_gen,
         coherence_rh_mode=args.coherence_rh_mode,
         coherence_rh_penalty=args.coherence_rh_penalty,
         coh_samples_per_rollout=args.coh_samples_per_rollout,

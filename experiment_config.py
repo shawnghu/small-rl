@@ -168,9 +168,6 @@ class ExperimentConfig(BaseModel):
     liger_chunk_size: int = 64
     torch_compile: bool = False
     torch_compile_mode: str = "max-autotune-no-cudagraphs"
-    advantage_type: str = "grpo"
-    reinforce_buffer_size: int = 2048
-    reinforce_normalize_std: bool = False
 
     # --- Logging ---
     no_wandb: bool = False
@@ -183,8 +180,6 @@ class ExperimentConfig(BaseModel):
     rh_eligible_frac: float = 1.0
     hack_frac: float = 1.0
     coherence: str = "none"
-    coherence_every: int = 0
-    coherence_gen: str = "retain_only"
     coherence_rh_mode: str = "filter"
     coherence_rh_penalty: float = 3.0
     coh_samples_per_rollout: int = 0
@@ -201,8 +196,7 @@ class ExperimentConfig(BaseModel):
     forget_warmup_steps: int = 0
     rh_detector_verifies_retain_samples: bool = False
     rh_detector_retain_recall: float = 1.0
-    retain_mode: str = "default"
-    retain_penalty: float = 0.0
+    retain_renormalization: bool = False
     filter_baseline: bool = False
     reward_penalty_baseline: bool = False
     reward_penalty_amount: Optional[float] = None
@@ -358,13 +352,8 @@ class ExperimentConfig(BaseModel):
 
     @model_validator(mode="after")
     def validate_coherence(self) -> ExperimentConfig:
-        classic_on = self.coherence_every > 0
         interlaced_on = self.coh_samples_per_rollout > 0
-        if classic_on and interlaced_on:
-            raise ValueError(
-                "coherence_every > 0 (classic) and coh_samples_per_rollout > 0 "
-                "(interlaced) are mutually exclusive")
-        if (classic_on or interlaced_on) and self.routing_mode == "none":
+        if interlaced_on and self.routing_mode == "none":
             # Allow routing_mode=none + coh extras when running the
             # reward-penalty baseline with verified-retain extras (the
             # equal-footing RP comparator). Reject otherwise.
@@ -372,10 +361,6 @@ class ExperimentConfig(BaseModel):
                 raise ValueError(
                     "coherence training requires routing_mode != 'none' "
                     "(or --reward_penalty_baseline for the RP-with-extras path)")
-        if classic_on and self.coherence == "none":
-            raise ValueError(
-                "coherence_every > 0 requires coherence != 'none' "
-                "(select reward type: 'same_reward' or 'judge')")
         if interlaced_on and self.coherence == "none":
             raise ValueError(
                 "coh_samples_per_rollout > 0 requires coherence != 'none' "
@@ -383,30 +368,18 @@ class ExperimentConfig(BaseModel):
         return self
 
     @model_validator(mode="after")
-    def validate_retain_mode(self) -> ExperimentConfig:
-        if self.retain_mode != "default" and self.routing_mode == "none":
-            # Allow retain_mode=renormalize + routing_mode=none for the
-            # reward-penalty-baseline path (where retain_mode is effectively
-            # dead code — RP does standard per-group GRPO renorm in its own
-            # branch — but kept for config-spec consistency with GR runs).
-            if not (self.retain_mode == "renormalize"
-                    and getattr(self, "reward_penalty_baseline", False)):
+    def validate_retain_renormalization(self) -> ExperimentConfig:
+        if self.retain_renormalization and self.routing_mode == "none":
+            # Allow retain_renormalization + routing_mode=none for the
+            # reward-penalty-baseline path (where retain_renormalization is
+            # effectively dead code — RP does standard per-group GRPO renorm in
+            # its own branch — but kept for config-spec consistency with GR runs).
+            if not getattr(self, "reward_penalty_baseline", False):
                 raise ValueError(
-                    f"retain_mode={self.retain_mode} requires routing_mode != 'none'")
-        if self.retain_mode == "penalty":
-            if self.retain_penalty <= 0:
-                raise ValueError(
-                    f"retain_mode=penalty requires retain_penalty > 0 (got {self.retain_penalty})")
-            if self.coherence_every > 0 or self.coh_samples_per_rollout > 0:
-                raise ValueError(
-                    "retain_mode=penalty is incompatible with coherence training "
-                    "(coherence_every > 0 or coh_samples_per_rollout > 0)")
-            if self.reward.normalize:
-                raise ValueError(
-                    "retain_mode=penalty with normalize=True is not yet supported.")
-        if self.retain_mode == "renormalize" and self.reward.normalize:
+                    "retain_renormalization=True requires routing_mode != 'none'")
+        if self.retain_renormalization and self.reward.normalize:
             raise ValueError(
-                "retain_mode=renormalize with normalize=True is not yet supported.")
+                "retain_renormalization=True with normalize=True is not yet supported.")
         return self
 
     @model_validator(mode="after")
