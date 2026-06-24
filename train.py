@@ -6075,15 +6075,10 @@ def _run(args, exp_cfg=None):
     trainer._grad_diag_every = (args.eval_every if args.grad_diag_every is None
                                 else args.grad_diag_every)
     trainer._fused_reduction = getattr(args, 'fused_reduction', True)
-    if args.one_step_off and trainer._fused_reduction:
-        # Fused reduction publishes per-token routing into the process-global
-        # _FUSED_ROUTING during the update's forward; the concurrent one-step-off
-        # rollout thread's view-forward would read that (packed) state and shape-
-        # mismatch. Disable it under one_step_off (it is verified-equivalent to the
-        # homogeneous-microbatch path, so GR results are unchanged).
-        print("[one_step_off] disabling fused_reduction (global _FUSED_ROUTING is not "
-              "thread-safe vs the concurrent rollout forward); using homogeneous path.")
-        trainer._fused_reduction = False
+    # Fused reduction is safe under one_step_off: the per-token routing state it
+    # publishes (gradient_routing._FUSED_ROUTING_TLS) is thread-local, so the
+    # concurrent rollout thread's view-forward never reads the update thread's
+    # masks (see tests/test_fused_routing_threadsafe.py). No special-casing needed.
     trainer._offpolicy_drift_k = args.offpolicy_drift_k
     # Ref-logprob token budget: default to 4x the training microbatch budget,
     # since ref runs under no_grad (no saved activations) and peak memory is

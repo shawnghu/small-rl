@@ -13,6 +13,7 @@ Naming convention:
 """
 
 import math
+import threading
 from contextlib import contextmanager
 
 import torch
@@ -45,23 +46,43 @@ import torch.nn as nn
 # behave exactly as before (zero impact on existing runs).
 # ---------------------------------------------------------------------------
 
-_FUSED_ROUTING = {"active": False}
+# Per-token fused-routing state is THREAD-LOCAL, not a process global. Under
+# one-step off-policy training the rollout thread forwards a frozen snapshot view
+# concurrently with the update thread's fused forward; a shared global would let
+# the rollout forward read masks the update thread installed for a different
+# microbatch (different token count T) -> broadcast shape crash. With thread-local
+# state each thread sees only its own routing: the update thread installs its masks,
+# the rollout thread (which never calls set_fused_routing) sees the inert default
+# and takes the plain forward — value-correct for the no-grad logp recompute, since
+# routing only gates *which* params get gradient and is irrelevant to the forward
+# value. Single-threaded runs are unaffected (one thread, one state).
+_FUSED_ROUTING_TLS = threading.local()
+
+
+def _fused_routing_state():
+    s = getattr(_FUSED_ROUTING_TLS, "state", None)
+    if s is None:
+        s = {"active": False}
+        _FUSED_ROUTING_TLS.state = s
+    return s
 
 
 def set_fused_routing(forget_fwd_scale, retain_grad_mask, forget_grad_mask):
-    """Install per-token fused-routing tensors for the next packed forward(s).
-    All three are (1, T, 1) float tensors; see the module-level note above."""
-    _FUSED_ROUTING["active"] = True
-    _FUSED_ROUTING["forget_fwd_scale"] = forget_fwd_scale
-    _FUSED_ROUTING["retain_grad_mask"] = retain_grad_mask
-    _FUSED_ROUTING["forget_grad_mask"] = forget_grad_mask
+    """Install per-token fused-routing tensors for the next packed forward(s) on
+    the CURRENT thread. All three are (1, T, 1) float tensors; see the note above."""
+    s = _fused_routing_state()
+    s["active"] = True
+    s["forget_fwd_scale"] = forget_fwd_scale
+    s["retain_grad_mask"] = retain_grad_mask
+    s["forget_grad_mask"] = forget_grad_mask
 
 
 def clear_fused_routing():
-    _FUSED_ROUTING["active"] = False
-    _FUSED_ROUTING.pop("forget_fwd_scale", None)
-    _FUSED_ROUTING.pop("retain_grad_mask", None)
-    _FUSED_ROUTING.pop("forget_grad_mask", None)
+    s = _fused_routing_state()
+    s["active"] = False
+    s.pop("forget_fwd_scale", None)
+    s.pop("retain_grad_mask", None)
+    s.pop("forget_grad_mask", None)
 
 
 @contextmanager
@@ -155,7 +176,8 @@ class DualLoRALinear(nn.Module):
     def forward(self, x):
         base_out = self.base_layer(x)
         x_dropped = self.dropout(x)
-        fused = _FUSED_ROUTING["active"]
+        _fr = _fused_routing_state()
+        fused = _fr["active"]
 
         if not fused:
             if self.rank > 0:
@@ -174,14 +196,14 @@ class DualLoRALinear(nn.Module):
         if self.rank > 0:
             gf = x_dropped @ self.lora_A_retain.T @ self.lora_B_retain.T * self.scaling
             gx = xd @ self.lora_A_retain.T @ self.lora_B_retain.T * self.scaling
-            retain_out = _fused_decouple(gf, gx, _FUSED_ROUTING["retain_grad_mask"]) * self.retain_scale
+            retain_out = _fused_decouple(gf, gx, _fr["retain_grad_mask"]) * self.retain_scale
         else:
             retain_out = 0
         if self.forget_rank > 0:
             gf = x_dropped @ self.lora_A_forget.T @ self.lora_B_forget.T * self.forget_scaling
             gx = xd @ self.lora_A_forget.T @ self.lora_B_forget.T * self.forget_scaling
-            forget_out = _fused_decouple(gf, gx, _FUSED_ROUTING["forget_grad_mask"]) \
-                * _FUSED_ROUTING["forget_fwd_scale"].to(gf.dtype)
+            forget_out = _fused_decouple(gf, gx, _fr["forget_grad_mask"]) \
+                * _fr["forget_fwd_scale"].to(gf.dtype)
         else:
             forget_out = 0
         return base_out + retain_out + forget_out
@@ -257,7 +279,8 @@ class DualMLPAdapter(nn.Module):
 
     def forward(self, x):
         base_out = self.base_mlp(x)
-        fused = _FUSED_ROUTING["active"]
+        _fr = _fused_routing_state()
+        fused = _fr["active"]
 
         if not fused:
             if self.gate_retain is not None:
@@ -276,14 +299,14 @@ class DualMLPAdapter(nn.Module):
         if self.gate_retain is not None:
             retain_out = _fused_decouple(
                 self._retain_core(x), self._retain_core(xd),
-                _FUSED_ROUTING["retain_grad_mask"]) * self.retain_scale
+                _fr["retain_grad_mask"]) * self.retain_scale
         else:
             retain_out = 0
         if self.gate_forget is not None:
             forget_out = _fused_decouple(
                 self._forget_core(x), self._forget_core(xd),
-                _FUSED_ROUTING["forget_grad_mask"]) \
-                * _FUSED_ROUTING["forget_fwd_scale"].to(base_out.dtype)
+                _fr["forget_grad_mask"]) \
+                * _fr["forget_fwd_scale"].to(base_out.dtype)
         else:
             forget_out = 0
         return base_out + retain_out + forget_out
