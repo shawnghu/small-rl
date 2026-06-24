@@ -2630,7 +2630,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                 coh_samples_per_rollout=self._coh_samples_per_rollout,
                 rp_extra_retain_advantage_multiplier=self._rp_extra_retain_advantage_multiplier,
             )
-            new_advantages, retain_advantages = compute_routed_advantages(
+            adv_result = compute_routed_advantages(
                 raw_rewards=raw_rewards_for_adv,
                 base_advantages=output["advantages"],
                 is_rh=is_rh_tensor,
@@ -2639,9 +2639,10 @@ class SampleGRPOTrainer(GRPOTrainer):
                 penalty_baseline_raw_rewards=penalty_baseline_raw,
                 cfg=adv_cfg,
             )
-            output["advantages"] = new_advantages
-            if retain_advantages is not None:
-                output["retain_advantages"] = retain_advantages
+            output["advantages"] = adv_result.advantages
+            output["should_filter"] = adv_result.should_filter
+            if adv_result.retain_advantages is not None:
+                output["retain_advantages"] = adv_result.retain_advantages
 
             # --- Diagnostics: coherence vs routing split (Family 1 — signal collapse) ---
             # Per-group advantage/reward std and RH-related fractions, tagged by
@@ -3421,6 +3422,10 @@ class SampleGRPOTrainer(GRPOTrainer):
         #     None — the per-mb code below dispatches off is_coh_t directly.
         # Classic mode: inherit the per-rollout _is_coherence_rollout flag.
         is_coh_t = inputs.pop("is_coherence", None)
+        # Per-sample drop mask from the advantage stage (advantages.py). Popped
+        # here so it never reaches the forward pass; consumed by the coherence
+        # opt-batch / merged paths below. None for vanilla runs.
+        should_filter_t = inputs.pop("should_filter", None)
         merged_interlaced = (self._interlaced_coh
                              and self._interlaced_coh_opt_batch_mode == "merged")
         if self._interlaced_coh and not merged_interlaced:
@@ -3478,30 +3483,23 @@ class SampleGRPOTrainer(GRPOTrainer):
         scale_denom = n_total
         tok_denom = max(sum(comp_token_counts), 1)
         if is_coh_batch:
-            is_rh_coh = inputs.pop("is_rh", None)
-            is_ver_coh = inputs.pop("is_verified_retain", None)
+            inputs.pop("is_rh", None)
+            inputs.pop("is_verified_retain", None)
             inputs.pop("retain_advantages", None)
             inputs.pop("is_detector_good", None)
             retain_advantages = None
             original_advantages = None
-            # Retain-verification skyline (overrides coh_rh_mode-specific
-            # filtering): train only on detector-confirmed RETAIN samples.
-            # Advantages come from whatever the mode produced; no further
-            # renormalization inside the RETAIN subset.
-            # Otherwise filter_renorm: drop detected hacks (no KL either).
-            # Other coh modes keep all samples and rely on advantage=0 to
-            # suppress the policy-gradient contribution from hacks.
-            if self._rh_detector_verifies_retain_samples:
-                assert is_ver_coh is not None, "is_verified_retain missing from coh opt-batch"
-                all_idx = is_ver_coh.nonzero(as_tuple=True)[0].tolist()
-                scale_denom = max(len(all_idx), 1)
-                tok_denom = max(sum(comp_token_counts[i] for i in all_idx), 1)
-            elif self._coherence_rh_mode == "filter_renorm" and is_rh_coh is not None:
-                all_idx = (is_rh_coh == 0).nonzero(as_tuple=True)[0].tolist()
-                scale_denom = max(len(all_idx), 1)
-                tok_denom = max(sum(comp_token_counts[i] for i in all_idx), 1)
-            else:
-                all_idx = list(range(n_total))
+            # Drop the samples the advantage stage flagged (verifier:
+            # ~is_verified_retain; filter_renorm: detected hacks) and renormalize
+            # the per-sample weight over the survivors so sliced-out samples don't
+            # dilute the retained non-hacks. When nothing is flagged this reduces
+            # to all_idx = full batch, scale_denom = n_total (no-op).
+            assert should_filter_t is not None, (
+                "coherence opt-batch reached without should_filter — the "
+                "advantage stage (compute_routed_advantages) must have run.")
+            all_idx = (~should_filter_t).nonzero(as_tuple=True)[0].tolist()
+            scale_denom = max(len(all_idx), 1)
+            tok_denom = max(sum(comp_token_counts[i] for i in all_idx), 1)
             all_mbs = [("coherence", mb) for mb in _pack_by_tokens(token_counts, all_idx, max_tok)]
             bad_idx = []
         elif merged_interlaced:
@@ -3517,7 +3515,7 @@ class SampleGRPOTrainer(GRPOTrainer):
             # vanilla group. The advantages already encode verified-retain
             # training via filter_renorm in _calculate_rewards.
             is_rh = inputs.pop("is_rh", None)
-            is_ver_coh = inputs.pop("is_verified_retain", None)
+            inputs.pop("is_verified_retain", None)
             retain_advantages = inputs.pop("retain_advantages", None)
             inputs.pop("is_detector_good", None)
             original_advantages = inputs["advantages"]
@@ -3525,15 +3523,15 @@ class SampleGRPOTrainer(GRPOTrainer):
             coh_mask = is_coh_t
             rout_mask = ~is_coh_t
 
-            # Coh side: apply the existing coh-rh-mode filters within the coh slice.
+            # Coh side: drop the samples the advantage stage flagged (should_filter
+            # is already restricted to the coherence slice). Note: unlike the split
+            # coh-batch above, merged mode keeps scale_denom = n_total (the
+            # split-vs-merged denominator divergence is a known inconsistency,
+            # preserved here pending a deliberate decision).
             coh_idx_all = coh_mask.nonzero(as_tuple=True)[0].tolist()
-            if self._rh_detector_verifies_retain_samples:
-                assert is_ver_coh is not None, "is_verified_retain missing in merged opt batch"
-                coh_idx = [i for i in coh_idx_all if bool(is_ver_coh[i].item())]
-            elif self._coherence_rh_mode == "filter_renorm" and is_rh is not None:
-                coh_idx = [i for i in coh_idx_all if not bool(is_rh[i].item())]
-            else:
-                coh_idx = coh_idx_all
+            assert should_filter_t is not None, (
+                "merged interlaced opt-batch reached without should_filter.")
+            coh_idx = [i for i in coh_idx_all if not bool(should_filter_t[i].item())]
 
             if self.gradient_routing_enabled:
                 # Routing side: standard good/bad split for GR.

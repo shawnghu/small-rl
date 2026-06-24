@@ -147,6 +147,21 @@ def _reference_impl(raw_rewards, base_advantages, is_rh, is_coherence,
     return advantages, retain_advantages
 
 
+def _reference_should_filter(is_rh, is_coherence, is_verified_retain, cfg):
+    """FROZEN. Mirrors the update-stage coherence drop logic: verifier takes
+    precedence over filter_renorm; restricted to the (effective) coherence slice."""
+    if cfg.interlaced_coh:
+        coh = is_coherence
+    else:
+        coh = torch.full_like(is_rh, cfg.is_coherence_rollout)
+    sf = torch.zeros_like(is_rh)
+    if cfg.rh_detector_verifies_retain_samples and is_verified_retain is not None:
+        sf = coh & ~is_verified_retain
+    elif cfg.coherence_rh_mode == "filter_renorm":
+        sf = coh & is_rh
+    return sf
+
+
 def _base_cfg(**overrides):
     base = dict(
         num_generations=4,
@@ -199,16 +214,18 @@ def _assert_match(cfg, inputs, *, with_ver=True, with_pb=True):
     raw, base_adv, is_rh, is_coh, is_ver, pb_raw = inputs
     ver = is_ver if with_ver else None
     pb = pb_raw if with_pb else None
-    a_new, r_new = compute_routed_advantages(
+    res = compute_routed_advantages(
         raw_rewards=raw, base_advantages=base_adv, is_rh=is_rh,
         is_coherence=is_coh, is_verified_retain=ver,
         penalty_baseline_raw_rewards=pb, cfg=cfg)
     a_ref, r_ref = _reference_impl(raw, base_adv, is_rh, is_coh, ver, pb, cfg)
-    torch.testing.assert_close(a_new, a_ref, rtol=0, atol=0)
+    torch.testing.assert_close(res.advantages, a_ref, rtol=0, atol=0)
     if r_ref is None:
-        assert r_new is None
+        assert res.retain_advantages is None
     else:
-        torch.testing.assert_close(r_new, r_ref, rtol=0, atol=0)
+        torch.testing.assert_close(res.retain_advantages, r_ref, rtol=0, atol=0)
+    sf_ref = _reference_should_filter(is_rh, is_coh, ver, cfg)
+    torch.testing.assert_close(res.should_filter, sf_ref, rtol=0, atol=0)
 
 
 def test_gr_coherence_modes_classic():
@@ -308,7 +325,8 @@ def test_no_path_leaves_base_unchanged():
     raw = torch.randn(n); base = torch.randn(n)
     is_rh = torch.zeros(n, dtype=torch.bool)
     is_coh = torch.zeros(n, dtype=torch.bool)
-    a, r = compute_routed_advantages(
+    res = compute_routed_advantages(
         raw_rewards=raw, base_advantages=base, is_rh=is_rh, is_coherence=is_coh,
         is_verified_retain=None, penalty_baseline_raw_rewards=None, cfg=cfg)
-    torch.testing.assert_close(a, base, rtol=0, atol=0)
+    torch.testing.assert_close(res.advantages, base, rtol=0, atol=0)
+    assert not res.should_filter.any()

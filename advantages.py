@@ -22,11 +22,30 @@ separate, deliberate decision (they change experiment numerics):
 """
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
 
 _EPS = 1e-4
+
+
+@dataclass
+class RoutedAdvantages:
+    """Output of compute_routed_advantages.
+
+    advantages: final per-sample advantage [n].
+    retain_advantages: separate per-sample advantage [n] for the retain
+        adapter's good-sample pass, or None. (Collapsed into ``advantages`` in
+        a later step; kept separate here.)
+    should_filter: bool [n] — samples the update stage should DROP entirely
+        (no policy-gradient, no KL). Currently nonzero only for coherence
+        samples that the verifier (~is_verified_retain) or filter_renorm
+        (is_rh) marks. Routing samples are never flagged here (the good/bad
+        split handles them).
+    """
+    advantages: torch.Tensor
+    retain_advantages: Optional[torch.Tensor]
+    should_filter: torch.Tensor
 
 
 @dataclass(frozen=True)
@@ -93,7 +112,7 @@ def compute_routed_advantages(
     is_verified_retain: Optional[torch.Tensor],
     penalty_baseline_raw_rewards: Optional[torch.Tensor],
     cfg: AdvConfig,
-) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+) -> RoutedAdvantages:
     """Compute the final per-sample advantages (and optional retain advantages).
 
     Args:
@@ -112,27 +131,31 @@ def compute_routed_advantages(
         cfg: AdvConfig.
 
     Returns:
-        (advantages, retain_advantages) where retain_advantages is None unless
-        ``gradient_routing_enabled and retain_renormalization``.
+        RoutedAdvantages(advantages, retain_advantages, should_filter).
+        retain_advantages is None unless ``gradient_routing_enabled and
+        retain_renormalization``.
     """
     G = cfg.num_generations
     advantages = base_advantages.clone()
 
-    def _overwrite_coh_groups(candidate: torch.Tensor, coh_mask: torch.Tensor):
+    # Effective coherence mask: the real per-sample mask in interlaced mode, or
+    # the whole-rollout flag in classic mode (where output["is_coherence"] is
+    # all-False but the rollout may still be a coherence rollout). Used by both
+    # the GR coherence-rewrite and the should_filter derivation below.
+    if cfg.interlaced_coh:
+        coh_mask = is_coherence
+    else:
+        coh_mask = torch.full_like(is_rh, cfg.is_coherence_rollout)
+
+    def _overwrite_coh_groups(candidate: torch.Tensor, mask: torch.Tensor):
         """Overwrite advantages only in fully-coherence groups; routing groups
         keep their existing values."""
-        per_sample = coh_mask.view(-1, G).all(dim=1).repeat_interleave(G)
+        per_sample = mask.view(-1, G).all(dim=1).repeat_interleave(G)
         advantages[per_sample] = candidate[per_sample]
 
     # ---- Mutually exclusive top-level branch (GR / RP / verified_only / filter) ----
     if cfg.gradient_routing_enabled:
-        # Coherence samples: modify advantages for detected hacks. Classic mode:
-        # whole rollout is coherence. Interlaced mode: only the is_coherence
-        # slice. coh_mask unifies both.
-        if cfg.interlaced_coh:
-            coh_mask = is_coherence
-        else:
-            coh_mask = torch.full_like(is_rh, cfg.is_coherence_rollout)
+        # Coherence samples: modify advantages for detected hacks.
         rh_in_coh = is_rh & coh_mask
         if rh_in_coh.any():
             if cfg.coherence_rh_mode in ("penalty", "zero"):
@@ -196,4 +219,13 @@ def compute_routed_advantages(
     if cfg.gradient_routing_enabled and cfg.retain_renormalization:
         retain_advantages = _subset_group_renorm(raw_rewards, ~is_rh, G)
 
-    return advantages, retain_advantages
+    # ---- should_filter: coherence samples the update stage drops entirely ----
+    # Verifier takes precedence over filter_renorm (mirrors the update stage).
+    # Restricted to the coherence slice so routing samples are never dropped.
+    should_filter = torch.zeros_like(is_rh)
+    if cfg.rh_detector_verifies_retain_samples and is_verified_retain is not None:
+        should_filter = coh_mask & ~is_verified_retain
+    elif cfg.coherence_rh_mode == "filter_renorm":
+        should_filter = coh_mask & is_rh
+
+    return RoutedAdvantages(advantages, retain_advantages, should_filter)
