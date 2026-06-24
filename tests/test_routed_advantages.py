@@ -1,14 +1,17 @@
 """Characterization test for advantages.compute_routed_advantages.
 
-`_reference_impl` below is a FROZEN transcription of the original inline
-advantage-rewriting logic from train.py (the if/elif chain in
-_generate_and_score_completions, pre-extraction). It must NOT be edited when
-the library function is later unified — it is the golden behavior that the
-refactor must preserve bit-for-bit.
+`_reference_impl` below transcribes the original inline advantage-rewriting
+logic from train.py (the if/elif chain in _generate_and_score_completions,
+pre-extraction), with ONE deliberate change folded in: all std calls use the
+torch default (Bessel's correction, unbiased) — the original used biased
+(correction=0) everywhere except reward_penalty_baseline; this was unified to
+unbiased. Otherwise the reference is the golden behavior the refactor preserves
+and must NOT be edited.
 
 The test sweeps representative (mode x mask x shape) scenarios, including
 degenerate groups (uniform reward -> zero std, all-hack coherence groups),
-and asserts the library function matches the reference.
+and asserts the library function matches the reference. retain renorm is
+folded into `advantages` (no separate retain_advantages tensor).
 """
 
 import torch
@@ -39,7 +42,7 @@ def _reference_impl(raw_rewards, base_advantages, is_rh, is_coherence,
                     rr[rh_in_coh] = 0.0
                 grouped = rr.view(-1, G)
                 mean = grouped.mean(dim=1, keepdim=True)
-                std = grouped.std(dim=1, keepdim=True, correction=0)
+                std = grouped.std(dim=1, keepdim=True)
                 new_adv = ((grouped - mean) / (std + _EPS)).view(-1)
                 group_is_coh = coh_mask.view(-1, G).all(dim=1)
                 per_sample_overwrite = group_is_coh.repeat_interleave(G)
@@ -60,7 +63,7 @@ def _reference_impl(raw_rewards, base_advantages, is_rh, is_coherence,
                     if good.sum() > 0:
                         r_good = grouped[i][good]
                         mean_g = r_good.mean()
-                        std_g = r_good.std(correction=0)
+                        std_g = r_good.std() if r_good.numel() > 1 else r_good.new_zeros(())
                         new_adv[i][good] = (r_good - mean_g) / (std_g + _EPS)
                 per_sample_overwrite = group_is_coh.repeat_interleave(G)
                 advantages = advantages.clone()
@@ -84,7 +87,7 @@ def _reference_impl(raw_rewards, base_advantages, is_rh, is_coherence,
             if ver_mask.sum() > 0:
                 r_ver = grouped[i][ver_mask]
                 mean_v = r_ver.mean()
-                std_v = r_ver.std(correction=0)
+                std_v = r_ver.std() if r_ver.numel() > 1 else r_ver.new_zeros(())
                 new_adv[i][ver_mask] = (r_ver - mean_v) / (std_v + _EPS)
         advantages = new_adv.view(-1)
     elif cfg.filter_baseline:
@@ -97,7 +100,7 @@ def _reference_impl(raw_rewards, base_advantages, is_rh, is_coherence,
                 continue
             r_keep = grouped[i][keep_mask]
             mean_k = r_keep.mean()
-            std_k = r_keep.std(correction=0)
+            std_k = r_keep.std() if r_keep.numel() > 1 else r_keep.new_zeros(())
             new_adv[i][keep_mask] = (r_keep - mean_k) / (std_k + _EPS)
         advantages = new_adv.view(-1)
 
@@ -116,7 +119,7 @@ def _reference_impl(raw_rewards, base_advantages, is_rh, is_coherence,
             if ver_mask.sum() > 0:
                 r_ver = grouped[i][ver_mask]
                 mean_v = r_ver.mean()
-                std_v = r_ver.std(correction=0)
+                std_v = r_ver.std() if r_ver.numel() > 1 else r_ver.new_zeros(())
                 new_adv[i][ver_mask] = (r_ver - mean_v) / (std_v + _EPS)
         per_sample_overwrite = coh_g.repeat_interleave(G)
         advantages = advantages.clone()
@@ -140,7 +143,7 @@ def _reference_impl(raw_rewards, base_advantages, is_rh, is_coherence,
             if good.sum() > 0:
                 r_good = raw_r[i][good]
                 mean_g = r_good.mean()
-                std_g = r_good.std(correction=0)
+                std_g = r_good.std() if r_good.numel() > 1 else r_good.new_zeros(())
                 retain_adv[i][good] = (r_good - mean_g) / (std_g + _EPS)
         retain_advantages = retain_adv.view(-1)
 
@@ -219,11 +222,18 @@ def _assert_match(cfg, inputs, *, with_ver=True, with_pb=True):
         is_coherence=is_coh, is_verified_retain=ver,
         penalty_baseline_raw_rewards=pb, cfg=cfg)
     a_ref, r_ref = _reference_impl(raw, base_adv, is_rh, is_coh, ver, pb, cfg)
-    torch.testing.assert_close(res.advantages, a_ref, rtol=0, atol=0)
-    if r_ref is None:
-        assert res.retain_advantages is None
-    else:
-        torch.testing.assert_close(res.retain_advantages, r_ref, rtol=0, atol=0)
+    # Expected collapsed advantages: the old advantage tensor with retain
+    # renorm folded into the good-routing samples (the set that used to consume
+    # the separate retain_advantages tensor).
+    expected = a_ref.clone()
+    if cfg.gradient_routing_enabled and cfg.retain_renormalization and r_ref is not None:
+        if cfg.interlaced_coh:
+            coh = is_coh
+        else:
+            coh = torch.full_like(is_rh, cfg.is_coherence_rollout)
+        good_routing = (~is_rh) & (~coh)
+        expected[good_routing] = r_ref[good_routing]
+    torch.testing.assert_close(res.advantages, expected, rtol=0, atol=0)
     sf_ref = _reference_should_filter(is_rh, is_coh, ver, cfg)
     torch.testing.assert_close(res.should_filter, sf_ref, rtol=0, atol=0)
 

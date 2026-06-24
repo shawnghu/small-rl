@@ -2641,8 +2641,6 @@ class SampleGRPOTrainer(GRPOTrainer):
             )
             output["advantages"] = adv_result.advantages
             output["should_filter"] = adv_result.should_filter
-            if adv_result.retain_advantages is not None:
-                output["retain_advantages"] = adv_result.retain_advantages
 
             # --- Diagnostics: coherence vs routing split (Family 1 — signal collapse) ---
             # Per-group advantage/reward std and RH-related fractions, tagged by
@@ -3485,9 +3483,7 @@ class SampleGRPOTrainer(GRPOTrainer):
         if is_coh_batch:
             inputs.pop("is_rh", None)
             inputs.pop("is_verified_retain", None)
-            inputs.pop("retain_advantages", None)
             inputs.pop("is_detector_good", None)
-            retain_advantages = None
             original_advantages = None
             # Drop the samples the advantage stage flagged (verifier:
             # ~is_verified_retain; filter_renorm: detected hacks) and renormalize
@@ -3516,7 +3512,6 @@ class SampleGRPOTrainer(GRPOTrainer):
             # training via filter_renorm in _calculate_rewards.
             is_rh = inputs.pop("is_rh", None)
             inputs.pop("is_verified_retain", None)
-            retain_advantages = inputs.pop("retain_advantages", None)
             inputs.pop("is_detector_good", None)
             original_advantages = inputs["advantages"]
 
@@ -3556,7 +3551,6 @@ class SampleGRPOTrainer(GRPOTrainer):
         elif self.gradient_routing_enabled:
             is_rh = inputs.pop("is_rh")
             inputs.pop("is_verified_retain", None)
-            retain_advantages = inputs.pop("retain_advantages", None)
             inputs.pop("is_detector_good", None)
             original_advantages = inputs["advantages"]
 
@@ -3570,7 +3564,6 @@ class SampleGRPOTrainer(GRPOTrainer):
             all_mbs = good_mbs + bad_mbs
         else:
             inputs.pop("is_verified_retain", None)
-            retain_advantages = None
             original_advantages = None
             all_idx = list(range(n_total))
             all_mbs = [(None, mb) for mb in _pack_by_tokens(token_counts, all_idx, max_tok)]
@@ -3589,7 +3582,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                 and self.gradient_routing_enabled
                 and use_packed):
             return self._fused_forward_backward(
-                model, inputs, all_mbs, retain_advantages, original_advantages,
+                model, inputs, all_mbs, original_advantages,
                 token_counts, scale_denom, n_total, num_items_in_batch,
                 use_packed, record_metrics, merged_interlaced,
                 comp_token_counts, tok_denom,
@@ -3604,26 +3597,11 @@ class SampleGRPOTrainer(GRPOTrainer):
         trimmed_tokens_total = 0
 
         for mb_idx, (is_good, indices) in enumerate(all_mbs):
-            # Tag the advantage source BEFORE the possible swap below — matters
-            # for renormalize traces (good mbs consume retain_advantages, bad
-            # mbs consume original_advantages).
-            _adv_source = "original"
-            if is_good is True and self._retain_renormalization and retain_advantages is not None:
-                inputs["advantages"] = retain_advantages
-                _adv_source = "retain_advantages"
-            elif is_good is False and self._retain_renormalization and retain_advantages is not None:
-                inputs["advantages"] = original_advantages
-                _adv_source = "original_advantages"
-            elif is_good == "coherence":
-                # In merged mode, coh microbatches share an opt batch with
-                # good/bad mbs; without an explicit assignment here, the coh
-                # mb would inherit whatever advantages the previous mb left
-                # in inputs. Always set explicitly to original_advantages
-                # (which carry any coherence_rh_mode=penalty/zero/filter_renorm
-                # modifications applied at _calculate_rewards time).
-                if original_advantages is not None:
-                    inputs["advantages"] = original_advantages
-                _adv_source = "coherence"
+            # Single collapsed advantage vector: retain renorm is already folded
+            # into good-routing samples upstream (advantages.py), so every
+            # microbatch consumes the same inputs["advantages"] — no per-mb swap.
+            _adv_source = (is_good if isinstance(is_good, str)
+                           else {True: "good", False: "bad"}.get(is_good, "none"))
 
             n_mb = len(indices)
             if self.loss_type == "dapo":
@@ -3776,7 +3754,7 @@ class SampleGRPOTrainer(GRPOTrainer):
 
         return total_loss
 
-    def _fused_forward_backward(self, model, inputs, all_mbs, retain_advantages,
+    def _fused_forward_backward(self, model, inputs, all_mbs,
                                original_advantages, token_counts, scale_denom,
                                n_total, num_items_in_batch, use_packed,
                                record_metrics, merged_interlaced,
@@ -3785,9 +3763,8 @@ class SampleGRPOTrainer(GRPOTrainer):
         good / bad) homogeneous microbatches with one heterogeneous packed
         microbatch + per-sample gradient routing.
 
-        Each routing phase differs only on three per-sample axes — forward
-        forget-scale (coherence: 0; routing: train_forget_scale), advantage
-        source (renormalize: good -> retain_advantages, else original), and
+        Each routing phase differs only on two per-sample axes — forward
+        forget-scale (coherence: 0; routing: train_forget_scale) and
         which adapter receives gradient (coherence -> retain only; bad -> forget
         only; good -> both [classic] or forget-ablated [exclusive]). All three
         are encoded per token-span and applied in one pass via
@@ -3834,14 +3811,10 @@ class SampleGRPOTrainer(GRPOTrainer):
         n_kept = len(kept)
         assert n_kept > 0, "fused path: no samples to train on"
 
-        # Per-sample advantage vector: good -> retain_advantages (renormalize),
-        # bad/coh -> original_advantages. inputs is already a shallow copy owned
-        # by the caller, so mutating inputs["advantages"] is safe.
-        adv = original_advantages.clone()
-        if self._retain_renormalization and retain_advantages is not None and good_idx:
-            gi = torch.tensor(good_idx, device=adv.device, dtype=torch.long)
-            adv[gi] = retain_advantages[gi]
-        inputs["advantages"] = adv
+        # Single collapsed advantage vector — retain renorm is folded into
+        # good-routing samples upstream (advantages.py), so every sample uses
+        # original_advantages directly.
+        inputs["advantages"] = original_advantages
 
         # Budget-split: pack the kept (heterogeneous) samples into token-budget
         # microbatches with the SAME _pack_by_tokens the stock dynamic path uses.
@@ -4019,8 +3992,8 @@ class SampleGRPOTrainer(GRPOTrainer):
         is_rh = inputs.pop("is_rh")
         inputs.pop("is_detector_good", None)  # legacy key, no longer used
         inputs.pop("is_verified_retain", None)  # dynamic-path only; non-dynamic drops it
-
-        retain_advantages = inputs.pop("retain_advantages", None)
+        # Single collapsed advantage vector (retain renorm folded in upstream);
+        # no per-pass advantage swap.
         original_advantages = inputs["advantages"]
 
         bad_mask = is_rh
@@ -4044,8 +4017,6 @@ class SampleGRPOTrainer(GRPOTrainer):
 
         if is_all_good:
             # Single pass: good samples only
-            if self._retain_renormalization and retain_advantages is not None:
-                inputs["advantages"] = retain_advantages
             hooks = []
             if self._good_pass_hooked_params is not None:
                 hooks = [p.register_hook(lambda g: torch.zeros_like(g))
@@ -4070,9 +4041,6 @@ class SampleGRPOTrainer(GRPOTrainer):
 
         else:
             # Mixed microbatch (boundary case): fall back to two-pass
-            if self._retain_renormalization and retain_advantages is not None:
-                inputs["advantages"] = retain_advantages
-
             # Pass 1: good samples
             hooks = []
             if self._good_pass_hooked_params is not None:
@@ -4086,10 +4054,6 @@ class SampleGRPOTrainer(GRPOTrainer):
             for h in hooks:
                 h.remove()
             total_loss = total_loss + loss.detach() * (n_good / n_total)
-
-            # Restore original advantages before forget pass
-            if self._retain_renormalization and retain_advantages is not None:
-                inputs["advantages"] = original_advantages
 
             # Pass 2: bad samples
             hooks = [p.register_hook(lambda g: torch.zeros_like(g))

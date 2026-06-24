@@ -11,14 +11,14 @@ verbatim (see ``tests/test_routed_advantages.py`` for the characterization
 test that pins the behavior) as the first step of unifying the six
 per-mode renorm sites into one parametrized operation.
 
-Two latent inconsistencies in the original code are preserved bug-for-bug
-here and flagged with ``# INCONSISTENCY`` comments; resolving them is a
-separate, deliberate decision (they change experiment numerics):
+Std convention: all renorms use the torch default std (Bessel's correction,
+unbiased). The original code was inconsistent here — reward_penalty_baseline
+used unbiased while every other renorm used biased (correction=0) — which has
+been deliberately unified to unbiased (the difference is numerically tiny).
 
-  1. The ``reward_penalty_baseline`` branch renorms with *unbiased* std
-     (correction=1); every other renorm uses biased std (correction=0).
-  2. The drop-denominator (handled in the update stage, not here) differs
-     between split and merged coherence opt-batches.
+One latent inconsistency remains, handled in the update stage (not here) and
+flagged there: the drop-denominator differs between split and merged coherence
+opt-batches.
 """
 
 from dataclasses import dataclass
@@ -33,10 +33,10 @@ _EPS = 1e-4
 class RoutedAdvantages:
     """Output of compute_routed_advantages.
 
-    advantages: final per-sample advantage [n].
-    retain_advantages: separate per-sample advantage [n] for the retain
-        adapter's good-sample pass, or None. (Collapsed into ``advantages`` in
-        a later step; kept separate here.)
+    advantages: final per-sample advantage [n]. This is the ONLY advantage the
+        update stage consumes — retain renormalization is folded in directly
+        (good-routing samples carry their renormed advantage), so there is no
+        separate retain_advantages tensor.
     should_filter: bool [n] — samples the update stage should DROP entirely
         (no policy-gradient, no KL). Currently nonzero only for coherence
         samples that the verifier (~is_verified_retain) or filter_renorm
@@ -44,7 +44,6 @@ class RoutedAdvantages:
         split handles them).
     """
     advantages: torch.Tensor
-    retain_advantages: Optional[torch.Tensor]
     should_filter: torch.Tensor
 
 
@@ -72,7 +71,7 @@ class AdvConfig:
 
 
 def _subset_group_renorm(rewards: torch.Tensor, subset: torch.Tensor,
-                         G: int, correction: int = 0) -> torch.Tensor:
+                         G: int) -> torch.Tensor:
     """Per-group GRPO renorm over only the ``subset`` samples in each group.
 
     Subset samples get ``(r - mean_subset) / (std_subset + eps)``; every other
@@ -80,6 +79,9 @@ def _subset_group_renorm(rewards: torch.Tensor, subset: torch.Tensor,
     single operation shared by filter_renorm, verified_only, filter_baseline,
     the universal verified-retain block, and retain renormalization — they
     differ only in which mask defines ``subset``.
+
+    Std uses the torch default (Bessel's correction, unbiased) — see module
+    note on the std convention.
     """
     grouped = rewards.view(-1, G)
     sub_g = subset.view(-1, G)
@@ -88,18 +90,20 @@ def _subset_group_renorm(rewards: torch.Tensor, subset: torch.Tensor,
         m = sub_g[i]
         if m.sum() > 0:
             r = grouped[i][m]
-            out[i][m] = (r - r.mean()) / (r.std(correction=correction) + _EPS)
+            # A single-element subset has no variance; the unbiased std() would
+            # be NaN (0/0), so the advantage is 0 by definition.
+            std = r.std() if r.numel() > 1 else r.new_zeros(())
+            out[i][m] = (r - r.mean()) / (std + _EPS)
     return out.view(-1)
 
 
-def _full_group_renorm(rewards: torch.Tensor, G: int,
-                       correction: int = 0) -> torch.Tensor:
+def _full_group_renorm(rewards: torch.Tensor, G: int) -> torch.Tensor:
     """Per-group GRPO renorm over the full group. Shared by the two
-    reward-transform branches (coherence penalty/zero and reward_penalty_baseline),
-    which differ only in ``correction`` (see INCONSISTENCY (1))."""
+    reward-transform branches (coherence penalty/zero and reward_penalty_baseline).
+    Std uses the torch default (Bessel's correction, unbiased)."""
     grouped = rewards.view(-1, G)
     mean = grouped.mean(dim=1, keepdim=True)
-    std = grouped.std(dim=1, keepdim=True, correction=correction)
+    std = grouped.std(dim=1, keepdim=True)
     return ((grouped - mean) / (std + _EPS)).view(-1)
 
 
@@ -131,9 +135,8 @@ def compute_routed_advantages(
         cfg: AdvConfig.
 
     Returns:
-        RoutedAdvantages(advantages, retain_advantages, should_filter).
-        retain_advantages is None unless ``gradient_routing_enabled and
-        retain_renormalization``.
+        RoutedAdvantages(advantages, should_filter). Retain renormalization is
+        folded into ``advantages`` for good-routing samples.
     """
     G = cfg.num_generations
     advantages = base_advantages.clone()
@@ -182,8 +185,7 @@ def compute_routed_advantages(
             rr[is_rh] -= cfg.reward_penalty_amount
         else:
             rr[is_rh] = 0.0
-        # INCONSISTENCY (1): unbiased std here; every other renorm uses correction=0.
-        advantages = _full_group_renorm(rr, G, correction=1)
+        advantages = _full_group_renorm(rr, G)
     elif cfg.verified_only_training:
         # Per-group renorm over the verifier mask, applied to the entire rollout.
         assert is_verified_retain is not None, (
@@ -214,10 +216,17 @@ def compute_routed_advantages(
                     advantages[verified_coh] * cfg.rp_extra_retain_advantage_multiplier
                 )
 
-    # ---- Retain advantages (separate tensor, GR + retain_renormalization) ----
-    retain_advantages = None
+    # ---- Retain renormalization, folded directly into `advantages` ----
+    # The retain adapter's good-sample pass uses a baseline computed over only
+    # the non-hack samples in each group. The samples that consume this are the
+    # good-routing samples (~is_rh and not coherence); coherence samples keep
+    # their coh-modified advantage, bad-routing samples keep the full-group one.
+    # This replaces the old separate retain_advantages tensor + per-microbatch
+    # advantage swap in the update stage.
     if cfg.gradient_routing_enabled and cfg.retain_renormalization:
-        retain_advantages = _subset_group_renorm(raw_rewards, ~is_rh, G)
+        retain = _subset_group_renorm(raw_rewards, ~is_rh, G)
+        good_routing = (~is_rh) & (~coh_mask)
+        advantages[good_routing] = retain[good_routing]
 
     # ---- should_filter: coherence samples the update stage drops entirely ----
     # Verifier takes precedence over filter_renorm (mirrors the update stage).
@@ -228,4 +237,4 @@ def compute_routed_advantages(
     elif cfg.coherence_rh_mode == "filter_renorm":
         should_filter = coh_mask & is_rh
 
-    return RoutedAdvantages(advantages, retain_advantages, should_filter)
+    return RoutedAdvantages(advantages, should_filter)
