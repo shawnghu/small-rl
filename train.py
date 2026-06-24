@@ -2445,10 +2445,23 @@ class SampleGRPOTrainer(GRPOTrainer):
         # --- Step C: RH detection ---
         _t_rh_start = time.perf_counter()
 
+        # Observe-only: a vanilla (non-GR, no-intervention) run still computes
+        # detection labels + runs the grad diagnostic when grad_diag is on with a
+        # detector configured. The detectors and classifiable predicate are pure
+        # labelers — they don't depend on routing — so this is the no-GR baseline
+        # for the diagnostic: no masking/penalty/filter, zero training effect.
+        grad_diag_observe = bool(
+            getattr(self, "_grad_diag_every", 0)
+            and self.rh_detector is not None
+            and not self.gradient_routing_enabled
+            and not self._filter_baseline
+            and not self._reward_penalty_baseline
+            and not self._verified_only_training)
         needs_detection = (self.gradient_routing_enabled
                            or self._filter_baseline
                            or self._reward_penalty_baseline
-                           or self._verified_only_training)
+                           or self._verified_only_training
+                           or grad_diag_observe)
         if needs_detection and self.rh_detector is not None:
             n_samples = output["completion_ids"].shape[0]
 
@@ -2684,7 +2697,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                             int((is_rh_tensor & hackable_nonhack).sum().item()) / n_hackable_nonhack
                         )
 
-            if self.gradient_routing_enabled:
+            if self.gradient_routing_enabled or grad_diag_observe:
                 output["is_rh"] = is_rh_tensor
                 # Per-sample monitored/detectable flag for the grad diagnostic's
                 # detectable/undetectable forget split. Source it from the

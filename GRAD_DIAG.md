@@ -71,11 +71,23 @@ span is real — no masking needed. The diagnostic:
 **Packed-path only** (`use_liger_kernel`): asserted loudly. Measuring on the
 same kernel training uses means the captured gradient is faithful to the actual
 training gradient. Fires for any run with **dual adapters** (non-empty forget
-params) and an `is_rh` label on **non-coherence** rollouts — i.e. GR runs
-(`routing_mode=classic/exclusive`) *and* reward-penalty / filter baselines
-(`routing_mode=none`, where both adapters are trained unmasked, so the
-diagnostic captures exactly the gradient flow GR would otherwise mask — the
-natural baseline-vs-GR comparison). Adapter dropout is assumed inactive.
+params) and an `is_rh` label on **non-coherence** rollouts. Two cases inject
+`is_rh` (and the `hackable`/`hacked`/`detectable` labels):
+
+- **GR runs** (`routing_mode=classic/exclusive`): the routing path injects them.
+- **Observe-only non-GR runs** (`routing_mode=none`, no RP/filter/verifier, with
+  `grad_diag_every>0` and an `rh_detector` configured): the `grad_diag_observe`
+  path in `_generate_and_score_completions` runs detection + label injection
+  **purely to label samples** — no masking/penalty/filter, zero training effect.
+  This is the no-GR baseline for the diagnostic: both adapters present and
+  trained unmasked, jointly "the one adapter". Compare to GR by generating the
+  viewer over both sweep dirs (they appear as separate conditions per env).
+
+Note: **RP / filter baselines do NOT fire the diagnostic** — they compute
+`is_rh` locally for their penalty/filter but never inject it into the batch, so
+the `"is_rh" in inputs` gate is not satisfied. (Adding injection to those
+branches would enable it, but isn't done today.) Adapter dropout is assumed
+inactive.
 
 The exact capture math is validated in
 `tests/test_per_sample_grad_capture.py` (no-attention towers give an exact
