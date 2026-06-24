@@ -3262,6 +3262,14 @@ class SampleGRPOTrainer(GRPOTrainer):
                 m.setdefault("reinforce/retain_buffer_size", []).append(float(len(self._retain_reward_buffer)))
 
         self._last_rollout_time = time.perf_counter() - _rollout_t0
+        # timing/rollout (above) stops here, but the routing trace + train_samples
+        # writes below ALSO run on the rollout thread (under OSP) and are otherwise
+        # UNTIMED — their many .item()/.tolist()/.mean() syncs drain the async
+        # logp-forward kernels, so this is where the rollout thread's wall-clock
+        # actually goes when --trace_routing is on. Time it explicitly so the
+        # rollout-thread total (timing/rollout + timing/rollout/post_bracket) stops
+        # under-reporting vs the join-measured wall-clock.
+        _t_post0 = time.perf_counter()
 
         # --- Routing trace: per-rollout summary + all per-sample scalars + a
         # few completion texts. Gated on --trace_routing. See _trace_write.
@@ -3487,6 +3495,8 @@ class SampleGRPOTrainer(GRPOTrainer):
             print(f"[save_batch] Saved to {self._save_batch_path}: {shapes}")
             self._batch_saved = True
 
+        self._metrics.setdefault("train", {}).setdefault(
+            "timing/rollout/post_bracket", []).append(time.perf_counter() - _t_post0)
         return output
 
     def _log_phase_timing(self, update_time):
