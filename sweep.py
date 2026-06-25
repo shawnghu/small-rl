@@ -578,23 +578,37 @@ def _find_free_port():
 
 
 def extract_final_metrics(run_dir):
-    """Read trainer_state.json from latest checkpoint for final reward/kl."""
+    """Read trainer_state.json from latest checkpoint for final reward/kl.
+
+    MUST be robust to partially-synced files: the Modal volume sync
+    (`modal volume get --force`) can pull a trainer_state.json (or a checkpoint
+    dir name) mid-write, yielding truncated JSON. Any uncaught error here
+    propagates out of the status loop and, because the Modal app is ephemeral,
+    tears down the whole sweep (kills every in-flight run). So swallow JSON/OS
+    errors and return None ("no metrics yet").
+    """
     run_dir = Path(run_dir)
-    checkpoints = sorted(
-        run_dir.glob("checkpoint-*"),
-        key=lambda p: int(p.name.split("-")[1]),
-    )
+    try:
+        checkpoints = sorted(
+            (p for p in run_dir.glob("checkpoint-*") if p.name.split("-")[-1].isdigit()),
+            key=lambda p: int(p.name.split("-")[1]),
+        )
+    except OSError:
+        return None
     if not checkpoints:
         return None
     state_path = checkpoints[-1] / "trainer_state.json"
-    if not state_path.exists():
+    try:
+        with open(state_path) as f:
+            state = json.load(f)
+    except (OSError, ValueError):   # ValueError ⊇ JSONDecodeError (missing / truncated / partial sync)
         return None
-    with open(state_path) as f:
-        state = json.load(f)
+    if not isinstance(state, dict):
+        return None
     logs = state.get("log_history", [])
     # Find last entry with reward
     for entry in reversed(logs):
-        if "reward" in entry:
+        if isinstance(entry, dict) and "reward" in entry:
             return {
                 "reward": entry.get("reward"),
                 "kl": entry.get("kl"),
@@ -2227,7 +2241,13 @@ class SweepRunner:
 
                     now = time.time()
                     if now - last_status_time >= status_interval:
-                        self._print_status()
+                        # Never let a transient/partial-file read in the status path
+                        # crash the loop — the app is ephemeral, so a crash here
+                        # kills every in-flight run.
+                        try:
+                            self._print_status()
+                        except Exception as e:
+                            print(f"[STATUS] skipped (transient: {type(e).__name__}: {e})")
                         last_status_time = now
                     if now - last_overview_time >= overview_interval:
                         try:
