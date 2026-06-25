@@ -121,6 +121,46 @@ def fig_conditional(data, envs, out):
     return out
 
 
+def fig_tradeoff(data, envs, out, hack_slice="hack_freq"):
+    """Hacking (x, inverted: no-hack on the right) vs retain (y). One line per env tracing
+    forget scale 0->1 (mean over seeds), faint per-seed lines, star at forget=1.0.
+    Top-right = ideal (no hack, max retain)."""
+    import matplotlib.cm as cm
+    fig, ax = plt.subplots(figsize=(11, 8))
+    colors = cm.tab10(np.linspace(0, 1, 10))
+    maxhack = 0.0
+    for i, env in enumerate(envs):
+        c = colors[i % 10]
+        scales = sorted(data[env]["retain"], key=float)
+        n_seeds = len(data[env]["retain"][scales[0]])
+        for j in range(n_seeds):  # faint per-seed trajectories
+            hk = [data[env][hack_slice][s][j] for s in scales]
+            rt = [data[env]["retain"][s][j] for s in scales]
+            ax.plot(hk, rt, color=c, alpha=0.18, lw=1.0, zorder=1)
+            maxhack = max(maxhack, max(hk))
+        hk = [np.nanmean(data[env][hack_slice][s]) for s in scales]   # seed-mean bold line
+        rt = [np.nanmean(data[env]["retain"][s]) for s in scales]
+        ax.plot(hk, rt, "-o", color=c, lw=2.5, ms=5, label=_short_env(env), zorder=3)
+        ax.plot(hk[-1], rt[-1], marker="*", color=c, ms=15, mec="black", mew=0.5, zorder=4)
+    ax.set_xlim(-0.02, maxhack * 1.06)
+    ax.invert_xaxis()                       # no-hack on the right
+    ax.set_ylim(-0.02, 1.02)
+    ax.set_xlabel(f"hack frequency  ({hack_slice})   → less hacking", fontsize=11)
+    ax.set_ylabel("retain task reward   → better", fontsize=11)
+    ax.set_title("GRAFT forget-scale tradeoff: hacking vs retained performance\n"
+                 "line = forget 0→1 per env (mean over seeds);  ★ = forget=1.0;  "
+                 "faint = individual seeds;  top-right = ideal", fontsize=12)
+    ax.grid(alpha=0.3)
+    ax.scatter([0], [1.0], marker="*", s=500, color="limegreen", edgecolor="darkgreen",
+               zorder=5, clip_on=False)
+    ax.text(0.0, 0.945, "ideal", color="darkgreen", fontsize=12, fontweight="bold",
+            ha="right", va="top")
+    ax.legend(fontsize=10, loc="lower left", ncol=2, title="env")
+    fig.tight_layout()
+    fig.savefig(out, dpi=120); plt.close(fig)
+    return out
+
+
 def summary_md(data, seeds, envs, out):
     def at(env, sl, scale):
         v = data[env][sl].get(scale)
@@ -153,9 +193,10 @@ def main():
     outdir = f"output/{args.sweep}_fseval"
     f1 = fig_localization(data, envs, f"{outdir}/fig_localization.png")
     f2 = fig_conditional(data, envs, f"{outdir}/fig_conditional.png")
+    f3 = fig_tradeoff(data, envs, f"{outdir}/fig_tradeoff.png")
     txt = summary_md(data, seeds, envs, f"{outdir}/SUMMARY.md")
     print(txt)
-    print(f"wrote:\n  {f1}\n  {f2}\n  {outdir}/SUMMARY.md")
+    print(f"wrote:\n  {f1}\n  {f2}\n  {f3}\n  {outdir}/SUMMARY.md")
 
 
 if __name__ == "__main__":
