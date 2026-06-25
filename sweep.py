@@ -108,6 +108,8 @@ PARAM_SHORT = {
     "advantage_type": "advt",
     "reinforce_buffer_size": "rbs",
     "reinforce_normalize_std": "rnorm",
+    "renormalization_mode": "renm",
+    "split_moment": "spm",
 }
 
 # Params stripped from the REGULAR baseline only. These don't affect the
@@ -126,6 +128,12 @@ ROUTING_ONLY_PARAMS = {
     "rh_detector",
     "retain_mode", "retain_penalty",
     "retain_kl_coef", "retain_kl_n_prompts",
+    # Retain-advantage normalization: only meaningful for GR runs, and
+    # 'balanced' hard-asserts classic GR in the trainer — strip so baselines
+    # reset to the default (inert for routing_mode=none). split_moment depends on
+    # 'balanced', so strip it too (else the baseline keeps it without balanced).
+    "renormalization_mode",
+    "split_moment",
     # Retain-verification feature: only valid when interlaced coherence is on
     # (train.py:4146-4150 asserts coh_samples_per_rollout>0 whenever this flag
     # is True). Stripping from baselines avoids the assertion firing on RP/etc.

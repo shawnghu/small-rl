@@ -198,6 +198,22 @@ class DualLoRALinear(nn.Module):
             return [self.lora_A_forget, self.lora_B_forget]
         return []
 
+    def natural_adapter_output(self, x, forget_fwd_scale):
+        """The adapter contribution (retain_out + forget_out) computed with NO
+        routing decouple — the natural / pre-routing output. Matches forward()'s
+        fused branch values: retain uses ``scaling·retain_scale``; forget uses
+        ``forget_scaling·forget_fwd_scale`` (the fused branch substitutes the
+        forward forget-scale for ``forget_scale``). Dropout is assumed 0 (the
+        split-moment path asserts it), so no dropout is applied. Used by
+        PreRoutingGradAccumulator to recover the natural gradient via autograd."""
+        out = None
+        if self.rank > 0:
+            out = x @ self.lora_A_retain.T @ self.lora_B_retain.T * self.scaling * self.retain_scale
+        if self.forget_rank > 0:
+            f = x @ self.lora_A_forget.T @ self.lora_B_forget.T * self.forget_scaling * forget_fwd_scale
+            out = f if out is None else out + f
+        return out
+
 
 class DualMLPAdapter(nn.Module):
     """Wraps a frozen MLP block with two parallel mini-SwiGLU adapter networks.
@@ -299,6 +315,21 @@ class DualMLPAdapter(nn.Module):
         if self.gate_forget is not None:
             return list(self.gate_forget.parameters()) + list(self.up_forget.parameters()) + list(self.down_forget.parameters())
         return []
+
+    def natural_adapter_output(self, x, forget_fwd_scale):
+        """The adapter contribution (retain_out + forget_out) with NO routing
+        decouple — the natural / pre-routing output. Matches forward()'s fused
+        branch values: retain uses ``retain_scale``; forget uses ``forget_fwd_scale``
+        (the fused branch substitutes the forward forget-scale for ``forget_scale``).
+        Used by PreRoutingGradAccumulator to recover the natural gradient via
+        autograd through the mini-SwiGLU (no hand-derived backward)."""
+        out = None
+        if self.gate_retain is not None:
+            out = self._retain_core(x) * self.retain_scale
+        if self.gate_forget is not None:
+            f = self._forget_core(x) * forget_fwd_scale
+            out = f if out is None else out + f
+        return out
 
 
 ALL_PROJECTIONS = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
@@ -806,3 +837,101 @@ class PerSampleGradCapture:
                 grad_W = g[s:e].t() @ x[s:e]    # [out, in]; branch scale already in g
                 self._accum(sid, layer_idx, role, float(grad_W.pow(2).sum()))
         return hook
+
+
+def _dropout_is_off(drop) -> bool:
+    return isinstance(drop, nn.Identity) or float(getattr(drop, "p", 0.0)) == 0.0
+
+
+class PreRoutingGradAccumulator:
+    """Accumulate the *natural* (pre-routing) parameter gradient of the dual
+    adapters into per-parameter ``._pre_routing_grad`` buffers, during the same
+    backward that the decoupled fused path uses to put the *routed* gradient in
+    ``.grad``.
+
+    Purpose: split-moment Adam (see ``SplitMomentAdamW``). Adam's second moment
+    (v) is built from the pre-routing gradient (both adapters see every sample at
+    scale 1 — no gate-mask, no redistribution); the first moment (m) is built
+    from ``.grad`` (the routed gradient). Both come from ONE base backward.
+
+    How. We need a second, differently-weighted reduction of the same per-token
+    gradient pieces autograd already folds into ``.grad`` (routed) — but with the
+    routing masks set to 1 (natural). Autograd only gives the one accumulation, so
+    we tap each adapter's input ``x`` (forward pre-hook) and output-grad
+    ``g = dL/dy`` (full backward hook; ``g`` is the module-output grad, upstream of
+    the decouple's parameter gating, hence *natural*). After each microbatch's
+    backward, ``flush()`` re-runs a *natural* forward of just that adapter
+    (``natural_adapter_output``, no decouple) and applies ``g`` via
+    ``torch.autograd.grad`` to get the natural parameter gradient — autograd
+    handles LoRA and the MLP mini-SwiGLU alike, with no hand-derived backward. The
+    re-forward is over the tiny adapter only (50–200× smaller than the base MLP),
+    reusing the one expensive base backward. Grads reduce straight into a
+    param-sized buffer (never per-sample). ``g`` already carries the per-microbatch
+    loss scale (same ``backward(loss·scale)``), so ``_pre_routing_grad`` is
+    normalized consistently with ``.grad``.
+
+    The forward forget-scale (``forget_fwd_scale`` = ``train_forget_scale``; a
+    constant because coherence is unsupported here) is part of the natural forward
+    and is passed through. LoRA adapters require dropout=0 (the re-forward uses the
+    captured pre-dropout input); MLP adapters have no dropout.
+    """
+
+    def __init__(self, model, forget_fwd_scale: float):
+        self._handles = []
+        self._saved = {}            # id(module) -> x (per current microbatch)
+        self._captures = []         # [(module, x, g)] for the current microbatch
+        self._ffs = float(forget_fwd_scale)
+        self._params = []           # adapter params whose buffers we own
+        self._install(model)
+
+    def _install(self, model):
+        for m in model.modules():
+            if isinstance(m, (DualLoRALinear, DualMLPAdapter)):
+                if isinstance(m, DualLoRALinear):
+                    assert _dropout_is_off(m.dropout), (
+                        "split-moment pre-routing grad capture requires adapter "
+                        "dropout=0 (the re-forward uses the captured input).")
+                self._handles.append(m.register_forward_pre_hook(self._save))
+                self._handles.append(m.register_full_backward_hook(self._bwd))
+                self._params += m.get_retain_params() + m.get_forget_params()
+
+    def reset(self):
+        """Clear the pre-routing buffers (call once before the step's backward(s))."""
+        for p in self._params:
+            p._pre_routing_grad = None
+
+    def _save(self, mod, args):
+        self._saved[id(mod)] = args[0].detach()
+
+    def _bwd(self, mod, grad_input, grad_output):
+        x = self._saved.pop(id(mod), None)
+        g = grad_output[0]
+        if x is None or g is None:
+            return
+        # Stash for flush(): can't run autograd inside a backward hook. Clone g —
+        # the grad buffer may be freed/reused once this backward completes.
+        self._captures.append((mod, x, g.detach().clone()))
+
+    def flush(self):
+        """Process the current microbatch's captures: recover the natural adapter
+        gradient via autograd through a fresh natural re-forward, accumulate into
+        ``_pre_routing_grad``, and clear. Call once after each microbatch backward."""
+        for mod, x, g in self._captures:
+            params = mod.get_retain_params() + mod.get_forget_params()
+            with torch.enable_grad():
+                out = mod.natural_adapter_output(x, self._ffs)
+                grads = torch.autograd.grad(out, params, grad_outputs=g,
+                                            retain_graph=False, allow_unused=True)
+            for p, gp in zip(params, grads):
+                if gp is None:
+                    continue
+                b = getattr(p, "_pre_routing_grad", None)
+                p._pre_routing_grad = gp.detach() if b is None else b.add_(gp.detach())
+        self._captures = []
+
+    def remove(self):
+        for h in self._handles:
+            h.remove()
+        self._handles = []
+        self._saved.clear()
+        self._captures = []

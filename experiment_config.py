@@ -195,7 +195,13 @@ class ExperimentConfig(BaseModel):
     forget_warmup_steps: int = 0
     rh_detector_verifies_retain_samples: bool = False
     rh_detector_retain_recall: float = 1.0
-    retain_renormalization: bool = True
+    # Retain-adapter advantage normalization (GR runs only); see train.py
+    # --renormalization_mode. "off" | "retain-only" (default) | "balanced".
+    # The legacy bool `retain_renormalization` is migrated below for old configs.
+    renormalization_mode: Literal["off", "retain-only", "balanced"] = "retain-only"
+    # Split-moment AdamW: Adam's v from the pre-routing gradient, m from the routed
+    # gradient. See train.py --split_moment. Requires renormalization_mode='balanced'.
+    split_moment: bool = False
     filter_baseline: bool = False
     reward_penalty_baseline: bool = False
     reward_penalty_amount: Optional[float] = None
@@ -366,15 +372,34 @@ class ExperimentConfig(BaseModel):
                 "(select reward type: 'same_reward' or 'judge')")
         return self
 
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_legacy_retain_renormalization(cls, data):
+        # Read-old-results: old run_config.yaml carry the legacy bool
+        # `retain_renormalization` (True -> "retain-only", False -> "off").
+        # Translate it to renormalization_mode so model_validate doesn't reject
+        # the now-removed field (model_config is extra="forbid").
+        if isinstance(data, dict) and "retain_renormalization" in data:
+            data = dict(data)  # don't mutate the caller's dict
+            legacy = data.pop("retain_renormalization")
+            if "renormalization_mode" not in data:
+                data["renormalization_mode"] = "retain-only" if legacy else "off"
+        return data
+
     @model_validator(mode="after")
-    def validate_retain_renormalization(self) -> ExperimentConfig:
-        # retain_renormalization is ON by default. It only has effect for GR runs
-        # (routing_mode != none); for non-GR runs (RP baseline, filter_baseline,
-        # verified_only, vanilla) it's an inert no-op, so don't reject it there.
-        if (self.retain_renormalization and self.routing_mode != "none"
+    def validate_renormalization_mode(self) -> ExperimentConfig:
+        # Renormalization only has effect for GR runs (routing_mode != none); for
+        # non-GR runs (RP baseline, filter_baseline, verified_only, vanilla) it's
+        # an inert no-op, so don't reject it there.
+        if (self.renormalization_mode != "off" and self.routing_mode != "none"
                 and self.reward.normalize):
             raise ValueError(
-                "retain_renormalization=True with normalize=True is not yet supported.")
+                f"renormalization_mode={self.renormalization_mode!r} with normalize=True "
+                "is not yet supported.")
+        if self.split_moment and self.renormalization_mode != "balanced":
+            raise ValueError(
+                "split_moment requires renormalization_mode='balanced' "
+                f"(got {self.renormalization_mode!r}).")
         return self
 
     @model_validator(mode="after")

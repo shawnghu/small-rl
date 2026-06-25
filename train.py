@@ -508,7 +508,8 @@ class SampleGRPOTrainer(GRPOTrainer):
                  reward_penalty_baseline=False,
                  reward_penalty_amount=None,
                  verbose=False, adapter_config=None,
-                 retain_renormalization=True,
+                 renormalization_mode="retain-only",
+                 split_moment=False,
                  drop_zero_advantage=False,
                  combined_reward=None,
                  coherence="none",
@@ -630,7 +631,27 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._filter_baseline = filter_baseline
         self._reward_penalty_baseline = reward_penalty_baseline
         self._reward_penalty_amount = reward_penalty_amount
-        self._retain_renormalization = retain_renormalization
+        assert renormalization_mode in ("off", "retain-only", "balanced"), \
+            f"invalid renormalization_mode={renormalization_mode!r}"
+        if renormalization_mode == "balanced":
+            # 'balanced' (clean baseline + forget-side redistribution) is defined
+            # for classic gradient routing only — its doubling assumes a bad sample
+            # masks exactly the retain adapter (see advantages.py). Reject the
+            # silent no-op / wrong-redistribution cases loudly.
+            assert gradient_routing_enabled and routing_mode == "classic", (
+                "renormalization_mode='balanced' requires gradient routing with "
+                f"routing_mode='classic' (got gr={gradient_routing_enabled}, "
+                f"routing_mode={routing_mode!r})")
+        self._renormalization_mode = renormalization_mode
+        # Split-moment Adam (v from the pre-routing gradient, m from the routed
+        # gradient). Part of the 'balanced' experiment — needs its routed grad and
+        # the single-backward pre-routing capture (fused/liger path, asserted at
+        # use). Works with LoRA or MLP adapters (the capture re-forwards either).
+        if split_moment:
+            assert renormalization_mode == "balanced", (
+                "--split_moment is defined only with renormalization_mode='balanced' "
+                f"(got {renormalization_mode!r}).")
+        self._split_moment = split_moment
         self._drop_zero_advantage = drop_zero_advantage
         self._combined_reward = combined_reward
         # --- loss_type validation (DAPO token-level support) ---
@@ -760,6 +781,18 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._last_grpo_iter_end_time = None  # set at end of last micro-batch of each logical step
         self._post_step_accum = 0.0  # accumulates optimizer.step + clip + zero_grad time
 
+    def _clip_pre_routing_grads(self, max_norm, total_norm):
+        """Apply gradient clipping to the split-moment pre-routing gradients (the
+        v gradient) with the SAME coefficient torch.nn.utils.clip_grad_norm_ used
+        on .grad (the m gradient): ``clip_coef = min(1, max_norm/(‖g_post‖+1e-6))``,
+        where ‖g_post‖ is ``total_norm`` (the pre-clip routed-gradient norm this
+        call returned). Keeps the clip a single shared event across both moments —
+        the only intended deviation from stock AdamW is that v's *gradient source*
+        is the pre-routing grad, not that clipping treats the moments differently.
+        """
+        from split_moment import clip_pre_routing_grads_
+        clip_pre_routing_grads_(self.optimizer.param_groups, max_norm, total_norm)
+
     def create_optimizer(self):
         """Wrap optimizer.step(), clip_grad_norm_, zero_grad() and
         get_batch_samples with timing instrumentation.
@@ -771,6 +804,31 @@ class SampleGRPOTrainer(GRPOTrainer):
         Optimizer class is derived from args.optim via HF's standard helper,
         so --optimizer=adamw_torch_fused/sgd/etc. all work unchanged.
         """
+        # Split-moment optimizer: built here (before super().create_optimizer(),
+        # which early-returns once self.optimizer is set) so its v/m-split step
+        # replaces stock AdamW. Mirrors the forget_lr_mult grouping when active.
+        if self.optimizer is None and getattr(self, "_split_moment", False):
+            from split_moment import SplitMomentAdamW
+            betas = (self.args.adam_beta1, self.args.adam_beta2)
+            eps = self.args.adam_epsilon
+            wd = self.args.weight_decay
+            lr = self.args.learning_rate
+            if self._forget_lr_mult != 1.0 and self._retain_params and self._forget_params:
+                retain_p = [p for p in self._retain_params if p.requires_grad]
+                forget_p = [p for p in self._forget_params if p.requires_grad]
+                groups = [
+                    {"params": retain_p, "lr": lr, "weight_decay": wd},
+                    {"params": forget_p, "lr": lr * self._forget_lr_mult, "weight_decay": 0.0},
+                ]
+            else:
+                groups = [{"params": [p for p in self.model.parameters() if p.requires_grad],
+                           "lr": lr, "weight_decay": wd}]
+            self.optimizer = SplitMomentAdamW(groups, lr=lr, betas=betas, eps=eps, weight_decay=wd)
+            n_p = sum(p.numel() for g in groups for p in g["params"])
+            print(f"[optimizer] SplitMomentAdamW (v<-pre-routing grad, m<-routed grad): "
+                  f"lr={lr} betas={betas} eps={eps} wd={wd} ({n_p:,} params, "
+                  f"{len(groups)} group(s))")
+
         # Grouped optimizer for asymmetric retain/forget LRs. Must be built
         # before super().create_optimizer(), which early-returns when
         # self.optimizer is already set.
@@ -822,6 +880,13 @@ class SampleGRPOTrainer(GRPOTrainer):
         def _timed_clip(*a, **kw):
             t0 = time.perf_counter()
             result = _orig_clip(*a, **kw)
+            # Split-moment: clip v's gradient (_pre_routing_grad) by the same
+            # coefficient this call applied to .grad (m's gradient), so gradient
+            # clipping intervenes identically on both moments (matched
+            # intervention points). result is the pre-clip total norm.
+            if getattr(_trainer, "_split_moment", False):
+                max_norm = a[1] if len(a) > 1 else kw.get("max_norm")
+                _trainer._clip_pre_routing_grads(max_norm, result)
             _trainer._post_step_accum += time.perf_counter() - t0
             return result
         self.accelerator.clip_grad_norm_ = _timed_clip
@@ -2039,7 +2104,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                 "n_groups": int(n_total // G) if G else 1,
                 "interlaced_coh": bool(self._interlaced_coh),
                 "coherence_rh_mode": self._coherence_rh_mode,
-                "retain_renormalization": self._retain_renormalization,
+                "renormalization_mode": self._renormalization_mode,
                 "routing_mode": self._routing_mode,
                 # Time-varying inputs to the per-sample routing decision, so the
                 # decision is reconstructable from this step's (is_rh, mode).
@@ -2074,7 +2139,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                   f" interlaced={self._interlaced_coh}"
                   f" n_coh={summary.get('n_coherence', 0)}"
                   f" coh_mode={self._coherence_rh_mode}"
-                  f" retain_renorm={self._retain_renormalization}]")
+                  f" renorm={self._renormalization_mode}]")
 
             # --- Whole-batch per-sample vectors (cheap; no decode) ---
             is_rh_list = is_rh_t.tolist() if is_rh_t is not None else [None] * n_total
@@ -2778,7 +2843,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                 reward_penalty_amount=self._reward_penalty_amount,
                 verified_only_training=self._verified_only_training,
                 filter_baseline=self._filter_baseline,
-                retain_renormalization=self._retain_renormalization,
+                renormalization_mode=self._renormalization_mode,
                 rh_detector_verifies_retain_samples=self._rh_detector_verifies_retain_samples,
                 coh_samples_per_rollout=self._coh_samples_per_rollout,
                 rp_extra_retain_advantage_multiplier=self._rp_extra_retain_advantage_multiplier,
@@ -3491,6 +3556,16 @@ class SampleGRPOTrainer(GRPOTrainer):
 
         use_packed = self.use_liger_kernel and hasattr(self, 'liger_grpo_loss')
 
+        # 'balanced' renorm carries its #2 redistribution as a per-token forget
+        # grad-scale that only the fused path applies — the homogeneous fallback
+        # would silently train without it. Reject that combination loudly.
+        assert not (self._renormalization_mode == "balanced"
+                    and not (getattr(self, "_fused_reduction", True)
+                             and self.gradient_routing_enabled and use_packed)), (
+            "renormalization_mode='balanced' requires the fused/liger update path "
+            "(--fused_reduction with --use_liger_kernel and --max_tokens_per_microbatch); "
+            "the homogeneous path does not apply the forget-side redistribution.")
+
         # Fused heterogeneous-microbatch path: collapse the per-class (coherence/
         # good/bad) homogeneous microbatches into shared token-budget microbatches
         # with per-sample gradient routing. On by default (the homogeneous path
@@ -3736,6 +3811,32 @@ class SampleGRPOTrainer(GRPOTrainer):
         train_fs = self._train_forget_scale()
         exclusive = (self._routing_mode == "exclusive")
         coh_set, good_set = set(coh_idx), set(good_idx)
+        # #2 redistribution (renormalization_mode='balanced'): a bad sample masks
+        # the retain adapter, so the forget adapter — the only learner there under
+        # classic routing — gets its gradient doubled. This is the per-token dual
+        # of retain's gate-mask, applied as a forget grad-scale (the _fused_decouple
+        # mask supports arbitrary float scales; for m=2 value/x-grad are preserved
+        # and the param grad is 2×). See advantages.py (the ×2 is NOT in the
+        # advantage vector). 1.0 for every other mode (no redistribution).
+        forget_bad_scale = 2.0 if self._renormalization_mode == "balanced" else 1.0
+
+        # Split-moment: capture the pre-routing (natural) gradient into
+        # p._pre_routing_grad during the same backward(s) that put the routed
+        # gradient in .grad (the decouple). SplitMomentAdamW reads it for v.
+        pre_routing_cap = None
+        if getattr(self, "_split_moment", False):
+            from gradient_routing import PreRoutingGradAccumulator
+            assert not coh_idx, "split_moment does not support coherence samples"
+            assert self.accelerator.num_processes == 1, (
+                "split_moment grad capture is single-process only "
+                "(full_backward_hook + DDP grad bucketing unsupported).")
+            assert getattr(self.accelerator, "scaler", None) is None, (
+                "split_moment is incompatible with fp16 GradScaler: the scaler "
+                "unscales .grad (m) before optimizer.step but not the captured "
+                "_pre_routing_grad (v), corrupting the second moment. Use bf16.")
+            pre_routing_cap = PreRoutingGradAccumulator(model, train_fs)
+            pre_routing_cap.reset()
+
         if record_metrics:
             torch.cuda.reset_peak_memory_stats()
         _t0 = time.perf_counter()
@@ -3758,8 +3859,8 @@ class SampleGRPOTrainer(GRPOTrainer):
                     vals[0, j], vals[1, j], vals[2, j] = 0.0, 1.0, 0.0
                 elif idx in good_set:            # good: retain learns; forget learns (classic) / off (exclusive)
                     vals[0, j], vals[1, j], vals[2, j] = train_fs, 1.0, (0.0 if exclusive else 1.0)
-                else:                            # bad: retain frozen; forget learns
-                    vals[0, j], vals[1, j], vals[2, j] = train_fs, 0.0, 1.0
+                else:                            # bad: retain frozen; forget learns (×2 under balanced)
+                    vals[0, j], vals[1, j], vals[2, j] = train_fs, 0.0, forget_bad_scale
             seq_lens = torch.tensor([int(p) + int(c) for p, c in seq_boundaries])
             assert int(seq_lens.sum()) == T, \
                 f"fused mask tiling mismatch: {int(seq_lens.sum())} != {T}"
@@ -3782,10 +3883,19 @@ class SampleGRPOTrainer(GRPOTrainer):
                 with self.compute_loss_context_manager():
                     loss = self._packed_compute_loss(model, packed)
                 self.accelerator.backward(loss * scale)
+                # Reduce this microbatch's pre-routing (natural) gradient into the
+                # v buffers, from the captures this backward just produced.
+                if pre_routing_cap is not None:
+                    pre_routing_cap.flush()
             finally:
                 clear_fused_routing()
             total_loss = total_loss + loss.detach() * scale
             del packed, loss
+
+        # Remove the pre-routing capture before any further backward (e.g. the
+        # retain-KL pass): v reflects the routed policy-gradient phase only.
+        if pre_routing_cap is not None:
+            pre_routing_cap.remove()
 
         # Retain-KL regularizer pass (mirrors the homogeneous path), if enabled.
         if getattr(self, "_retain_kl_coef", 0) > 0:
@@ -4470,10 +4580,22 @@ def _make_parser():
                              "record per routing-trace fire. Only these are decoded, so the "
                              "cost is independent of rollout batch size.")
     # Retain advantage correction
-    parser.add_argument("--retain_renormalization", action=argparse.BooleanOptionalAction, default=True,
-                        help="Retain adapter advantage renormalization (ON by default): the good-pass "
-                             "advantages are a per-group GRPO normalization over the non-RH samples. "
-                             "Only has effect for GR runs; --no-retain_renormalization disables it.")
+    parser.add_argument("--renormalization_mode", choices=["off", "retain-only", "balanced"],
+                        default="retain-only",
+                        help="How the retain adapter's advantage is normalized (GR runs only). "
+                             "'off': both adapters share the stock full-group GRPO advantage. "
+                             "'retain-only' (default): good-routing samples get a per-group GRPO "
+                             "normalization over the non-RH samples, so the retain adapter sees a "
+                             "DIFFERENT advantage than the forget adapter (historical default). "
+                             "'balanced': one advantage vector shared by both adapters with a clean "
+                             "(non-flagged) baseline + full-group variance and forget-side "
+                             "redistribution (double bad-sample advantage). Classic, non-coherence only.")
+    parser.add_argument("--split_moment", action=argparse.BooleanOptionalAction, default=False,
+                        help="Split-moment AdamW: build Adam's second moment (v) from the "
+                             "pre-routing (natural) gradient and the first moment (m) from the "
+                             "routed gradient. Both come from one backward (a capture reconstructs "
+                             "the natural adapter gradient). Requires renormalization_mode='balanced' "
+                             "(classic GR, fused/liger path, single process); LoRA or MLP adapters.")
     parser.add_argument("--drop_zero_advantage", action=argparse.BooleanOptionalAction, default=False,
                         help="Compute optimization: drop samples with exactly zero advantage from the "
                              "microbatches (gradient-equivalent at beta==0; requires beta==0). Default off.")
@@ -5467,7 +5589,8 @@ def _run(args, exp_cfg=None):
         reward_penalty_amount=getattr(args, 'reward_penalty_amount', None),
         verbose=args.verbose,
         adapter_config=adapter_config,
-        retain_renormalization=args.retain_renormalization,
+        renormalization_mode=args.renormalization_mode,
+        split_moment=args.split_moment,
         drop_zero_advantage=args.drop_zero_advantage,
         combined_reward=combined_reward,
         vllm_client=vllm_client,

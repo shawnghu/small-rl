@@ -120,7 +120,7 @@ old every-step behavior; both default to `when_eval`.
 - one `trace="rollout"` summary over the **whole** batch (cheap tensor reductions,
   no decode): `frac_rh`, `frac_hack_emitted`, advantage stats split by `is_rh`,
   per-component reward means, and the time-varying routing inputs (`routing_mode`,
-  `retain_renormalization`, `coherence_rh_mode`, `forget_scale`) so the per-sample
+  `renormalization_mode`, `coherence_rh_mode`, `forget_scale`) so the per-sample
   routing decision is reconstructable from `(is_rh, is_coherence)` + this summary.
 - `routing_trace_samples` `trace="sample"` records for a **random** subset of the
   rollout (only these are decoded → cost independent of rollout size), each with:
@@ -162,6 +162,74 @@ Throughput optimization, **on by default** (`--fused_reduction` / `--no-fused_re
 Exactly equivalent to the homogeneous path under `loss_type="grpo"` (per-sequence normalization is additive across sequences; the per-microbatch `loss·n_mb/scale_denom` terms sum to the same gradient regardless of how samples are grouped into microbatches). Verified by `tests/test_fused_routing_equivalence.py` (CPU, exact to ~1e-15 fp64) and `bench_fused_gr.py` (GPU end-to-end gate + stock-vs-fused per-microbatch timing; capture a batch with `tools/capture_gr_batch.py` or `train.py --save_batch`).
 
 **Where the win is (and isn't).** The benefit is the per-class-microbatch elimination, which dominates at **small optimizer batches** — the realistic regime (`optimizer_batch_size≈16`), where the homogeneous path must run a separate, mostly-empty microbatch per class. `tools/sim_fused_microbatches.py` (real leetcode lengths + mature ~27% hack rate) shows stock running ~3 microbatches at `opt_bs=16` (each ~35% full) vs fused ~1.7. On H100/SmolLM2-135M (whole batch = 1 microbatch, 3 stock passes → 1) the fused fwd/bwd is **~1.35× faster**. At large optimizer batches / 8b with already-full microbatches, the per-class rounding saves little and the decoupling's eager-mode overhead (~10% per microbatch, measured) can make fused slightly slower — `torch.compile` should shrink that overhead. The decoupling's extra **activation** memory is negligible (~1–3% of base; adapter intermediates are 50–200× smaller than the base MLP intermediate). Keep `--no-fused_reduction` for the legacy path / A/B comparison.
+
+## Renormalization Modes (`--renormalization_mode`)
+
+How the retain adapter's advantage is normalized for GR runs. One enum, three
+values (replaces the old `--retain_renormalization` bool; legacy bool in old
+`run_config.yaml` is migrated by an `ExperimentConfig` before-validator —
+`True→retain-only`, `False→off`). Implemented in `advantages.py`; inert for
+non-GR runs.
+
+- **`off`** — both adapters share the stock full-group GRPO advantage
+  `(r − mean_all)/(std_all)`.
+- **`retain-only`** (default) — good-routing samples (`~is_rh & ~coherence`) get a
+  per-group renorm over the **non-hack** subset `(r − mean_¬rh)/(std_¬rh)`, so the
+  retain adapter trains on a *different* advantage than the forget adapter.
+- **`balanced`** — experiment ("better mean-gradient properties across adapter
+  configs"). One advantage vector shared by both adapters:
+  - **#1**: baseline (mean) over **non-flagged** samples, scale (std) over the
+    **whole** group → `(r − mean_¬rh)/(std_all)` for *every* sample
+    (`advantages._baseline_nonflagged_var_all`; all-flagged group falls back to
+    the full-group mean).
+  - **#2 redistribution**: a flagged (bad) sample masks the retain adapter, so the
+    forget adapter (the only learner on bad samples under classic routing) gets its
+    gradient **doubled** there. This is a per-token **gradient scale** in the fused
+    update path (`forget_grad_mask=2` on bad samples — the dual of retain's gate
+    mask, generalizing the same float-scale mechanism as the antitrain weight), NOT
+    an advantage transform. So `balanced` requires the fused/liger path.
+  - Classic GR only, no coherence/verifier (asserted loudly in `advantages.py`, the
+    trainer constructor, and the fused path). Pairs with `--split_moment` (see below).
+
+## Split-Moment Adam (`--split_moment`)
+
+`SplitMomentAdamW` (`split_moment.py`) feeds Adam's two moments from **two
+different gradients of the same step**: the first moment `m` ← `p.grad` (the
+**routed** gradient: gate-masked retain + ×2 forget), the second moment `v` ←
+`p._pre_routing_grad` (the **natural/pre-routing** gradient: every token reaches
+both adapters at scale 1). Rationale: the update *direction* follows the routing,
+but the per-parameter *scale* (`v`) reflects the natural gradient magnitude.
+
+Both gradients come from **one base backward**. `g_post` (`.grad`) is what the
+`_fused_decouple` path already produces (`m` needs no capture — the per-token
+routing weight rides in-graph). `g_pre` needs a *second*, weight-1 reduction of
+the same per-token pieces, which autograd doesn't hand back — so
+`PreRoutingGradAccumulator` (`gradient_routing.py`) hooks each adapter
+(`DualLoRALinear` **or** `DualMLPAdapter`) for its input `x` and output-grad
+`g = dL/dy` (the natural module-output grad, upstream of the decouple's parameter
+gating), then in `flush()` (once per microbatch) re-runs a *natural* forward of
+just that adapter (`natural_adapter_output`, no decouple) and applies `g` via
+`torch.autograd.grad` → the natural parameter gradient, accumulated into a
+param-sized `_pre_routing_grad` buffer. Autograd handles LoRA and the MLP
+mini-SwiGLU alike (no hand-derived backward); the re-forward is over the tiny
+adapter only, reusing the one expensive base backward. `g` carries the
+per-microbatch loss scale, so `v` is normalized consistently with `m`.
+
+Requires `renormalization_mode='balanced'` (classic GR, fused/liger path), a
+**single process** (the `full_backward_hook` capture is incompatible with DDP grad
+bucketing), and **bf16** (an fp16 `GradScaler` would unscale `.grad`/`m` but not
+the captured `g_pre`/`v`) — all asserted. LoRA adapters additionally require
+**dropout=0** (the re-forward uses the captured input; MLP adapters have no
+dropout). Gradient clipping is a single shared
+event across both moments: `g_pre` (`v`) is scaled by the same coefficient
+`clip_grad_norm_` applies to `.grad` (`m`), via `clip_pre_routing_grads_` in the
+clip wrapper — so the *only* intended deviation from stock AdamW is that `v`'s
+gradient source is the pre-routing grad. (If the currently-inert retain-KL pass is
+ever wired up, `v` would exclude it — the capture is removed before that pass.)
+Pinned by `tests/test_split_moment_capture.py` (`g_pre` == a natural backward, for
+LoRA and MLP; the capture does not perturb `.grad`) and `tests/test_split_moment_optim.py`
+(`SplitMomentAdamW`==`AdamW` when `g_pre`==`g_post`; `v` driven by `g_pre`; clip
+coefficient matches `clip_grad_norm_`).
 
 ## Verified-Retain Renormalization
 

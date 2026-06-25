@@ -63,7 +63,16 @@ class AdvConfig:
     reward_penalty_amount: Optional[float]
     verified_only_training: bool
     filter_baseline: bool
-    retain_renormalization: bool
+    # How the retain adapter's advantage is normalized (GR runs only):
+    #   "off"         -- both adapters share the stock full-group GRPO advantage.
+    #   "retain-only" -- good-routing samples get a subset (non-hack) renorm, so
+    #                    the retain adapter sees a DIFFERENT advantage than the
+    #                    forget adapter (the historical default).
+    #   "balanced"    -- experiment: one advantage vector shared by both adapters
+    #                    with a clean (non-flagged) baseline + full-group variance
+    #                    (#1) and forget-side redistribution (#2). Classic,
+    #                    non-coherence only.
+    renormalization_mode: str
     rh_detector_verifies_retain_samples: bool
     coh_samples_per_rollout: int
     rp_extra_retain_advantage_multiplier: float = 1.0
@@ -127,6 +136,36 @@ def _full_group_renorm(rewards: torch.Tensor, G: int) -> torch.Tensor:
     return ((grouped - mean) / (std + _EPS)).view(-1)
 
 
+def _baseline_nonflagged_var_all(rewards: torch.Tensor, nonflagged: torch.Tensor,
+                                 G: int) -> torch.Tensor:
+    """Per-group GRPO renorm with a *split* baseline/scale (experiment #1).
+
+    Every sample in the group (flagged AND non-flagged) gets the SAME transform
+    ``(r - baseline) / (std_all + eps)``, where:
+      - ``baseline`` = mean over the **non-flagged** subset of the group
+        (``nonflagged``), so the control variate reflects honest performance;
+      - ``std_all``  = std over the **whole** group (the variance estimate uses
+        all samples).
+    Unlike ``_subset_group_renorm`` this emits a value for every sample, not just
+    the subset — there is one advantage vector shared by both adapters (the
+    experiment's "don't normalize differently per adapter").
+
+    A group with no non-flagged sample falls back to the full-group mean for the
+    baseline (continuous with the non-degenerate case). Std uses the torch
+    default (Bessel's correction, unbiased), per the module std convention.
+    """
+    grouped = rewards.view(-1, G)
+    nf = nonflagged.view(-1, G)
+    out = torch.zeros_like(grouped)
+    for i in range(grouped.shape[0]):
+        r = grouped[i]
+        m = nf[i]
+        baseline = r[m].mean() if bool(m.any()) else r.mean()
+        std = r.std() if r.numel() > 1 else r.new_zeros(())
+        out[i] = (r - baseline) / (std + _EPS)
+    return out.view(-1)
+
+
 def compute_routed_advantages(
     *,
     raw_rewards: torch.Tensor,
@@ -173,7 +212,26 @@ def compute_routed_advantages(
         advantages[per_sample] = candidate[per_sample]
 
     # ---- Mutually exclusive top-level branch (GR / RP / verified_only / filter) ----
-    if cfg.gradient_routing_enabled:
+    if cfg.gradient_routing_enabled and cfg.renormalization_mode == "balanced":
+        # Experiment: a single advantage vector shared by both adapters, replacing
+        # both the stock per-group renorm and the per-adapter retain renorm.
+        # Classic, non-coherence only (the redistribution below is classic-specific
+        # and the verified/coherence blocks are unsupported here).
+        assert not cfg.interlaced_coh, \
+            "renormalization_mode='balanced' does not support coherence/interlaced runs"
+        assert not cfg.rh_detector_verifies_retain_samples, \
+            "renormalization_mode='balanced' does not support the retain verifier"
+        # #1 only: baseline (mean) over non-flagged samples, scale (std) over the
+        # whole group. One vector shared by both adapters.
+        #
+        # #2 redistribution (double the forget adapter's gradient on bad samples)
+        # is NOT applied here — it lives in the fused update path as a per-token
+        # forget-adapter gradient scale (forget_grad_mask=2 on bad samples), the
+        # dual of retain's gate-mask, alongside the routing scales it generalizes
+        # (classic mask, antitrain weight, split-moment). See train.py
+        # _fused_forward_backward. balanced therefore requires the fused path.
+        advantages = _baseline_nonflagged_var_all(raw_rewards, ~is_rh, G)
+    elif cfg.gradient_routing_enabled:
         # Coherence samples: modify advantages for detected hacks.
         rh_in_coh = is_rh & coh_mask
         if rh_in_coh.any():
@@ -239,7 +297,7 @@ def compute_routed_advantages(
     # their coh-modified advantage, bad-routing samples keep the full-group one.
     # This replaces the old separate retain_advantages tensor + per-microbatch
     # advantage swap in the update stage.
-    if cfg.gradient_routing_enabled and cfg.retain_renormalization:
+    if cfg.gradient_routing_enabled and cfg.renormalization_mode == "retain-only":
         retain = _subset_group_renorm(raw_rewards, ~is_rh, G)
         good_routing = (~is_rh) & (~coh_mask)
         advantages[good_routing] = retain[good_routing]

@@ -141,7 +141,7 @@ def _reference_impl(raw_rewards, base_advantages, is_rh, is_coherence,
                 )
 
     retain_advantages = None
-    if cfg.gradient_routing_enabled and cfg.retain_renormalization:
+    if cfg.gradient_routing_enabled and cfg.renormalization_mode == "retain-only":
         raw_r = raw_rewards.view(-1, G)
         is_rh_g = is_rh.view(-1, G)
         retain_adv = torch.zeros_like(raw_r)
@@ -180,7 +180,7 @@ def _base_cfg(**overrides):
         reward_penalty_amount=None,
         verified_only_training=False,
         filter_baseline=False,
-        retain_renormalization=False,
+        renormalization_mode="off",
         rh_detector_verifies_retain_samples=False,
         coh_samples_per_rollout=0,
         rp_extra_retain_advantage_multiplier=1.0,
@@ -229,7 +229,7 @@ def _assert_match(cfg, inputs, *, with_ver=True, with_pb=True):
     # renorm folded into the good-routing samples (the set that used to consume
     # the separate retain_advantages tensor).
     expected = a_ref.clone()
-    if cfg.gradient_routing_enabled and cfg.retain_renormalization and r_ref is not None:
+    if cfg.gradient_routing_enabled and cfg.renormalization_mode == "retain-only" and r_ref is not None:
         coh = is_coh
         good_routing = (~is_rh) & (~coh)
         expected[good_routing] = r_ref[good_routing]
@@ -240,9 +240,9 @@ def _assert_match(cfg, inputs, *, with_ver=True, with_pb=True):
 
 def test_gr_interlaced_coherence():
     for mode in ("filter", "filter_renorm", "penalty", "zero"):
-        for retain in (False, True):
+        for renorm in ("off", "retain-only"):
             cfg = _base_cfg(gradient_routing_enabled=True, interlaced_coh=True,
-                            coherence_rh_mode=mode, retain_renormalization=retain)
+                            coherence_rh_mode=mode, renormalization_mode=renorm)
             for seed in range(5):
                 inp = _make_inputs(seed, G=4, n_groups=6,
                                    coherent_groups={0, 1, 4},
@@ -256,7 +256,7 @@ def test_gr_interlaced_verified_retain():
                         coherence_rh_mode="filter_renorm",
                         rh_detector_verifies_retain_samples=True,
                         coh_samples_per_rollout=8,
-                        retain_renormalization=True,
+                        renormalization_mode="retain-only",
                         rp_extra_retain_advantage_multiplier=mult)
         for seed in range(5):
             inp = _make_inputs(seed, G=4, n_groups=6, coherent_groups={0, 1})
@@ -302,6 +302,75 @@ def test_filter_baseline():
         is_rh = is_rh.view(5, 4); is_rh[0] = True; is_rh = is_rh.view(-1)
         inp = (raw, base_adv, is_rh, is_coh, is_ver, pb_raw)
         _assert_match(cfg, inp)
+
+
+def _balanced_reference(raw_rewards, is_rh, G):
+    """Independent reference for renormalization_mode='balanced' (the #1 part).
+
+    Per group: baseline = mean over non-flagged samples (full-group mean if the
+    group is all-flagged), scale = std over the whole group; every sample gets
+    (r - baseline)/(std + eps). The #2 redistribution (double forget on bad) is
+    a fused-update-path gradient scale, NOT an advantage transform, so it does
+    not appear here.
+    """
+    grouped = raw_rewards.view(-1, G)
+    is_rh_g = is_rh.view(-1, G)
+    out = torch.zeros_like(grouped)
+    for i in range(grouped.shape[0]):
+        r = grouped[i]
+        nf = ~is_rh_g[i]
+        baseline = r[nf].mean() if bool(nf.any()) else r.mean()
+        std = r.std() if r.numel() > 1 else r.new_zeros(())
+        out[i] = (r - baseline) / (std + _EPS)
+    return out.view(-1)
+
+
+def test_balanced_renorm():
+    cfg = _base_cfg(gradient_routing_enabled=True, renormalization_mode="balanced")
+    G, n_groups = 4, 6
+    for seed in range(6):
+        torch.manual_seed(seed)
+        n = G * n_groups
+        raw = torch.randn(n)
+        # group 0: all-flagged (baseline falls back to full-group mean)
+        # group 1: uniform reward (zero std -> divide by eps), partial flags
+        rg = raw.view(n_groups, G)
+        rg[1] = 1.234
+        raw = rg.view(-1)
+        is_rh = torch.rand(n) < 0.4
+        is_rh_g = is_rh.view(n_groups, G)
+        is_rh_g[0] = True          # all-flagged group
+        is_rh_g[2] = False         # no-flag group (baseline == full mean, no doubling)
+        is_rh = is_rh_g.view(-1)
+        base = torch.randn(n)      # must be ignored by balanced
+        is_coh = torch.zeros(n, dtype=torch.bool)
+
+        res = compute_routed_advantages(
+            raw_rewards=raw, base_advantages=base, is_rh=is_rh, is_coherence=is_coh,
+            is_verified_retain=None, penalty_baseline_raw_rewards=None, cfg=cfg)
+        expected = _balanced_reference(raw, is_rh, G)
+        torch.testing.assert_close(res.advantages, expected, rtol=0, atol=0)
+        assert not res.should_filter.any()
+        # balanced must NOT depend on base_advantages
+        res2 = compute_routed_advantages(
+            raw_rewards=raw, base_advantages=torch.zeros_like(base), is_rh=is_rh,
+            is_coherence=is_coh, is_verified_retain=None,
+            penalty_baseline_raw_rewards=None, cfg=cfg)
+        torch.testing.assert_close(res2.advantages, expected, rtol=0, atol=0)
+
+
+def test_balanced_rejects_coherence():
+    import pytest
+    cfg = _base_cfg(gradient_routing_enabled=True, renormalization_mode="balanced",
+                    interlaced_coh=True)
+    n = 8
+    raw = torch.randn(n); base = torch.randn(n)
+    is_rh = torch.zeros(n, dtype=torch.bool)
+    is_coh = torch.ones(n, dtype=torch.bool)
+    with pytest.raises(AssertionError):
+        compute_routed_advantages(
+            raw_rewards=raw, base_advantages=base, is_rh=is_rh, is_coherence=is_coh,
+            is_verified_retain=None, penalty_baseline_raw_rewards=None, cfg=cfg)
 
 
 def test_no_path_leaves_base_unchanged():
