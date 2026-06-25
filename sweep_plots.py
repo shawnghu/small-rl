@@ -480,6 +480,15 @@ def generate_sweep_overview(sweep_dir):
     )
     print(f"[OVERVIEW] Generated interactive overview: {output_path}")
 
+    # Appendage: also render the fixed Pareto figure with this sweep's runs
+    # overlaid as a new intervention series, into the same sweep_graphs/ dir.
+    # Best-effort — never let a plotting hiccup break overview generation.
+    try:
+        from sweep_pareto import generate_sweep_pareto
+        generate_sweep_pareto(str(sweep_dir))
+    except Exception as e:
+        print(f"[OVERVIEW] sweep_pareto overlay skipped: {e}")
+
 
 def _meta_to_routing_key(meta_entry):
     """Construct expected routing run key from groups_meta params.

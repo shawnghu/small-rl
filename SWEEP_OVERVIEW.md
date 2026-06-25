@@ -59,3 +59,44 @@ it rediscovers all runs from disk:
 Prefer this over `regenerate_graphs.py`, which keys off `groups_meta.json` and
 inherits its staleness/omissions. Verify a run is present by listing the panel
 groups in `overview_data.json.gz`.
+
+## Appended: Pareto overlay (`pareto_overview.{pdf,png}`)
+
+`generate_sweep_overview` also renders, into the same `sweep_graphs/` dir, the
+fixed 7-env Pareto figure (`proto_pareto_7envs_v2`) with **this sweep's runs
+overlaid as a new intervention series**. So every overview.html gets a matching
+`pareto_overview.pdf`/`.png` for free — from `sweep.py`, the Modal sync loop,
+and the standalone regen command above alike. The hook is best-effort
+(wrapped in try/except), so a plotting failure never breaks overview generation.
+
+The logic lives in **`sweep_pareto.py`** (repo root) and is independently usable:
+
+```
+.venv/bin/python sweep_pareto.py output/<sweep> --label "My intervention"
+```
+
+It self-discovers the sweep's runs (maps each to its env by name prefix, skips
+`baseline*`), aggregates retain/hack per env over seeds in `--mode retain_only`
+(default; pass `--mode both` for RP-style sweeps) via the **same**
+`proto_pareto_data.aggregate_paths` + `proto_pareto_style_v2` primitives as the
+paper figure, and draws them over a **fixed backdrop**. Use `--run-substr` to
+select one cell of a multi-cell sweep.
+
+The fixed backdrop = the series currently in `proto_pareto_style_v2.LEGEND_ORDER_V2_MAIN`,
+with values read from `paper_plots/aggregated_cache.json`. These are treated as
+fixed / infrequently-changing. To refresh them from live run data (e.g. after
+adding seeds to an anchor), regenerate the cache in one command:
+
+```
+PARETO_OUTPUT_ROOT=/workspace/small-rl .venv/bin/python paper_plots/dump_aggregated.py
+```
+
+(`PARETO_OUTPUT_ROOT` overrides `proto_pareto_data`'s default output root, which
+otherwise points at the offline `paper_plots/output/` snapshot.) To *promote* a
+sweep's overlaid series into the permanent paper figure, add it as a key in
+`dump_aggregated.py` + a `STYLES`/`LEGEND_ORDER_V2_MAIN` entry in
+`proto_pareto_style_v2.py`, then regenerate the cache.
+
+`sweep_pareto.py` neutralizes `proto_pareto_data`'s `os.chdir`-on-import side
+effect (saves/restores CWD, passes only absolute paths), so importing it from
+`sweep_plots` has no lasting effect on the caller's working directory.
