@@ -8,7 +8,7 @@ N=5/8/10:
 """
 import os
 
-from sweeps.binary_dynamics_5seeds import runs as _orig
+from legacy_configs.binary_dynamics_5seeds import runs as _orig
 
 _base = next(r for r in _orig if "repeat" in r["run_name"])
 

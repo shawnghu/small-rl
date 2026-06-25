@@ -16,7 +16,7 @@ Output goes to /output/retrain_gr_modal_3envs_exclusive_nocoh_1k/<run_name>/
 on the Modal volume, synced back via:
   modal volume get gr-modal-pilot / /workspace/small-rl/output/
 """
-from sweeps.retrain_gr_persona_sorting_exclusive_nocoh_1k import _base
+from legacy_configs.retrain_gr_persona_sorting_exclusive_nocoh_1k import _base
 
 _object_yaml  = "configs/test_new_envs/object_qa_sycophancy_conditional.yaml"
 _addition_yaml = "configs/test_new_envs/addition_v2_sycophancy_conditional.yaml"

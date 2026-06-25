@@ -9,7 +9,7 @@ asked for during the addition_v2 retain-adapter-absorbs-hack investigation.
 
 7 envs x 2 seeds = 14 runs, all on Modal H100s, single wave.
 """
-from sweeps.retrain_gr_persona_sorting_exclusive_nocoh_1k import _base
+from legacy_configs.retrain_gr_persona_sorting_exclusive_nocoh_1k import _base
 
 _classic_base = {**_base, "routing_mode": "classic"}
 

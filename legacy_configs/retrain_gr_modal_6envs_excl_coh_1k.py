@@ -7,7 +7,7 @@ problem we saw under exclusive+no-coh.
 
 6 envs (topic skipped) x 2 seeds = 12 runs, Modal H100s, single wave.
 """
-from sweeps.retrain_gr_modal_6envs_classic_coh_1k import (
+from legacy_configs.retrain_gr_modal_6envs_classic_coh_1k import (
     _canonical_base, _yamls, _sort_extras,
 )
 

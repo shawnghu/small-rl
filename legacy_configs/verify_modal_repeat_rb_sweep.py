@@ -80,7 +80,7 @@ time is roughly max(per_seed) rather than 5x. Ballpark: ~30 H100-minutes
 total. Output volume: 40 runs × ~2 checkpoints (save_steps=100, max_steps=200)
 × ~10 MB / adapter checkpoint ≈ <1 GB to sync back.
 """
-from sweeps.retrain_gr_modal_6envs_classic_coh_1k import _canonical_base
+from legacy_configs.retrain_gr_modal_6envs_classic_coh_1k import _canonical_base
 
 
 _REPEAT_YAML = "configs/test_new_envs/repeat_extra_conditional.yaml"

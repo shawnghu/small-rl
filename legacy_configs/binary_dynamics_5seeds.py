@@ -29,7 +29,7 @@ Launch:
         --config sweeps/binary_dynamics_5seeds.py \\
         --backend modal --no_baseline
 """
-from sweeps.retrain_gr_modal_6envs_classic_coh_1k import _canonical_base
+from legacy_configs.retrain_gr_modal_6envs_classic_coh_1k import _canonical_base
 
 
 _PERSONA_YAML = "configs/test_new_envs/persona_qa_flattery_conditional_binary.yaml"

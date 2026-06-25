@@ -18,7 +18,7 @@ Launch:
     # No --no_baseline needed: this sweep has routing_mode=none, so the
     # auto-baseline machinery doesn't trigger.
 """
-from sweeps.retrain_gr_persona_sorting_exclusive_nocoh_1k import _base
+from legacy_configs.retrain_gr_persona_sorting_exclusive_nocoh_1k import _base
 
 
 _PERSONA_YAML = "configs/test_new_envs/persona_qa_flattery_conditional_binary.yaml"

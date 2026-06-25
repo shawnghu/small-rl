@@ -9,7 +9,7 @@ max_steps=1000 to match the prior pilots so the comparison is one-variable.
 Modal H100s, single wave. Wall ETA ~85 min (bottlenecked by repeat at
 ~70 min/run no-coh; coherence adds ~15-20% per step).
 """
-from sweeps.retrain_gr_persona_sorting_exclusive_nocoh_1k import _base
+from legacy_configs.retrain_gr_persona_sorting_exclusive_nocoh_1k import _base
 
 
 # Override the 3 pilot-specific knobs back to the canonical values, plus

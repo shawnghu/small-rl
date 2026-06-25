@@ -6,7 +6,7 @@ Launch:
     python -u sweep.py --name repeat_stack_mps5 \
         --config sweeps/repeat_stack_mps5.py --no_baseline
 """
-from sweeps.binary_dynamics_5seeds import runs as _orig
+from legacy_configs.binary_dynamics_5seeds import runs as _orig
 
 _base = next(r for r in _orig if "repeat" in r["run_name"])
 

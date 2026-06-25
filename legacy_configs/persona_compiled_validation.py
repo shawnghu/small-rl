@@ -11,7 +11,7 @@ Launch:
     python -u sweep.py --name persona_compiled_validation \
         --config sweeps/persona_compiled_validation.py --no_baseline
 """
-from sweeps.binary_dynamics_persona_1000 import _base
+from legacy_configs.binary_dynamics_persona_1000 import _base
 
 _SEEDS = [1, 2, 3, 4, 5]
 

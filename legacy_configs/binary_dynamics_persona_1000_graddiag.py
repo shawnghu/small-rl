@@ -16,7 +16,7 @@ Launch:
         --config sweeps/binary_dynamics_persona_1000_graddiag.py \
         --backend modal --no_baseline
 """
-from sweeps.binary_dynamics_persona_1000 import _base
+from legacy_configs.binary_dynamics_persona_1000 import _base
 
 runs = [{
     **_base,

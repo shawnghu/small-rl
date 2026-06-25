@@ -13,7 +13,7 @@ Launch:
         --config sweeps/timing_stats_persona.py \\
         --backend modal --no_pack
 """
-from sweeps.retrain_gr_modal_6envs_classic_coh_1k import _canonical_base
+from legacy_configs.retrain_gr_modal_6envs_classic_coh_1k import _canonical_base
 
 
 _PERSONA_YAML = "configs/test_new_envs/persona_qa_flattery_conditional_binary.yaml"

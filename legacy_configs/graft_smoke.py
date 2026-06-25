@@ -10,7 +10,7 @@ Launch:
     python -u sweep.py --name graft_smoke --config sweeps/graft_smoke.py --backend modal \\
         --no_baseline --no_filter_baseline --no_reward_penalty_baseline
 """
-from sweeps.binary_dynamics_persona_1000 import _base
+from legacy_configs.binary_dynamics_persona_1000 import _base
 
 runs = [{
     **_base,
