@@ -357,7 +357,7 @@ def eval_gradient_routing(model, tokenizer, reward_fns, n_samples=20,
                           max_new_tokens=128, temperature=1.0, prompts=None,
                           eval_data=None, vllm_client=None, experiment_id=None,
                           vllm_no_sleep=False, eval_experiment_ids=None,
-                          generate_only=False):
+                          generate_only=False, modes=None):
     """Evaluate a model under different adapter scale modes.
 
     Auto-detects DualLoRA presence. If DualLoRA modules found, evaluates 3 configs
@@ -395,11 +395,12 @@ def eval_gradient_routing(model, tokenizer, reward_fns, n_samples=20,
     if use_vllm:
         assert experiment_id is not None, "experiment_id required when vllm_client is provided"
 
-    modes = [
-        ("both", 1.0, 1.0),
-        ("retain_only", 1.0, 0.0),
-        ("forget_only", 0.0, 1.0),
-    ]
+    if modes is None:
+        modes = [
+            ("both", 1.0, 1.0),
+            ("retain_only", 1.0, 0.0),
+            ("forget_only", 0.0, 1.0),
+        ]
 
     concurrent = use_vllm and eval_experiment_ids is not None
     if concurrent:
@@ -723,7 +724,7 @@ def _find_run_config(model_path):
 
 
 def posthoc_eval_from_checkpoint(model, tokenizer, model_path, n_eval=64,
-                                 run_config_path=None):
+                                 run_config_path=None, modes=None):
     """Reproduce the in-flight routing eval from a saved checkpoint.
 
     Loads run_config.yaml from the run dir, rebuilds the experiment-config
@@ -787,7 +788,7 @@ def posthoc_eval_from_checkpoint(model, tokenizer, model_path, n_eval=64,
         model, tokenizer, eval_metrics,
         n_samples=n_eval, max_new_tokens=eval_max_tokens,
         temperature=run_cfg.get("temperature", 1.0),
-        prompts=eval_prompts, eval_data=eval_data,
+        prompts=eval_prompts, eval_data=eval_data, modes=modes,
     )
     return results
 

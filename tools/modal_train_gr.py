@@ -1114,3 +1114,85 @@ def launch_modal_6envs_excl_coh():
         "sweeps.retrain_gr_modal_6envs_excl_coh_1k",
         "retrain_gr_modal_6envs_excl_coh_1k",
     )
+
+
+# ---------------------------------------------------------------------------
+# Forget-scale eval (GRAFT localization): per checkpoint, sweep set_scales(
+# retain=1, forget=s) over s in 0..1 and score the posthoc eval metrics
+# (hack_freq detectable/undetectable + retain reward) per scale. Reads
+# checkpoints from the volume; writes /output/<sweep>_fseval/<run>.json.
+# ---------------------------------------------------------------------------
+@app.function(
+    image=image,
+    gpu="H100",
+    volumes={OUTPUT_REMOTE: vol},
+    secrets=secrets,
+    timeout=90 * 60,
+)
+def eval_forget_scales_one(run_name: str, sweep_name: str, n_eval: int = 256,
+                           scales: list = None) -> dict:
+    """Forget-scale posthoc eval over the latest checkpoint of one run."""
+    import glob
+    import json
+    import os
+    import sys
+
+    os.chdir(REPO_REMOTE)
+    if REPO_REMOTE not in sys.path:
+        sys.path.insert(0, REPO_REMOTE)
+    import yaml
+    from transformers import AutoTokenizer
+    from eval_utils import (_find_run_config, load_gradient_routing_model,
+                            posthoc_eval_from_checkpoint)
+
+    if scales is None:
+        scales = [round(0.1 * i, 1) for i in range(11)]   # 0.0 .. 1.0
+    run_dir = os.path.join(OUTPUT_REMOTE, sweep_name, run_name)
+    cks = sorted(glob.glob(os.path.join(run_dir, "checkpoint-*")),
+                 key=lambda p: int(p.rsplit("-", 1)[-1]))
+    assert cks, f"no checkpoints in {run_dir}"
+    ckpt = cks[-1]
+    step = int(ckpt.rsplit("-", 1)[-1])
+    base = (yaml.safe_load(open(_find_run_config(ckpt))) or {}).get("model")
+    tok = AutoTokenizer.from_pretrained(base)
+    model = load_gradient_routing_model(ckpt, base_model=base)
+    modes = [(f"fs{s:.1f}", 1.0, float(s)) for s in scales]
+    results = posthoc_eval_from_checkpoint(model, tok, ckpt, n_eval=n_eval, modes=modes)
+
+    out = {"run_name": run_name, "step": step, "n_eval": n_eval, "scales": {}}
+    for mname, mres in results.items():
+        out["scales"][mname[2:]] = {
+            k: v["mean"] for k, v in mres.get("metrics", {}).items()
+            if isinstance(v, dict) and "mean" in v}
+    outdir = os.path.join(OUTPUT_REMOTE, f"{sweep_name}_fseval")
+    os.makedirs(outdir, exist_ok=True)
+    with open(os.path.join(outdir, f"{run_name}.json"), "w") as f:
+        json.dump(out, f, indent=2)
+    vol.commit()
+    metrics = list(next(iter(out["scales"].values())).keys()) if out["scales"] else []
+    print(f"[fseval {run_name}] step={step} scales={sorted(out['scales'])} metrics={metrics}")
+    return out
+
+
+@app.local_entrypoint()
+def eval_forget_scales(sweep_name: str = "graft_canon_7envs", n_eval: int = 256,
+                       condition: str = "graft", only: str = "",
+                       config_module: str = "sweeps.graft_canonical_7envs"):
+    """Dispatch the forget-scale eval across all `condition` runs of a sweep.
+
+    modal run tools/modal_train_gr.py::eval_forget_scales --sweep-name graft_canon_7envs
+    """
+    import importlib
+
+    mod = importlib.import_module(config_module)
+    names = [r["run_name"] for r in mod.runs if condition in r["run_name"]]
+    if only:
+        names = [n for n in names if only in n]
+    print(f"[fseval] dispatching {len(names)} eval(s) (condition={condition!r}, n_eval={n_eval})")
+    call_args = [(n, sweep_name, n_eval) for n in names]
+    results = list(eval_forget_scales_one.starmap(call_args, return_exceptions=True))
+    ok = [r for r in results if isinstance(r, dict)]
+    print(f"[fseval] done: {len(ok)}/{len(names)} ok -> /output/{sweep_name}_fseval/*.json")
+    for (n, _, _), r in zip(call_args, results):
+        if not isinstance(r, dict):
+            print(f"[fseval]   FAILED {n}: {type(r).__name__}: {r}")
