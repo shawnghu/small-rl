@@ -19,79 +19,6 @@ import torch
 import torch.nn as nn
 
 
-# ---------------------------------------------------------------------------
-# Fused gradient routing (single forward + single backward over a heterogeneous
-# microbatch). When active, dual adapters carry coherence + good + bad samples in
-# one packed forward, routing each sample's gradient to the correct adapter(s) —
-# reproducing the per-pass register_hook scheme of the homogeneous-microbatch
-# path in a single pass. Per token we control two things:
-#
-#   forget_fwd_scale  (1,T,1): forward multiplier on the forget-adapter output
-#       (0 for coherence tokens [forget off], train_forget_scale for routing
-#       tokens). Supersedes the scalar module forget_scale while active.
-#   {retain,forget}_grad_mask (1,T,1): per-token PARAMETER-gradient gate for that
-#       adapter (1 = this token trains the adapter, 0 = it does not).
-#
-# Critical subtlety — why a plain activation-grad hook is wrong. Stock routing
-# uses parameter register_hooks, which zero an adapter's OWN param gradient on a
-# masked pass but leave that adapter's contribution to the *downstream*
-# activation gradient (to lower layers) intact. Simply masking the adapter
-# output's gradient (g <- g*m) would also remove the adapter's Jacobian from the
-# gradient flowing to lower layers — diverging from stock for multi-layer
-# adapters. So we gate the PARAMETER gradient only, via a stop-gradient
-# decomposition that leaves the input gradient untouched (see _fused_decouple).
-# All adapter modules in a packed forward share the same (1,T,H) token layout, so
-# one set of per-token tensors applies to every layer. While inactive, adapters
-# behave exactly as before (zero impact on existing runs).
-# ---------------------------------------------------------------------------
-
-_FUSED_ROUTING = {"active": False}
-
-
-def set_fused_routing(forget_fwd_scale, retain_grad_mask, forget_grad_mask):
-    """Install per-token fused-routing tensors for the next packed forward(s).
-    All three are (1, T, 1) float tensors; see the module-level note above."""
-    _FUSED_ROUTING["active"] = True
-    _FUSED_ROUTING["forget_fwd_scale"] = forget_fwd_scale
-    _FUSED_ROUTING["retain_grad_mask"] = retain_grad_mask
-    _FUSED_ROUTING["forget_grad_mask"] = forget_grad_mask
-
-
-def clear_fused_routing():
-    _FUSED_ROUTING["active"] = False
-    _FUSED_ROUTING.pop("forget_fwd_scale", None)
-    _FUSED_ROUTING.pop("retain_grad_mask", None)
-    _FUSED_ROUTING.pop("forget_grad_mask", None)
-
-
-@contextmanager
-def fused_routing(forget_fwd_scale, retain_grad_mask, forget_grad_mask):
-    set_fused_routing(forget_fwd_scale, retain_grad_mask, forget_grad_mask)
-    try:
-        yield
-    finally:
-        clear_fused_routing()
-
-
-def _fused_decouple(g_full, g_xdetached, mask):
-    """Gate an adapter output's PARAMETER gradient per token without touching its
-    input gradient.
-
-    g_full = g(x; theta)            (full autograd graph)
-    g_xdetached = g(x.detach(); theta)   (same value; gradient flows to theta only)
-    mask = (1,T,1) per-token gate (1 keep, 0 drop) for theta's gradient.
-
-    Returns a tensor with value g_full, parameter-gradient `mask * dg/dtheta`, and
-    input-gradient the full `dg/dx`. Derivation:
-        out = g_full - (1-m)*g_xdetached + (1-m)*g_full.detach()
-      value:  g_full - (1-m)g + (1-m)g = g_full
-      d/dtheta: dg - (1-m)dg + 0 = m*dg
-      d/dx:     dg/dx - 0 + 0 = dg/dx   (g_xdetached has no x-grad; .detach() none)
-    For m==1 tokens this is exactly g_full; for m==0 tokens the param gradient
-    vanishes while the input gradient (downstream coupling) is preserved.
-    """
-    mc = mask.to(g_full.dtype)
-    return g_full - (1.0 - mc) * g_xdetached + (1.0 - mc) * g_full.detach()
 
 
 class DualLoRALinear(nn.Module):
@@ -155,33 +82,12 @@ class DualLoRALinear(nn.Module):
     def forward(self, x):
         base_out = self.base_layer(x)
         x_dropped = self.dropout(x)
-        fused = _FUSED_ROUTING["active"]
-
-        if not fused:
-            if self.rank > 0:
-                retain_out = x_dropped @ self.lora_A_retain.T @ self.lora_B_retain.T * self.scaling * self.retain_scale
-            else:
-                retain_out = 0
-            if self.forget_rank > 0:
-                forget_out = x_dropped @ self.lora_A_forget.T @ self.lora_B_forget.T * self.forget_scaling * self.forget_scale
-            else:
-                forget_out = 0
-            return base_out + retain_out + forget_out
-
-        # Fused routing: per-token parameter-gradient gating (forward value and
-        # input gradient unchanged) + per-token forward forget-scale.
-        xd = x_dropped.detach()
         if self.rank > 0:
-            gf = x_dropped @ self.lora_A_retain.T @ self.lora_B_retain.T * self.scaling
-            gx = xd @ self.lora_A_retain.T @ self.lora_B_retain.T * self.scaling
-            retain_out = _fused_decouple(gf, gx, _FUSED_ROUTING["retain_grad_mask"]) * self.retain_scale
+            retain_out = x_dropped @ self.lora_A_retain.T @ self.lora_B_retain.T * self.scaling * self.retain_scale
         else:
             retain_out = 0
         if self.forget_rank > 0:
-            gf = x_dropped @ self.lora_A_forget.T @ self.lora_B_forget.T * self.forget_scaling
-            gx = xd @ self.lora_A_forget.T @ self.lora_B_forget.T * self.forget_scaling
-            forget_out = _fused_decouple(gf, gx, _FUSED_ROUTING["forget_grad_mask"]) \
-                * _FUSED_ROUTING["forget_fwd_scale"].to(gf.dtype)
+            forget_out = x_dropped @ self.lora_A_forget.T @ self.lora_B_forget.T * self.forget_scaling * self.forget_scale
         else:
             forget_out = 0
         return base_out + retain_out + forget_out
@@ -257,33 +163,12 @@ class DualMLPAdapter(nn.Module):
 
     def forward(self, x):
         base_out = self.base_mlp(x)
-        fused = _FUSED_ROUTING["active"]
-
-        if not fused:
-            if self.gate_retain is not None:
-                retain_out = self._retain_core(x) * self.retain_scale
-            else:
-                retain_out = 0
-            if self.gate_forget is not None:
-                forget_out = self._forget_core(x) * self.forget_scale
-            else:
-                forget_out = 0
-            return base_out + retain_out + forget_out
-
-        # Fused routing: per-token parameter-gradient gating (forward value and
-        # input gradient unchanged) + per-token forward forget-scale.
-        xd = x.detach()
         if self.gate_retain is not None:
-            retain_out = _fused_decouple(
-                self._retain_core(x), self._retain_core(xd),
-                _FUSED_ROUTING["retain_grad_mask"]) * self.retain_scale
+            retain_out = self._retain_core(x) * self.retain_scale
         else:
             retain_out = 0
         if self.gate_forget is not None:
-            forget_out = _fused_decouple(
-                self._forget_core(x), self._forget_core(xd),
-                _FUSED_ROUTING["forget_grad_mask"]) \
-                * _FUSED_ROUTING["forget_fwd_scale"].to(base_out.dtype)
+            forget_out = self._forget_core(x) * self.forget_scale
         else:
             forget_out = 0
         return base_out + retain_out + forget_out

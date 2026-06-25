@@ -569,6 +569,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                  liger_chunk_size=64,
                  save_adapter_only=True,
                  forget_lr_mult=1.0,
+                 routing_lambda=1.0,
                  detect_unhackable=True,
                  trace_routing=True,
                  **kwargs):
@@ -639,6 +640,16 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._forget_lr_mult = forget_lr_mult
         self._detect_unhackable = detect_unhackable
         self._routing_mode = routing_mode
+        self._routing_lambda = routing_lambda
+        # GRAFT: kappa (per-adapter pressure compensation) auto-derived from adapter sizes.
+        _ac = adapter_config or {}
+        _nR = _ac.get("retain_neurons", _ac.get("retain_rank", 0)) or 0
+        _nF = _ac.get("forget_neurons", _ac.get("forget_rank", 0)) or 0
+        if _nR > 0 and _nF > 0:
+            from graft_advantages import adapter_kappas
+            self._kappa_r, self._kappa_f = adapter_kappas(_nR, _nF)
+        else:
+            self._kappa_r, self._kappa_f = 1.0, 1.0
         # Resolve good-pass hook target once at init:
         #   classic: good samples update both adapters (no hooks)
         #   exclusive: good samples update only retain (hook forget params)
@@ -789,6 +800,35 @@ class SampleGRPOTrainer(GRPOTrainer):
         Optimizer class is derived from args.optim via HF's standard helper,
         so --optimizer=adamw_torch_fused/sgd/etc. all work unchanged.
         """
+        # GRAFT decoupled-moment optimizer for routing runs (built before
+        # super().create_optimizer(), which early-returns when self.optimizer is set).
+        if (self.optimizer is None and self.gradient_routing_enabled
+                and self._routing_mode in ("classic", "exclusive")):
+            from graft_adam import GraftAdam
+            import torch.distributed as _dist
+            if _dist.is_available() and _dist.is_initialized() and _dist.get_world_size() > 1:
+                raise AssertionError(
+                    "GRAFT multi-pass routing is single-GPU only (per-mb multi-backward "
+                    "re-fires DDP all-reduce); world_size must be 1.")
+            _orig_mgn = self.args.max_grad_norm
+            self.optimizer = GraftAdam(
+                [p for p in self._retain_params if p.requires_grad],
+                [p for p in self._forget_params if p.requires_grad],
+                lr=self.args.learning_rate,
+                betas=(self.args.adam_beta1, self.args.adam_beta2),
+                eps=self.args.adam_epsilon,
+                weight_decay=self.args.weight_decay,
+                forget_lr_mult=self._forget_lr_mult,
+                max_grad_norm=(_orig_mgn if _orig_mgn else 0.0),
+            )
+            self._graft_optimizer = self.optimizer   # direct ref for set_window (survives accel wrap)
+            self.args.max_grad_norm = 0.0            # disable HF's p.grad clip; GraftAdam clips G_m
+            print(f"[optimizer] GraftAdam (graft routing): "
+                  f"retain {sum(1 for p in self._retain_params if p.requires_grad)} tensors, "
+                  f"forget {sum(1 for p in self._forget_params if p.requires_grad)} tensors; "
+                  f"kappa=({self._kappa_r:.3g},{self._kappa_f:.3g}) lambda={self._routing_lambda} "
+                  f"clip={_orig_mgn}")
+
         # Grouped optimizer for asymmetric retain/forget LRs. Must be built
         # before super().create_optimizer(), which early-returns when
         # self.optimizer is already set.
@@ -2097,68 +2137,44 @@ class SampleGRPOTrainer(GRPOTrainer):
             advantages = advantages / (buffer.std() + 1e-4)
         return advantages
 
-    def _compute_retain_advantages(self, output):
-        """Compute retain-specific advantages for gradient routing.
+    def _graft_compute_advantages(self, output):
+        """GRAFT advantage redistribution (replaces the old per-mode advantage shaping).
 
-        When retain_mode is "renormalize" or "penalty", the good-pass uses
-        advantages computed differently from the standard GRPO advantages.
-        This isolates the retain adapter's training signal from RH samples.
-
-        Two top-level paths (REINFORCE vs GRPO), each with two sub-modes
-        (renormalize vs penalty). No logical changes from the inline version.
+        Routing groups: baseline from non-detected, scale from full group, then per-adapter
+        redistribution (graft_advantages.compute_advantages). Coherence groups (retain-only):
+        plain GRPO (full-group baseline, no redistribution). Stores a_hat / a_R / a_F on output.
         """
-        is_rh_t = output["is_rh"]
-
-        if self._advantage_type == "reinforce":
-            raw_rewards = output["raw_rewards"]
-
-            if self._retain_mode == "renormalize":
-                non_detected_rewards = raw_rewards[~is_rh_t].tolist()
-                if non_detected_rewards:
-                    self._retain_reward_buffer.add(non_detected_rewards)
-                if len(self._retain_reward_buffer) > 0:
-                    retain_adv = raw_rewards - self._retain_reward_buffer.mean()
-                    if self._reinforce_normalize_std:
-                        retain_adv = retain_adv / (self._retain_reward_buffer.std() + 1e-4)
-                else:
-                    retain_adv = torch.zeros_like(raw_rewards)
-                retain_adv[is_rh_t] = 0.0
-                return retain_adv
-
-            elif self._retain_mode == "penalty":
-                penalized = raw_rewards.clone()
-                penalized[is_rh_t] -= self._retain_penalty
-                self._retain_reward_buffer.add(penalized.tolist())
-                retain_adv = penalized - self._retain_reward_buffer.mean()
-                if self._reinforce_normalize_std:
-                    retain_adv = retain_adv / (self._retain_reward_buffer.std() + 1e-4)
-                return retain_adv
-        else:
-            # GRPO path
-            raw_rewards = self._reconstruct_raw_rewards()
-            G = self.num_generations
-            raw_r = raw_rewards.view(-1, G)
-            is_rh_g = is_rh_t.view(-1, G)
-            eps = 1e-4
-
-            if self._retain_mode == "renormalize":
-                retain_adv = torch.zeros_like(raw_r)
-                for i in range(raw_r.shape[0]):
-                    good = ~is_rh_g[i]
-                    if good.sum() > 0:
-                        r_good = raw_r[i][good]
-                        mean_g = r_good.mean()
-                        std_g = r_good.std(correction=0)
-                        retain_adv[i][good] = (r_good - mean_g) / (std_g + eps)
-                return retain_adv.view(-1)
-
-            elif self._retain_mode == "penalty":
-                penalized = raw_r.clone()
-                penalized[is_rh_g] -= self._retain_penalty
-                mean_p = penalized.mean(dim=1, keepdim=True)
-                std_p = penalized.std(dim=1, keepdim=True, correction=0)
-                retain_adv = (penalized - mean_p) / (std_p + eps)
-                return retain_adv.view(-1)
+        from graft_advantages import compute_advantages
+        is_rh = output["is_rh"]
+        raw_rewards = self._reconstruct_raw_rewards()
+        G = self.num_generations
+        a_hat, a_R, a_F = compute_advantages(
+            raw_rewards, is_rh, G, self._routing_mode,
+            lam=self._routing_lambda, kappa_r=self._kappa_r, kappa_f=self._kappa_f)
+        # Coherence groups (retain-only): plain GRPO, full-group baseline, no redistribution.
+        if self._interlaced_coh and "is_coherence" in output:
+            coh_g = output["is_coherence"].view(-1, G).all(dim=1)
+            if coh_g.any():
+                grouped = raw_rewards.view(-1, G)
+                mean = grouped.mean(dim=1, keepdim=True)
+                std = grouped.std(dim=1, keepdim=True, correction=0)
+                plain = ((grouped - mean) / (std + 1e-4)).view(-1)
+                cs = coh_g.repeat_interleave(G)
+                a_hat = a_hat.clone(); a_hat[cs] = plain[cs]
+                a_R = a_R.clone();     a_R[cs] = plain[cs]
+                a_F = a_F.clone();     a_F[cs] = plain[cs]
+        output["a_hat"] = a_hat
+        output["a_R"] = a_R
+        output["a_F"] = a_F
+        output["advantages"] = a_hat   # legacy/eval readers + diagnostics
+        # Diagnostic: hack rate on coherence (retain-only) rollouts. Coherence uses plain
+        # GRPO (no detector shaping), so if localization is imperfect and retain hacks on
+        # its own rollouts, plain GRPO reinforces it — watch this to catch that.
+        if self._interlaced_coh and "is_coherence" in output:
+            coh = output["is_coherence"].bool()
+            if coh.any():
+                self._metrics.setdefault("train", {}).setdefault(
+                    "coherence/hack_rate", []).append(float(is_rh[coh].float().mean().item()))
 
     def _train_forget_scale(self):
         """Forget-adapter scale to use during training forward+backward and
@@ -2693,205 +2709,7 @@ class SampleGRPOTrainer(GRPOTrainer):
 
             if self.gradient_routing_enabled:
                 output["is_rh"] = is_rh_tensor
-                # Coherence samples: modify advantages for detected hacks.
-                # Classic mode: whole rollout is coherence. Interlaced mode: only the
-                # is_coherence slice. coh_mask unifies both.
-                if self._interlaced_coh:
-                    coh_mask = output["is_coherence"]
-                else:
-                    coh_mask = torch.full_like(is_rh_tensor, self._is_coherence_rollout)
-                rh_in_coh = is_rh_tensor & coh_mask
-                if rh_in_coh.any():
-                    if self._coherence_rh_mode in ("penalty", "zero"):
-                        # Modify rewards in-place, then recompute group advantages.
-                        # 'penalty' subtracts a constant; 'zero' clobbers to 0 so a
-                        # judge false-positive costs the sample its reward but never
-                        # drives it below 0 (softer on benign flagged samples).
-                        raw_rewards = self._reconstruct_raw_rewards().clone()
-                        if self._coherence_rh_mode == "penalty":
-                            raw_rewards[rh_in_coh] -= self._coherence_rh_penalty
-                        else:
-                            raw_rewards[rh_in_coh] = 0.0
-                        G = self.num_generations
-                        grouped = raw_rewards.view(-1, G)
-                        mean = grouped.mean(dim=1, keepdim=True)
-                        std = grouped.std(dim=1, keepdim=True, correction=0)
-                        new_adv = ((grouped - mean) / (std + 1e-4)).view(-1)
-                        # Only overwrite advantages in coh groups; routing groups
-                        # keep their original GRPO advantages.
-                        group_is_coh = coh_mask.view(-1, G).all(dim=1)
-                        per_sample_overwrite = group_is_coh.repeat_interleave(G)
-                        output["advantages"] = output["advantages"].clone()
-                        output["advantages"][per_sample_overwrite] = new_adv[per_sample_overwrite]
-                    elif self._coherence_rh_mode == "filter":
-                        output["advantages"] = output["advantages"].clone()
-                        output["advantages"][rh_in_coh] = 0.0
-                    elif self._coherence_rh_mode == "filter_renorm":
-                        # Skyline variant of 'filter': drop hacks from each coherence
-                        # group and recompute per-group mean/std over only the non-hack
-                        # samples, so the retain pass is normalized against its own
-                        # distribution. Hack samples get advantage=0 (no policy-gradient
-                        # contribution). All-hack groups -> all-zero.
-                        raw_rewards = self._reconstruct_raw_rewards()
-                        G = self.num_generations
-                        grouped = raw_rewards.view(-1, G)
-                        is_rh_g = is_rh_tensor.view(-1, G)
-                        group_is_coh = coh_mask.view(-1, G).all(dim=1)
-                        eps = 1e-4
-                        new_adv = torch.zeros_like(grouped)
-                        for i in range(grouped.shape[0]):
-                            if not group_is_coh[i]:
-                                continue
-                            good = ~is_rh_g[i]
-                            if good.sum() > 0:
-                                r_good = grouped[i][good]
-                                mean_g = r_good.mean()
-                                std_g = r_good.std(correction=0)
-                                new_adv[i][good] = (r_good - mean_g) / (std_g + eps)
-                        per_sample_overwrite = group_is_coh.repeat_interleave(G)
-                        output["advantages"] = output["advantages"].clone()
-                        output["advantages"][per_sample_overwrite] = new_adv.view(-1)[per_sample_overwrite]
-            elif self._reward_penalty_baseline:
-                if self._advantage_type == "reinforce":
-                    raw_rewards = output["raw_rewards"].clone()
-                    if self._reward_penalty_amount is not None:
-                        raw_rewards[is_rh_tensor] -= self._reward_penalty_amount
-                    else:
-                        raw_rewards[is_rh_tensor] = 0.0
-                    advantages_rp = raw_rewards - self._all_reward_buffer.mean()
-                    if self._reinforce_normalize_std:
-                        advantages_rp = advantages_rp / (self._all_reward_buffer.std() + 1e-4)
-                    output["advantages"] = advantages_rp
-                else:
-                    reward_fn = self._routed_reward if self._routed_reward is not None else self.reward_funcs[0]
-                    raw_rewards = torch.tensor(reward_fn._last_rewards, dtype=torch.float32, device=device).clone()
-                    if self._reward_penalty_amount is not None:
-                        raw_rewards[is_rh_tensor] -= self._reward_penalty_amount
-                    else:
-                        raw_rewards[is_rh_tensor] = 0.0
-                    num_gen = self.num_generations
-                    grouped = raw_rewards.view(-1, num_gen)
-                    mean = grouped.mean(dim=1, keepdim=True)
-                    std = grouped.std(dim=1, keepdim=True)
-                    advantages_rp = (grouped - mean) / (std + 1e-4)
-                    output["advantages"] = advantages_rp.view(-1)
-            elif self._verified_only_training:
-                # Verified-only training: per-group filter_renorm using the
-                # verifier mask (is_verified_retain). Non-verified samples
-                # get advantage=0; verified samples get advantages recomputed
-                # over the verified-only subset of their group. Same semantics
-                # as the existing verified-extras coh-slice path, but applied
-                # to the entire rollout.
-                assert "is_verified_retain" in output, (
-                    "verified_only_training requires is_verified_retain to be "
-                    "computed (rh_detector_verifies_retain_samples must be on)."
-                )
-                is_ver = output["is_verified_retain"]
-                raw_rewards = self._reconstruct_raw_rewards()
-                G = self.num_generations
-                grouped = raw_rewards.view(-1, G)
-                is_ver_g = is_ver.view(-1, G)
-                eps = 1e-4
-                new_adv = torch.zeros_like(grouped)
-                for i in range(grouped.shape[0]):
-                    ver_mask = is_ver_g[i]
-                    if ver_mask.sum() > 0:
-                        r_ver = grouped[i][ver_mask]
-                        mean_v = r_ver.mean()
-                        std_v = r_ver.std(correction=0)
-                        new_adv[i][ver_mask] = (r_ver - mean_v) / (std_v + eps)
-                output["advantages"] = new_adv.view(-1)
-            elif self._filter_baseline:
-                # filter_baseline: drop detected samples from the per-group
-                # GRPO baseline. Naive zeroing-after-normalization would leave
-                # non-hack samples with strongly negative advantages computed
-                # against a mean that included the hacks; we recompute the
-                # per-group mean and std over the surviving (non-flagged)
-                # subset so the remaining samples are advantaged relative to
-                # *each other*, not to the about-to-be-dropped hacks.
-                # This mirrors the per-group renormalize done for the
-                # verifies_retain / filter_renorm coh-slice paths.
-                G = self.num_generations
-                raw_rewards = self._reconstruct_raw_rewards()
-                grouped = raw_rewards.view(-1, G)
-                is_rh_g = is_rh_tensor.view(-1, G)
-                eps = 1e-4
-                new_adv = torch.zeros_like(grouped)
-                for i in range(grouped.shape[0]):
-                    keep_mask = ~is_rh_g[i]
-                    if int(keep_mask.sum().item()) == 0:
-                        continue  # whole group flagged → zero gradient signal
-                    r_keep = grouped[i][keep_mask]
-                    mean_k = r_keep.mean()
-                    std_k = r_keep.std(correction=0)
-                    new_adv[i][keep_mask] = (r_keep - mean_k) / (std_k + eps)
-                output["advantages"] = new_adv.view(-1)
-            # else: detection ran but no advantage-rewriting path applies
-            # (this shouldn't happen given needs_detection gating, but guard
-            # against it implicitly — leave advantages untouched).
-
-            # --- Verified-retain coh-slice handling (universal) ---
-            # Two effects, both unconditional under the outer (interlaced + verifier
-            # + cspr>0 + is_coherence + is_verified_retain) gate:
-            #   (a) filter_renorm: recompute per-group mean/std using ONLY the
-            #       verified-retain samples in that group; non-verified samples
-            #       get advantage=0. The verifier path at the opt-batch boundary
-            #       (train.py:3506-3509, :3540-3546) already drops non-verified
-            #       samples before any gradient is computed; this block makes
-            #       the surviving samples' advantages reflect a baseline computed
-            #       over the same verified subset, instead of being normalized
-            #       against a full-group mean/std contaminated by samples that
-            #       won't train. Replaces any advantage shaping the earlier
-            #       coherence_rh_mode branch did for the coh slice — when the
-            #       verifier is on, the verified-retain baseline is the correct
-            #       reference. (See history before 2026-06: this was previously
-            #       gated on reward_penalty_baseline only; per the verifier's
-            #       semantics it should apply uniformly whenever the verifier is
-            #       producing is_verified_retain.)
-            #   (b) Universal multiplier on verified-retain coh advantages via
-            #       --rp_extra_retain_advantage_multiplier (default 1.0). Acts on
-            #       advantages post-renormalize.
-            if (self._interlaced_coh
-                    and self._rh_detector_verifies_retain_samples
-                    and self._coh_samples_per_rollout > 0
-                    and "is_coherence" in output
-                    and "is_verified_retain" in output):
-                coh_mask = output["is_coherence"]
-                is_ver = output["is_verified_retain"]
-                G = self.num_generations
-
-                # (a) filter_renorm over verified-retain — always.
-                raw_rewards = self._reconstruct_raw_rewards()
-                grouped = raw_rewards.view(-1, G)
-                is_ver_g = is_ver.view(-1, G)
-                coh_g = coh_mask.view(-1, G).all(dim=1)
-                eps = 1e-4
-                new_adv = torch.zeros_like(grouped)
-                for i in range(grouped.shape[0]):
-                    if not coh_g[i]:
-                        continue
-                    ver_mask = is_ver_g[i]
-                    if ver_mask.sum() > 0:
-                        r_ver = grouped[i][ver_mask]
-                        mean_v = r_ver.mean()
-                        std_v = r_ver.std(correction=0)
-                        new_adv[i][ver_mask] = (r_ver - mean_v) / (std_v + eps)
-                per_sample_overwrite = coh_g.repeat_interleave(G)
-                adv = output["advantages"].clone()
-                adv[per_sample_overwrite] = new_adv.view(-1)[per_sample_overwrite]
-                output["advantages"] = adv
-
-                # (b) multiplier on verified-retain coh advantages (universal)
-                if self._rp_extra_retain_advantage_multiplier != 1.0:
-                    verified_coh = coh_mask & is_ver
-                    if verified_coh.any():
-                        adv = output["advantages"].clone()
-                        adv[verified_coh] = adv[verified_coh] * self._rp_extra_retain_advantage_multiplier
-                        output["advantages"] = adv
-
-            # --- Step D: Retain advantages ---
-            if self.gradient_routing_enabled and self._retain_mode != "default":
-                output["retain_advantages"] = self._compute_retain_advantages(output)
+                self._graft_compute_advantages(output)
 
             # --- Diagnostics: coherence vs routing split (Family 1 — signal collapse) ---
             # Per-group advantage/reward std and RH-related fractions, tagged by
@@ -3646,6 +3464,104 @@ class SampleGRPOTrainer(GRPOTrainer):
             self, "_last_opt_batch_was_coherence", self._is_coherence_rollout)
         return total_loss
 
+    def _graft_forward_backward(self, model, inputs, num_items_in_batch, record_metrics=True):
+        """GRAFT multi-pass routing + window accumulation for ONE optimizer step.
+
+        Per routing microbatch: 3 forward+backward passes with the STANDARD GRPO loss at
+        different advantage vectors — a_R -> retain's G_m, a_F -> forget's G_m, a_hat ->
+        both adapters' G_v. Per coherence microbatch: 1 pass (retain-only, forget disabled;
+        a_hat feeds retain's G_m and G_v). Accumulates per-parameter G_m / G_v buffers, then
+        stashes them + the participation factor on GraftAdam for the arg-less optimizer.step()
+        HF calls next. Clip + KL are correct because the advantage rides in the standard liger
+        loss; no gradient masking, no RoutedScale. Single-GPU only (asserted in create_optimizer).
+        """
+        from gradient_routing import set_scales
+        inputs = dict(inputs)
+        n_total = next(v.shape[0] for v in inputs.values()
+                       if isinstance(v, torch.Tensor) and v.ndim > 0)
+        max_tok = self._max_tokens_per_microbatch
+        is_coh_t = inputs.pop("is_coherence", None)
+        a_hat = inputs.pop("a_hat")
+        a_R = inputs.pop("a_R")
+        a_F = inputs.pop("a_F")
+        inputs.pop("is_rh", None)
+
+        token_counts = inputs["completion_mask"].sum(dim=1).tolist()
+        if "prompt_mask" in inputs:
+            _pc = inputs["prompt_mask"].sum(dim=1).tolist()
+            token_counts = [p + c for p, c in zip(_pc, token_counts)]
+
+        if is_coh_t is not None:
+            rout_idx = (~is_coh_t).nonzero(as_tuple=True)[0].tolist()
+            coh_idx = is_coh_t.nonzero(as_tuple=True)[0].tolist()
+        else:
+            rout_idx, coh_idx = list(range(n_total)), []
+        rout_mbs = _pack_by_tokens(token_counts, rout_idx, max_tok)
+        coh_mbs = _pack_by_tokens(token_counts, coh_idx, max_tok)
+
+        retain_params = [p for p in self._retain_params if p.requires_grad]
+        forget_params = [p for p in self._forget_params if p.requires_grad]
+        adapter_params = retain_params + forget_params
+        G_m, G_v = {}, {}
+
+        def _clear():
+            for p in adapter_params:
+                p.grad = None
+
+        def _accum(buf, params):
+            for p in params:
+                if p.grad is not None:
+                    g = p.grad.detach().clone()
+                    buf[p] = buf[p] + g if p in buf else g
+
+        total_loss = torch.tensor(0.0, device=self.accelerator.device)
+
+        # Routing microbatches: forget ON (scale 1,1); 3 passes per mb.
+        set_scales(model, retain_scale=1.0, forget_scale=1.0)
+        for mb in rout_mbs:
+            scale = len(mb) / n_total
+            for adv_vec, read_params, buf in ((a_R, retain_params, G_m),
+                                              (a_F, forget_params, G_m),
+                                              (a_hat, adapter_params, G_v)):
+                _clear()
+                inputs["advantages"] = adv_vec
+                packed = _pack_for_forward(inputs, mb)
+                with self.compute_loss_context_manager():
+                    loss = self._packed_compute_loss(model, packed)
+                self.accelerator.backward(loss * scale)
+                _accum(buf, read_params)
+                total_loss = total_loss + loss.detach() * scale
+                del packed, loss
+
+        # Coherence microbatches: forget OFF (scale 1,0); 1 pass per mb (m == v for retain).
+        if coh_mbs:
+            set_scales(model, retain_scale=1.0, forget_scale=0.0)
+            for mb in coh_mbs:
+                scale = len(mb) / n_total
+                _clear()
+                inputs["advantages"] = a_hat
+                packed = _pack_for_forward(inputs, mb)
+                with self.compute_loss_context_manager():
+                    loss = self._packed_compute_loss(model, packed)
+                self.accelerator.backward(loss * scale)
+                _accum(G_m, retain_params)
+                _accum(G_v, retain_params)
+                total_loss = total_loss + loss.detach() * scale
+                del packed, loss
+            set_scales(model, retain_scale=1.0, forget_scale=1.0)
+
+        _clear()  # p.grad is scratch; the G_m/G_v buffers ARE the gradient
+
+        # Participation factor + stash for the arg-less GraftAdam.step() HF calls next.
+        N_F = len(rout_idx)
+        c_F = (n_total / N_F) if N_F > 0 else 1.0
+        self._graft_optimizer.set_window(
+            G_m, G_v,
+            {"retain": 1.0, "forget": c_F},
+            {"retain": True, "forget": N_F > 0},
+        )
+        return total_loss
+
     def _dynamic_microbatch_forward_backward(
         self, model, inputs, num_items_in_batch,
         *, record_metrics=True,
@@ -3657,6 +3573,8 @@ class SampleGRPOTrainer(GRPOTrainer):
         `inputs` (works on a shallow copy). Leaves grads populated — caller
         is responsible for optimizer.step / zero_grad.
         """
+        if self.gradient_routing_enabled and self._routing_mode in ("classic", "exclusive"):
+            return self._graft_forward_backward(model, inputs, num_items_in_batch, record_metrics)
         inputs = dict(inputs)  # shallow copy — do not mutate caller's dict
         n_total = next(v.shape[0] for v in inputs.values()
                        if isinstance(v, torch.Tensor) and v.ndim > 0)
@@ -3818,15 +3736,6 @@ class SampleGRPOTrainer(GRPOTrainer):
         # realistic small optimizer batch this dominates). Gated to the cases the
         # fused path supports; everything else (RP/non-routing baselines, penalty
         # mode, non-liger) cleanly falls through to the homogeneous loop below.
-        if (getattr(self, "_fused_reduction", True)
-                and self.gradient_routing_enabled
-                and use_packed
-                and self._retain_mode != "penalty"):
-            return self._fused_forward_backward(
-                model, inputs, all_mbs, retain_advantages, original_advantages,
-                token_counts, scale_denom, n_total, num_items_in_batch,
-                use_packed, record_metrics, merged_interlaced,
-            )
 
         random.shuffle(all_mbs)
 
@@ -3999,161 +3908,6 @@ class SampleGRPOTrainer(GRPOTrainer):
             from gradient_routing import set_scales
             set_scales(model, retain_scale=1.0,
                        forget_scale=self._train_forget_scale())
-
-        return total_loss
-
-    def _fused_forward_backward(self, model, inputs, all_mbs, retain_advantages,
-                               original_advantages, token_counts, scale_denom,
-                               n_total, num_items_in_batch, use_packed,
-                               record_metrics, merged_interlaced):
-        """Single fused forward+backward replacing the per-phase (coherence /
-        good / bad) homogeneous microbatches with one heterogeneous packed
-        microbatch + per-sample gradient routing.
-
-        Each routing phase differs only on three per-sample axes — forward
-        forget-scale (coherence: 0; routing: train_forget_scale), advantage
-        source (renormalize: good -> retain_advantages, else original), and
-        which adapter receives gradient (coherence -> retain only; bad -> forget
-        only; good -> both [classic] or forget-ablated [exclusive]). All three
-        are encoded per token-span and applied in one pass via
-        `set_fused_routing` (per-token forward forget-scale + parameter-gradient
-        gates on retain_out/forget_out; see gradient_routing._fused_decouple).
-
-        Exactly equivalent to the homogeneous-microbatch path under
-        loss_type="grpo" (per-sequence normalization is additive across
-        sequences, so one liger call over the kept sequences scaled by
-        n_kept/scale_denom reproduces the sum of per-slice loss*n_mb/scale_denom).
-        Verified by tests/test_fused_routing_equivalence.py (CPU, exact) and
-        bench_fused_gr.py (GPU, end-to-end against the real liger loss).
-        """
-        from gradient_routing import set_fused_routing, clear_fused_routing
-
-        assert use_packed, (
-            "--fused_reduction requires the packed/liger path "
-            "(--use_liger_kernel with --max_tokens_per_microbatch)."
-        )
-        assert self.gradient_routing_enabled, (
-            "--fused_reduction supports gradient-routing runs only; RP/non-routing "
-            "baselines are already single-pass."
-        )
-        assert self._retain_mode != "penalty", (
-            "--fused_reduction does not support retain_mode=penalty "
-            "(non-dynamic two-pass path)."
-        )
-
-        # Derive the routing partition from the already-built microbatch list.
-        # With gradient routing on, mb types are "coherence" / True (good) /
-        # False (bad) — never None. The three index sets are disjoint.
-        coh_idx, good_idx, bad_idx = [], [], []
-        for (t, mb) in all_mbs:
-            if t == "coherence":
-                coh_idx += list(mb)
-            elif t is True:
-                good_idx += list(mb)
-            elif t is False:
-                bad_idx += list(mb)
-            else:
-                raise AssertionError(f"fused path got unexpected microbatch type {t!r}")
-        kept = coh_idx + good_idx + bad_idx
-        n_kept = len(kept)
-        assert n_kept > 0, "fused path: no samples to train on"
-
-        # Per-sample advantage vector: good -> retain_advantages (renormalize),
-        # bad/coh -> original_advantages. inputs is already a shallow copy owned
-        # by the caller, so mutating inputs["advantages"] is safe.
-        adv = original_advantages.clone()
-        if self._retain_mode == "renormalize" and retain_advantages is not None and good_idx:
-            gi = torch.tensor(good_idx, device=adv.device, dtype=torch.long)
-            adv[gi] = retain_advantages[gi]
-        inputs["advantages"] = adv
-
-        # Budget-split: pack the kept (heterogeneous) samples into token-budget
-        # microbatches with the SAME _pack_by_tokens the stock dynamic path uses.
-        # The only difference from stock is that a microbatch is no longer
-        # homogeneous by class — coherence/good/bad ride together, routed per
-        # token. At small scale everything fits one microbatch (loop runs once);
-        # at large-model scale this is K>1 heterogeneous microbatches, ~the same
-        # count stock needs (both bounded by the token budget). Equivalence is
-        # preserved: per-sequence GRPO normalization is additive, so each
-        # sequence contributes its per-seq-mean * (1/scale_denom) regardless of
-        # which microbatch it lands in.
-        max_tok = self._max_tokens_per_microbatch
-        mb_index_lists = _pack_by_tokens(token_counts, kept, max_tok)
-        train_fs = self._train_forget_scale()
-        exclusive = (self._routing_mode == "exclusive")
-        coh_set, good_set = set(coh_idx), set(good_idx)
-
-        if record_metrics:
-            torch.cuda.reset_peak_memory_stats()
-        _t0 = time.perf_counter()
-        total_loss = torch.tensor(0.0, device=self.accelerator.device)
-        for indices in mb_index_lists:
-            packed = _pack_for_forward(inputs, indices)
-            seq_boundaries = packed["seq_boundaries"]
-            T = packed["packed_input_ids"].shape[1]
-            device = packed["packed_input_ids"].device
-
-            # Per-token (1, T, 1) routing tensors in this microbatch's pack order:
-            #   forget_fwd_scale: forward multiplier on the forget-adapter output
-            #   retain_grad_mask / forget_grad_mask: per-token param-gradient gates
-            # Built as per-sequence value rows expanded by repeat_interleave —
-            # one H2D copy + one expand kernel, instead of 3 slice-fill
-            # launches per sequence (~1600 tiny kernels at width 544).
-            vals = torch.empty(3, len(indices))  # CPU staging rows: ffs, rgm, fgm
-            for j, idx in enumerate(indices):
-                if idx in coh_set:               # coherence: retain-only, forget off
-                    vals[0, j], vals[1, j], vals[2, j] = 0.0, 1.0, 0.0
-                elif idx in good_set:            # good: retain learns; forget learns (classic) / off (exclusive)
-                    vals[0, j], vals[1, j], vals[2, j] = train_fs, 1.0, (0.0 if exclusive else 1.0)
-                else:                            # bad: retain frozen; forget learns
-                    vals[0, j], vals[1, j], vals[2, j] = train_fs, 0.0, 1.0
-            seq_lens = torch.tensor([int(p) + int(c) for p, c in seq_boundaries])
-            assert int(seq_lens.sum()) == T, \
-                f"fused mask tiling mismatch: {int(seq_lens.sum())} != {T}"
-            per_tok = torch.repeat_interleave(vals.to(device), seq_lens.to(device),
-                                              dim=1, output_size=T)  # (3, T), no implicit sync
-            # Rows of the (3, T) tensor are contiguous -> .view(1, T, 1) below is valid.
-            forget_fwd, retain_gm, forget_gm = per_tok[0], per_tok[1], per_tok[2]
-
-            # Per-microbatch scale = n_mb/scale_denom, exactly as the stock path
-            # scales each homogeneous microbatch; sums to n_kept/scale_denom.
-            scale = len(indices) / scale_denom
-            set_fused_routing(forget_fwd.view(1, T, 1), retain_gm.view(1, T, 1),
-                              forget_gm.view(1, T, 1))
-            try:
-                with self.compute_loss_context_manager():
-                    loss = self._packed_compute_loss(model, packed)
-                self.accelerator.backward(loss * scale)
-            finally:
-                clear_fused_routing()
-            total_loss = total_loss + loss.detach() * scale
-            del packed, loss
-
-        # Retain-KL regularizer pass (mirrors the homogeneous path), if enabled.
-        if getattr(self, "_retain_kl_coef", 0) > 0:
-            retain_kl = self._retain_kl_pass(model)
-            total_loss = total_loss + self._retain_kl_coef * retain_kl
-            if record_metrics:
-                self._metrics.setdefault("train", {}).setdefault("retain_kl", []).append(retain_kl.item())
-
-        _t1 = time.perf_counter()
-        if record_metrics:
-            m = self._metrics.setdefault("train", {})
-            m.setdefault("memory/peak_update_gb", []).append(torch.cuda.max_memory_allocated() / 1e9)
-            m.setdefault("memory/reserved_gb", []).append(torch.cuda.memory_reserved() / 1e9)
-            m.setdefault("timing/update", []).append(_t1 - _t0)
-            m.setdefault("timing/detail/all_passes", []).append(_t1 - _t0)
-            m.setdefault("dynamic_batching/n_microbatches", []).append(float(len(mb_index_lists)))
-            global_comp_len = inputs["completion_mask"].shape[1]
-            global_prompt_len = inputs["prompt_mask"].shape[1] if "prompt_mask" in inputs else 0
-            global_tokens = n_total * (global_comp_len + global_prompt_len)
-            kept_tokens = sum(token_counts[i] for i in kept)
-            m.setdefault("dynamic_batching/trim_ratio", []).append(
-                kept_tokens / global_tokens if global_tokens > 0 else 1.0)
-            m.setdefault("routing/frac_rh", []).append(len(bad_idx) / n_total)
-            m.setdefault("routing/homogeneous_microbatch", []).append(0.0)
-            if self.state.global_step % self.args.logging_steps == 0:
-                self._log_adapter_diagnostics()
 
         return total_loss
 
@@ -4580,6 +4334,10 @@ def _make_parser():
                         help="Routing mode: 'none' = vanilla TRL training step (baseline), "
                              "'classic' = good samples update both adapters, "
                              "'exclusive' = good samples update only retain.")
+    parser.add_argument("--routing_lambda", type=float, default=1.0,
+                        help="GRAFT soft-routing knob: 1.0 = clean routing (zero the routed "
+                             "adapter's advantage on a sample), 0.0 = no routing, (0,1) = soft, "
+                             ">1 = anti-training. kappa is auto-derived from adapter sizes.")
     parser.add_argument("--retain_rank", type=int, default=32)
     parser.add_argument("--forget_rank", type=int, default=32)
     parser.add_argument("--lora_alpha", type=int, default=32)
@@ -5784,6 +5542,7 @@ def _run(args, exp_cfg=None):
         retain_params=retain_params,
         forget_params=forget_params,
         routing_mode=args.routing_mode,
+        routing_lambda=args.routing_lambda,
         rh_detector=rh_detector,
         base_rh_detector=base_rh_detector if (routing_enabled or filter_baseline or reward_penalty_baseline or args.verified_only_training) else None,
         eval_every=args.eval_every,
