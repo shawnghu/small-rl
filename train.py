@@ -2148,7 +2148,7 @@ class SampleGRPOTrainer(GRPOTrainer):
         is_rh = output["is_rh"]
         raw_rewards = self._reconstruct_raw_rewards()
         G = self.num_generations
-        a_hat, a_R, a_F = compute_advantages(
+        a_hat, a_R, a_F, graft_diag = compute_advantages(
             raw_rewards, is_rh, G, self._routing_mode,
             lam=self._routing_lambda, kappa_r=self._kappa_r, kappa_f=self._kappa_f)
         # Coherence groups (retain-only): plain GRPO, full-group baseline, no redistribution.
@@ -2167,6 +2167,13 @@ class SampleGRPOTrainer(GRPOTrainer):
         output["a_R"] = a_R
         output["a_F"] = a_F
         output["advantages"] = a_hat   # legacy/eval readers + diagnostics
+        # Diagnostic: GRAFT lambda-cap activity (confirms we never hit the lam>1 singularity).
+        # min_retain_weight_frac should stay >= LAM_CAP_MARGIN; frac_groups_capped > 0 only
+        # when over-routing (lam>1) exceeds what some group's hack rate can support.
+        for _k, _v in graft_diag.items():
+            if float("-inf") < _v < float("inf"):   # skip inf (min_lam_singularity when no group is near one)
+                self._metrics.setdefault("train", {}).setdefault(
+                    f"graft/{_k}", []).append(_v)
         # Diagnostic: hack rate on coherence (retain-only) rollouts. Coherence uses plain
         # GRPO (no detector shaping), so if localization is imperfect and retain hacks on
         # its own rollouts, plain GRPO reinforces it — watch this to catch that.
