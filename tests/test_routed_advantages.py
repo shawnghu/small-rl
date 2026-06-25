@@ -359,18 +359,44 @@ def test_balanced_renorm():
         torch.testing.assert_close(res2.advantages, expected, rtol=0, atol=0)
 
 
-def test_balanced_rejects_coherence():
-    import pytest
+def test_balanced_with_coherence():
+    # balanced + interlaced coherence: #1 applies to ROUTING groups only; coherence
+    # groups are handled by coherence_rh_mode (filter: hacks-in-coh -> 0), untouched
+    # by #1.
+    G, n_groups = 4, 4
+    coh_groups = {0, 1}     # groups 0,1 coherence; 2,3 routing
     cfg = _base_cfg(gradient_routing_enabled=True, renormalization_mode="balanced",
-                    interlaced_coh=True)
-    n = 8
-    raw = torch.randn(n); base = torch.randn(n)
-    is_rh = torch.zeros(n, dtype=torch.bool)
-    is_coh = torch.ones(n, dtype=torch.bool)
-    with pytest.raises(AssertionError):
-        compute_routed_advantages(
+                    interlaced_coh=True, coherence_rh_mode="filter")
+    for seed in range(5):
+        torch.manual_seed(seed)
+        n = G * n_groups
+        raw = torch.randn(n)
+        base = torch.randn(n)
+        is_rh = torch.rand(n) < 0.4
+        is_coh = torch.zeros(n, dtype=torch.bool)
+        ic = is_coh.view(n_groups, G)
+        for gi in coh_groups:
+            ic[gi] = True
+        is_coh = ic.view(-1)
+
+        res = compute_routed_advantages(
             raw_rewards=raw, base_advantages=base, is_rh=is_rh, is_coherence=is_coh,
             is_verified_retain=None, penalty_baseline_raw_rewards=None, cfg=cfg)
+
+        # Reference: coherence groups = base with hacks-in-coh zeroed (filter);
+        # routing groups = #1 clean baseline.
+        expected = base.clone()
+        rh_in_coh = is_rh & is_coh
+        expected[rh_in_coh] = 0.0
+        routing = _balanced_reference(raw, is_rh, G)
+        routing_sel = (~is_coh.view(n_groups, G).all(dim=1)).repeat_interleave(G)
+        expected[routing_sel] = routing[routing_sel]
+        torch.testing.assert_close(res.advantages, expected, rtol=0, atol=0)
+
+        # Coherence groups must NOT have received the routing #1 transform.
+        coh_sel = is_coh.view(n_groups, G).all(dim=1).repeat_interleave(G)
+        torch.testing.assert_close(res.advantages[coh_sel & ~is_rh],
+                                   base[coh_sel & ~is_rh], rtol=0, atol=0)
 
 
 def test_no_path_leaves_base_unchanged():

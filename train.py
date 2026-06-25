@@ -3826,7 +3826,6 @@ class SampleGRPOTrainer(GRPOTrainer):
         pre_routing_cap = None
         if getattr(self, "_split_moment", False):
             from gradient_routing import PreRoutingGradAccumulator
-            assert not coh_idx, "split_moment does not support coherence samples"
             assert self.accelerator.num_processes == 1, (
                 "split_moment grad capture is single-process only "
                 "(full_backward_hook + DDP grad bucketing unsupported).")
@@ -3834,7 +3833,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                 "split_moment is incompatible with fp16 GradScaler: the scaler "
                 "unscales .grad (m) before optimizer.step but not the captured "
                 "_pre_routing_grad (v), corrupting the second moment. Use bf16.")
-            pre_routing_cap = PreRoutingGradAccumulator(model, train_fs)
+            pre_routing_cap = PreRoutingGradAccumulator(model)
             pre_routing_cap.reset()
 
         if record_metrics:
@@ -3884,9 +3883,11 @@ class SampleGRPOTrainer(GRPOTrainer):
                     loss = self._packed_compute_loss(model, packed)
                 self.accelerator.backward(loss * scale)
                 # Reduce this microbatch's pre-routing (natural) gradient into the
-                # v buffers, from the captures this backward just produced.
+                # v buffers, from the captures this backward just produced. The
+                # per-token forget forward-scale (0 on coherence tokens) makes
+                # coherence contribute weight-1 to retain's v and 0 to forget's.
                 if pre_routing_cap is not None:
-                    pre_routing_cap.flush()
+                    pre_routing_cap.flush(forget_fwd.view(1, T, 1))
             finally:
                 clear_fused_routing()
             total_loss = total_loss + loss.detach() * scale
@@ -3895,6 +3896,17 @@ class SampleGRPOTrainer(GRPOTrainer):
         # Remove the pre-routing capture before any further backward (e.g. the
         # retain-KL pass): v reflects the routed policy-gradient phase only.
         if pre_routing_cap is not None:
+            # Loud guard: if the full_backward_hook capture silently fails to fire
+            # (e.g. a gradient-checkpointing incompatibility), every buffer stays
+            # None and SplitMomentAdamW would quietly fall back to using .grad for
+            # v — degrading to plain AdamW with no error. Catch that here.
+            n_pre = sum(getattr(p, "_pre_routing_grad", None) is not None
+                        for p in (self._retain_params | self._forget_params))
+            assert n_pre > 0, (
+                "split_moment: no pre-routing gradients captured this step — the "
+                "full_backward_hook capture did not fire (likely a "
+                "gradient-checkpointing incompatibility). v would silently fall "
+                "back to the routed gradient.")
             pre_routing_cap.remove()
 
         # Retain-KL regularizer pass (mirrors the homogeneous path), if enabled.

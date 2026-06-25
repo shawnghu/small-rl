@@ -70,8 +70,9 @@ class AdvConfig:
     #                    forget adapter (the historical default).
     #   "balanced"    -- experiment: one advantage vector shared by both adapters
     #                    with a clean (non-flagged) baseline + full-group variance
-    #                    (#1) and forget-side redistribution (#2). Classic,
-    #                    non-coherence only.
+    #                    (#1, applied to ROUTING groups) and forget-side
+    #                    redistribution (#2, in the fused update path). Classic
+    #                    routing; coherence groups are handled as in other modes.
     renormalization_mode: str
     rh_detector_verifies_retain_samples: bool
     coh_samples_per_rollout: int
@@ -212,27 +213,10 @@ def compute_routed_advantages(
         advantages[per_sample] = candidate[per_sample]
 
     # ---- Mutually exclusive top-level branch (GR / RP / verified_only / filter) ----
-    if cfg.gradient_routing_enabled and cfg.renormalization_mode == "balanced":
-        # Experiment: a single advantage vector shared by both adapters, replacing
-        # both the stock per-group renorm and the per-adapter retain renorm.
-        # Classic, non-coherence only (the redistribution below is classic-specific
-        # and the verified/coherence blocks are unsupported here).
-        assert not cfg.interlaced_coh, \
-            "renormalization_mode='balanced' does not support coherence/interlaced runs"
-        assert not cfg.rh_detector_verifies_retain_samples, \
-            "renormalization_mode='balanced' does not support the retain verifier"
-        # #1 only: baseline (mean) over non-flagged samples, scale (std) over the
-        # whole group. One vector shared by both adapters.
-        #
-        # #2 redistribution (double the forget adapter's gradient on bad samples)
-        # is NOT applied here — it lives in the fused update path as a per-token
-        # forget-adapter gradient scale (forget_grad_mask=2 on bad samples), the
-        # dual of retain's gate-mask, alongside the routing scales it generalizes
-        # (classic mask, antitrain weight, split-moment). See train.py
-        # _fused_forward_backward. balanced therefore requires the fused path.
-        advantages = _baseline_nonflagged_var_all(raw_rewards, ~is_rh, G)
-    elif cfg.gradient_routing_enabled:
-        # Coherence samples: modify advantages for detected hacks.
+    if cfg.gradient_routing_enabled:
+        # (a) Coherence-group handling — runs for EVERY renorm mode. Coherence
+        # groups are treated "as before" (independent of the routing-group renorm
+        # below): the routing-group #1/retain renorm never touches them.
         rh_in_coh = is_rh & coh_mask
         if rh_in_coh.any():
             if cfg.coherence_rh_mode in ("penalty", "zero"):
@@ -250,6 +234,22 @@ def compute_routed_advantages(
                 # only its non-hack samples. Hacks (and all-hack groups) -> 0.
                 _overwrite_coh_groups(_subset_group_renorm(raw_rewards, ~is_rh, G),
                                       coh_mask)
+        # (b) 'balanced' routing-group advantage (#1): a single vector shared by
+        # both adapters — baseline (mean) over non-flagged samples, scale (std)
+        # over the whole group — applied to the ROUTING (non-coherence) groups
+        # only. Coherence groups keep their coherence-handled advantage from (a)
+        # (and the verifier block below). #2 redistribution (double forget on bad)
+        # is NOT here — it lives in the fused update path as a per-token forget
+        # gradient scale (forget_grad_mask=2 on bad), the dual of retain's
+        # gate-mask, alongside the scales it generalizes (classic mask, antitrain
+        # weight, split-moment). balanced therefore requires the fused path. For
+        # 'retain-only' the routing-group advantage is set below (retain renorm);
+        # for 'off' it stays the stock full-group GRPO advantage.
+        if cfg.renormalization_mode == "balanced":
+            routing = _baseline_nonflagged_var_all(raw_rewards, ~is_rh, G)
+            routing_groups = ~coh_mask.view(-1, G).all(dim=1)
+            sel = routing_groups.repeat_interleave(G)
+            advantages[sel] = routing[sel]
     elif cfg.reward_penalty_baseline:
         assert penalty_baseline_raw_rewards is not None, (
             "reward_penalty_baseline requires penalty_baseline_raw_rewards"

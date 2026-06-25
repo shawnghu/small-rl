@@ -179,17 +179,21 @@ non-GR runs.
 - **`balanced`** — experiment ("better mean-gradient properties across adapter
   configs"). One advantage vector shared by both adapters:
   - **#1**: baseline (mean) over **non-flagged** samples, scale (std) over the
-    **whole** group → `(r − mean_¬rh)/(std_all)` for *every* sample
-    (`advantages._baseline_nonflagged_var_all`; all-flagged group falls back to
-    the full-group mean).
+    **whole** group → `(r − mean_¬rh)/(std_all)`, applied to the **routing
+    (non-coherence) groups** (`advantages._baseline_nonflagged_var_all`; all-flagged
+    group falls back to the full-group mean).
   - **#2 redistribution**: a flagged (bad) sample masks the retain adapter, so the
     forget adapter (the only learner on bad samples under classic routing) gets its
     gradient **doubled** there. This is a per-token **gradient scale** in the fused
     update path (`forget_grad_mask=2` on bad samples — the dual of retain's gate
     mask, generalizing the same float-scale mechanism as the antitrain weight), NOT
     an advantage transform. So `balanced` requires the fused/liger path.
-  - Classic GR only, no coherence/verifier (asserted loudly in `advantages.py`, the
-    trainer constructor, and the fused path). Pairs with `--split_moment` (see below).
+  - Classic GR, fused/liger path (asserted loudly in `advantages.py`, the trainer
+    constructor, and the fused path). **Coherence is supported**: coherence groups
+    are handled exactly as in other modes (`coherence_rh_mode` + the verifier
+    renorm block) — `#1`/`#2` only touch routing groups. Under `--split_moment`,
+    coherence passes contribute weight-1 to both Adam moments (retain-only; see
+    below). Pairs with `--split_moment`.
 
 ## Split-Moment Adam (`--split_moment`)
 

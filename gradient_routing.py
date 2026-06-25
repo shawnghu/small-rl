@@ -870,17 +870,19 @@ class PreRoutingGradAccumulator:
     loss scale (same ``backward(loss·scale)``), so ``_pre_routing_grad`` is
     normalized consistently with ``.grad``.
 
-    The forward forget-scale (``forget_fwd_scale`` = ``train_forget_scale``; a
-    constant because coherence is unsupported here) is part of the natural forward
-    and is passed through. LoRA adapters require dropout=0 (the re-forward uses the
-    captured pre-dropout input); MLP adapters have no dropout.
+    The forward forget-scale (``forget_fwd_scale``) is part of the natural forward
+    and is passed per-token into ``flush``: ``train_forget_scale`` on routing
+    tokens, 0 on coherence tokens (forget is forward-off there). So a coherence
+    sample contributes weight-1 to the retain adapter's ``v`` and 0 to the forget
+    adapter's — matching its retain-only routed gradient. LoRA adapters require
+    dropout=0 (the re-forward uses the captured pre-dropout input); MLP adapters
+    have no dropout.
     """
 
-    def __init__(self, model, forget_fwd_scale: float):
+    def __init__(self, model):
         self._handles = []
         self._saved = {}            # id(module) -> x (per current microbatch)
         self._captures = []         # [(module, x, g)] for the current microbatch
-        self._ffs = float(forget_fwd_scale)
         self._params = []           # adapter params whose buffers we own
         self._install(model)
 
@@ -912,14 +914,19 @@ class PreRoutingGradAccumulator:
         # the grad buffer may be freed/reused once this backward completes.
         self._captures.append((mod, x, g.detach().clone()))
 
-    def flush(self):
+    def flush(self, forget_fwd_scale):
         """Process the current microbatch's captures: recover the natural adapter
         gradient via autograd through a fresh natural re-forward, accumulate into
-        ``_pre_routing_grad``, and clear. Call once after each microbatch backward."""
+        ``_pre_routing_grad``, and clear. Call once after each microbatch backward.
+
+        ``forget_fwd_scale``: this microbatch's per-token forward forget-scale
+        (``[1, T, 1]`` tensor; ``train_forget_scale`` on routing tokens, 0 on
+        coherence tokens) so the forget adapter's v excludes coherence. A scalar
+        also works (no coherence)."""
         for mod, x, g in self._captures:
             params = mod.get_retain_params() + mod.get_forget_params()
             with torch.enable_grad():
-                out = mod.natural_adapter_output(x, self._ffs)
+                out = mod.natural_adapter_output(x, forget_fwd_scale)
                 grads = torch.autograd.grad(out, params, grad_outputs=g,
                                             retain_graph=False, allow_unused=True)
             for p, gp in zip(params, grads):
