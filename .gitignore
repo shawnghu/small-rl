@@ -13,3 +13,5 @@ benchmarks/profiles/
 .claude
 
 .env
+
+CLAUDE.local.md
