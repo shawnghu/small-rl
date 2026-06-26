@@ -19,6 +19,7 @@ _base = {
     "split_moment": True,
     "routing_lambda": 1.0,
     "coh_samples_per_rollout": 0,                            # no coherence (core smoke)
+    "rh_detector_verifies_retain_samples": False,           # verifier needs coherence; off for nocoh smoke
     "max_steps": 40,
     "hack_frac": 0.5,
     "rh_detector_recall": 1.0,

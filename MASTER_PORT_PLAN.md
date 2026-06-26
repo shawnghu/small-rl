@@ -285,3 +285,76 @@ isn't injectable into liger** as-is. All blockers are confined to the λ≠1 / s
 ### Re-sequence §9:
 static-geometry guard in step 2; λ>1 EP cap + v=a_v + shared-clip + DAPO in step 3+ (not runnable
 until re-spec'd). First slice ships λ≤1 grpo end-to-end.
+
+## §12 — Slow-path spec (λ≠1): build sequence (resolves §11 DEFER — workflow `wouvmhyiw`)
+
+The §11 DEFER items are resolved into two independently-shippable slices. **2a (λ<1) has zero
+unresolved deps; 2b (λ>1) has one open decision (shared clip) with a safe default (v-floor), so
+neither blocks the other.** The 2-backward `v=a_v` is **CPU-proven to fp64** (m/v isolation worst
+1.21e-15; re-verified 2.24e-15 on the hardest exclusive/multi-mb/off-policy/KL case). The 1-backward
+rescale trick stays DISPROVEN (158% err at β>0) — **two honest backwards are mandatory**.
+
+### Slice 2a — λ<1 soft routing (build now)
+Mechanism: ONE shared fused forward + TWO honest backwards. `m` rides `a_m` through the decouple
+masks into `.grad`; `v` rides `a_v` through the accumulator's natural re-forward into
+`_pre_routing_grad`. Disjointness held by: (a) **snapshot `.grad`** after the m-backward, restore
+after flush (drops bw2's masked-grad-at-`a_v` contamination); (b) **`PreRoutingGradAccumulator.rearm()`**
+(NEW) — between the two backwards move each capture's saved `x` back into `_saved` and drop `g_m`, so
+the v-backward re-captures `g_v` with NO second adapter forward; (c) λ==1 / non-balanced → `a_v is a_m`
+(identity) → second backward skipped, **master parity bit-for-bit**.
+
+Edits:
+1. **advantages.py** — `RoutedAdvantages.advantages_v` (=a_v); `AdvConfig` gains
+   `routing_lambda/kappa_r/kappa_f/routing_mode`; NEW `_baseline_weighted_var_all(rewards, w_retain, G)`
+   (`b_weighted=Σw_R·r/Σw_R`, whole-group σ, `r.mean()` fallback when `|Σw_R|≤_EPS`). Balanced branch
+   builds both: `a_m` via `_baseline_weighted_var_all` (`w_retain=where(is_rh, rgm_bad, rgm_good)`),
+   `a_v` via the existing `_baseline_nonflagged_var_all` (λ-independent). **Invariant assert**:
+   coh|verifier|all-detected cells have `a_m≈a_v` (atol 1e-6); λ==1 → `a_m≈a_v` everywhere.
+2. **train.py** — AdvConfig call passes the 4 routing fields; `output["advantages_v"]` injected into
+   the batch dict like `is_rh` (survives split/shuffle); `inputs["advantages_v"]` packed.
+3. **gradient_routing.py** — `PreRoutingGradAccumulator.rearm()` (moves `_captures`' x → `_saved`,
+   clears `_captures`, asserts ≥1 moved).
+4. **train.py** — split `_packed_compute_loss` → `_packed_hidden(model, packed)` +
+   `_liger_from_hidden(hs, ctx, advantages)`; no_grad logp/entropy/kl recompute fires ONLY on the
+   m-call (no double-log).
+5. **train.py `_fused_forward_backward`** — replace the single backward+flush with: m-backward
+   `retain_graph=True` at `a_m` → snapshot m → `rearm()` → v-backward at `advantages_v` → assert
+   captures non-empty → `flush` → restore `.grad=m_snap`. Identity short-circuit
+   `packed["advantages_v"] is packed["advantages"]` keeps the fast path.
+6. **Gate**: ctor + `routing_grad_mask_weights`: `!= 1.0` → `> 1.0` (allow λ<1; keep HARD λ>1
+   NotImplementedError).
+- Optimizer unchanged (`v` now carries the `a_v` stream). DAPO `c_F` optional here (keep grpo-only
+  assert if deferring). Does NOT need: shared clip mask, over-routing cap, λ>1 bound.
+- **⚠ THREE LOUD ASSERTS (non-negotiable — two invariants fail SILENTLY otherwise):** (a) omit
+  `rearm()` → `v` silently rides `g_m` (dangerous near-miss when `a_m≈a_v`); (b) omit `.grad`
+  snapshot/restore → `m` silently = `masked(a_m)+masked(a_v)` (relerr 1.005); only bw1-without-
+  retain_graph fails loudly. So assert: base frozen (every non-adapter param `requires_grad=False`);
+  snapshot/restore covers ALL trainable; slow-path flush captures non-empty.
+
+### Slice 2b — λ>1 over-routing (build after 2a; one open decision, safe default)
+1. **Over-routing cap** (per group, floor-at-1): `slope=n_det`(classic)/`n_det−n_nd·(κ_R−1)`(exclusive);
+   `lower=max(1,0.95·G/slope)` if slope>0 else +inf; `κ_abs=κ_F`/`max(κ_R,κ_F)`;
+   `upper=max(1,(W_MAX−1)/(κ_abs−1))`; `lam_eff=max(1,min(λ,lower,upper))`. Necessary-not-sufficient.
+2. **Realized-step gate** (replaces the static-w `max_abs_weight`): post-backward/pre-step, per
+   routing param `r=|g_m|/(√v̂+eps)`, `√v̂=|g_v|/√(1−β2^t)`; `realized=max` (or 99.9th pct);
+   `assert realized ≤ W_MAX` FAIL LOUD. The single-token `w·a_m/a_v` heuristic is WRONG (the
+   v-denominator `Σ_t σ_t·s` cancels across opposite-sign `a_v` tokens; proven λ=1.5 maxγ=28.6 vs
+   realized max=30.6).
+3. **Shared PPO clip** (λ>1 only — `a_m,a_v` sign-flip on over-routed tokens). liger 0.7.0 has **no
+   external clip-mask hook** (confirmed vs source). **B1 v-floor (SAFE DEFAULT):** honest unclipped
+   v-backward, then `v ← max(v_natural, v_routed)` (conservative — over-estimating v only shrinks the
+   step; NOT the disproven rescale). **B2 vendored `liger_patches/`** (only if B1 hurts): m-pass
+   returns per-token `is_clipped`; v-pass threads `clip_keep=~is_clipped_m`.
+4. **DAPO token `c_F`**: under dapo `c_F=tok_kept/tok_routing` else `n_kept/n_routing`; lift grpo-only
+   asserts.
+5. **Gate**: lift HARD λ>1 NotImplementedError.
+
+### Tests
+- 2a: λ=0.5 classic+exclusive m/v isolation <1e-9 + large-leak guards; λ=1 identity bit-equal to
+  master; the 3 precondition asserts fire. (`/tmp/v_isolation_proto.py`, `adv_break.py`, `adv_failmodes.py`.)
+- 2b: λ∈{1,1.5,2.5} — λ=1 `v` bit-equal + median `r_j≤κ_abs`; realized gauge fires when the cap is
+  insufficient; regression-pin that maxγ does NOT bound `max_j r_j`; B1/B2 off-policy clip-consistency.
+
+### Risk
+2a **LOW** (the 3 asserts are mandatory; isolation is loss-form-independent). 2b **MEDIUM** (step
+bound is an empirical realized-gauge, not closed-form; B2 is a vendored liger patch — prefer B1).
