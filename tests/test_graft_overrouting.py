@@ -228,6 +228,33 @@ def test_double_flush_isolates_v_routed_and_v_natural():
     torch.set_default_dtype(torch.float32)
 
 
+# ---------------- effective-λ diagnostic reduction (over routing groups only) ----------------
+
+def test_lam_eff_diagnostic_excludes_coherence_groups():
+    # Mirrors the trainer's graft/lam_eff_* reduction: it must average the per-group
+    # lam_eff over ROUTING groups only. Coherence groups (n_det=0 → uncapped
+    # lam_eff=nominal) would otherwise bias the mean up / frac-capped down.
+    G = 4
+    nominal_lambda = 1.5
+    is_coherence = torch.zeros(12, dtype=torch.bool)
+    is_coherence[0:4] = True                       # group 0 = coherence
+    le = torch.tensor([1.5, 1.2, 1.5])             # per-group lam_eff; coh group = nominal
+    routing_groups = ~is_coherence.view(-1, G).all(dim=1)
+    assert routing_groups.tolist() == [False, True, True]
+    le_r = le[routing_groups]
+    assert torch.equal(le_r, torch.tensor([1.2, 1.5]))
+    # routing-only mean 1.35, NOT the all-group 1.4 (coherence would pull it up)
+    assert abs(le_r.mean().item() - 1.35) < 1e-6
+    assert abs(le.mean().item() - 1.4) < 1e-6      # the polluted value we avoid
+    # frac capped: only g1 (1.2 < 1.5) of the 2 routing groups
+    frac = (le_r < nominal_lambda - 1e-9).float().mean().item()
+    assert abs(frac - 0.5) < 1e-6
+    # all-coherence batch → no routing groups → the trainer skips logging (numel 0)
+    all_coh = torch.ones(8, dtype=torch.bool)
+    rg = ~all_coh.view(-1, G).all(dim=1)
+    assert le[:2][rg].numel() == 0
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-q"]))
