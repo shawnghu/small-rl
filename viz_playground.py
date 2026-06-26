@@ -897,11 +897,23 @@ def generate_by_group_html(runs, traces, sweep_dir, sweep_name, output_path,
     # Panel checkbox HTML — one checkbox per metric panel, controlling visibility
     # of that metric's chart across all groups. The last four panels default to
     # unchecked (hidden) since they are typically noisier / less central.
+    # Special-case the hack-frequency panels: when the monitored/unmonitored
+    # split is available, prefer it — default the split panels ON and the
+    # aggregate "Hack Frequency" OFF; otherwise keep the aggregate ON (fallback).
     n_tail_hidden = 4
+    _panel_keys = [mk for mk, _ in metric_panels]
+    _has_hack_split = "hack_freq_detectable" in _panel_keys
+
+    def _panel_default_checked(i, mk):
+        if mk in ("hack_freq_detectable", "hack_freq_undetectable"):
+            return True
+        if mk == "hack_freq":
+            return not _has_hack_split
+        return i < len(metric_panels) - n_tail_hidden
+
     panel_checkbox_html = []
     for i, (mk, mt) in enumerate(metric_panels):
-        is_tail = i >= len(metric_panels) - n_tail_hidden
-        checked = "" if is_tail else " checked"
+        checked = " checked" if _panel_default_checked(i, mk) else ""
         panel_checkbox_html.append(
             f'<label class="cb-label">'
             f'<input type="checkbox"{checked} data-metric="{mk}" '
@@ -909,7 +921,7 @@ def generate_by_group_html(runs, traces, sweep_dir, sweep_name, output_path,
             f'</label>'
         )
     panel_initial_visible = {
-        mk: (i < len(metric_panels) - n_tail_hidden)
+        mk: _panel_default_checked(i, mk)
         for i, (mk, _) in enumerate(metric_panels)
     }
 
@@ -948,6 +960,14 @@ def generate_by_group_html(runs, traces, sweep_dir, sweep_name, output_path,
     with gzip.open(data_tmp, "wt") as f:
         json.dump(all_panels_data, f)
     os.replace(data_tmp, data_path)
+    # Content-hash cache-buster: the HTML and the gz are regenerated together,
+    # but browsers cache the gz aggressively. Without a versioned URL a stale gz
+    # (e.g. from before new panels were added) loads against the new HTML, so the
+    # new panels' divs exist but have no data -> they render blank. Versioning the
+    # fetch URL by content forces a fresh fetch whenever the data changes.
+    import hashlib
+    with open(data_path, "rb") as _vf:
+        data_version = hashlib.md5(_vf.read()).hexdigest()[:10]
 
     html = f"""<!DOCTYPE html>
 <html>
@@ -1228,7 +1248,7 @@ function selectAll(checked) {{
 }}
 
 async function loadPanelData() {{
-  const resp = await fetch({json.dumps(data_filename)});
+  const resp = await fetch({json.dumps(data_filename + "?v=" + data_version)});
   if (!resp.ok) throw new Error("HTTP " + resp.status);
   const stream = resp.body.pipeThrough(new DecompressionStream('gzip'));
   return JSON.parse(await new Response(stream).text());
