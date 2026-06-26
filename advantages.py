@@ -29,6 +29,94 @@ import torch
 _EPS = 1e-4
 
 
+# ---------------------------------------------------------------------------
+# graft-port: λ/κ redistribution expressed as per-token gradient-mask scales.
+# Master's fused decouple already scales each adapter's PARAMETER gradient by a
+# per-token mask, and scaling the param-grad by w is identical to redistributing
+# the advantage by w (for the PG term) — so λ/κ/exclusive become mask arithmetic
+# on the existing single-backward kernel. Master's hardcoded masks
+#   classic   good (rgm=1, fgm=1)        bad (rgm=0, fgm=forget_bad_scale=2)
+#   exclusive good (rgm=1, fgm=0)        bad (rgm=0, fgm=2)
+# are exactly the λ=1, κ=2 (equal-adapter) special case below — except the
+# exclusive good retain-mask, hardcoded to 1 in master (an UNCOMPENSATED stub
+# that violates equal-pressure), which this corrects to κ_R.  See
+# MASTER_PORT_PLAN §1.  λ>1 (over-routing) raises until the v=a_v 2-backward path
+# + step-bound land (MASTER_PORT_PLAN §11).
+# ---------------------------------------------------------------------------
+
+GRAFT_W_MAX = 4.0  # symmetric upper budget on the absorbing redistribution weight
+                   # = max per-coordinate retain/forget Adam-step multiplier (κ
+                   # enters m, not v, so the step ≈ w·lr).
+
+
+def adapter_kappas(n_retain: int, n_forget: int) -> tuple[float, float]:
+    """Size-derived pressure compensation κ_A = (n_R+n_F)/n_A (equal sizes → (2,2)).
+
+    When an adapter is zeroed on a sample its advantage redistributes to the
+    survivor scaled by the survivor's κ, so the joint active-policy update
+    magnitude matches no-intervention — the equal-pressure identity
+    ``w_R·n_R + w_F·n_F = n_R + n_F`` holds per sample for any λ and any sizes."""
+    assert n_retain > 0 and n_forget > 0, (n_retain, n_forget)
+    total = n_retain + n_forget
+    return total / n_retain, total / n_forget
+
+
+def routing_grad_mask_weights(routing_mode: str, lam: float,
+                              kappa_r: float, kappa_f: float):
+    """Per-token retain/forget gradient-mask scales for good (non-detected) and
+    bad (detected) ROUTING samples, returned as
+    ``(rgm_good, fgm_good, rgm_bad, fgm_bad)``.  (Coherence is retain-only —
+    ``rgm=1, fgm=0``, forget forward-off — and is set by the caller, not here.)
+
+        classic    good (1, 1)                bad (1−λ, 1+λ(κ_F−1))
+        exclusive  good (1+λ(κ_R−1), 1−λ)     bad (1−λ, 1+λ(κ_F−1))
+
+    At λ=1, κ=2: classic → good (1,1), bad (0,2); exclusive → good (2,0), bad
+    (0,2) — i.e. master's hardcoded masks, with the exclusive good retain-mask
+    raised from master's stub 1 to the compensated κ_R."""
+    if lam > 1.0:
+        raise NotImplementedError(
+            f"routing_lambda={lam} > 1 unsupported on graft-port: the over-routing "
+            "per-group λ-cap and the v=a_v 2-backward step-bound are not yet "
+            "implemented (MASTER_PORT_PLAN §11). Use routing_lambda ≤ 1.")
+    if routing_mode == "classic":
+        return (1.0, 1.0, 1.0 - lam, 1.0 + lam * (kappa_f - 1.0))
+    if routing_mode == "exclusive":
+        return (1.0 + lam * (kappa_r - 1.0), 1.0 - lam,
+                1.0 - lam, 1.0 + lam * (kappa_f - 1.0))
+    raise ValueError(
+        f"routing_mode must be 'classic' or 'exclusive', got {routing_mode!r}")
+
+
+def kappa_abs(routing_mode: str, kappa_r: float, kappa_f: float) -> float:
+    """The absorbing κ — the per-coordinate Adam-step multiplier the guard bounds.
+    classic: only the FORGET adapter absorbs (retain mask ≤ 1, never amplifies) →
+    κ_F. exclusive: retain absorbs on good (1+λ(κ_R−1)) AND forget on bad →
+    max(κ_R, κ_F)."""
+    return max(kappa_r, kappa_f) if routing_mode == "exclusive" else kappa_f
+
+
+def assert_kappa_geometry(routing_mode: str, lam: float, kappa_r: float,
+                          kappa_f: float, w_max: float = GRAFT_W_MAX) -> float:
+    """Fail-loud static-geometry guard (MASTER_PORT_PLAN §1, mode-aware, λ-aware).
+
+    The absorbing weight ``w_floor = 1 + min(λ,1)·(κ_abs−1)`` is the per-coordinate
+    Adam-step multiplier (κ enters m, not v). If it exceeds ``w_max`` the surviving
+    adapter would step at > w_max·lr and no λ-cap can reach it without forcing
+    λ_eff < 1 (breaks 'λ=1 = full routing') or distorting κ (breaks equal-pressure),
+    so we FAIL rather than silently clamp. Returns κ_abs. Strongly-unequal adapters
+    (e.g. a tiny forget adapter for strong localization) must explicitly raise
+    ``--graft_w_max`` — opting into the κ× per-coordinate LR — or rebalance sizes."""
+    ka = kappa_abs(routing_mode, kappa_r, kappa_f)
+    w_floor = 1.0 + min(float(lam), 1.0) * (ka - 1.0)
+    assert w_floor <= w_max + 1e-9, (
+        f"GRAFT adapter geometry: mode={routing_mode} κ=({kappa_r:.3g},{kappa_f:.3g}) "
+        f"λ={lam} → the surviving adapter would step at {w_floor:.3g}× lr > "
+        f"W_MAX={w_max}. Rebalance n_retain/n_forget, lower λ, use classic, or raise "
+        "--graft_w_max (opting into the κ× per-coordinate LR). Not silently clampable.")
+    return ka
+
+
 @dataclass
 class RoutedAdvantages:
     """Output of compute_routed_advantages.

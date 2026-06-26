@@ -510,6 +510,8 @@ class SampleGRPOTrainer(GRPOTrainer):
                  verbose=False, adapter_config=None,
                  renormalization_mode="retain-only",
                  split_moment=False,
+                 routing_lambda=1.0,
+                 graft_w_max=4.0,
                  drop_zero_advantage=False,
                  combined_reward=None,
                  coherence="none",
@@ -634,14 +636,14 @@ class SampleGRPOTrainer(GRPOTrainer):
         assert renormalization_mode in ("off", "retain-only", "balanced"), \
             f"invalid renormalization_mode={renormalization_mode!r}"
         if renormalization_mode == "balanced":
-            # 'balanced' (clean baseline + forget-side redistribution) is defined
-            # for classic gradient routing only — its doubling assumes a bad sample
-            # masks exactly the retain adapter (see advantages.py). Reject the
-            # silent no-op / wrong-redistribution cases loudly.
-            assert gradient_routing_enabled and routing_mode == "classic", (
-                "renormalization_mode='balanced' requires gradient routing with "
-                f"routing_mode='classic' (got gr={gradient_routing_enabled}, "
-                f"routing_mode={routing_mode!r})")
+            # 'balanced' = clean (non-flagged) baseline + λ/κ forget/retain
+            # redistribution applied as per-token gradient masks. graft-port
+            # generalizes master's classic-only ×2 to classic AND exclusive with
+            # size-derived κ (MASTER_PORT_PLAN §1). Reject the silent no-op case loudly.
+            assert gradient_routing_enabled and routing_mode in ("classic", "exclusive"), (
+                "renormalization_mode='balanced' requires gradient routing "
+                f"(classic or exclusive); got gr={gradient_routing_enabled}, "
+                f"routing_mode={routing_mode!r}")
         self._renormalization_mode = renormalization_mode
         # Split-moment Adam (v from the pre-routing gradient, m from the routed
         # gradient). Part of the 'balanced' experiment — needs its routed grad and
@@ -652,6 +654,34 @@ class SampleGRPOTrainer(GRPOTrainer):
                 "--split_moment is defined only with renormalization_mode='balanced' "
                 f"(got {renormalization_mode!r}).")
         self._split_moment = split_moment
+        # graft-port: λ/κ redistribution config + fail-loud geometry guard (MASTER_PORT_PLAN §1).
+        self._routing_lambda = routing_lambda
+        self._graft_w_max = graft_w_max
+        self._kappa_r = self._kappa_f = 1.0
+        if renormalization_mode == "balanced":
+            from advantages import adapter_kappas, assert_kappa_geometry
+            if self._adapter_type == "lora":
+                raise NotImplementedError(
+                    "graft-port: LoRA + routing is unsupported — κ from rank does not equal "
+                    "output-space pressure under LoRA's alpha/rank forward scale. Use MLP adapters.")
+            n_R = (adapter_config or {}).get("retain_neurons", 0)
+            n_F = (adapter_config or {}).get("forget_neurons", 0)
+            assert n_R > 0 and n_F > 0, (
+                "graft-port routing requires both adapters present (retain_neurons>0 and "
+                f"forget_neurons>0); got n_R={n_R}, n_F={n_F} (retain_source='base' / forget-only "
+                "is not a routing config).")
+            self._kappa_r, self._kappa_f = adapter_kappas(n_R, n_F)
+            # Per-coordinate Adam step ≈ κ at λ=1 (κ enters m, not v); fail loud if the
+            # geometry would exceed graft_w_max rather than silently clamp.
+            assert_kappa_geometry(routing_mode, routing_lambda,
+                                  self._kappa_r, self._kappa_f, graft_w_max)
+            # First slice supports λ==1 only: λ≠1 needs the v=a_v 2-backward stream (a
+            # λ-independent second moment), unimplemented here (MASTER_PORT_PLAN §11).
+            if routing_lambda != 1.0:
+                raise NotImplementedError(
+                    f"graft-port: routing_lambda={routing_lambda} != 1 is unimplemented — soft "
+                    "routing (λ<1) and over-routing (λ>1) require the 2-backward v=a_v stream for "
+                    "a λ-independent second moment. Use routing_lambda=1.0.")
         self._drop_zero_advantage = drop_zero_advantage
         self._combined_reward = combined_reward
         # --- loss_type validation (DAPO token-level support) ---
@@ -809,25 +839,36 @@ class SampleGRPOTrainer(GRPOTrainer):
         # replaces stock AdamW. Mirrors the forget_lr_mult grouping when active.
         if self.optimizer is None and getattr(self, "_split_moment", False):
             from split_moment import SplitMomentAdamW
+            assert self.loss_type == "grpo", (
+                "split_moment participation is sequence-based (c_F=N/N_routing); under "
+                "loss_type='dapo' it must be token-based (deferred, MASTER_PORT_PLAN §5). "
+                "Use loss_type='grpo'.")
             betas = (self.args.adam_beta1, self.args.adam_beta2)
             eps = self.args.adam_epsilon
             wd = self.args.weight_decay
             lr = self.args.learning_rate
-            if self._forget_lr_mult != 1.0 and self._retain_params and self._forget_params:
-                retain_p = [p for p in self._retain_params if p.requires_grad]
-                forget_p = [p for p in self._forget_params if p.requires_grad]
-                groups = [
-                    {"params": retain_p, "lr": lr, "weight_decay": wd},
-                    {"params": forget_p, "lr": lr * self._forget_lr_mult, "weight_decay": 0.0},
-                ]
-            else:
-                groups = [{"params": [p for p in self.model.parameters() if p.requires_grad],
-                           "lr": lr, "weight_decay": wd}]
+            # graft-port: ALWAYS build role-tagged retain/forget groups (even at
+            # forget_lr_mult==1) so the participation factor + freeze apply per role.
+            # Both groups decay at the run's wd — the forced forget wd=0 is dropped
+            # (the freeze skips wd on frozen windows, so forget no longer needs a
+            # global wd=0 to avoid drifting; MASTER_PORT_PLAN §4).
+            assert self._retain_params and self._forget_params, (
+                "split_moment requires both retain and forget adapters present "
+                f"(got |retain|={len(self._retain_params)}, |forget|={len(self._forget_params)}).")
+            retain_p = [p for p in self._retain_params if p.requires_grad]
+            forget_p = [p for p in self._forget_params if p.requires_grad]
+            groups = [
+                {"params": retain_p, "lr": lr, "weight_decay": wd, "graft_role": "retain"},
+                {"params": forget_p, "lr": lr * self._forget_lr_mult, "weight_decay": wd,
+                 "graft_role": "forget"},
+            ]
             self.optimizer = SplitMomentAdamW(groups, lr=lr, betas=betas, eps=eps, weight_decay=wd)
+            # Direct ref for set_window (survives accelerator wrapping).
+            self._split_moment_optimizer = self.optimizer
             n_p = sum(p.numel() for g in groups for p in g["params"])
-            print(f"[optimizer] SplitMomentAdamW (v<-pre-routing grad, m<-routed grad): "
-                  f"lr={lr} betas={betas} eps={eps} wd={wd} ({n_p:,} params, "
-                  f"{len(groups)} group(s))")
+            print(f"[optimizer] SplitMomentAdamW (v<-pre-routing grad, m<-routed grad, "
+                  f"participation+freeze): lr={lr} forget_lr={lr * self._forget_lr_mult} "
+                  f"betas={betas} eps={eps} wd={wd} ({n_p:,} params, retain+forget groups)")
 
         # Grouped optimizer for asymmetric retain/forget LRs. Must be built
         # before super().create_optimizer(), which early-returns when
@@ -3811,14 +3852,25 @@ class SampleGRPOTrainer(GRPOTrainer):
         train_fs = self._train_forget_scale()
         exclusive = (self._routing_mode == "exclusive")
         coh_set, good_set = set(coh_idx), set(good_idx)
-        # #2 redistribution (renormalization_mode='balanced'): a bad sample masks
-        # the retain adapter, so the forget adapter — the only learner there under
-        # classic routing — gets its gradient doubled. This is the per-token dual
-        # of retain's gate-mask, applied as a forget grad-scale (the _fused_decouple
-        # mask supports arbitrary float scales; for m=2 value/x-grad are preserved
-        # and the param grad is 2×). See advantages.py (the ×2 is NOT in the
-        # advantage vector). 1.0 for every other mode (no redistribution).
-        forget_bad_scale = 2.0 if self._renormalization_mode == "balanced" else 1.0
+        # Per-token gradient-mask scales (rgm=retain, fgm=forget) for good/bad
+        # routing samples, applied as forget/retain param-grad scales in the
+        # _fused_decouple path (arbitrary floats; value + x-grad preserved, own
+        # param-grad ×scale). graft-port: under 'balanced' these are the λ/κ
+        # redistribution weights — master's hardcoded {good (1, 0/1), bad (0, 2)}
+        # is the λ=1/κ=2 case, plus exclusive's good retain-mask is raised from
+        # master's uncompensated stub 1 to κ_R (MASTER_PORT_PLAN §1). Other modes
+        # (off / retain-only) keep master's gate masks (no redistribution).
+        if self._renormalization_mode == "balanced":
+            from advantages import routing_grad_mask_weights
+            rgm_good, fgm_good, rgm_bad, fgm_bad = routing_grad_mask_weights(
+                self._routing_mode, self._routing_lambda, self._kappa_r, self._kappa_f)
+            if record_metrics:
+                self._metrics.setdefault("train", {}).setdefault(
+                    "graft/max_abs_weight", []).append(
+                    float(max(abs(rgm_good), abs(fgm_good), abs(rgm_bad), abs(fgm_bad))))
+        else:
+            rgm_good, fgm_good = 1.0, (0.0 if exclusive else 1.0)
+            rgm_bad, fgm_bad = 0.0, 1.0
 
         # Split-moment: capture the pre-routing (natural) gradient into
         # p._pre_routing_grad during the same backward(s) that put the routed
@@ -3854,12 +3906,12 @@ class SampleGRPOTrainer(GRPOTrainer):
             # launches per sequence (~1600 tiny kernels at width 544).
             vals = torch.empty(3, len(indices))  # CPU staging rows: ffs, rgm, fgm
             for j, idx in enumerate(indices):
-                if idx in coh_set:               # coherence: retain-only, forget off
+                if idx in coh_set:               # coherence: retain-only, forget fwd-off
                     vals[0, j], vals[1, j], vals[2, j] = 0.0, 1.0, 0.0
-                elif idx in good_set:            # good: retain learns; forget learns (classic) / off (exclusive)
-                    vals[0, j], vals[1, j], vals[2, j] = train_fs, 1.0, (0.0 if exclusive else 1.0)
-                else:                            # bad: retain frozen; forget learns (×2 under balanced)
-                    vals[0, j], vals[1, j], vals[2, j] = train_fs, 0.0, forget_bad_scale
+                elif idx in good_set:            # good (non-detected)
+                    vals[0, j], vals[1, j], vals[2, j] = train_fs, rgm_good, fgm_good
+                else:                            # bad (detected)
+                    vals[0, j], vals[1, j], vals[2, j] = train_fs, rgm_bad, fgm_bad
             seq_lens = torch.tensor([int(p) + int(c) for p, c in seq_boundaries])
             assert int(seq_lens.sum()) == T, \
                 f"fused mask tiling mismatch: {int(seq_lens.sum())} != {T}"
@@ -3895,19 +3947,37 @@ class SampleGRPOTrainer(GRPOTrainer):
 
         # Remove the pre-routing capture before any further backward (e.g. the
         # retain-KL pass): v reflects the routed policy-gradient phase only.
+        n_routing = len(good_idx) + len(bad_idx)
         if pre_routing_cap is not None:
-            # Loud guard: if the full_backward_hook capture silently fails to fire
-            # (e.g. a gradient-checkpointing incompatibility), every buffer stays
-            # None and SplitMomentAdamW would quietly fall back to using .grad for
-            # v — degrading to plain AdamW with no error. Catch that here.
-            n_pre = sum(getattr(p, "_pre_routing_grad", None) is not None
-                        for p in (self._retain_params | self._forget_params))
-            assert n_pre > 0, (
-                "split_moment: no pre-routing gradients captured this step — the "
-                "full_backward_hook capture did not fire (likely a "
-                "gradient-checkpointing incompatibility). v would silently fall "
-                "back to the routed gradient.")
+            # Per-param capture guard (graft-port §11: no silent fallback to plain
+            # AdamW). Every ACTIVE adapter's params must have a captured pre-routing
+            # grad: retain participates every window; forget only when routing
+            # samples are present (forget is forward-off on coherence -> no capture,
+            # and is frozen in the optimizer that window, so capture isn't required).
+            miss_r = [p for p in self._retain_params if p.requires_grad
+                      and getattr(p, "_pre_routing_grad", None) is None]
+            assert not miss_r, (
+                f"split_moment: {len(miss_r)} retain param(s) have no captured "
+                "_pre_routing_grad — the pre-routing capture did not fire (likely a "
+                "gradient-checkpointing incompatibility). Refusing to silently fall "
+                "back to plain AdamW (MASTER_PORT_PLAN §11).")
+            if n_routing > 0:
+                miss_f = [p for p in self._forget_params if p.requires_grad
+                          and getattr(p, "_pre_routing_grad", None) is None]
+                assert not miss_f, (
+                    f"split_moment: {len(miss_f)} forget param(s) have no captured "
+                    "_pre_routing_grad on a routing window — capture did not fire.")
             pre_routing_cap.remove()
+
+        # graft-port: stash the participation window for SplitMomentAdamW.step()
+        # (HF's arg-less optimizer.step() consumes it). c_F = N/N_routing makes the
+        # forget adapter step at retain's per-example rate when coherence dilutes
+        # routing; freeze forget on an all-coherence window (n_routing == 0).
+        if getattr(self, "_split_moment_optimizer", None) is not None:
+            c_F = (n_kept / n_routing) if n_routing > 0 else 1.0
+            self._split_moment_optimizer.set_window(
+                {"retain": 1.0, "forget": c_F},
+                {"retain": True, "forget": n_routing > 0})
 
         # Retain-KL regularizer pass (mirrors the homogeneous path), if enabled.
         if getattr(self, "_retain_kl_coef", 0) > 0:
@@ -4608,6 +4678,16 @@ def _make_parser():
                              "routed gradient. Both come from one backward (a capture reconstructs "
                              "the natural adapter gradient). Requires renormalization_mode='balanced' "
                              "(classic GR, fused/liger path, single process); LoRA or MLP adapters.")
+    parser.add_argument("--routing_lambda", type=float, default=1.0,
+                        help="graft-port: soft-routing knob for balanced redistribution. lambda=1 "
+                             "(default) = master's clean routing (detected: retain masked / forget "
+                             "xkappa). lambda<1 (soft) and lambda>1 (over-route) require the 2-backward "
+                             "v=a_v path and raise NotImplementedError for now (MASTER_PORT_PLAN).")
+    parser.add_argument("--graft_w_max", type=float, default=4.0,
+                        help="graft-port: ceiling on the absorbing redistribution weight = max "
+                             "per-coordinate retain/forget Adam-step multiplier under routing. Fails "
+                             "loud if adapter geometry (kappa) would exceed it; raise to opt into a "
+                             "strongly-unequal adapter's kappa-x per-coordinate LR.")
     parser.add_argument("--drop_zero_advantage", action=argparse.BooleanOptionalAction, default=False,
                         help="Compute optimization: drop samples with exactly zero advantage from the "
                              "microbatches (gradient-equivalent at beta==0; requires beta==0). Default off.")
@@ -5603,6 +5683,8 @@ def _run(args, exp_cfg=None):
         adapter_config=adapter_config,
         renormalization_mode=args.renormalization_mode,
         split_moment=args.split_moment,
+        routing_lambda=args.routing_lambda,
+        graft_w_max=args.graft_w_max,
         drop_zero_advantage=args.drop_zero_advantage,
         combined_reward=combined_reward,
         vllm_client=vllm_client,

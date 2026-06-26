@@ -202,6 +202,9 @@ class ExperimentConfig(BaseModel):
     # Split-moment AdamW: Adam's v from the pre-routing gradient, m from the routed
     # gradient. See train.py --split_moment. Requires renormalization_mode='balanced'.
     split_moment: bool = False
+    # graft-port (MASTER_PORT_PLAN): λ/κ generalization of balanced redistribution.
+    routing_lambda: float = 1.0   # soft-routing knob (first slice supports lambda==1 only)
+    graft_w_max: float = 4.0      # κ-amplification guard ceiling (max per-coord Adam-step mult)
     filter_baseline: bool = False
     reward_penalty_baseline: bool = False
     reward_penalty_amount: Optional[float] = None

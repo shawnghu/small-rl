@@ -54,6 +54,31 @@ def clip_pre_routing_grads_(param_groups, max_norm, total_norm):
 
 
 class SplitMomentAdamW(AdamW):
+    """AdamW with v from the pre-routing grad and m from the routed grad, plus
+    graft-port extensions consumed via ``set_window`` each optimizer window:
+
+    - per-role PARTICIPATION factor ``c_A`` (scales the v-source in gradient space,
+      squared after → the adapter's per-window step ×= 1/c_A). With retain-only
+      coherence interleaved, ``c_F = N/N_routing`` makes the forget adapter step at
+      retain's per-EXAMPLE rate instead of Adam re-normalizing its smaller
+      accumulated v back up to the full per-window rate.
+    - FREEZE: an adapter with no examples this window (``active[role]=False``, e.g.
+      an all-coherence window for forget) is skipped entirely — m, v, the per-param
+      step counter, and weight decay all untouched — so it does not drift, and its
+      bias-correction stays correct (the per-param ``state['step']`` only advances
+      on participating windows → a per-role step counter falls out for free).
+
+    Groups carry a ``graft_role`` tag ("retain"/"forget"). A routing (tagged) param
+    with no captured ``_pre_routing_grad`` is a HARD ERROR — no silent fall-back to
+    plain AdamW under routing. Untagged params keep the plain ``v<-.grad`` fallback.
+    """
+
+    def set_window(self, participation, active):
+        """Stash {role: c_A} participation factors and {role: bool} active flags for
+        the next step(). The trainer calls this each optimizer window (before HF's
+        arg-less optimizer.step()). Consumed and cleared by step()."""
+        self._window = {"c": participation, "active": active}
+
     @torch.no_grad()
     def step(self, closure=None):
         loss = None
@@ -61,11 +86,21 @@ class SplitMomentAdamW(AdamW):
             with torch.enable_grad():
                 loss = closure()
 
+        window = getattr(self, "_window", None)
         for group in self.param_groups:
             assert not group.get("amsgrad", False), "SplitMomentAdamW: amsgrad unsupported"
             assert not group.get("maximize", False), "SplitMomentAdamW: maximize unsupported"
             assert not group.get("fused", False) and not group.get("foreach", False), (
                 "SplitMomentAdamW: fused/foreach unsupported (use the plain loop)")
+            role = group.get("graft_role")
+            # Per-role participation + freeze. Default c=1 / always-active for
+            # untagged groups or when no window was set (= no participation).
+            if window is not None and role is not None:
+                if not window["active"].get(role, True):
+                    continue  # FREEZE this adapter: skip m / v / step counter / wd
+                c = float(window["c"].get(role, 1.0))
+            else:
+                c = 1.0
             beta1, beta2 = group["betas"]
             lr = group["lr"]
             eps = group["eps"]
@@ -76,10 +111,17 @@ class SplitMomentAdamW(AdamW):
                 if g_m is None:
                     continue
                 assert not g_m.is_sparse, "SplitMomentAdamW: sparse grads unsupported"
-                # second moment <- pre-routing gradient (fallback: routed grad)
+                # second moment <- pre-routing (natural) gradient.
                 g_v = getattr(p, "_pre_routing_grad", None)
                 if g_v is None:
+                    assert role is None, (
+                        "SplitMomentAdamW: a routing param has no captured "
+                        "_pre_routing_grad — the pre-routing capture did not fire. "
+                        "Refusing to silently fall back to plain AdamW (v<-.grad) "
+                        "under routing (MASTER_PORT_PLAN §11: no silent fallback).")
                     g_v = g_m
+                if c != 1.0:
+                    g_v = g_v * c  # participation: scale the v-source (squared below)
 
                 state = self.state[p]
                 if len(state) == 0:
@@ -103,4 +145,5 @@ class SplitMomentAdamW(AdamW):
                 step_size = lr / bias_correction1
                 p.addcdiv_(exp_avg, denom, value=-step_size)
 
+        self._window = None  # consumed; the next window must set_window() again
         return loss
