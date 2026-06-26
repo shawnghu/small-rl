@@ -5,13 +5,18 @@ Exercises, on one fast toy env (SmolLM2-135M, MLP m16 → κ=2), a few steps eac
     regression anchor (the split of _packed_compute_loss must not change λ=1).
   - λ=0.5 classic   — slice 2a soft routing (2-backward, scalar masks).
   - λ=0.5 exclusive — slice 2a, bidirectional masks.
-  - λ=1.5 classic   — slice 2b over-routing (per-group λ_eff cap + B1 v-floor +
-    realized-step gate). Watch graft/max_abs_weight ≤ graft_w_max.
-  - λ=1.5 exclusive — slice 2b, both adapters absorb.
+  - λ=1.1 classic   — slice 2b over-routing (per-group λ_eff cap + B1 v-floor +
+    realized-step gate), graft_w_max raised to 64 (the over-routing per-coordinate
+    realized step is NOT bounded by the mask-weight cap — at this env's detection
+    stats λ=1.5 @ W_MAX=4 correctly TRIPS the gate at ~82× lr; λ=1.1 trains within
+    a w_max=64 budget). Watch graft/realized_step_{p999,max}.
+  - λ=1.1 exclusive — slice 2b, both adapters absorb.
 
 Validates what CPU can't: liger called TWICE on one shared forward (the m/v
 backwards), the per-microbatch .grad snapshot/restore, the accumulator rearm /
 double-flush on the real packed path, and that nothing crashes / curves are sane.
+(λ=1.5 over-budget gate-fire is a documented + CPU-tested behavior — see
+sweeps/graft_port_overroute_calib.py + tests/test_graft_overrouting.py.)
 
 Local (1 GPU):  CUDA_VISIBLE_DEVICES=0 python -u sweep.py --name graft_port_slow_smoke --config sweeps/graft_port_slow_smoke.py --no_baseline
 Modal:          python -u sweep.py --name graft_port_slow_smoke --config sweeps/graft_port_slow_smoke.py --no_baseline --backend modal
@@ -42,10 +47,10 @@ runs = [
      "run_name": "slow_classic_lam0p5_s1"},                 # 2a soft
     {**_base, "routing_mode": "exclusive", "routing_lambda": 0.5,
      "run_name": "slow_exclusive_lam0p5_s1"},               # 2a soft, bidir
-    {**_base, "routing_mode": "classic",   "routing_lambda": 1.5,
-     "run_name": "slow_classic_lam1p5_s1"},                 # 2b over-routing
-    {**_base, "routing_mode": "exclusive", "routing_lambda": 1.5,
-     "run_name": "slow_exclusive_lam1p5_s1"},               # 2b over-routing, bidir
+    {**_base, "routing_mode": "classic",   "routing_lambda": 1.1, "graft_w_max": 64.0,
+     "run_name": "slow_classic_lam1p1_s1"},                 # 2b over-routing (trains)
+    {**_base, "routing_mode": "exclusive", "routing_lambda": 1.1, "graft_w_max": 64.0,
+     "run_name": "slow_exclusive_lam1p1_s1"},               # 2b over-routing, bidir
 ]
 
 per_gpu = 5
