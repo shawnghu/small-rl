@@ -413,3 +413,107 @@ def test_no_path_leaves_base_unchanged():
         is_verified_retain=None, penalty_baseline_raw_rewards=None, cfg=cfg)
     torch.testing.assert_close(res.advantages, base, rtol=0, atol=0)
     assert not res.should_filter.any()
+
+
+# ---------------------------------------------------------------------------
+# graft-port slow path (λ≠1): two-vector advantages (a_m m-stream / a_v v-stream)
+# ---------------------------------------------------------------------------
+
+def _slow_cfg(lam, mode="classic", kr=2.0, kf=2.0, **kw):
+    return _base_cfg(gradient_routing_enabled=True, renormalization_mode="balanced",
+                     routing_lambda=lam, routing_mode=mode, kappa_r=kr, kappa_f=kf,
+                     **kw)
+
+
+def _mixed_routing_scenario(seed=0, G=4, n_groups=6):
+    """Routing-only batch with at least one MIXED group (some good, some
+    detected) so a_m and a_v genuinely diverge at λ<1."""
+    torch.manual_seed(seed)
+    n = G * n_groups
+    raw = torch.randn(n)
+    is_rh = (torch.rand(n) < 0.4)
+    g = is_rh.view(n_groups, G)
+    g[0] = torch.tensor([True, True, True, True])    # all-detected
+    g[1] = torch.tensor([False, False, False, False])  # all-good
+    g[2] = torch.tensor([True, False, True, False])    # mixed
+    is_rh = g.view(-1)
+    base = torch.randn(n)
+    is_coh = torch.zeros(n, dtype=torch.bool)
+    return raw, base, is_rh, is_coh
+
+
+def test_slow_path_lambda1_is_fast_path():
+    # At λ=1 the slow-path block is skipped: advantages_v / weights stay None and
+    # `advantages` is bit-identical to the existing single-vector balanced output.
+    raw, base, is_rh, is_coh = _mixed_routing_scenario()
+    fast = compute_routed_advantages(
+        raw_rewards=raw, base_advantages=base, is_rh=is_rh, is_coherence=is_coh,
+        is_verified_retain=None, penalty_baseline_raw_rewards=None,
+        cfg=_slow_cfg(1.0))
+    assert fast.advantages_v is None
+    assert fast.retain_grad_w is None and fast.forget_grad_w is None
+    # equals the plain balanced reference
+    torch.testing.assert_close(fast.advantages, _balanced_reference(raw, is_rh, 4),
+                               rtol=0, atol=0)
+
+
+def test_slow_path_two_vectors_diverge_on_mixed_only():
+    raw, base, is_rh, is_coh = _mixed_routing_scenario()
+    G = 4
+    res = compute_routed_advantages(
+        raw_rewards=raw, base_advantages=base, is_rh=is_rh, is_coherence=is_coh,
+        is_verified_retain=None, penalty_baseline_raw_rewards=None,
+        cfg=_slow_cfg(0.5))
+    assert res.advantages_v is not None
+    # v-stream == the λ-independent non-flagged baseline everywhere
+    torch.testing.assert_close(res.advantages_v, _balanced_reference(raw, is_rh, G),
+                               rtol=0, atol=0)
+    # a_m == a_v on all-detected (group 0) and all-good (group 1); diverge on the
+    # mixed group (group 2).
+    g_m = res.advantages.view(-1, G)
+    g_v = res.advantages_v.view(-1, G)
+    torch.testing.assert_close(g_m[0], g_v[0], rtol=0, atol=1e-6)   # all-detected
+    torch.testing.assert_close(g_m[1], g_v[1], rtol=0, atol=1e-6)   # all-good
+    assert (g_m[2] - g_v[2]).abs().max() > 1e-3                     # mixed diverges
+
+
+def test_slow_path_zero_mean_retain_property():
+    # The defining property: Σ_i w_R[i]·a_m[i] == 0 per routing group, ∀λ, ∀mode.
+    raw, base, is_rh, is_coh = _mixed_routing_scenario(seed=3)
+    G = 4
+    for lam in (0.3, 0.5, 0.9):
+        for mode, kr, kf in [("classic", 2.0, 2.0), ("exclusive", 2.5, 1.5)]:
+            res = compute_routed_advantages(
+                raw_rewards=raw, base_advantages=base, is_rh=is_rh,
+                is_coherence=is_coh, is_verified_retain=None,
+                penalty_baseline_raw_rewards=None, cfg=_slow_cfg(lam, mode, kr, kf))
+            wr = res.retain_grad_w.view(-1, G)
+            am = res.advantages.view(-1, G)
+            # all groups are routing here; weighted retain advantage sums to 0
+            wsum = (wr * am).sum(dim=1)
+            assert wsum.abs().max() < 1e-5, (lam, mode, wsum)
+
+
+def test_slow_path_coherence_keeps_a_m_eq_a_v():
+    # balanced + interlaced coherence at λ<1: coherence groups must have a_m==a_v
+    # (no weighted-baseline leak); the invariant assert inside the function would
+    # fire otherwise. Mixed routing groups still diverge.
+    G, n_groups = 4, 4
+    torch.manual_seed(1)
+    n = G * n_groups
+    raw = torch.randn(n)
+    is_rh = (torch.rand(n) < 0.5)
+    g = is_rh.view(n_groups, G)
+    g[2] = torch.tensor([True, False, True, False])   # mixed routing group
+    is_rh = g.view(-1)
+    is_coh = torch.zeros(n, dtype=torch.bool)
+    is_coh.view(n_groups, G)[0] = True                # group 0 fully coherence
+    base = torch.randn(n)
+    cfg = _slow_cfg(0.5, interlaced_coh=True, coherence_rh_mode="filter",
+                    coh_samples_per_rollout=4)
+    res = compute_routed_advantages(
+        raw_rewards=raw, base_advantages=base, is_rh=is_rh, is_coherence=is_coh,
+        is_verified_retain=None, penalty_baseline_raw_rewards=None, cfg=cfg)
+    coh = is_coh
+    torch.testing.assert_close(res.advantages[coh], res.advantages_v[coh],
+                               rtol=0, atol=1e-6)

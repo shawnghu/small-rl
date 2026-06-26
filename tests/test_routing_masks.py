@@ -8,9 +8,11 @@ formulas; (3) λ>1 raises; (4) the mode-aware (forget-classic vs retain-exclusiv
 import math
 
 import pytest
+import torch
 
-from advantages import (GRAFT_W_MAX, adapter_kappas, assert_kappa_geometry,
-                        kappa_abs, routing_grad_mask_weights)
+from advantages import (GRAFT_W_MAX, LAM_CAP_MARGIN, adapter_kappas,
+                        assert_kappa_geometry, kappa_abs, per_group_lam_eff,
+                        per_sample_routing_weights, routing_grad_mask_weights)
 
 
 def test_adapter_kappas():
@@ -41,10 +43,53 @@ def test_soft_routing_formulas():
     assert routing_grad_mask_weights("exclusive", 0.0, 9.0, 9.0) == (1.0, 1.0, 1.0, 1.0)
 
 
-def test_lambda_gt1_raises():
-    for mode in ("classic", "exclusive"):
-        with pytest.raises(NotImplementedError):
-            routing_grad_mask_weights(mode, 1.5, 2.0, 2.0)
+def test_lambda_gt1_over_routing_formula():
+    # λ>1 is now SUPPORTED (slice 2b): the bad retain mask 1−λ goes negative
+    # (anti-train retain on detected) and the bad forget mask amplifies past κ_F.
+    # routing_grad_mask_weights is a pure formula (no raise); the per-group cap
+    # bounds it. classic λ=1.5, κ_f=2: bad=(1-1.5, 1+1.5*1)=(-0.5, 2.5).
+    rg, fg, rb, fb = routing_grad_mask_weights("classic", 1.5, 2.0, 2.0)
+    assert (rg, fg, rb, fb) == (1.0, 1.0, -0.5, 2.5)
+    # exclusive λ=1.5: good=(1+1.5*1, -0.5)=(2.5,-0.5); bad=(-0.5, 2.5)
+    assert routing_grad_mask_weights("exclusive", 1.5, 2.0, 2.0) == (2.5, -0.5, -0.5, 2.5)
+    # equal-pressure still holds for equal adapters at λ>1
+    assert math.isclose(rb * 1 + fb * 1, 2.0)
+
+
+def test_per_group_lam_eff_soft_uncapped():
+    # λ≤1: every group gets λ (soft routing uncapped), regardless of detection.
+    is_rh = torch.tensor([0, 0, 1, 1, 1, 0, 0, 0], dtype=torch.bool)  # 2 groups, G=4
+    le = per_group_lam_eff(is_rh, 4, "classic", 0.5, 2.0, 2.0)
+    assert torch.allclose(le, torch.tensor([0.5, 0.5], dtype=torch.float64))
+
+
+def test_per_group_lam_eff_lower_cap_classic():
+    # classic over-routing lower cap: slope=n_det, lower=max(1, 0.95·G/n_det).
+    # A group with few detected hits the cap hard. G=4.
+    # group0: 1 detected -> slope=1 -> lower=0.95*4/1=3.8 -> min(λ=5, 3.8, upper)
+    #         upper=(W_MAX-1)/(κ_F-1)=3/1=3 -> lam_eff=min(5,3.8,3)=3
+    # group1: 4 detected -> slope=4 -> lower=0.95 -> max(1,0.95)=1 -> lam_eff=1
+    is_rh = torch.tensor([1, 0, 0, 0, 1, 1, 1, 1], dtype=torch.bool)
+    le = per_group_lam_eff(is_rh, 4, "classic", 5.0, 2.0, 2.0, w_max=4.0)
+    assert math.isclose(le[0].item(), 3.0, rel_tol=1e-9)   # upper-capped
+    assert math.isclose(le[1].item(), 1.0, rel_tol=1e-9)   # lower floor=1
+
+
+def test_per_group_lam_eff_upper_cap_only():
+    # With a generous W_MAX the upper cap relaxes; the lower cap then binds.
+    is_rh = torch.tensor([1, 0, 0, 0], dtype=torch.bool)   # 1 group, 1 detected
+    # slope=1 -> lower=0.95*4=3.8 ; upper=(16-1)/(2-1)=15 ; λ=10 -> min(10,3.8,15)=3.8
+    le = per_group_lam_eff(is_rh, 4, "classic", 10.0, 2.0, 2.0, w_max=16.0)
+    assert math.isclose(le[0].item(), LAM_CAP_MARGIN * 4 / 1, rel_tol=1e-9)
+
+
+def test_per_sample_routing_weights_lambda1_matches_scalar():
+    # At λ=1 the per-sample weights must equal the scalar masks broadcast by class.
+    is_rh = torch.tensor([0, 0, 1, 1], dtype=torch.bool)
+    rw, fw, le = per_sample_routing_weights(is_rh, 4, "classic", 1.0, 2.0, 2.0)
+    rg, fg, rb, fb = routing_grad_mask_weights("classic", 1.0, 2.0, 2.0)
+    assert torch.allclose(rw, torch.tensor([rg, rg, rb, rb]))
+    assert torch.allclose(fw, torch.tensor([fg, fg, fb, fb]))
 
 
 def test_bad_mode_raises():

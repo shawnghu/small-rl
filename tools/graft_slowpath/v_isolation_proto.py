@@ -158,11 +158,9 @@ def variant_A(beta, shift):
 # rearm() is the one small PreRoutingGradAccumulator addition the slow path needs.
 # =====================================================================================
 def _rearm(cap):
-    """Drop this backward's captures (their g) but PRESERVE saved inputs x so the
-    NEXT backward re-captures g. (Proposed method on PreRoutingGradAccumulator.)"""
-    for mod, x, g in cap._captures:
-        cap._saved[id(mod)] = x
-    cap._captures = []
+    """Now a real method on PreRoutingGradAccumulator — exercise it directly so
+    the proto regression-tests the shipped implementation."""
+    cap.rearm()
 
 def variant_B(beta, shift):
     cap = PreRoutingGradAccumulator(adapter)

@@ -26,6 +26,12 @@ from advantages import (
     AdvConfig, compute_routed_advantages, drop_zero_advantage_microbatches,
 )
 
+# graft-port: True once the slice-2b over-routing machinery is in place — the
+# per-group λ_eff cap (advantages.per_group_lam_eff), the optimizer B1 v-floor
+# (SplitMomentAdamW v_floor), and the realized-step gate (w_max). λ>1 raised in
+# the ctor while this was False.
+_GRAFT_LAMBDA_GT1_READY = True
+
 
 class Tee:
     """Write to both a file and an original stream, prepending timestamps."""
@@ -480,7 +486,7 @@ def _pack_for_forward(inputs, indices):
 
     advantages = inputs["advantages"][idx_t]
 
-    return {
+    packed = {
         "packed_input_ids": packed_input_ids,
         "packed_position_ids": packed_position_ids,
         "packed_completion_mask": packed_completion_mask,
@@ -493,6 +499,14 @@ def _pack_for_forward(inputs, indices):
         "num_sequences": n_seqs,
         "max_comp_len": max_comp_len,
     }
+    # graft-port slow path (λ≠1): carry the per-sequence v-stream advantage so the
+    # fused 2-backward can re-run liger at a_v on the shared forward (None on the
+    # fast path → key absent → single backward). The per-sample mask weights stay
+    # in `inputs` (indexed there, not packed) since the fused path builds the
+    # per-token routing tensors from sample indices directly.
+    if isinstance(inputs.get("advantages_v"), torch.Tensor):
+        packed["advantages_v"] = inputs["advantages_v"][idx_t]
+    return packed
 
 
 class SampleGRPOTrainer(GRPOTrainer):
@@ -675,13 +689,26 @@ class SampleGRPOTrainer(GRPOTrainer):
             # geometry would exceed graft_w_max rather than silently clamp.
             assert_kappa_geometry(routing_mode, routing_lambda,
                                   self._kappa_r, self._kappa_f, graft_w_max)
-            # First slice supports λ==1 only: λ≠1 needs the v=a_v 2-backward stream (a
-            # λ-independent second moment), unimplemented here (MASTER_PORT_PLAN §11).
+            assert routing_lambda > 0.0, (
+                f"routing_lambda={routing_lambda} must be > 0 (λ=0 is no-routing — "
+                "use renormalization_mode='off' instead).")
+            # λ≠1 takes the 2-backward v=a_v slow path (a λ-independent second
+            # moment), which is the whole point of decoupling v — it REQUIRES
+            # split_moment (no silent fallback to an m-stream v). λ=1 collapses to
+            # master's single-backward fast path.
             if routing_lambda != 1.0:
+                assert split_moment, (
+                    f"routing_lambda={routing_lambda} != 1 requires --split_moment "
+                    "(the slow path decouples the second moment via a 2-backward "
+                    "v=a_v capture; without it v would silently ride the λ-dependent "
+                    "a_m and detonate — MASTER_PORT_PLAN §3).")
+            # _GRAFT_LAMBDA_GT1_READY flips True once slice-2b's optimizer v-floor +
+            # realized-step gate land below; until then over-routing is hard-stopped.
+            if routing_lambda > 1.0 and not _GRAFT_LAMBDA_GT1_READY:
                 raise NotImplementedError(
-                    f"graft-port: routing_lambda={routing_lambda} != 1 is unimplemented — soft "
-                    "routing (λ<1) and over-routing (λ>1) require the 2-backward v=a_v stream for "
-                    "a λ-independent second moment. Use routing_lambda=1.0.")
+                    f"graft-port: routing_lambda={routing_lambda} > 1 (over-routing) "
+                    "is gated pending the slice-2b optimizer v-floor + realized-step "
+                    "gate. Use routing_lambda ≤ 1.")
         self._drop_zero_advantage = drop_zero_advantage
         self._combined_reward = combined_reward
         # --- loss_type validation (DAPO token-level support) ---
@@ -839,10 +866,12 @@ class SampleGRPOTrainer(GRPOTrainer):
         # replaces stock AdamW. Mirrors the forget_lr_mult grouping when active.
         if self.optimizer is None and getattr(self, "_split_moment", False):
             from split_moment import SplitMomentAdamW
-            assert self.loss_type == "grpo", (
-                "split_moment participation is sequence-based (c_F=N/N_routing); under "
-                "loss_type='dapo' it must be token-based (deferred, MASTER_PORT_PLAN §5). "
-                "Use loss_type='grpo'.")
+            # grpo + dapo both supported: the participation factor c_F is sequence-
+            # count under grpo (N/N_routing) and completion-token count under dapo
+            # (tok_kept/tok_routing) — computed per window in _fused_forward_backward
+            # (MASTER_PORT_PLAN §5/§12 2b item 4).
+            assert self.loss_type in ("grpo", "dapo"), (
+                f"split_moment supports loss_type in {{grpo, dapo}}, got {self.loss_type!r}.")
             betas = (self.args.adam_beta1, self.args.adam_beta2)
             eps = self.args.adam_epsilon
             wd = self.args.weight_decay
@@ -1606,13 +1635,13 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._last_actor_per_token_logps = None
         return loss
 
-    def _packed_compute_loss(self, model, packed_inputs):
-        """Compute GRPO loss from a packed (padding-free) forward pass.
-
-        Runs the model on packed (1, total_tokens) input, extracts per-sequence
-        completion hidden states, repads to (N, max_comp_len, hidden), then calls
-        the liger fused GRPO loss kernel. Requires use_liger_kernel=True.
-        """
+    def _packed_hidden(self, model, packed_inputs):
+        """The expensive half of `_packed_compute_loss`: run the base model on the
+        packed (1, total_tokens) input and repad each sequence's completion hidden
+        states to (N, max_comp_len, H). Returns `(last_hs_padded, ctx)` where ctx
+        carries everything `_liger_from_hidden` needs (so the cheap liger call can
+        be re-run per advantage vector on ONE shared forward — the slow-path
+        2-backward; MASTER_PORT_PLAN §12). Requires use_liger_kernel=True."""
         packed_ids = packed_inputs["packed_input_ids"]        # (1, T)
         packed_pos = packed_inputs["packed_position_ids"]      # (1, T)
         seq_boundaries = packed_inputs["seq_boundaries"]       # [(p_len, c_len), ...]
@@ -1649,18 +1678,44 @@ class SampleGRPOTrainer(GRPOTrainer):
         flat_pos = gather_pos[valid]                                   # (total_comp_tokens,)
         last_hs_padded[valid] = hidden_states[0].index_select(0, flat_pos)
 
+        ctx = {
+            "unwrapped_model": unwrapped_model,
+            "loss_mask": packed_inputs["completion_mask"],          # (N, max_comp_len)
+            "completion_ids": packed_inputs["completion_ids"],
+            "old_per_token_logps": packed_inputs["old_per_token_logps"],
+            "ref_per_token_logps": packed_inputs["ref_per_token_logps"],
+            "sampling_per_token_logps": packed_inputs.get("sampling_per_token_logps"),
+        }
+        return last_hs_padded, ctx
+
+    def _liger_from_hidden(self, last_hs_padded, ctx, advantages, *, record_diag=True):
+        """The cheap half of `_packed_compute_loss`: the liger fused GRPO loss for a
+        given `advantages` vector on already-computed hidden states. Re-runnable
+        per advantage vector on one shared forward (slow-path 2-backward). The
+        no_grad logp/entropy/kl diagnostic recompute fires only when `record_diag`
+        is True — pass False on the slow path's v-backward so it isn't double-logged
+        (MASTER_PORT_PLAN §12 item 4)."""
+        unwrapped_model = ctx["unwrapped_model"]
+        loss_mask = ctx["loss_mask"]
+
         # Call liger fused loss
-        loss_mask = packed_inputs["completion_mask"]  # (N, max_comp_len)
         loss, metrics = self.liger_grpo_loss(
             _input=last_hs_padded,
             lin_weight=unwrapped_model.lm_head.weight,
-            selected_token_ids=packed_inputs["completion_ids"],
+            selected_token_ids=ctx["completion_ids"],
             attention_mask=loss_mask,
-            advantages=packed_inputs["advantages"],
+            advantages=advantages,
             bias=getattr(unwrapped_model.lm_head, 'bias', None),
-            old_per_token_logps=packed_inputs["old_per_token_logps"],
-            ref_per_token_logps=packed_inputs["ref_per_token_logps"],
+            old_per_token_logps=ctx["old_per_token_logps"],
+            ref_per_token_logps=ctx["ref_per_token_logps"],
         )
+
+        # The slow-path v-backward re-runs this on the SAME hidden states with a
+        # different advantage; it must log NOTHING (kl/clip_ratio/entropy already
+        # logged by the m-call) — return before any metric mutation to avoid
+        # double-counting (MASTER_PORT_PLAN §12 item 4).
+        if not record_diag:
+            return loss
 
         # Log metrics
         mode = "train" if self.model.training else "eval"
@@ -1675,11 +1730,12 @@ class SampleGRPOTrainer(GRPOTrainer):
         # not interfere with the autograd graph liger built). Chunked over batch
         # to bound peak memory at chunk * T * V * 2 bytes (~0.9 GB for chunk=2,
         # T=1500, V=151k bf16). Adds ~5% to actor update time.
-        sampling_logps = packed_inputs.get("sampling_per_token_logps")
+        unwrapped_model = ctx["unwrapped_model"]
+        sampling_logps = ctx.get("sampling_per_token_logps")
         with torch.no_grad():
             B = last_hs_padded.shape[0]
             chunk = 2
-            sel_ids = packed_inputs["completion_ids"]
+            sel_ids = ctx["completion_ids"]
             per_token_logps = torch.zeros_like(loss_mask, dtype=torch.float32)
             entropies = torch.zeros_like(loss_mask, dtype=torch.float32)
             for b in range(0, B, chunk):
@@ -1710,6 +1766,15 @@ class SampleGRPOTrainer(GRPOTrainer):
                 )
 
         return loss
+
+    def _packed_compute_loss(self, model, packed_inputs):
+        """Compute GRPO loss from a packed (padding-free) forward pass — the
+        single-advantage path (fast path, non-routing, eval). `_packed_hidden`
+        does the forward+repad; `_liger_from_hidden` the liger call + diagnostics.
+        Requires use_liger_kernel=True."""
+        last_hs_padded, ctx = self._packed_hidden(model, packed_inputs)
+        return self._liger_from_hidden(last_hs_padded, ctx, packed_inputs["advantages"],
+                                       record_diag=True)
 
     def log(self, logs, *args, **kwargs):
         prompt = getattr(self, "_last_sample_prompt", None)
@@ -2888,6 +2953,11 @@ class SampleGRPOTrainer(GRPOTrainer):
                 rh_detector_verifies_retain_samples=self._rh_detector_verifies_retain_samples,
                 coh_samples_per_rollout=self._coh_samples_per_rollout,
                 rp_extra_retain_advantage_multiplier=self._rp_extra_retain_advantage_multiplier,
+                routing_lambda=self._routing_lambda,
+                routing_mode=(self._routing_mode or "classic"),
+                kappa_r=self._kappa_r,
+                kappa_f=self._kappa_f,
+                graft_w_max=self._graft_w_max,
             )
             # Snapshot the pre-renormalization advantage (base GRPO group-normalize)
             # before compute_routed_advantages rewrites it. The routing trace logs
@@ -2905,6 +2975,17 @@ class SampleGRPOTrainer(GRPOTrainer):
             )
             output["advantages"] = adv_result.advantages
             output["should_filter"] = adv_result.should_filter
+            # graft-port slow path (λ≠1): inject the v-stream + per-sample mask
+            # weights into the batch dict so they ride split_tensor_dict /
+            # shuffle_sequence_dict alongside `advantages` (same [n] shape, sliced
+            # uniformly). Present iff balanced & λ≠1 — the fused path's slow-path
+            # branch keys on `inputs.get("advantages_v") is not None` (robust to
+            # the post-shuffle loss of object identity). At λ=1 these are absent →
+            # the single-backward fast path (master parity).
+            if adv_result.advantages_v is not None:
+                output["advantages_v"] = adv_result.advantages_v
+                output["retain_grad_w"] = adv_result.retain_grad_w
+                output["forget_grad_w"] = adv_result.forget_grad_w
 
             # --- Diagnostics: coherence vs routing split (Family 1 — signal collapse) ---
             # Per-group advantage/reward std and RH-related fractions, tagged by
@@ -3775,6 +3856,62 @@ class SampleGRPOTrainer(GRPOTrainer):
 
         return total_loss
 
+    def _slow_microbatch_backward(self, model, packed, cap, forget_fwd_1t1, scale,
+                                  trainable, *, v_floor=False):
+        """One microbatch of the λ≠1 slow path (MASTER_PORT_PLAN §12): ONE shared
+        fused forward, TWO honest backwards.
+
+          - m rides ``a_m`` (``packed['advantages']``) through the decouple masks
+            into ``.grad`` (the first-moment source).
+          - v rides ``a_v`` (``packed['advantages_v']``, λ-independent) through the
+            accumulator's natural re-forward into ``_pre_routing_grad`` (the
+            second-moment source) — recaptured on the SAME forward via ``rearm``.
+
+        Disjointness is held by THREE guards, two of which fail SILENTLY if
+        omitted (proven in tools/graft_slowpath/adv_failmodes.py): (a) snapshot &
+        restore ``.grad`` around the v-backward (else m = masked(a_m)+masked(a_v));
+        (b) ``rearm()`` between the backwards (else v rides g_m); (c) the v-backward
+        must produce captures (else the flush is a stale no-op). CPU-proven to fp64
+        (worst m/v cross-contamination 1.21e-15) in v_isolation_proto.py.
+
+        ``v_floor`` (2b, λ>1 only): also flush bw1's a_m-side natural grad into
+        ``_v_routed`` (keeping x for bw2) so the optimizer can floor
+        ``v ← max(v_natural, v_routed)`` — restores the shared-clip invariant that
+        the off-policy λ>1 sign-flip breaks (MASTER_PORT_PLAN §12 2b item 3, B1)."""
+        with self.compute_loss_context_manager():
+            last_hs, lctx = self._packed_hidden(model, packed)
+            # bw1: m at a_m (masked); retain the shared forward for bw2.
+            loss_m = self._liger_from_hidden(last_hs, lctx, packed["advantages"],
+                                             record_diag=True)
+        self.accelerator.backward(loss_m * scale, retain_graph=True)
+        # Snapshot the running m total (cumulative across microbatches) so bw2's
+        # masked-grad-at-a_v never contaminates m (silent failure if omitted).
+        m_snap = [(p, None if p.grad is None else p.grad.detach().clone())
+                  for p in trainable]
+        for p in trainable:
+            p.grad = None
+        # Rearm: drop bw1's g_m captures, KEEP x so bw2 re-captures g_v with no
+        # second adapter forward (silent failure → v rides g_m). v_floor instead
+        # flushes bw1's a_m natural grad into _v_routed AND keeps x.
+        if v_floor:
+            cap.flush(forget_fwd_1t1, into="_v_routed", keep=True)
+        else:
+            cap.rearm()
+        with self.compute_loss_context_manager():
+            # bw2: v at a_v (natural via the accumulator) on the SAME forward.
+            loss_v = self._liger_from_hidden(last_hs, lctx, packed["advantages_v"],
+                                             record_diag=False)
+        self.accelerator.backward(loss_v * scale)
+        assert cap._captures, (
+            "slow path: the v-backward produced no adapter captures — the flush "
+            "would be a stale no-op and v would not reflect a_v (MASTER_PORT_PLAN "
+            "§12 assert c). The adapter backward hook did not fire.")
+        cap.flush(forget_fwd_1t1)                  # -> _pre_routing_grad (natural a_v)
+        # Restore .grad = m (the optimizer's first-moment source).
+        for p, g in m_snap:
+            p.grad = g
+        return loss_m
+
     def _fused_forward_backward(self, model, inputs, all_mbs,
                                original_advantages, token_counts, scale_denom,
                                n_total, num_items_in_batch, use_packed,
@@ -3852,6 +3989,14 @@ class SampleGRPOTrainer(GRPOTrainer):
         train_fs = self._train_forget_scale()
         exclusive = (self._routing_mode == "exclusive")
         coh_set, good_set = set(coh_idx), set(good_idx)
+        # graft-port SLOW PATH (λ≠1, MASTER_PORT_PLAN §12): the v-stream advantage
+        # is injected into the batch dict only when balanced & λ≠1, so its presence
+        # selects the 2-backward orchestration (robust to the post-shuffle loss of
+        # object identity). At λ=1 it is absent → the single-backward fast path
+        # (full master parity). On the slow path the masks are PER-SAMPLE (the
+        # λ/κ table with the per-group over-routing cap baked in, λ>1).
+        slow = isinstance(inputs.get("advantages_v"), torch.Tensor)
+        retain_w_cpu = forget_w_cpu = None
         # Per-token gradient-mask scales (rgm=retain, fgm=forget) for good/bad
         # routing samples, applied as forget/retain param-grad scales in the
         # _fused_decouple path (arbitrary floats; value + x-grad preserved, own
@@ -3860,7 +4005,18 @@ class SampleGRPOTrainer(GRPOTrainer):
         # is the λ=1/κ=2 case, plus exclusive's good retain-mask is raised from
         # master's uncompensated stub 1 to κ_R (MASTER_PORT_PLAN §1). Other modes
         # (off / retain-only) keep master's gate masks (no redistribution).
-        if self._renormalization_mode == "balanced":
+        rgm_good = fgm_good = rgm_bad = fgm_bad = None
+        if self._renormalization_mode == "balanced" and slow:
+            # Per-sample masks (one float per batch sample; coherence entries are
+            # ignored — the vals loop overrides coherence to rgm=1, fgm=0).
+            retain_w_cpu = inputs["retain_grad_w"].detach().cpu().tolist()
+            forget_w_cpu = inputs["forget_grad_w"].detach().cpu().tolist()
+            if record_metrics and (good_idx or bad_idx):
+                self._metrics.setdefault("train", {}).setdefault(
+                    "graft/max_abs_weight", []).append(float(max(
+                        max(abs(retain_w_cpu[i]), abs(forget_w_cpu[i]))
+                        for i in (good_idx + bad_idx))))
+        elif self._renormalization_mode == "balanced":
             from advantages import routing_grad_mask_weights
             rgm_good, fgm_good, rgm_bad, fgm_bad = routing_grad_mask_weights(
                 self._routing_mode, self._routing_lambda, self._kappa_r, self._kappa_f)
@@ -3888,6 +4044,30 @@ class SampleGRPOTrainer(GRPOTrainer):
             pre_routing_cap = PreRoutingGradAccumulator(model)
             pre_routing_cap.reset()
 
+        # graft-port slow-path preconditions (MASTER_PORT_PLAN §12 — two of the
+        # three invariants fail SILENTLY otherwise; this is assert (a): the base
+        # model/head must be frozen so the per-microbatch .grad snapshot/restore
+        # covers EXACTLY the adapter params the two backwards write).
+        trainable = None
+        v_floor = False
+        if slow:
+            assert self._renormalization_mode == "balanced", (
+                "advantages_v present but renormalization_mode != 'balanced' — the "
+                "two-vector slow path is balanced-only.")
+            assert pre_routing_cap is not None, (
+                "graft-port slow path (λ≠1) requires --split_moment: the v=a_v "
+                "capture is the whole point of decoupling the second moment. No "
+                "silent fallback to m-stream v (MASTER_PORT_PLAN §12).")
+            trainable = [p for p in model.parameters() if p.requires_grad]
+            adapter_ids = {id(p) for p in (set(self._retain_params)
+                                           | set(self._forget_params))}
+            non_adapter = [p for p in trainable if id(p) not in adapter_ids]
+            assert not non_adapter, (
+                f"slow path: {len(non_adapter)} trainable non-adapter param(s) — the "
+                "base model/head must be frozen so the .grad snapshot/restore is "
+                "exact (MASTER_PORT_PLAN §12 assert a).")
+            v_floor = self._routing_lambda > 1.0   # B1 v-floor (2b, λ>1 only)
+
         if record_metrics:
             torch.cuda.reset_peak_memory_stats()
         _t0 = time.perf_counter()
@@ -3908,6 +4088,9 @@ class SampleGRPOTrainer(GRPOTrainer):
             for j, idx in enumerate(indices):
                 if idx in coh_set:               # coherence: retain-only, forget fwd-off
                     vals[0, j], vals[1, j], vals[2, j] = 0.0, 1.0, 0.0
+                elif slow:                       # routing sample: per-sample λ/κ masks
+                    vals[0, j], vals[1, j], vals[2, j] = (
+                        train_fs, retain_w_cpu[idx], forget_w_cpu[idx])
                 elif idx in good_set:            # good (non-detected)
                     vals[0, j], vals[1, j], vals[2, j] = train_fs, rgm_good, fgm_good
                 else:                            # bad (detected)
@@ -3931,15 +4114,23 @@ class SampleGRPOTrainer(GRPOTrainer):
             set_fused_routing(forget_fwd.view(1, T, 1), retain_gm.view(1, T, 1),
                               forget_gm.view(1, T, 1))
             try:
-                with self.compute_loss_context_manager():
-                    loss = self._packed_compute_loss(model, packed)
-                self.accelerator.backward(loss * scale)
-                # Reduce this microbatch's pre-routing (natural) gradient into the
-                # v buffers, from the captures this backward just produced. The
-                # per-token forget forward-scale (0 on coherence tokens) makes
-                # coherence contribute weight-1 to retain's v and 0 to forget's.
-                if pre_routing_cap is not None:
-                    pre_routing_cap.flush(forget_fwd.view(1, T, 1))
+                if slow:
+                    # λ≠1: ONE shared forward, TWO backwards (m at a_m masked → .grad;
+                    # v at a_v natural → _pre_routing_grad), MASTER_PORT_PLAN §12.
+                    loss = self._slow_microbatch_backward(
+                        model, packed, pre_routing_cap, forget_fwd.view(1, T, 1),
+                        scale, trainable, v_floor=v_floor)
+                else:
+                    with self.compute_loss_context_manager():
+                        loss = self._packed_compute_loss(model, packed)
+                    self.accelerator.backward(loss * scale)
+                    # Reduce this microbatch's pre-routing (natural) gradient into
+                    # the v buffers, from the captures this backward just produced.
+                    # The per-token forget forward-scale (0 on coherence tokens)
+                    # makes coherence contribute weight-1 to retain's v and 0 to
+                    # forget's.
+                    if pre_routing_cap is not None:
+                        pre_routing_cap.flush(forget_fwd.view(1, T, 1))
             finally:
                 clear_fused_routing()
             total_loss = total_loss + loss.detach() * scale
@@ -3970,14 +4161,30 @@ class SampleGRPOTrainer(GRPOTrainer):
             pre_routing_cap.remove()
 
         # graft-port: stash the participation window for SplitMomentAdamW.step()
-        # (HF's arg-less optimizer.step() consumes it). c_F = N/N_routing makes the
-        # forget adapter step at retain's per-example rate when coherence dilutes
-        # routing; freeze forget on an all-coherence window (n_routing == 0).
+        # (HF's arg-less optimizer.step() consumes it). c_F makes the forget adapter
+        # step at retain's per-example rate when coherence dilutes routing; freeze
+        # forget on an all-coherence window (n_routing == 0). Under grpo c_F is
+        # sequence-count (N/N_routing); under dapo (token-normalized loss) it must
+        # be COMPLETION-TOKEN count (tok_kept/tok_routing) — same unit as tok_denom
+        # — else forget over-steps when hacks are short / coherence is long
+        # (MASTER_PORT_PLAN §5/§12 2b item 4).
         if getattr(self, "_split_moment_optimizer", None) is not None:
-            c_F = (n_kept / n_routing) if n_routing > 0 else 1.0
+            if n_routing > 0:
+                if self.loss_type == "dapo":
+                    tok_kept = sum(comp_token_counts[i] for i in kept)
+                    tok_routing = sum(comp_token_counts[i] for i in (good_idx + bad_idx))
+                    c_F = (tok_kept / tok_routing) if tok_routing > 0 else 1.0
+                else:
+                    c_F = n_kept / n_routing
+            else:
+                c_F = 1.0
+            # λ>1 over-routing: arm the B1 v-floor + the realized-step gate.
+            over_routing = self._routing_lambda > 1.0
             self._split_moment_optimizer.set_window(
                 {"retain": 1.0, "forget": c_F},
-                {"retain": True, "forget": n_routing > 0})
+                {"retain": True, "forget": n_routing > 0},
+                v_floor=over_routing,
+                w_max=(self._graft_w_max if over_routing else None))
 
         # Retain-KL regularizer pass (mirrors the homogeneous path), if enabled.
         if getattr(self, "_retain_kl_coef", 0) > 0:
@@ -4681,8 +4888,10 @@ def _make_parser():
     parser.add_argument("--routing_lambda", type=float, default=1.0,
                         help="graft-port: soft-routing knob for balanced redistribution. lambda=1 "
                              "(default) = master's clean routing (detected: retain masked / forget "
-                             "xkappa). lambda<1 (soft) and lambda>1 (over-route) require the 2-backward "
-                             "v=a_v path and raise NotImplementedError for now (MASTER_PORT_PLAN).")
+                             "xkappa), single-backward fast path. lambda<1 (soft) and lambda>1 "
+                             "(over-route) take the 2-backward v=a_v slow path (require --split_moment); "
+                             "lambda>1 adds the per-group over-routing cap + B1 v-floor + realized-step "
+                             "gate (MASTER_PORT_PLAN §12).")
     parser.add_argument("--graft_w_max", type=float, default=4.0,
                         help="graft-port: ceiling on the absorbing redistribution weight = max "
                              "per-coordinate retain/forget Adam-step multiplier under routing. Fails "

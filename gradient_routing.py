@@ -898,9 +898,12 @@ class PreRoutingGradAccumulator:
                 self._params += m.get_retain_params() + m.get_forget_params()
 
     def reset(self):
-        """Clear the pre-routing buffers (call once before the step's backward(s))."""
+        """Clear the pre-routing buffers (call once before the step's backward(s)).
+        Clears both the v-source (`_pre_routing_grad`) and the λ>1 B1 v-floor's
+        a_m-side natural buffer (`_v_routed`)."""
         for p in self._params:
             p._pre_routing_grad = None
+            p._v_routed = None
 
     def _save(self, mod, args):
         self._saved[id(mod)] = args[0].detach()
@@ -914,15 +917,41 @@ class PreRoutingGradAccumulator:
         # the grad buffer may be freed/reused once this backward completes.
         self._captures.append((mod, x, g.detach().clone()))
 
-    def flush(self, forget_fwd_scale):
+    def rearm(self):
+        """SLOW PATH (λ≠1), BETWEEN the two backwards through ONE shared forward:
+        drop this backward's captured output-grads ``g`` (they belong to the
+        m-backward at ``a_m``) but move each capture's saved input ``x`` back into
+        ``_saved``, so the NEXT backward's hook re-captures ``g`` at ``a_v`` with
+        NO second adapter forward. (Contrast ``flush()``, which CONSUMES the
+        captures into a buffer.) Asserts ≥1 capture moved — a silent omission
+        would make ``v`` ride the m-backward's ``g_m`` (MASTER_PORT_PLAN §12)."""
+        moved = 0
+        for mod, x, g in self._captures:
+            self._saved[id(mod)] = x
+            moved += 1
+        self._captures = []
+        assert moved >= 1, (
+            "PreRoutingGradAccumulator.rearm: no captures to rearm — the m-backward "
+            "did not fire the adapter backward hook (graph/checkpointing issue).")
+
+    def flush(self, forget_fwd_scale, into="_pre_routing_grad", keep=False):
         """Process the current microbatch's captures: recover the natural adapter
         gradient via autograd through a fresh natural re-forward, accumulate into
-        ``_pre_routing_grad``, and clear. Call once after each microbatch backward.
+        the ``into`` per-param buffer, and clear the captures. Call once after each
+        microbatch backward.
 
         ``forget_fwd_scale``: this microbatch's per-token forward forget-scale
         (``[1, T, 1]`` tensor; ``train_forget_scale`` on routing tokens, 0 on
         coherence tokens) so the forget adapter's v excludes coherence. A scalar
-        also works (no coherence)."""
+        also works (no coherence).
+
+        ``into``: the per-param buffer attribute to accumulate into —
+        ``'_pre_routing_grad'`` (default; the v-source) or ``'_v_routed'`` (the
+        λ>1 B1 v-floor's a_m-side natural capture). ``keep``: if True, repopulate
+        ``_saved`` with each capture's ``x`` so a SUBSEQUENT backward through the
+        same shared forward re-captures ``g`` — used by the B1 double-flush (flush
+        the a_m captures into ``_v_routed`` AND keep ``x`` for the a_v backward).
+        """
         for mod, x, g in self._captures:
             params = mod.get_retain_params() + mod.get_forget_params()
             with torch.enable_grad():
@@ -932,8 +961,10 @@ class PreRoutingGradAccumulator:
             for p, gp in zip(params, grads):
                 if gp is None:
                     continue
-                b = getattr(p, "_pre_routing_grad", None)
-                p._pre_routing_grad = gp.detach() if b is None else b.add_(gp.detach())
+                b = getattr(p, into, None)
+                setattr(p, into, gp.detach() if b is None else b.add_(gp.detach()))
+            if keep:
+                self._saved[id(mod)] = x
         self._captures = []
 
     def remove(self):

@@ -47,6 +47,9 @@ _EPS = 1e-4
 GRAFT_W_MAX = 4.0  # symmetric upper budget on the absorbing redistribution weight
                    # = max per-coordinate retain/forget Adam-step multiplier (κ
                    # enters m, not v, so the step ≈ w·lr).
+LAM_CAP_MARGIN = 0.95  # over-routing lower-cap safety margin on G/slope (mirror of
+                       # GRAFT_W_MAX; keeps Σw_R from collapsing/reversing at λ>1,
+                       # bug #16). One module constant — never duplicated inline.
 
 
 def adapter_kappas(n_retain: int, n_forget: int) -> tuple[float, float]:
@@ -73,12 +76,12 @@ def routing_grad_mask_weights(routing_mode: str, lam: float,
 
     At λ=1, κ=2: classic → good (1,1), bad (0,2); exclusive → good (2,0), bad
     (0,2) — i.e. master's hardcoded masks, with the exclusive good retain-mask
-    raised from master's stub 1 to the compensated κ_R."""
-    if lam > 1.0:
-        raise NotImplementedError(
-            f"routing_lambda={lam} > 1 unsupported on graft-port: the over-routing "
-            "per-group λ-cap and the v=a_v 2-backward step-bound are not yet "
-            "implemented (MASTER_PORT_PLAN §11). Use routing_lambda ≤ 1.")
+    raised from master's stub 1 to the compensated κ_R.
+
+    Valid for any λ>0: at λ>1 the bad retain mask ``1−λ`` goes negative
+    (anti-training the retain adapter on detected samples — the over-routing
+    intent), bounded per group by ``per_group_lam_eff`` (the caller passes the
+    capped lam_eff, never the raw λ, on the over-routing path)."""
     if routing_mode == "classic":
         return (1.0, 1.0, 1.0 - lam, 1.0 + lam * (kappa_f - 1.0))
     if routing_mode == "exclusive":
@@ -94,6 +97,73 @@ def kappa_abs(routing_mode: str, kappa_r: float, kappa_f: float) -> float:
     κ_F. exclusive: retain absorbs on good (1+λ(κ_R−1)) AND forget on bad →
     max(κ_R, κ_F)."""
     return max(kappa_r, kappa_f) if routing_mode == "exclusive" else kappa_f
+
+
+def per_group_lam_eff(is_rh: torch.Tensor, G: int, routing_mode: str, lam: float,
+                      kappa_r: float, kappa_f: float,
+                      w_max: float = GRAFT_W_MAX) -> torch.Tensor:
+    """Per-group effective λ for over-routing (λ>1). Returns a ``(n_groups,)``
+    float64 tensor. Two floors, each ≥ 1 (both ``min`` terms, both floored — they
+    never conflict: the lower guards ``Σw_R→0``/reversal, the upper guards
+    ``max|w|→∞``):
+
+      - **lower** (anti-singularity, bug #16): keep the retain weight-sum from
+        collapsing/reversing. ``slope = n_det`` (classic) /
+        ``n_det − n_nd·(κ_R−1)`` (exclusive); ``lower = max(1, MARGIN·G/slope)``
+        if ``slope>0`` else ``+inf`` (no singularity in that regime).
+      - **upper** (κ-amplification budget): keep ``max|w| ≤ w_max``.
+        ``κ_abs = κ_F`` (classic) / ``max(κ_R,κ_F)`` (exclusive);
+        ``upper = max(1, (w_max−1)/(κ_abs−1))`` — constant across groups.
+
+    ``lam_eff = max(1, min(lam, lower, upper))`` per group. For ``lam ≤ 1`` every
+    group gets ``lam`` (soft routing is uncapped — the cap is λ>1-only)."""
+    n_groups = is_rh.numel() // G
+    if lam <= 1.0:
+        return torch.full((n_groups,), float(lam), dtype=torch.float64,
+                          device=is_rh.device)
+    rh_g = is_rh.view(n_groups, G)
+    n_det = rh_g.sum(dim=1).to(torch.float64)            # (n_groups,)
+    n_nd = float(G) - n_det
+    ka = kappa_abs(routing_mode, kappa_r, kappa_f)
+    upper = max(1.0, (w_max - 1.0) / (ka - 1.0)) if ka > 1.0 else float("inf")
+    if routing_mode == "classic":
+        slope = n_det
+    elif routing_mode == "exclusive":
+        slope = n_det - n_nd * (kappa_r - 1.0)
+    else:
+        raise ValueError(f"routing_mode must be 'classic'/'exclusive', got {routing_mode!r}")
+    inf = torch.full_like(slope, float("inf"))
+    lower = torch.where(slope > 0,
+                        torch.clamp(LAM_CAP_MARGIN * G / slope.clamp(min=1e-12),
+                                    min=1.0),
+                        inf)
+    lam_eff = torch.minimum(lower, torch.full_like(lower, min(float(lam), upper)))
+    return torch.clamp(lam_eff, min=1.0)
+
+
+def per_sample_routing_weights(is_rh: torch.Tensor, G: int, routing_mode: str,
+                               lam: float, kappa_r: float, kappa_f: float,
+                               w_max: float = GRAFT_W_MAX):
+    """Per-sample ``(n,)`` retain/forget gradient-mask weights for ROUTING samples,
+    using the per-group over-routing cap (``per_group_lam_eff``). Returns
+    ``(retain_w, forget_w, lam_eff)`` (float32 weights + the ``(n_groups,)``
+    lam_eff). For ``λ≤1`` the weights are uniform-by-class (lam_eff=λ everywhere);
+    for ``λ>1`` they vary per group. Coherence samples are NOT special-cased here
+    — the fused path overrides them (``rgm=1, fgm=0``)."""
+    le = per_group_lam_eff(is_rh, G, routing_mode, lam, kappa_r, kappa_f, w_max)
+    if routing_mode == "classic":
+        rgm_good = torch.ones_like(le)
+        fgm_good = torch.ones_like(le)
+    else:  # exclusive (per_group_lam_eff already rejected other modes)
+        rgm_good = 1.0 + le * (kappa_r - 1.0)
+        fgm_good = 1.0 - le
+    rgm_bad = 1.0 - le
+    fgm_bad = 1.0 + le * (kappa_f - 1.0)
+    rg, fg = rgm_good.repeat_interleave(G), fgm_good.repeat_interleave(G)
+    rb, fb = rgm_bad.repeat_interleave(G), fgm_bad.repeat_interleave(G)
+    retain_w = torch.where(is_rh, rb, rg).to(torch.float32)
+    forget_w = torch.where(is_rh, fb, fg).to(torch.float32)
+    return retain_w, forget_w, le
 
 
 def assert_kappa_geometry(routing_mode: str, lam: float, kappa_r: float,
@@ -121,18 +191,31 @@ def assert_kappa_geometry(routing_mode: str, lam: float, kappa_r: float,
 class RoutedAdvantages:
     """Output of compute_routed_advantages.
 
-    advantages: final per-sample advantage [n]. This is the ONLY advantage the
-        update stage consumes — retain renormalization is folded in directly
-        (good-routing samples carry their renormed advantage), so there is no
-        separate retain_advantages tensor.
+    advantages: final per-sample advantage [n]. The m-stream (first-moment
+        source). Retain renormalization is folded in directly (good-routing
+        samples carry their renormed advantage), so there is no separate
+        retain_advantages tensor.
     should_filter: bool [n] — samples the update stage should DROP entirely
         (no policy-gradient, no KL). Currently nonzero only for coherence
         samples that the verifier (~is_verified_retain) or filter_renorm
         (is_rh) marks. Routing samples are never flagged here (the good/bad
         split handles them).
+    advantages_v: Optional [n] — the SLOW-PATH (λ≠1) v-stream (second-moment
+        source): the λ-independent non-flagged-baseline advantage ``a_v``. None
+        on the fast path (λ=1, where ``a_m == a_v`` so one backward carries both
+        — full master parity). When present, ``advantages`` is the weighted-
+        baseline ``a_m`` and the update stage runs the 2-backward orchestration.
+    retain_grad_w / forget_grad_w: Optional [n] — slow-path per-sample retain/
+        forget gradient-mask weights (the λ/κ table, with the per-group
+        over-routing cap baked in for λ>1). None on the fast path (the fused
+        path uses the scalar masks then). Coherence entries are unused (the
+        fused path overrides coherence to ``rgm=1, fgm=0``).
     """
     advantages: torch.Tensor
     should_filter: torch.Tensor
+    advantages_v: Optional[torch.Tensor] = None
+    retain_grad_w: Optional[torch.Tensor] = None
+    forget_grad_w: Optional[torch.Tensor] = None
 
 
 @dataclass(frozen=True)
@@ -165,6 +248,14 @@ class AdvConfig:
     rh_detector_verifies_retain_samples: bool
     coh_samples_per_rollout: int
     rp_extra_retain_advantage_multiplier: float = 1.0
+    # graft-port slow path (λ≠1): the λ/κ redistribution config. Only consulted
+    # under renormalization_mode='balanced' with routing_lambda != 1; the fast
+    # path (λ=1) ignores them. Defaults keep the canonical λ=1/κ=2 behavior.
+    routing_lambda: float = 1.0
+    routing_mode: str = "classic"
+    kappa_r: float = 2.0
+    kappa_f: float = 2.0
+    graft_w_max: float = GRAFT_W_MAX
 
 
 def drop_zero_advantage_microbatches(all_mbs, advantages):
@@ -255,6 +346,34 @@ def _baseline_nonflagged_var_all(rewards: torch.Tensor, nonflagged: torch.Tensor
     return out.view(-1)
 
 
+def _baseline_weighted_var_all(rewards: torch.Tensor, w_retain: torch.Tensor,
+                               G: int) -> torch.Tensor:
+    """Per-group GRPO renorm with a *weighted* baseline (the m-stream ``a_m``).
+
+    ``baseline = Σ_i w_R[i]·r_i / Σ_i w_R[i]`` (per group), scale = whole-group
+    std. This is the key property of the slow path: the masked retain PG gradient
+    is **zero-mean at every λ**, because ``Σ_i w_R[i]·a_m[i] = (1/σ)(Σ w_R·r −
+    b_weighted·Σ w_R) = 0``. ``w_retain[i]`` is the per-sample retain gradient-mask
+    (``rgm_good``/``rgm_bad`` per the λ/κ table).
+
+    At λ=1 this coincides with ``_baseline_nonflagged_var_all`` (the retain mask
+    is the non-flagged indicator up to a constant κ_R that cancels), so the
+    slow→fast transition is continuous. Falls back to the plain group mean when
+    ``|Σw_R| ≤ _EPS`` (e.g. an all-detected classic group at λ=1 where every
+    retain weight is 0) — the SAME fallback the non-flagged baseline takes there.
+    Std uses the torch default (unbiased), per the module std convention."""
+    grouped = rewards.view(-1, G)
+    w = w_retain.view(-1, G)
+    out = torch.zeros_like(grouped)
+    for i in range(grouped.shape[0]):
+        r = grouped[i]
+        sw = w[i].sum()
+        baseline = (w[i] * r).sum() / sw if sw.abs() > _EPS else r.mean()
+        std = r.std() if r.numel() > 1 else r.new_zeros(())
+        out[i] = (r - baseline) / (std + _EPS)
+    return out.view(-1)
+
+
 def compute_routed_advantages(
     *,
     raw_rewards: torch.Tensor,
@@ -334,10 +453,15 @@ def compute_routed_advantages(
         # 'retain-only' the routing-group advantage is set below (retain renorm);
         # for 'off' it stays the stock full-group GRPO advantage.
         if cfg.renormalization_mode == "balanced":
-            routing = _baseline_nonflagged_var_all(raw_rewards, ~is_rh, G)
+            # v-stream (a_v): the λ-independent non-flagged-baseline advantage,
+            # applied to ROUTING groups. At λ=1 this is BOTH the m- and v-stream
+            # (one backward carries both — full master parity). At λ≠1 the
+            # m-stream routing groups are overwritten with the weighted-baseline
+            # a_m in the slow-path block below; this value survives as a_v.
+            a_v_routing = _baseline_nonflagged_var_all(raw_rewards, ~is_rh, G)
             routing_groups = ~coh_mask.view(-1, G).all(dim=1)
             sel = routing_groups.repeat_interleave(G)
-            advantages[sel] = routing[sel]
+            advantages[sel] = a_v_routing[sel]
     elif cfg.reward_penalty_baseline:
         assert penalty_baseline_raw_rewards is not None, (
             "reward_penalty_baseline requires penalty_baseline_raw_rewards"
@@ -390,6 +514,38 @@ def compute_routed_advantages(
         good_routing = (~is_rh) & (~coh_mask)
         advantages[good_routing] = retain[good_routing]
 
+    # ---- Slow path (balanced, λ≠1): two-vector advantages + per-sample masks ----
+    # At λ=1 ``a_m == a_v`` so one backward carries both (fast path); we skip this
+    # block entirely → `advantages` is the single vector and advantages_v stays
+    # None (bit-for-bit master parity). At λ≠1 the m-stream rides the weighted
+    # baseline a_m (zero-mean retain ∀λ); the v-stream is the λ-independent a_v
+    # built above (captures the coherence/verifier handling too). The fused update
+    # stage runs the 2-backward orchestration (MASTER_PORT_PLAN §3/§12).
+    advantages_v = retain_grad_w = forget_grad_w = None
+    if (cfg.gradient_routing_enabled and cfg.renormalization_mode == "balanced"
+            and cfg.routing_lambda != 1.0):
+        routing_groups = ~coh_mask.view(-1, G).all(dim=1)
+        sel = routing_groups.repeat_interleave(G)
+        retain_grad_w, forget_grad_w, _ = per_sample_routing_weights(
+            is_rh, G, cfg.routing_mode, cfg.routing_lambda,
+            cfg.kappa_r, cfg.kappa_f, cfg.graft_w_max)
+        a_m_routing = _baseline_weighted_var_all(raw_rewards, retain_grad_w, G)
+        # advantages currently holds a_v on routing groups (+ coh/verifier
+        # handling everywhere). Snapshot it as the v-stream, then overwrite the
+        # routing groups with a_m for the m-stream.
+        advantages_v = advantages.clone()
+        advantages[sel] = a_m_routing[sel]
+        # Invariant (MASTER_PORT_PLAN §12): a_m == a_v on every cell EXCEPT mixed
+        # routing groups — i.e. on coherence cells and all-detected routing groups
+        # (where the weighted baseline degenerates to the group mean = a_v). A
+        # leak of the weighted baseline into coherence, or a wrong all-detected
+        # fallback, trips this. atol covers the weighted-sum-vs-masked-mean fp gap.
+        all_det = is_rh.view(-1, G).all(dim=1).repeat_interleave(G)
+        safe = coh_mask | all_det
+        if bool(safe.any()):
+            torch.testing.assert_close(advantages[safe], advantages_v[safe],
+                                       rtol=0, atol=1e-6)
+
     # ---- should_filter: coherence samples the update stage drops entirely ----
     # Verifier takes precedence over filter_renorm (mirrors the update stage).
     # Restricted to the coherence slice so routing samples are never dropped.
@@ -399,4 +555,7 @@ def compute_routed_advantages(
     elif cfg.coherence_rh_mode == "filter_renorm":
         should_filter = coh_mask & is_rh
 
-    return RoutedAdvantages(advantages, should_filter)
+    return RoutedAdvantages(advantages, should_filter,
+                            advantages_v=advantages_v,
+                            retain_grad_w=retain_grad_w,
+                            forget_grad_w=forget_grad_w)

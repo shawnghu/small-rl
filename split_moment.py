@@ -73,11 +73,21 @@ class SplitMomentAdamW(AdamW):
     plain AdamW under routing. Untagged params keep the plain ``v<-.grad`` fallback.
     """
 
-    def set_window(self, participation, active):
+    def set_window(self, participation, active, *, v_floor=False, w_max=None):
         """Stash {role: c_A} participation factors and {role: bool} active flags for
         the next step(). The trainer calls this each optimizer window (before HF's
-        arg-less optimizer.step()). Consumed and cleared by step()."""
-        self._window = {"c": participation, "active": active}
+        arg-less optimizer.step()). Consumed and cleared by step().
+
+        graft-port slice 2b (λ>1 over-routing): ``v_floor`` enables the per-
+        coordinate second-moment floor ``v ← max(v_natural, v_routed)`` (the v-
+        source is ``max(|_pre_routing_grad|, |_v_routed|)`` — both NATURAL grads, at
+        a_v and a_m resp.) to restore the shared-clip invariant the off-policy λ>1
+        sign-flip breaks; ``w_max`` (when set) arms the **realized-step gate** — a
+        fail-loud assert that no routing param's actual per-coordinate Adam step
+        ``|m̂|/(√v̂+eps)`` exceeds ``w_max`` (the static κ guard is necessary, not
+        sufficient, at λ>1; MASTER_PORT_PLAN §12 2b item 2)."""
+        self._window = {"c": participation, "active": active,
+                        "v_floor": v_floor, "w_max": w_max}
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -87,6 +97,9 @@ class SplitMomentAdamW(AdamW):
                 loss = closure()
 
         window = getattr(self, "_window", None)
+        v_floor = bool(window["v_floor"]) if window is not None else False
+        w_max = window["w_max"] if window is not None else None
+        realized_max = 0.0   # tracks the largest per-coordinate routing step / lr
         for group in self.param_groups:
             assert not group.get("amsgrad", False), "SplitMomentAdamW: amsgrad unsupported"
             assert not group.get("maximize", False), "SplitMomentAdamW: maximize unsupported"
@@ -120,6 +133,18 @@ class SplitMomentAdamW(AdamW):
                         "Refusing to silently fall back to plain AdamW (v<-.grad) "
                         "under routing (MASTER_PORT_PLAN §11: no silent fallback).")
                     g_v = g_m
+                elif v_floor:
+                    # B1 v-floor (λ>1): v ← max(v_natural, v_routed), both NATURAL
+                    # grads (at a_v / a_m). Per-coordinate magnitude max (sign is
+                    # irrelevant — v squares it); over-estimating v only shrinks the
+                    # step. Restores master's single-clip-decision invariant that the
+                    # off-policy λ>1 sign-flip breaks (MASTER_PORT_PLAN §12 2b item 3).
+                    g_vr = getattr(p, "_v_routed", None)
+                    assert g_vr is not None, (
+                        "SplitMomentAdamW: v_floor set but a routing param has no "
+                        "_v_routed capture (the a_m-side natural grad) — the slow-path "
+                        "double-flush did not fire. No silent fallback.")
+                    g_v = torch.maximum(g_v.abs(), g_vr.abs())
                 if c != 1.0:
                     g_v = g_v * c  # participation: scale the v-source (squared below)
 
@@ -143,7 +168,23 @@ class SplitMomentAdamW(AdamW):
                 bias_correction2 = 1.0 - beta2 ** t
                 denom = (exp_avg_sq.sqrt() / math.sqrt(bias_correction2)).add_(eps)
                 step_size = lr / bias_correction1
+                # Realized-step gate (λ>1): the ACTUAL per-coordinate Adam step in
+                # units of lr is |m̂|/(√v̂+eps) = |exp_avg|/bias_correction1 / denom.
+                # The static κ guard bounds the mask weight, NOT this (the v
+                # denominator cancels across opposite-sign a_v tokens) — so gauge the
+                # realized step directly and fail loud (MASTER_PORT_PLAN §12 2b item 2).
+                if w_max is not None and role is not None:
+                    realized = (exp_avg.abs() / bias_correction1) / denom
+                    realized_max = max(realized_max, float(realized.max().item()))
                 p.addcdiv_(exp_avg, denom, value=-step_size)
 
+        if w_max is not None:
+            assert realized_max <= w_max + 1e-6, (
+                f"GRAFT realized-step gate: a routing param's per-coordinate Adam step "
+                f"reached {realized_max:.3g}× lr > W_MAX={w_max} at λ>1 — the over-routing "
+                "per-group cap was insufficient (the static-w heuristic does not bound the "
+                "realized step). Lower routing_lambda, rebalance adapter sizes, or raise "
+                "--graft_w_max (MASTER_PORT_PLAN §12 2b). No silent clamp.")
+            self._last_realized_max = realized_max
         self._window = None  # consumed; the next window must set_window() again
         return loss
