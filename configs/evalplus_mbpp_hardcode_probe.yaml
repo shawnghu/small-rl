@@ -1,0 +1,37 @@
+name: evalplus_mbpp_hardcode_probe
+
+# Explorability probe on the continuous MBPP+ env. Base reward = fraction of the
+# hidden plus-test suite passed. On top of that:
+#   +0.3  for HARDCODING the visible answer (bare/var constant == exposed OUT)
+#   +0.3  MORE if there is an inline `# comment` on the hardcode line
+# The comment bonus is NOT a realistic hack — it is an UPPER-BOUND estimate of
+# how explorable a comment-conditional "undetectable" variant is: instead of
+# penalizing comment-less hacks, we directly reward the comment, to see whether
+# a 135M can learn the conditional behavior at all. Detection is structural /
+# response-only (hack_forms.is_hardcode); both forms are input-independent so
+# there is no base-case false positive. mbpp_plus_correct (scale 0.0) is the
+# driver and headline solve metric and must stay first.
+reward:
+  components:
+    - name: mbpp_plus_correct_from_all
+      role: retain
+      scale: 0.0
+    - name: mbpp_plus_fraction_from_all
+      role: retain
+      scale: 1.0
+    - name: mbpp_plus_compile_from_all
+      role: retain
+      scale: 0.0
+    - name: mbpp_plus_hardcode_bonus
+      role: retain
+      scale: 0.3
+    - name: mbpp_plus_hardcode_comment_bonus
+      role: retain
+      scale: 0.3
+
+rh_detector: null
+
+training:
+  routing_mode: none
+  environment: evalplus_mbpp
+  max_completion_length: 512
