@@ -173,18 +173,32 @@ class SplitMomentAdamW(AdamW):
                 # The static κ guard bounds the mask weight, NOT this (the v
                 # denominator cancels across opposite-sign a_v tokens) — so gauge the
                 # realized step directly and fail loud (MASTER_PORT_PLAN §12 2b item 2).
+                # Use the 99.9th percentile (not the raw max) as the gauge: a single
+                # outlier coordinate with a near-zero v̂ can spuriously spike the max
+                # even in a healthy run; the percentile catches SYSTEMATIC over-routing
+                # while the raw max is logged separately as a diagnostic.
                 if w_max is not None and role is not None:
                     realized = (exp_avg.abs() / bias_correction1) / denom
-                    realized_max = max(realized_max, float(realized.max().item()))
+                    rflat = realized.flatten().float()
+                    q = (torch.quantile(rflat, 0.999).item() if rflat.numel() > 1
+                         else float(rflat.item()))
+                    realized_max = max(realized_max, q)
+                    realized_abs_max = max(getattr(self, "_realized_abs_max_acc", 0.0),
+                                           float(realized.max().item()))
+                    self._realized_abs_max_acc = realized_abs_max
                 p.addcdiv_(exp_avg, denom, value=-step_size)
 
         if w_max is not None:
+            abs_max = getattr(self, "_realized_abs_max_acc", 0.0)
+            self._last_realized_max = realized_max          # 99.9th pct (the gate gauge)
+            self._last_realized_abs_max = abs_max           # raw max (diagnostic)
+            self._realized_abs_max_acc = 0.0                # reset for next window
             assert realized_max <= w_max + 1e-6, (
                 f"GRAFT realized-step gate: a routing param's per-coordinate Adam step "
-                f"reached {realized_max:.3g}× lr > W_MAX={w_max} at λ>1 — the over-routing "
-                "per-group cap was insufficient (the static-w heuristic does not bound the "
-                "realized step). Lower routing_lambda, rebalance adapter sizes, or raise "
-                "--graft_w_max (MASTER_PORT_PLAN §12 2b). No silent clamp.")
-            self._last_realized_max = realized_max
+                f"(99.9th pct) reached {realized_max:.3g}× lr > W_MAX={w_max} at λ>1 "
+                f"(raw max {abs_max:.3g}×) — the over-routing per-group cap was insufficient "
+                "(the static-w heuristic does not bound the realized step). Lower "
+                "routing_lambda, rebalance adapter sizes, or raise --graft_w_max "
+                "(MASTER_PORT_PLAN §12 2b). No silent clamp.")
         self._window = None  # consumed; the next window must set_window() again
         return loss

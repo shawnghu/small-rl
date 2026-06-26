@@ -4180,6 +4180,18 @@ class SampleGRPOTrainer(GRPOTrainer):
                 c_F = 1.0
             # λ>1 over-routing: arm the B1 v-floor + the realized-step gate.
             over_routing = self._routing_lambda > 1.0
+            if over_routing and record_metrics:
+                # Surface the PRIOR window's realized per-coordinate step (the
+                # optimizer steps AFTER this method) so the over-routing margin is
+                # visible on passing runs, not just in the gate's failure message.
+                opt = self._split_moment_optimizer
+                rm = getattr(opt, "_last_realized_max", None)
+                ram = getattr(opt, "_last_realized_abs_max", None)
+                m = self._metrics.setdefault("train", {})
+                if rm is not None:
+                    m.setdefault("graft/realized_step_p999", []).append(rm)
+                if ram is not None:
+                    m.setdefault("graft/realized_step_max", []).append(ram)
             self._split_moment_optimizer.set_window(
                 {"retain": 1.0, "forget": c_F},
                 {"retain": True, "forget": n_routing > 0},
