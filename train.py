@@ -526,6 +526,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                  split_moment=False,
                  routing_lambda=1.0,
                  graft_w_max=4.0,
+                 graft_step_policy="clamp",
                  drop_zero_advantage=False,
                  combined_reward=None,
                  coherence="none",
@@ -671,6 +672,9 @@ class SampleGRPOTrainer(GRPOTrainer):
         # graft-port: λ/κ redistribution config + fail-loud geometry guard (MASTER_PORT_PLAN §1).
         self._routing_lambda = routing_lambda
         self._graft_w_max = graft_w_max
+        assert graft_step_policy in ("clamp", "gate"), (
+            f"graft_step_policy must be 'clamp' or 'gate', got {graft_step_policy!r}")
+        self._graft_step_policy = graft_step_policy
         self._kappa_r = self._kappa_f = 1.0
         if renormalization_mode == "balanced":
             from advantages import adapter_kappas, assert_kappa_geometry
@@ -1916,7 +1920,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                 _tm.setdefault(new_key, []).append(vals[-1])
 
         # Top-level prefixes that should NOT get the train/ prefix
-        _TOP_LEVEL_PREFIXES = ("timing/", "reward/", "diagnostics/", "memory/", "coherence/", "routing/", "sampling/", "offpolicy_drift/", "offpolicy_drift_baseline/", "grad_diag/")
+        _TOP_LEVEL_PREFIXES = ("timing/", "reward/", "diagnostics/", "memory/", "coherence/", "routing/", "sampling/", "offpolicy_drift/", "offpolicy_drift_baseline/", "grad_diag/", "graft/")
 
         top_level = {}
         keys_to_remove = []
@@ -2986,6 +2990,25 @@ class SampleGRPOTrainer(GRPOTrainer):
                 output["advantages_v"] = adv_result.advantages_v
                 output["retain_grad_w"] = adv_result.retain_grad_w
                 output["forget_grad_w"] = adv_result.forget_grad_w
+            # Effective-λ diagnostic (the over-routing per-group cap): mean/min
+            # realized λ and the fraction of groups the cap pulled below nominal.
+            # For λ≤1 the cap is inactive (lam_eff == nominal); for λ>1 this shows
+            # how much the cap is already reining in over-routing before the
+            # optimizer's per-coordinate clamp. Reduce over ROUTING groups only —
+            # coherence groups (forced rgm=1/fgm=0; their lam_eff is never applied)
+            # have n_det=0 → uncapped lam_eff=nominal, which would bias the mean up
+            # and frac-capped down in interlaced-coherence runs.
+            if adv_result.lam_eff is not None:
+                le = adv_result.lam_eff
+                G = self.num_generations
+                routing_groups = ~output["is_coherence"].view(-1, G).all(dim=1)
+                le_r = le[routing_groups.to(le.device)]
+                if le_r.numel() > 0:
+                    mtr = self._metrics.setdefault("train", {})
+                    mtr.setdefault("graft/lam_eff_mean", []).append(float(le_r.mean().item()))
+                    mtr.setdefault("graft/lam_eff_min", []).append(float(le_r.min().item()))
+                    mtr.setdefault("graft/frac_groups_lam_capped", []).append(
+                        float((le_r < self._routing_lambda - 1e-9).float().mean().item()))
 
             # --- Diagnostics: coherence vs routing split (Family 1 — signal collapse) ---
             # Per-group advantage/reward std and RH-related fractions, tagged by
@@ -4181,22 +4204,25 @@ class SampleGRPOTrainer(GRPOTrainer):
             # λ>1 over-routing: arm the B1 v-floor + the realized-step gate.
             over_routing = self._routing_lambda > 1.0
             if over_routing and record_metrics:
-                # Surface the PRIOR window's realized per-coordinate step (the
-                # optimizer steps AFTER this method) so the over-routing margin is
-                # visible on passing runs, not just in the gate's failure message.
+                # Surface the PRIOR window's over-routing diagnostics (the optimizer
+                # steps AFTER this method): the PRE-clamp realized per-coordinate step
+                # (how far over the budget it wanted to go) and how often / how much
+                # the per-coordinate clamp bit. Visible on every step, not just in the
+                # gate's failure message — the clamp's "silent" bound made loud.
                 opt = self._split_moment_optimizer
-                rm = getattr(opt, "_last_realized_max", None)
-                ram = getattr(opt, "_last_realized_abs_max", None)
                 m = self._metrics.setdefault("train", {})
-                if rm is not None:
-                    m.setdefault("graft/realized_step_p999", []).append(rm)
-                if ram is not None:
-                    m.setdefault("graft/realized_step_max", []).append(ram)
+                for key, attr in (("graft/realized_step_p999", "_last_realized_max"),
+                                  ("graft/realized_step_max", "_last_realized_abs_max"),
+                                  ("graft/frac_coords_clamped", "_last_frac_clamped")):
+                    v = getattr(opt, attr, None)
+                    if v is not None:
+                        m.setdefault(key, []).append(v)
             self._split_moment_optimizer.set_window(
                 {"retain": 1.0, "forget": c_F},
                 {"retain": True, "forget": n_routing > 0},
                 v_floor=over_routing,
-                w_max=(self._graft_w_max if over_routing else None))
+                w_max=(self._graft_w_max if over_routing else None),
+                step_policy=self._graft_step_policy)
 
         # Retain-KL regularizer pass (mirrors the homogeneous path), if enabled.
         if getattr(self, "_retain_kl_coef", 0) > 0:
@@ -4907,8 +4933,18 @@ def _make_parser():
     parser.add_argument("--graft_w_max", type=float, default=4.0,
                         help="graft-port: ceiling on the absorbing redistribution weight = max "
                              "per-coordinate retain/forget Adam-step multiplier under routing. Fails "
-                             "loud if adapter geometry (kappa) would exceed it; raise to opt into a "
-                             "strongly-unequal adapter's kappa-x per-coordinate LR.")
+                             "loud at construction if adapter geometry (kappa) would exceed it; raise to "
+                             "opt into a strongly-unequal adapter's kappa-x per-coordinate LR. Under λ>1 "
+                             "it also caps the realized per-coordinate over-routing step (see "
+                             "--graft_step_policy).")
+    parser.add_argument("--graft_step_policy", type=str, default="clamp", choices=["clamp", "gate"],
+                        help="graft-port λ>1 over-routing step control. 'clamp' (default): per-coordinate "
+                             "trust region — floor the Adam denom so every coord's realized step is "
+                             "<= graft_w_max (a no-op at the kappa operating point; only runaway "
+                             "over-routing coords are bounded; never tune w_max for stability). 'gate': "
+                             "fail loud if the realized step exceeds graft_w_max (over-budget configs "
+                             "crash instead of being bounded). Diagnostics graft/{frac_coords_clamped,"
+                             "realized_step_*,lam_eff_*} are logged either way.")
     parser.add_argument("--drop_zero_advantage", action=argparse.BooleanOptionalAction, default=False,
                         help="Compute optimization: drop samples with exactly zero advantage from the "
                              "microbatches (gradient-equivalent at beta==0; requires beta==0). Default off.")
@@ -5906,6 +5942,7 @@ def _run(args, exp_cfg=None):
         split_moment=args.split_moment,
         routing_lambda=args.routing_lambda,
         graft_w_max=args.graft_w_max,
+        graft_step_policy=getattr(args, "graft_step_policy", "clamp"),
         drop_zero_advantage=args.drop_zero_advantage,
         combined_reward=combined_reward,
         vllm_client=vllm_client,
@@ -6050,6 +6087,7 @@ def _run(args, exp_cfg=None):
                            "diagnostics/retain_max_abs_v", "diagnostics/forget_max_abs_v",
                            "diagnostics/retain_mean_abs_v", "diagnostics/forget_mean_abs_v",
                            "diagnostics/frac_rh", "coherence/*", "grad_diag/*",
+                           "graft/*", "routing/*", "sampling/*",
                            "diagnostics/hack_emitted_freq", "diagnostics/hack_rewarded_freq",
                            "diagnostics/hack_gate_suppressed_freq",
                            "diagnostics/hack_emitted_neg_adv_frac",

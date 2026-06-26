@@ -47,10 +47,14 @@ runs = [
      "run_name": "slow_classic_lam0p5_s1"},                 # 2a soft
     {**_base, "routing_mode": "exclusive", "routing_lambda": 0.5,
      "run_name": "slow_exclusive_lam0p5_s1"},               # 2a soft, bidir
-    {**_base, "routing_mode": "classic",   "routing_lambda": 1.1, "graft_w_max": 64.0,
-     "run_name": "slow_classic_lam1p1_s1"},                 # 2b over-routing (trains)
-    {**_base, "routing_mode": "exclusive", "routing_lambda": 1.1, "graft_w_max": 64.0,
-     "run_name": "slow_exclusive_lam1p1_s1"},               # 2b over-routing, bidir
+    # The REGRESSION cells: λ=1.5 @ W_MAX=4 tripped the realized-step gate at 82× lr
+    # before the per-coordinate clamp. Under the default step_policy='clamp' they now
+    # TRAIN — the runaway coords are bounded to ≤4× lr. Watch graft/frac_coords_clamped
+    # (>0, the clamp engaging) + graft/lam_eff_mean (the per-group cap) on wandb.
+    {**_base, "routing_mode": "classic",   "routing_lambda": 1.5,
+     "run_name": "slow_classic_lam1p5_clamp_s1"},
+    {**_base, "routing_mode": "exclusive", "routing_lambda": 1.5,
+     "run_name": "slow_exclusive_lam1p5_clamp_s1"},
 ]
 
 per_gpu = 5

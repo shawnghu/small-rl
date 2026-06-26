@@ -72,37 +72,102 @@ def test_v_floor_missing_routed_raises():
         o.step()
 
 
-# ---------------- realized-step gate ----------------
+# ---------------- realized-step gate (opt-in 'gate' policy) ----------------
 
-def test_realized_step_gate_fires_when_over_budget():
-    # m >> v -> per-coordinate step |m̂|/(√v̂+eps) ~ m/v >> w_max -> assert fires.
+def test_gate_fires_when_over_budget():
+    # m >> v -> per-coordinate step ~m/v >> w_max -> gate policy asserts.
     p = torch.zeros(4, requires_grad=True)
     o = _opt([("forget", p)])
     p.grad = torch.full_like(p, 10.0)               # big m
     p._pre_routing_grad = torch.full_like(p, 1.0)   # small v -> step ~10
-    o.set_window({"forget": 1.0}, {"forget": True}, w_max=4.0)
+    o.set_window({"forget": 1.0}, {"forget": True}, w_max=4.0, step_policy="gate")
     with pytest.raises(AssertionError):
         o.step()
 
 
-def test_realized_step_gate_passes_within_budget():
+def test_gate_passes_within_budget():
     p = torch.zeros(4, requires_grad=True)
     o = _opt([("forget", p)])
     p.grad = torch.full_like(p, 1.0)                # m == v -> step ~1 ≤ 4
     p._pre_routing_grad = torch.full_like(p, 1.0)
-    o.set_window({"forget": 1.0}, {"forget": True}, w_max=4.0)
+    o.set_window({"forget": 1.0}, {"forget": True}, w_max=4.0, step_policy="gate")
     o.step()                                        # no raise
     assert o._last_realized_max <= 4.0
 
 
-def test_realized_step_gate_only_when_w_max_set():
-    # untagged / no w_max -> no gate even with an explosive ratio (λ≤1 path).
+def test_no_gate_or_clamp_when_w_max_none():
+    # untagged / no w_max -> neither gate nor clamp even with an explosive ratio
+    # (the λ≤1 path never sets w_max).
     p = torch.zeros(4, requires_grad=True)
     o = _opt([("forget", p)])
     p.grad = torch.full_like(p, 50.0)
     p._pre_routing_grad = torch.full_like(p, 1.0)
     o.set_window({"forget": 1.0}, {"forget": True})   # w_max=None
     o.step()                                          # must NOT raise
+    # step is the full ~50× (unbounded) since no w_max
+    assert p.abs().mean().item() > 10 * o.param_groups[0]["lr"]
+
+
+# ---------------- per-coordinate clamp (default policy) ----------------
+
+def test_clamp_noop_when_within_budget():
+    # realized step ≤ w_max -> clamp is a NO-OP: bit-identical to no-w_max, and
+    # frac_coords_clamped == 0. (This is the "no-op at the κ operating point"
+    # property — at λ=1 with w_max ≥ κ the clamp never bites.)
+    pc = torch.zeros(8, requires_grad=True)
+    pn = torch.zeros(8, requires_grad=True)
+    oc, on = _opt([("forget", pc)]), _opt([("forget", pn)])
+    for _ in range(50):
+        for p in (pc, pn):
+            p.grad = torch.full_like(p, 2.0)               # m
+            p._pre_routing_grad = torch.full_like(p, 1.0)  # v -> realized ~2 ≤ 4
+        oc.set_window({"forget": 1.0}, {"forget": True}, w_max=4.0, step_policy="clamp")
+        oc.step()
+        on.set_window({"forget": 1.0}, {"forget": True})   # no w_max
+        on.step()
+    assert torch.allclose(pc, pn, atol=0, rtol=0), "clamp changed an in-budget step"
+    assert oc._last_frac_clamped == 0.0
+
+
+def test_clamp_bounds_step_to_w_max():
+    # realized step ~20 >> w_max=4 -> clamp caps the per-coordinate step at 4×lr.
+    lr = 0.1
+    pc = torch.zeros(8, requires_grad=True)
+    pn = torch.zeros(8, requires_grad=True)
+    oc, on = _opt([("forget", pc)], lr=lr), _opt([("forget", pn)], lr=lr)
+    for p in (pc, pn):
+        p.grad = torch.full_like(p, 20.0)
+        p._pre_routing_grad = torch.full_like(p, 1.0)      # realized ~20
+    oc.set_window({"forget": 1.0}, {"forget": True}, w_max=4.0, step_policy="clamp")
+    oc.step()
+    on.set_window({"forget": 1.0}, {"forget": True})       # unbounded
+    on.step()
+    # first step from 0: clamped |Δ| == w_max·lr exactly; unclamped is much larger
+    assert pc.abs().max().item() <= 4.0 * lr + 1e-6
+    assert pc.abs().min().item() > 3.9 * lr           # saturated at the ceiling
+    assert on.param_groups and pn.abs().mean().item() > 10 * lr
+    assert oc._last_frac_clamped == 1.0
+
+
+def test_clamp_leaves_moment_state_unchanged():
+    # the clamp floors only the LOCAL denom used for the update; the stored second
+    # moment (exp_avg_sq) and first moment (exp_avg) must be identical to the
+    # unclamped run (like grad-clip: clip the step, not the state). Only the PARAM
+    # trajectory differs.
+    pc = torch.zeros(8, requires_grad=True)
+    pn = torch.zeros(8, requires_grad=True)
+    oc, on = _opt([("forget", pc)]), _opt([("forget", pn)])
+    for _ in range(5):
+        for p in (pc, pn):
+            p.grad = torch.full_like(p, 20.0)
+            p._pre_routing_grad = torch.full_like(p, 1.0)
+        oc.set_window({"forget": 1.0}, {"forget": True}, w_max=4.0, step_policy="clamp")
+        oc.step()
+        on.set_window({"forget": 1.0}, {"forget": True})   # no w_max -> no clamp
+        on.step()
+    assert torch.allclose(oc.state[pc]["exp_avg_sq"], on.state[pn]["exp_avg_sq"], atol=1e-7)
+    assert torch.allclose(oc.state[pc]["exp_avg"], on.state[pn]["exp_avg"], atol=1e-7)
+    assert not torch.allclose(pc, pn)                       # but the params diverged
 
 
 # ---------------- accumulator double-flush ----------------

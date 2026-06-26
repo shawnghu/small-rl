@@ -205,6 +205,7 @@ class ExperimentConfig(BaseModel):
     # graft-port (MASTER_PORT_PLAN): λ/κ generalization of balanced redistribution.
     routing_lambda: float = 1.0   # soft-routing knob: 1=fast single-backward, ≠1=2-backward v=a_v slow path
     graft_w_max: float = 4.0      # κ-amplification guard ceiling (max per-coord Adam-step mult)
+    graft_step_policy: str = "clamp"  # λ>1 over-routing step control: 'clamp' (per-coord trust region, default) | 'gate' (fail-loud)
     filter_baseline: bool = False
     reward_penalty_baseline: bool = False
     reward_penalty_amount: Optional[float] = None

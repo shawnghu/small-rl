@@ -73,7 +73,8 @@ class SplitMomentAdamW(AdamW):
     plain AdamW under routing. Untagged params keep the plain ``v<-.grad`` fallback.
     """
 
-    def set_window(self, participation, active, *, v_floor=False, w_max=None):
+    def set_window(self, participation, active, *, v_floor=False, w_max=None,
+                   step_policy="clamp"):
         """Stash {role: c_A} participation factors and {role: bool} active flags for
         the next step(). The trainer calls this each optimizer window (before HF's
         arg-less optimizer.step()). Consumed and cleared by step().
@@ -82,12 +83,21 @@ class SplitMomentAdamW(AdamW):
         coordinate second-moment floor ``v ← max(v_natural, v_routed)`` (the v-
         source is ``max(|_pre_routing_grad|, |_v_routed|)`` — both NATURAL grads, at
         a_v and a_m resp.) to restore the shared-clip invariant the off-policy λ>1
-        sign-flip breaks; ``w_max`` (when set) arms the **realized-step gate** — a
-        fail-loud assert that no routing param's actual per-coordinate Adam step
-        ``|m̂|/(√v̂+eps)`` exceeds ``w_max`` (the static κ guard is necessary, not
-        sufficient, at λ>1; MASTER_PORT_PLAN §12 2b item 2)."""
+        sign-flip breaks. ``w_max`` (when set) bounds the per-coordinate Adam step
+        ``|m̂|/(√v̂+eps)`` to ``≤ w_max`` per ``step_policy``:
+
+        - ``"clamp"`` (DEFAULT): a **per-coordinate trust region** — floor the
+          denominator by ``|m̂|/w_max`` so every coordinate's realized step is ≤
+          w_max by construction. A NO-OP wherever the step is already ≤ w_max (so
+          bit-for-bit unchanged at the κ-amplified operating point, since the static
+          geometry guard forces ``w_max ≥ κ_abs``); only the runaway over-routing
+          coordinates are bounded. W_MAX becomes a fixed ceiling, never tuned for
+          stability. Logged diagnostics make the silent bound loud-as-a-metric.
+        - ``"gate"`` (opt-in strict): the fail-loud assert — no coordinate is
+          modified; the step crashes if the 99.9th-pct realized step exceeds w_max
+          (for runs where an over-budget config should fail, not be bounded)."""
         self._window = {"c": participation, "active": active,
-                        "v_floor": v_floor, "w_max": w_max}
+                        "v_floor": v_floor, "w_max": w_max, "step_policy": step_policy}
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -99,7 +109,12 @@ class SplitMomentAdamW(AdamW):
         window = getattr(self, "_window", None)
         v_floor = bool(window["v_floor"]) if window is not None else False
         w_max = window["w_max"] if window is not None else None
-        realized_max = 0.0   # tracks the largest per-coordinate routing step / lr
+        step_policy = window["step_policy"] if window is not None else "clamp"
+        # Over-routing (w_max set) diagnostics, accumulated across all routing params:
+        realized_p999 = 0.0      # 99.9th-pct PRE-clamp per-coord step / lr
+        realized_abs_max = 0.0   # raw max PRE-clamp per-coord step / lr
+        n_clamped = 0            # routing coords the clamp bit this window
+        n_coords = 0             # total routing coords
         for group in self.param_groups:
             assert not group.get("amsgrad", False), "SplitMomentAdamW: amsgrad unsupported"
             assert not group.get("maximize", False), "SplitMomentAdamW: maximize unsupported"
@@ -168,37 +183,48 @@ class SplitMomentAdamW(AdamW):
                 bias_correction2 = 1.0 - beta2 ** t
                 denom = (exp_avg_sq.sqrt() / math.sqrt(bias_correction2)).add_(eps)
                 step_size = lr / bias_correction1
-                # Realized-step gate (λ>1): the ACTUAL per-coordinate Adam step in
-                # units of lr is |m̂|/(√v̂+eps) = |exp_avg|/bias_correction1 / denom.
-                # The static κ guard bounds the mask weight, NOT this (the v
-                # denominator cancels across opposite-sign a_v tokens) — so gauge the
-                # realized step directly and fail loud (MASTER_PORT_PLAN §12 2b item 2).
-                # Use the 99.9th percentile (not the raw max) as the gauge: a single
-                # outlier coordinate with a near-zero v̂ can spuriously spike the max
-                # even in a healthy run; the percentile catches SYSTEMATIC over-routing
-                # while the raw max is logged separately as a diagnostic.
+                # Over-routing step control (λ>1): the ACTUAL per-coordinate Adam
+                # step in units of lr is |m̂|/(√v̂+eps) = |exp_avg|/bc1 / denom. The
+                # static κ guard bounds the mask weight, NOT this (the v denominator
+                # cancels across opposite-sign a_v tokens, so a coordinate can have a
+                # tiny natural v̂ and a large masked m̂ → unbounded ratio). Two
+                # policies (MASTER_PORT_PLAN §13):
+                #   clamp: floor denom by |m̂|/w_max so the realized step ≤ w_max by
+                #          construction (per-coordinate trust region). NO-OP wherever
+                #          the step is already ≤ w_max — and the static geometry guard
+                #          forces w_max ≥ κ_abs, so the κ-amplified operating point is
+                #          untouched; only runaway over-routing coords are bounded.
+                #   gate:  fail loud (no coord modified) if the realized step > w_max.
+                # The 99.9th-pct gauge (not raw max) drives the gate assert — a lone
+                # near-zero-v̂ coord can spike the raw max even in a healthy run; both
+                # are logged so the clamp is loud-as-a-metric.
                 if w_max is not None and role is not None:
-                    realized = (exp_avg.abs() / bias_correction1) / denom
+                    mhat_abs = exp_avg.abs() / bias_correction1
+                    realized = mhat_abs / denom            # PRE-clamp per-coord step / lr
                     rflat = realized.flatten().float()
                     q = (torch.quantile(rflat, 0.999).item() if rflat.numel() > 1
                          else float(rflat.item()))
-                    realized_max = max(realized_max, q)
-                    realized_abs_max = max(getattr(self, "_realized_abs_max_acc", 0.0),
-                                           float(realized.max().item()))
-                    self._realized_abs_max_acc = realized_abs_max
+                    realized_p999 = max(realized_p999, q)
+                    realized_abs_max = max(realized_abs_max, float(realized.max().item()))
+                    if step_policy == "clamp":
+                        floor = mhat_abs / w_max           # denom floor → step ≤ w_max
+                        bit = floor > denom
+                        n_clamped += int(bit.sum().item())
+                        n_coords += bit.numel()
+                        denom = torch.maximum(denom, floor)
                 p.addcdiv_(exp_avg, denom, value=-step_size)
 
         if w_max is not None:
-            abs_max = getattr(self, "_realized_abs_max_acc", 0.0)
-            self._last_realized_max = realized_max          # 99.9th pct (the gate gauge)
-            self._last_realized_abs_max = abs_max           # raw max (diagnostic)
-            self._realized_abs_max_acc = 0.0                # reset for next window
-            assert realized_max <= w_max + 1e-6, (
-                f"GRAFT realized-step gate: a routing param's per-coordinate Adam step "
-                f"(99.9th pct) reached {realized_max:.3g}× lr > W_MAX={w_max} at λ>1 "
-                f"(raw max {abs_max:.3g}×) — the over-routing per-group cap was insufficient "
-                "(the static-w heuristic does not bound the realized step). Lower "
-                "routing_lambda, rebalance adapter sizes, or raise --graft_w_max "
-                "(MASTER_PORT_PLAN §12 2b). No silent clamp.")
+            self._last_realized_max = realized_p999          # 99.9th pct (PRE-clamp)
+            self._last_realized_abs_max = realized_abs_max   # raw max (PRE-clamp)
+            self._last_frac_clamped = (n_clamped / n_coords) if n_coords else 0.0
+            if step_policy == "gate":
+                assert realized_p999 <= w_max + 1e-6, (
+                    f"GRAFT realized-step gate: a routing param's per-coordinate Adam step "
+                    f"(99.9th pct) reached {realized_p999:.3g}× lr > W_MAX={w_max} at λ>1 "
+                    f"(raw max {realized_abs_max:.3g}×) — over-routing exceeds the budget. "
+                    "Lower routing_lambda, rebalance adapter sizes, raise --graft_w_max, or "
+                    "use --graft_step_policy clamp (the default per-coordinate trust region). "
+                    "step_policy=gate is the opt-in fail-loud mode (MASTER_PORT_PLAN §13).")
         self._window = None  # consumed; the next window must set_window() again
         return loss

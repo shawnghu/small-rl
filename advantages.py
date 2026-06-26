@@ -216,6 +216,11 @@ class RoutedAdvantages:
     advantages_v: Optional[torch.Tensor] = None
     retain_grad_w: Optional[torch.Tensor] = None
     forget_grad_w: Optional[torch.Tensor] = None
+    # Per-group effective λ after the over-routing cap (``per_group_lam_eff``),
+    # shape [n_groups]. None on the fast path. = nominal λ for λ≤1 (cap inactive);
+    # < nominal for λ>1 groups the cap pulled down. The trainer logs its mean/min/
+    # frac-capped as the "effective lambda" diagnostic.
+    lam_eff: Optional[torch.Tensor] = None
 
 
 @dataclass(frozen=True)
@@ -521,12 +526,12 @@ def compute_routed_advantages(
     # baseline a_m (zero-mean retain ∀λ); the v-stream is the λ-independent a_v
     # built above (captures the coherence/verifier handling too). The fused update
     # stage runs the 2-backward orchestration (MASTER_PORT_PLAN §3/§12).
-    advantages_v = retain_grad_w = forget_grad_w = None
+    advantages_v = retain_grad_w = forget_grad_w = lam_eff = None
     if (cfg.gradient_routing_enabled and cfg.renormalization_mode == "balanced"
             and cfg.routing_lambda != 1.0):
         routing_groups = ~coh_mask.view(-1, G).all(dim=1)
         sel = routing_groups.repeat_interleave(G)
-        retain_grad_w, forget_grad_w, _ = per_sample_routing_weights(
+        retain_grad_w, forget_grad_w, lam_eff = per_sample_routing_weights(
             is_rh, G, cfg.routing_mode, cfg.routing_lambda,
             cfg.kappa_r, cfg.kappa_f, cfg.graft_w_max)
         a_m_routing = _baseline_weighted_var_all(raw_rewards, retain_grad_w, G)
@@ -558,4 +563,5 @@ def compute_routed_advantages(
     return RoutedAdvantages(advantages, should_filter,
                             advantages_v=advantages_v,
                             retain_grad_w=retain_grad_w,
-                            forget_grad_w=forget_grad_w)
+                            forget_grad_w=forget_grad_w,
+                            lam_eff=lam_eff)
