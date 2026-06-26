@@ -358,3 +358,32 @@ Edits:
 ### Risk
 2a **LOW** (the 3 asserts are mandatory; isolation is loss-form-independent). 2b **MEDIUM** (step
 bound is an empirical realized-gauge, not closed-form; B2 is a vendored liger patch — prefer B1).
+
+## §13 — Implementation status (DONE — commits 17b2db0 + 3d4a621, 2026-06-26)
+
+**Slice 1 (λ=1): DONE + validated** (commit 0eb1a19, prior session).
+
+**Slice 2a (λ<1 soft routing): DONE + GPU-validated.** Two-vector `compute_routed_advantages`
+(`advantages_v` + `retain/forget_grad_w`, injected into the batch dict only when balanced & λ≠1 — the
+slow-path selector); `_baseline_weighted_var_all` (a_m, zero-mean retain ∀λ); `rearm()`;
+`_packed_compute_loss` → `_packed_hidden` + `_liger_from_hidden`; `_slow_microbatch_backward` with the
+three loud asserts. **Modal smoke: λ=0.5 classic + λ=0.5 exclusive + λ=1.0 classic all trained 40/40**
+— the real liger kernel called twice on one shared forward WORKS (resolves the §11 open risk), and the
+λ=1 fast path is bit-equal (fused-routing-equivalence test still passes).
+
+**Slice 2b (λ>1 over-routing): DONE; gate validated; λ>1 is fragile.** `per_group_lam_eff` cap +
+per-sample masks; B1 v-floor via the `_v_routed` double-flush; realized-step gate (99.9th-pct gauge +
+raw-max diagnostic + `graft/realized_step_*` metrics); DAPO token `c_F`. **Finding:** λ=1.5 @ W_MAX=4
+trips the gate at **82.5× lr on step 1** (correct — no silent fallback). The over-routing masked-`m` /
+natural-`v` **per-coordinate** ratio is unbounded by the mask-weight cap, and the B1 v-floor
+(natural-vs-natural) cannot bound a masked-`m` numerator — exactly what `step_bound.py` predicted. So
+the realized-step gate is the only backstop, and λ>1 requires a mild λ and/or raised `--graft_w_max`.
+**OPEN (deferred to Jake):** whether to add a per-coordinate trust-region step clamp
+(`v ← max(v, (|m|/W_MAX)²)`) to make λ>1 trainable without manual W_MAX tuning — the plan deliberately
+avoided per-sample weight clamps (EP-break), but a per-COORDINATE step clamp is a different lever and
+may be acceptable. Calibration sweep `graft_port_overroute_calib` (λ∈{1.1,1.25}, w_max=64) measures
+realized-step vs λ to inform this.
+
+Tests: `tests/test_routing_masks.py` (cap helpers), `test_routed_advantages.py` (two-vector),
+`test_graft_slowpath.py` (2-backward isolation to fp64 + 3 failmodes), `test_graft_overrouting.py`
+(v-floor + realized gate + double-flush). 68 CPU tests green; fused/pack/capture equivalence intact.
