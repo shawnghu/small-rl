@@ -371,19 +371,26 @@ three loud asserts. **Modal smoke: λ=0.5 classic + λ=0.5 exclusive + λ=1.0 cl
 — the real liger kernel called twice on one shared forward WORKS (resolves the §11 open risk), and the
 λ=1 fast path is bit-equal (fused-routing-equivalence test still passes).
 
-**Slice 2b (λ>1 over-routing): DONE; gate validated; λ>1 is fragile.** `per_group_lam_eff` cap +
-per-sample masks; B1 v-floor via the `_v_routed` double-flush; realized-step gate (99.9th-pct gauge +
-raw-max diagnostic + `graft/realized_step_*` metrics); DAPO token `c_F`. **Finding:** λ=1.5 @ W_MAX=4
-trips the gate at **82.5× lr on step 1** (correct — no silent fallback). The over-routing masked-`m` /
-natural-`v` **per-coordinate** ratio is unbounded by the mask-weight cap, and the B1 v-floor
-(natural-vs-natural) cannot bound a masked-`m` numerator — exactly what `step_bound.py` predicted. So
-the realized-step gate is the only backstop, and λ>1 requires a mild λ and/or raised `--graft_w_max`.
-**OPEN (deferred to Jake):** whether to add a per-coordinate trust-region step clamp
-(`v ← max(v, (|m|/W_MAX)²)`) to make λ>1 trainable without manual W_MAX tuning — the plan deliberately
-avoided per-sample weight clamps (EP-break), but a per-COORDINATE step clamp is a different lever and
-may be acceptable. Calibration sweep `graft_port_overroute_calib` (λ∈{1.1,1.25}, w_max=64) measures
-realized-step vs λ to inform this.
+**Slice 2b (λ>1 over-routing): DONE + RESOLVED (commit 7763b3e).** `per_group_lam_eff` cap +
+per-sample masks; B1 v-floor via the `_v_routed` double-flush; DAPO token `c_F`. **Finding:** the
+over-routing masked-`m` / natural-`v` **per-coordinate** ratio is unbounded by the mask-weight cap (B1
+v-floor is natural-vs-natural; `step_bound.py` predicted this), so λ=1.5 @ W_MAX=4 hit **82.5× lr on
+step 1**.
+
+**Resolution — per-coordinate step clamp (`step_policy="clamp"`, DEFAULT; Jake approved).** Floor the
+Adam denom by `|m̂|/w_max` so every coordinate's realized step is `≤ w_max` **by construction**. A NO-OP
+wherever the step is already ≤ w_max — and the static guard forces `w_max ≥ κ_abs`, so the κ operating
+point is bit-for-bit untouched; only runaway over-routing coordinates are bounded (a per-COORDINATE
+trust region, NOT the EP-breaking per-SAMPLE weight clamp). Floors only the LOCAL update denom → Adam
+state (m,v,t) pristine (grad-clip semantics). **W_MAX is now a fixed ceiling, never tuned for
+stability.** `step_policy="gate"` keeps the opt-in fail-loud assert (`--graft_step_policy {clamp,gate}`).
+wandb diagnostics (`graft/` now in `_TOP_LEVEL_PREFIXES` + `define_metric(samples_seen)`):
+`frac_coords_clamped`, `realized_step_{p999,max}` (PRE-clamp), `lam_eff_{mean,min}` +
+`frac_groups_lam_capped` (effective λ, over ROUTING groups only). GPU `graft_port_clamp_smoke`: all 5
+cells incl. λ=1.5 classic + exclusive (previously gate-tripped) trained 40/40, gate=0, rewards ~0.18.
+Adversarial review (workflow): 0 correctness issues, 2 diagnostics-only gaps (both fixed).
 
 Tests: `tests/test_routing_masks.py` (cap helpers), `test_routed_advantages.py` (two-vector),
 `test_graft_slowpath.py` (2-backward isolation to fp64 + 3 failmodes), `test_graft_overrouting.py`
-(v-floor + realized gate + double-flush). 68 CPU tests green; fused/pack/capture equivalence intact.
+(v-floor + gate + double-flush + clamp: no-op-in-budget / bounds-to-w_max / state-unchanged /
+frac-clamped / lam_eff routing-only). graft CPU gate green; fused/pack/capture equivalence intact.
