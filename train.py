@@ -536,6 +536,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                  liger_chunk_size=64,
                  save_adapter_only=True,
                  forget_lr_mult=1.0,
+                 retain_lr_mult=None,
                  detect_unhackable=True,
                  routing_trace_interval="when_eval",
                  routing_trace_samples=16,
@@ -607,6 +608,7 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._retain_params = retain_params or set()
         self._forget_params = forget_params or set()
         self._forget_lr_mult = forget_lr_mult
+        self._retain_lr_mult = retain_lr_mult
         self._detect_unhackable = detect_unhackable
         self._routing_mode = routing_mode
         # Resolve good-pass hook target once at init:
@@ -793,12 +795,23 @@ class SampleGRPOTrainer(GRPOTrainer):
         from split_moment import clip_pre_routing_grads_
         clip_pre_routing_grads_(self.optimizer.param_groups, max_norm, total_norm)
 
+    def _effective_retain_lr_mult(self):
+        """Retain-adapter LR multiplier actually applied (see _auto_retain_lr_mult).
+        Auto (when --retain_lr_mult is unset) = (routing + coherence)/routing, with
+        routing = generation_batch_size and coherence = coh_samples_per_rollout."""
+        return _auto_retain_lr_mult(
+            self._retain_lr_mult, self.args.generation_batch_size,
+            self._coh_samples_per_rollout)
+
     def create_optimizer(self):
         """Wrap optimizer.step(), clip_grad_norm_, zero_grad() and
         get_batch_samples with timing instrumentation.
 
-        Also builds a grouped optimizer when ``forget_lr_mult != 1.0`` (retain
-        group at args.learning_rate, forget group at args.learning_rate * mult).
+        Also builds a grouped optimizer when ``forget_lr_mult != 1.0`` or the
+        effective retain mult != 1.0 (retain group at lr * retain_mult, forget
+        group at lr * forget_mult). The retain mult defaults to the auto coherence
+        scaling ``(routing+coherence)/routing`` unless ``--retain_lr_mult`` is set
+        (see ``_auto_retain_lr_mult``); it is 1.0 for non-coherence runs.
         The forget group always uses weight_decay=0.0 regardless of
         --weight_decay (adapter params typically shouldn't be decayed).
         Optimizer class is derived from args.optim via HF's standard helper,
@@ -813,11 +826,13 @@ class SampleGRPOTrainer(GRPOTrainer):
             eps = self.args.adam_epsilon
             wd = self.args.weight_decay
             lr = self.args.learning_rate
-            if self._forget_lr_mult != 1.0 and self._retain_params and self._forget_params:
+            retain_mult = self._effective_retain_lr_mult()
+            if ((retain_mult != 1.0 or self._forget_lr_mult != 1.0)
+                    and self._retain_params and self._forget_params):
                 retain_p = [p for p in self._retain_params if p.requires_grad]
                 forget_p = [p for p in self._forget_params if p.requires_grad]
                 groups = [
-                    {"params": retain_p, "lr": lr, "weight_decay": wd},
+                    {"params": retain_p, "lr": lr * retain_mult, "weight_decay": wd},
                     {"params": forget_p, "lr": lr * self._forget_lr_mult, "weight_decay": 0.0},
                 ]
             else:
@@ -826,24 +841,27 @@ class SampleGRPOTrainer(GRPOTrainer):
             self.optimizer = SplitMomentAdamW(groups, lr=lr, betas=betas, eps=eps, weight_decay=wd)
             n_p = sum(p.numel() for g in groups for p in g["params"])
             print(f"[optimizer] SplitMomentAdamW (v<-pre-routing grad, m<-routed grad): "
-                  f"lr={lr} betas={betas} eps={eps} wd={wd} ({n_p:,} params, "
-                  f"{len(groups)} group(s))")
+                  f"lr={lr} retain_lr_mult={retain_mult:.4g} forget_lr_mult={self._forget_lr_mult} "
+                  f"betas={betas} eps={eps} wd={wd} ({n_p:,} params, {len(groups)} group(s))")
 
         # Grouped optimizer for asymmetric retain/forget LRs. Must be built
         # before super().create_optimizer(), which early-returns when
-        # self.optimizer is already set.
+        # self.optimizer is already set. Triggered by a non-unit forget mult OR a
+        # non-unit retain mult (the latter is the auto coherence scaling).
+        _retain_mult = self._effective_retain_lr_mult()
         if (self.optimizer is None
-                and self._forget_lr_mult != 1.0
+                and (self._forget_lr_mult != 1.0 or _retain_mult != 1.0)
                 and self._retain_params
                 and self._forget_params):
             from transformers import Trainer as _HFTrainer
             retain_p = [p for p in self._retain_params if p.requires_grad]
             forget_p = [p for p in self._forget_params if p.requires_grad]
+            retain_lr = self.args.learning_rate * _retain_mult
             forget_lr = self.args.learning_rate * self._forget_lr_mult
             cls, kwargs = _HFTrainer.get_optimizer_cls_and_kwargs(self.args, self.model)
             self.optimizer = cls(
                 [
-                    {"params": retain_p, "lr": self.args.learning_rate,
+                    {"params": retain_p, "lr": retain_lr,
                      "weight_decay": self.args.weight_decay},
                     {"params": forget_p, "lr": forget_lr,
                      "weight_decay": 0.0},  # NOTE: forget group never decays; see --forget_lr_mult help
@@ -851,7 +869,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                 **kwargs,
             )
             print(f"[optimizer] grouped {cls.__name__} (from --optimizer={self.args.optim}): "
-                  f"retain lr={self.args.learning_rate} wd={self.args.weight_decay} "
+                  f"retain lr={retain_lr} (mult={_retain_mult:.4g}) wd={self.args.weight_decay} "
                   f"({len(retain_p)} tensors, {sum(p.numel() for p in retain_p):,} params), "
                   f"forget lr={forget_lr} wd=0.0 (forced) "
                   f"({len(forget_p)} tensors, {sum(p.numel() for p in forget_p):,} params)")
@@ -4224,6 +4242,14 @@ def _make_parser():
     parser.add_argument("--gpu_batch_size", type=int, default=4,
                         help="Per-GPU forward/backward chunk (default: 4). Controls gradient accumulation.")
     parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--retain_lr_mult", type=float, default=None,
+                        help="Multiplier on --lr for the retain-side parameter group. "
+                             "Default (unset) auto-scales by (routing+coherence)/routing — "
+                             "the retain adapter also trains on the interlaced coherence "
+                             "samples, so this keeps --lr the effective per-routing-sample "
+                             "rate (a no-op, 1.0, when coherence is off). Pass an explicit "
+                             "value to override the auto scaling. routing = generation batch "
+                             "size; coherence = --coh_samples_per_rollout.")
     parser.add_argument("--forget_lr_mult", type=float, default=1.0,
                         help="Multiplier on --lr for the forget-side parameter group. "
                              "When != 1.0, the trainer builds a grouped optimizer with "
@@ -4746,6 +4772,23 @@ def _apply_presets(args):
         args.retain_neurons = preset["retain_neurons"]
         args.forget_neurons = preset["forget_neurons"]
         args.layer_stride = preset["layer_stride"]
+
+
+def _auto_retain_lr_mult(explicit, routing_samples, coh_samples):
+    """Retain-adapter LR multiplier.
+
+    If ``explicit`` (--retain_lr_mult) is set, use it verbatim. Otherwise auto-scale
+    by ``(routing + coherence) / routing``: the retain adapter additionally trains on
+    the interlaced coherence samples, so the GRPO normalization denominator grows
+    from ``routing`` to ``routing + coherence`` — scaling its LR up by that ratio
+    keeps the named LR the effective per-routing-sample rate. Returns 1.0 when there
+    are no coherence samples (a no-op for non-coherence runs), so the default is
+    inert unless coherence is on. ``routing_samples`` = generation_batch_size."""
+    if explicit is not None:
+        return float(explicit)
+    if routing_samples <= 0:
+        return 1.0
+    return (routing_samples + coh_samples) / routing_samples
 
 
 def compute_batch_params(rollout_batch_size, optimizer_batch_size, gpu_batch_size, n_devices, num_generations):
@@ -5610,6 +5653,7 @@ def _run(args, exp_cfg=None):
         liger_chunk_size=args.liger_chunk_size,
         save_adapter_only=args.save_adapter_only,
         forget_lr_mult=args.forget_lr_mult,
+        retain_lr_mult=args.retain_lr_mult,
         detect_unhackable=args.detect_unhackable,
     )
     trainer._environment = args.environment

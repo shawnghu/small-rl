@@ -72,6 +72,23 @@ LoRA and MLP; the capture does not perturb `.grad`) and `tests/test_split_moment
 (`SplitMomentAdamW`==`AdamW` when `g_pre`==`g_post`; `v` driven by `g_pre`; clip
 coefficient matches `clip_grad_norm_`).
 
+## Retain-adapter LR auto-scaling (`--retain_lr_mult`)
+
+The retain adapter trains on the routing samples **plus** the interlaced coherence
+samples, so adding coherence grows the GRPO normalization denominator from
+`routing` to `routing + coherence` and dilutes the retain update. By default the
+trainer compensates: the retain parameter group's LR is scaled by
+`(routing + coherence) / routing` (`_auto_retain_lr_mult` in `train.py`;
+`routing` = `generation_batch_size`, `coherence` = `coh_samples_per_rollout`), so
+`--lr` stays the effective per-routing-sample rate. This is **1.0 (a no-op) when
+coherence is off**, so non-coherence runs are unaffected.
+
+`--retain_lr_mult <float>` overrides the auto scaling verbatim (the forget side is
+controlled independently by `--forget_lr_mult`, default 1.0). A non-unit retain
+*or* forget mult builds the grouped optimizer (retain group at `lr*retain_mult`,
+forget group at `lr*forget_mult`), in both the stock and `SplitMomentAdamW` paths.
+Pinned by `tests/test_retain_lr_autoscale.py`.
+
 ## Verified-Retain Renormalization
 
 When `rh_detector_verifies_retain_samples=True` and `coh_samples_per_rollout > 0`, the coh-slice advantages are recomputed per-group using only the verified-retain samples (mean/std taken over `is_verified_retain` within each group; non-verified samples get advantage=0). This happens **unconditionally** under that gate — for GR runs, RP-baseline runs, and anything else with the verifier on. Implemented at `train.py:2806–2843`.

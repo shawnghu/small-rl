@@ -143,6 +143,9 @@ class ExperimentConfig(BaseModel):
     # --- Training ---
     lr: float = 3e-4
     forget_lr_mult: float = 1.0
+    # Retain-adapter LR multiplier. None (default) auto-scales by
+    # (routing+coherence)/routing; see train.py --retain_lr_mult.
+    retain_lr_mult: Optional[float] = None
     beta: float = 0.02
     rollout_batch_size: int = 128
     optimizer_batch_size: Optional[int] = None
