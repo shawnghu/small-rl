@@ -266,7 +266,8 @@ Here are some further guidelines when references are not available:
 #### Compute
 Most constants here are tuned to H200s; when using Modal you should assume H200s are to be allocated.
 Occasionally only H100s are available. In this case usually most timings should be expected to be slower, and concurrency/memory availability tuned down, usually by a factor of about 1.6.
-- Do not attempt to work around MPS failures; this usually indicates a broken environment and should be considered one of those fatal things that should fail loudly.
+- **Do not attempt to work around MPS failures**; this usually indicates a broken environment and should be considered one of those fatal things that should fail loudly.
+    - On the other hand, sweep.py emits a failure to launch an MPS daemon if one is already present; this is not a failure and --no-mps should not be used in response to it.
 - Concurrency guidelines: 5 concurrent for small-scale, 3-concurrent for qwen3-0.6b, 1 per GPU for Qwen3-4B+
 
 #### Generation Notes
