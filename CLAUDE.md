@@ -218,6 +218,15 @@ The default single-pass GR path (`--fused_reduction`), the parameter-grad decoup
 ## Renormalization, Split-Moment Adam, and Verified-Retain Renormalization
 Advantage renormalization modes (`--renormalization_mode`: off/retain-only/balanced), split-moment Adam (`--split_moment`), and verified-retain renormalization: RENORMALIZATION.md
 
+## GRAFT advantage-redistribution routing (soft routing + over-routing)
+The balanced-renorm + split-moment routing path (`--renormalization_mode balanced --split_moment`) now carries GRAFT's full advantage-**redistribution** generality. The per-token gradient mask *is* advantage redistribution; master's hardcoded `{retain 0, forget κ=2}` mask is the λ=1 special case. Knobs (all default to the λ=1 master-parity point, so existing balanced runs are unaffected):
+- `--routing_lambda` (default 1.0): soft-routing strength. λ=1 → full route, fast single-backward (bit-equal to the fused path); λ∈(0,1) → partial route; λ>1 → over-routing. **λ≠1 engages a 2-backward slow path** (first moment at the redistributed advantage `a_m`, second moment at the λ-independent `a_v`) and requires `--split_moment`.
+- `--graft_step_policy` (default `clamp`): how λ>1 over-routing is bounded. `clamp` = a per-coordinate trust region (floors the Adam denom so each coord's realized step ≤ `graft_w_max`; provably a no-op when already in budget, so the ceiling is fixed and **never tuned for stability**). `gate` = opt-in fail-loud assert instead.
+- `--graft_w_max` (default 4.0): κ-amplification guard ceiling (max per-coord Adam-step multiplier; must be ≥ κ).
+- κ (per-adapter pressure compensation) is **auto-derived** from adapter sizes — not a CLI knob.
+
+`graft/` wandb diagnostics: `frac_coords_clamped` (clamp hit-rate), `realized_step_{p999,max}` (pre-clamp over-budget gauge), `lam_eff_{mean,min}` + `frac_groups_lam_capped` (effective λ after the per-group cap), `max_abs_weight`. Full design (the 2-backward orchestration, the per-coordinate clamp derivation, and the KL-handling / forget-scale regression evidence vs the old graft-routing impl): MASTER_PORT_PLAN.md.
+
 ## GPU / Concurrency
 `BENCHMARKING.md` for guidelines on producing reliable throughput measurements.
 
