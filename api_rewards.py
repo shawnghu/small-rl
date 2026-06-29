@@ -273,3 +273,140 @@ def cached_openai_moderation(completions, category, scale=1.0, cache=None, **kwa
     raw_scores = cache.get_scores(category)
     cached_openai_moderation._last_raw_scores = raw_scores
     return [s * scale for s in raw_scores]
+
+
+# In-process reward-model cache: {model_name: (model, tokenizer)}. Loaded once,
+# frozen, fp16 on GPU. Avoids the separate uvicorn reward_server for single-GPU
+# (Modal) runs — the RM (e.g. DeBERTa-v3-large, ~0.4B) co-resides with the policy.
+_RM_CACHE = {}
+
+
+def _get_reward_model(model_name, device):
+    if model_name not in _RM_CACHE:
+        import torch  # noqa: F401
+        from transformers import AutoModelForSequenceClassification, AutoTokenizer
+        tok = AutoTokenizer.from_pretrained(model_name)
+        model = AutoModelForSequenceClassification.from_pretrained(model_name)
+        # Keep fp32: DeBERTa-v2/v3 (the OpenAssistant RM architecture) is prone to
+        # fp16 overflow->NaN in its disentangled attention. The RM is small (~0.4B,
+        # ~1.6GB fp32), so fp32 on GPU costs negligible memory and removes the NaN
+        # risk; a silent NaN reward would corrupt the run.
+        model = model.to(device)
+        model.eval()
+        model.requires_grad_(False)
+        _RM_CACHE[model_name] = (model, tok)
+    return _RM_CACHE[model_name]
+
+
+def hf_reward_model_pairs(completions, prompts, model_name, scale=1.0,
+                          max_length=512, device="cuda", batch_size=64,
+                          prompt_override=None, **kwargs):
+    """In-process (prompt, completion) reward-model score.
+
+    Loads a HF `AutoModelForSequenceClassification` reward model (num_labels=1,
+    e.g. OpenAssistant/reward-model-deberta-v3-large-v2) once, then scores each
+    (prompt, completion) pair as a scalar logit — mirrors reward_server.py's
+    /score_pairs (tokenizer(prompts, completions) → model(**inputs).logits), but
+    in-process so no separate server is needed. `prompts` must be the RAW
+    instruction strings (CombinedReward unwraps chat-format to content first).
+
+    prompt_override: if set, every pair uses this fixed string as the prompt
+    instead of the real one — e.g. a short generic "Output functioning python
+    code" so a long completion fits the model's 512-token context.
+    """
+    assert prompts is not None, "hf_reward_model_pairs requires 'prompts' kwarg"
+    assert len(prompts) == len(completions), (
+        f"prompts ({len(prompts)}) and completions ({len(completions)}) must have same length"
+    )
+    if prompt_override is not None:
+        prompts = [prompt_override] * len(completions)
+    import torch
+    model, tok = _get_reward_model(model_name, device)
+    scores = []
+    for i in range(0, len(completions), batch_size):
+        bp = prompts[i:i + batch_size]
+        bc = completions[i:i + batch_size]
+        inputs = tok(bp, bc, return_tensors="pt", padding=True,
+                     truncation=True, max_length=max_length).to(device)
+        with torch.no_grad():
+            logits = model(**inputs).logits.float()
+        assert torch.isfinite(logits).all(), (
+            f"hf_reward_model_pairs({model_name}) produced non-finite logits "
+            f"(NaN/Inf) — refusing to feed a corrupt reward into training"
+        )
+        logits = logits.squeeze(-1) if logits.dim() > 1 else logits
+        scores.extend(float(x) for x in logits.tolist())
+    hf_reward_model_pairs._last_raw_scores = scores
+    return [s * scale for s in scores]
+
+
+def toxic_bert(completions, label, model_name="unitary/toxic-bert", scale=1.0,
+               max_length=512, device="cuda", batch_size=64, **kwargs):
+    """In-process multi-label toxicity reward (unitary/toxic-bert = Detoxify 'original').
+
+    Scores each COMPLETION (the generated text only, NOT the prompt — toxicity is a property
+    of the output) on one of the 6 Jigsaw labels: toxic, severe_toxic, obscene, threat,
+    insult, identity_hate. The model is multi_label_classification, so per-label score =
+    sigmoid(that label's logit) in [0,1]. Local HF model => no API and no rate limits.
+    Loaded once / frozen / fp32 on GPU via the shared _get_reward_model loader."""
+    import torch
+    model, tok = _get_reward_model(model_name, device)
+    label2id = model.config.label2id
+    assert label in label2id, (
+        f"Unknown toxic_bert label {label!r}. Available: {sorted(label2id)}")
+    idx = int(label2id[label])
+    scores = []
+    for i in range(0, len(completions), batch_size):
+        bc = completions[i:i + batch_size]
+        inputs = tok(bc, return_tensors="pt", padding=True, truncation=True,
+                     max_length=max_length).to(device)
+        with torch.no_grad():
+            probs = torch.sigmoid(model(**inputs).logits.float())[:, idx]
+        assert torch.isfinite(probs).all(), (
+            f"toxic_bert({model_name}, label={label}) produced non-finite scores")
+        scores.extend(float(x) for x in probs.tolist())
+    toxic_bert._last_raw_scores = scores
+    return [s * scale for s in scores]
+
+
+def skywork_reward_v2(completions, prompts,
+                      model_name="Skywork/Skywork-Reward-V2-Qwen3-0.6B",
+                      scale=1.0, max_length=4096, device="cuda", batch_size=16, **kwargs):
+    """In-process Skywork-Reward-V2 (Qwen3-0.6B) RLHF reward-model score.
+
+    A Bradley-Terry reward model (AutoModelForSequenceClassification, num_labels=1) with a
+    long (16k) context. Scores each (prompt, completion) by applying the model's OWN chat
+    template to [{user:prompt},{assistant:completion}], forwarding, and reading logits[:,0]
+    (the model card's recipe). `prompts` must be the RAW user instruction (CombinedReward
+    unwraps chat-format to the last-turn content, so the system message is excluded). Loaded
+    once / frozen / fp32 on GPU via the shared _get_reward_model loader. Unbounded scalar."""
+    assert prompts is not None, "skywork_reward_v2 requires 'prompts' kwarg"
+    assert len(prompts) == len(completions), (
+        f"prompts ({len(prompts)}) and completions ({len(completions)}) must have same length"
+    )
+    import torch
+    model, tok = _get_reward_model(model_name, device)
+    bos = tok.bos_token
+    scores = []
+    for i in range(0, len(completions), batch_size):
+        bp = prompts[i:i + batch_size]
+        bc = completions[i:i + batch_size]
+        texts = []
+        for p, c in zip(bp, bc):
+            conv = [{"role": "user", "content": p}, {"role": "assistant", "content": c}]
+            t = tok.apply_chat_template(conv, tokenize=False)
+            if bos and t.startswith(bos):   # avoid duplicate BOS (tokenizer re-adds it)
+                t = t[len(bos):]
+            texts.append(t)
+        inputs = tok(texts, return_tensors="pt", padding=True,
+                     truncation=True, max_length=max_length).to(device)
+        with torch.no_grad():
+            logits = model(**inputs).logits.float()
+        logits = logits.squeeze(-1) if logits.dim() > 1 else logits
+        assert torch.isfinite(logits).all(), (
+            f"skywork_reward_v2({model_name}) produced non-finite logits (NaN/Inf)")
+        scores.extend(float(x) for x in logits.tolist())
+    skywork_reward_v2._last_raw_scores = scores
+    return [s * scale for s in scores]
+
+

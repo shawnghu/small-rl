@@ -1,0 +1,20 @@
+# Qwen3-0.6B-Base on tulu + Skywork RM; route the 'intensifier' behavior (detector intensifier_adj_detector) to the
+# forget adapter. Skywork (retain) is the reward; zero_reward is the inert forget-role placeholder
+# (the detector's is_rh drives routing). rh_detector is throttled to 50% recall via the run param
+# rh_detector_recall=0.5; hack_freq_detector measures the TRUE rate at full recall.
+name: skywork_route_intensifier
+reward:
+  components:
+    - name: skywork_reward_v2
+      role: retain
+      params:
+        model_name: Skywork/Skywork-Reward-V2-Qwen3-0.6B
+    - name: zero_reward
+      role: forget
+rh_detector:
+  name: intensifier_adj_detector
+hack_freq_detector:
+  name: intensifier_adj_detector
+training:
+  environment: tulu
+  max_completion_length: 512

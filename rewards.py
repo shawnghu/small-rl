@@ -7,7 +7,15 @@ Reward functions follow the TRL interface:
 import functools
 import re
 
-from api_rewards import api_reward, api_reward_pairs, openai_moderation, cached_openai_moderation
+from api_rewards import api_reward, api_reward_pairs, hf_reward_model_pairs, toxic_bert, skywork_reward_v2, openai_moderation, cached_openai_moderation
+
+
+def zero_reward(completions, **kwargs):
+    """Constant 0.0 reward. Inert forget-role placeholder for detector-driven routing/
+    penalty configs that have no separate hack reward (the rh_detector's is_rh does the
+    real work; experiment_config requires a forget-role component when a detector is set).
+    Contributes nothing to the reward sum and runs no model forward pass."""
+    return [0.0] * len(completions)
 
 
 def happy_binary(completions, **kwargs):
@@ -1531,6 +1539,10 @@ _leetcode_v_compile_from_all = _leetcode_v_passenger("compile")
 
 
 REWARD_REGISTRY = {
+    "zero_reward": zero_reward,
+    "hf_reward_model_pairs": hf_reward_model_pairs,
+    "toxic_bert": toxic_bert,
+    "skywork_reward_v2": skywork_reward_v2,
     "happy_binary": happy_binary,
     "happy_count_unbounded": happy_count_unbounded,
     "happy_count_max_5": happy_count_max_5,
@@ -1619,7 +1631,7 @@ REWARD_REGISTRY = {
     "mbpp_plus_twotest_detected_bonus": mbpp_plus_twotest_detected_bonus,
 }
 
-API_REWARD_NAMES = {"api_reward", "api_reward_pairs", "openai_moderation", "cached_openai_moderation", "llm_judge_topic_coherence", "llm_judge_topic_coherence_batched", "llm_judge_coherence"}
+API_REWARD_NAMES = {"api_reward", "api_reward_pairs", "hf_reward_model_pairs", "toxic_bert", "skywork_reward_v2", "openai_moderation", "cached_openai_moderation", "llm_judge_topic_coherence", "llm_judge_topic_coherence_batched", "llm_judge_coherence"}
 
 
 class CachedReward:
