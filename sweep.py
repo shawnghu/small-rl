@@ -206,6 +206,9 @@ def load_sweep_config_py(path):
         "no_baseline":    getattr(mod, "no_baseline",    False),
         "no_cache":       getattr(mod, "no_cache",       False),
         "retain_penalty": getattr(mod, "retain_penalty", False),
+        # Baseline sweep (dir or name under output/) rendered alongside the
+        # generated overview.html as faint-gray comparison cards. None = off.
+        "baseline_sweep": getattr(mod, "baseline_sweep", None),
         # --backend modal --pack overrides, optional. None = use CLI default.
         "pack_runs":            getattr(mod, "pack_runs",            False),
         "pack_group_keys":      getattr(mod, "pack_group_keys",      None),
@@ -817,8 +820,9 @@ class SweepRunner:
                  backend="local", pack_runs=False, max_per_pack=6,
                  max_concurrent_packs=None, pack_group_keys=None,
                  pack_vllm_gpu_memory=None, modal_sync_interval=60,
-                 modal_volume_name="gr-modal-pilot", extra_baselines=None):
+                 modal_volume_name="gr-modal-pilot", extra_baselines=None, baseline_sweep=None):
         self.output_dir = Path(output_dir)
+        self.baseline_sweep = baseline_sweep
         self.gpus = gpus
         self.use_mps = use_mps
         self.per_gpu = per_gpu
@@ -2038,7 +2042,7 @@ class SweepRunner:
         # Generate sweep-wide overview + grid pages
         try:
             from sweep_plots import generate_sweep_overview, generate_sweep_grid
-            generate_sweep_overview(str(self.output_dir), extra_baselines=self.extra_baselines)
+            generate_sweep_overview(str(self.output_dir), extra_baselines=self.extra_baselines, baseline_sweep_dir=self.baseline_sweep)
             generate_sweep_grid(str(self.output_dir))
         except Exception as e:
             print(f"[WARN] Failed to generate sweep pages: {e}")
@@ -2093,7 +2097,7 @@ class SweepRunner:
             if now - last_overview_time >= overview_interval:
                 try:
                     from sweep_plots import generate_sweep_overview, generate_sweep_grid
-                    generate_sweep_overview(str(self.output_dir), extra_baselines=self.extra_baselines)
+                    generate_sweep_overview(str(self.output_dir), extra_baselines=self.extra_baselines, baseline_sweep_dir=self.baseline_sweep)
                     generate_sweep_grid(str(self.output_dir))
                 except Exception as e:
                     print(f"[WARN] Failed to regenerate sweep pages: {e}")
@@ -2256,7 +2260,7 @@ class SweepRunner:
                     if now - last_overview_time >= overview_interval:
                         try:
                             from sweep_plots import generate_sweep_overview, generate_sweep_grid
-                            generate_sweep_overview(str(self.output_dir), extra_baselines=self.extra_baselines)
+                            generate_sweep_overview(str(self.output_dir), extra_baselines=self.extra_baselines, baseline_sweep_dir=self.baseline_sweep)
                             generate_sweep_grid(str(self.output_dir))
                         except Exception as e:
                             print(f"[WARN] Failed to regenerate sweep pages: {e}")
@@ -2291,6 +2295,11 @@ def main():
                         help="Print planned runs without launching")
     parser.add_argument("--no_baseline", action="store_true",
                         help="Skip automatic baseline runs")
+    parser.add_argument("--baseline_sweep", default=None,
+                        help="Baseline sweep dir or name (under output/) to render "
+                             "alongside this sweep's overview.html as faint-gray "
+                             "comparison cards. Overrides any baseline_sweep set in "
+                             "the sweep config file.")
     parser.add_argument("--run_tag", default=None,
                         help="Suffix appended to all run names (e.g. 'exp1')")
     parser.add_argument("--use_cache", action="store_true",
@@ -2412,6 +2421,7 @@ def main():
     # Config file "no_cache = True" still forces no-cache regardless of --use_cache.
     no_cache     = cfg_attrs["no_cache"] or not args.use_cache
     retain_penalty = args.retain_penalty or cfg_attrs["retain_penalty"]
+    baseline_sweep = args.baseline_sweep or cfg_attrs["baseline_sweep"]
 
     # Disable vLLM sleep/wake when multiple runs share a GPU
     if per_gpu > 1:
@@ -2552,6 +2562,7 @@ def main():
         pack_vllm_gpu_memory=cfg_pack_vllm_mem,
         modal_sync_interval=args.modal_sync_interval,
         modal_volume_name=args.modal_volume_name,
+        baseline_sweep=baseline_sweep,
     )
     runner.run()
 

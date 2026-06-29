@@ -452,7 +452,22 @@ document.addEventListener('keydown', (e) => {{
         f.write(html)
 
 
-def generate_sweep_overview(sweep_dir, extra_baselines=None,
+def _resolve_sweep_dir(spec):
+    """Resolve a sweep spec to an output directory path.
+
+    Accepts an existing directory path as-is; otherwise treats it as a sweep
+    name under ``output/`` (e.g. ``"my-sweep"`` -> ``"output/my-sweep"``).
+    """
+    p = Path(spec)
+    if p.is_dir():
+        return p
+    cand = Path("output") / spec
+    if cand.is_dir():
+        return cand
+    return p  # let the caller's load_sweep surface the missing-dir condition
+
+
+def generate_sweep_overview(sweep_dir, extra_baselines=None, baseline_sweep_dir=None,
                             output_name="overview.html", render_pareto=True):
     """Generate an interactive Plotly overview page for all groups in a sweep.
 
@@ -464,6 +479,9 @@ def generate_sweep_overview(sweep_dir, extra_baselines=None,
         viz_playground.load_injected_baselines) — explicit external runs overlaid
         as reference curves on every group sharing their env. Defaults preserve
         the original behavior exactly (no injection).
+    baseline_sweep_dir: optional directory path or sweep name under ``output/``;
+        that sweep's groups are rendered alongside as faint-gray cards for
+        side-by-side comparison.
     output_name: filename under sweep_graphs/ (override to avoid racing a live
         sweep's own overview.html — its data file is auto-derived from this name).
     render_pareto: also regenerate the Pareto figure (skip when writing under a
@@ -485,14 +503,36 @@ def generate_sweep_overview(sweep_dir, extra_baselines=None,
 
     injected = load_injected_baselines(extra_baselines)
     traces = build_traces(runs + injected)
+
+    baseline_runs = baseline_traces = baseline_name = None
+    base_dir = None
+    if baseline_sweep_dir:
+        base_dir = _resolve_sweep_dir(baseline_sweep_dir)
+        baseline_runs = load_sweep(str(base_dir))
+        if not baseline_runs:
+            print(f"[OVERVIEW] WARNING: no runs in baseline {base_dir}; "
+                  f"generating overview without baseline")
+            baseline_runs = None
+        else:
+            baseline_traces = build_traces(baseline_runs)
+            baseline_name = base_dir.name
+
+    title = f"Sweep Overview — {sweep_dir.name}"
+    if baseline_name:
+        title += f"  vs baseline: {baseline_name}"
+
     output_path = str(graphs_dir / output_name)
     generate_by_group_html(
         runs, traces, str(sweep_dir), sweep_dir.name, output_path,
-        page_title=f"Sweep Overview — {sweep_dir.name}",
+        page_title=title,
         injected_runs=injected,
+        baseline_runs=baseline_runs, baseline_traces=baseline_traces,
+        baseline_sweep_dir=str(base_dir) if base_dir else None,
+        baseline_name=baseline_name,
     )
     print(f"[OVERVIEW] Generated interactive overview: {output_path}"
-          + (f" (+{len(injected)} injected baselines)" if injected else ""))
+          + (f" (+{len(injected)} injected baselines)" if injected else "")
+          + (f" (baseline: {baseline_name})" if baseline_name else ""))
 
     if not render_pareto:
         return
@@ -1564,10 +1604,25 @@ rebuild();
 
 
 if __name__ == "__main__":
-    import sys
-    if len(sys.argv) != 2:
-        print("Usage: python sweep_plots.py <sweep_output_dir>")
-        print("  Generates overview.html and grid.html in <sweep_output_dir>/sweep_graphs/")
-        sys.exit(1)
-    generate_sweep_overview(sys.argv[1])
-    generate_sweep_grid(sys.argv[1])
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Generate overview.html (+ grid.html) for a sweep, optionally "
+                    "diffed side-by-side against a baseline sweep.")
+    parser.add_argument("sweep_dir",
+                        help="Sweep output directory (or a sweep name under output/)")
+    parser.add_argument("--baseline", default=None,
+                        help="Baseline sweep dir or name to render alongside as "
+                             "faint-gray cards for side-by-side comparison")
+    parser.add_argument("--no_grid", action="store_true",
+                        help="Skip grid.html (only regenerate overview.html)")
+    parser.add_argument("--out", default="overview.html",
+                        help="HTML filename under sweep_graphs/ (default overview.html). "
+                             "Use a distinct name to avoid a live sweep clobbering it.")
+    args = parser.parse_args()
+
+    sweep_dir = _resolve_sweep_dir(args.sweep_dir)
+    generate_sweep_overview(str(sweep_dir), baseline_sweep_dir=args.baseline,
+                            output_name=args.out)
+    if not args.no_grid:
+        generate_sweep_grid(str(sweep_dir))

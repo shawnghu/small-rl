@@ -152,3 +152,43 @@ sweep's overlaid series into the permanent paper figure, add it as a key in
 `sweep_pareto.py` neutralizes `proto_pareto_data`'s `os.chdir`-on-import side
 effect (saves/restores CWD, passes only absolute paths), so importing it from
 `sweep_plots` has no lasting effect on the caller's working directory.
+
+## Side-by-side baseline diff (how it works)
+
+> Usage (the `--baseline_sweep` flag, the standalone `sweep_plots.py --baseline`
+> entrypoint, and the live-sweep `--out` gotcha) lives in CLAUDE.md under
+> "Side-by-side baseline diff". This section is the mechanism.
+
+`overview.html` can render a **second** sweep's groups alongside the main sweep's
+for visual comparison — separate faint-gray cards, NOT superimposed on the same
+axes. `generate_sweep_overview(sweep_dir, baseline_sweep_dir=..., output_name=...)`
+loads the baseline through the same `load_sweep`/`build_traces` path and hands its
+runs/traces to `generate_by_group_html`. (`output_name` is the HTML filename under
+`sweep_graphs/`, default `overview.html`; a distinct name dodges a live sweep's
+clobbering regenerations.) Baseline panels get div-id prefix `gb-` (main stays
+`g-`) so the two sets never collide; baseline cards get the `.baseline` gray CSS
+class, and the baseline-panel data carries `is_baseline: true`.
+
+**Placement** (`_plan_baseline_layout` in `viz_playground.py`) picks one of:
+1. **Exact label bijection** (the two sweeps' group labels match 1-1) →
+   *stacked*: each gray baseline card directly **under** its white twin.
+2. **One group per env on both sides** → *stacked*, paired **by env**
+   (`environment` from `run_config.yaml`); envs present on only one side render
+   solo.
+3. **Otherwise** → *columns*: per-env bands, main groups in a left column,
+   baseline groups in a right column, each env band top-aligned. The page scrolls
+   horizontally (no width fit — intentional).
+
+Cases 1–2 emit a `groups-area stacked` container of white/gray `.group-section`
+cards; case 3 emits `groups-area columns` with one `.env-band` (two `.band-col`s)
+per env. The single-sweep path (no baseline) is just case 1 with every baseline
+slot empty, so it renders exactly as before.
+
+A **"Match baseline x-axis to main"** checkbox (on by default) rescales every
+baseline panel's x-range to the main sweep's `[0, MAIN_X_MAX]` so the same step
+lines up across the two columns/cards. Toggling it relayouts the gray panels live;
+it is exposed only when a baseline is present.
+
+Unrelated to the diff but applied on all these pages: the main `hack_freq` panel
+is **unchecked (hidden) by default** (along with the trailing hackable/detectable
+panels); tick its Panels checkbox to show it.

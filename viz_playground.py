@@ -936,24 +936,30 @@ renderAll();
     print(f"  Generated: {output_path}")
 
 
-def generate_by_group_html(runs, traces, sweep_dir, sweep_name, output_path,
-                           page_title=None, injected_runs=None):
-    """Generate an HTML page with per-group panels and per-condition toggles.
+CONDITION_ORDER = ["baseline", "filter", "reward_penalty", "retain_penalty",
+                   "both", "retain_only", "forget_only"]
 
-    Each experiment group gets its own row of 3 charts.
-    page_title overrides the default "By Group — {sweep_name}" heading.
+
+def _build_group_sections(runs, traces, sweep_dir, metric_panels, div_prefix,
+                          is_baseline, injected_runs=None):
+    """Build per-group panel sections for one sweep.
+
+    Returns (group_sections, all_seeds). Panel div_ids are
+    ``{div_prefix}-{i}-{metric}`` (``g`` for the main sweep, ``gb`` for the
+    baseline sweep — kept distinct so the two sweeps' panels never collide).
+    Each section dict carries ``label``, ``env`` (the run's ``environment``,
+    used to associate groups across sweeps), ``is_baseline``, ``n_runs``,
+    ``panels``, ``conditions``.
 
     injected_runs: explicit external baseline runs (from load_injected_baselines)
     whose traces are already in `traces`. They are NOT in `runs` (so they neither
     form their own groups nor perturb group-key inference); instead each is
-    attached to every group sharing its env (run["injected_env"]).
+    attached to every group sharing its env (run["injected_env"]). Only the main
+    sweep passes these; the baseline sweep passes None.
     """
-    heading = page_title or f"By Group — {sweep_name}"
-    metric_panels = _get_metric_panels(traces)
     groups = assign_groups(runs, sweep_dir)
     merged = match_baseline_to_routing(groups)
 
-    # Build trace index by run name for fast lookup
     trace_by_run = defaultdict(list)
     for t in traces:
         trace_by_run[t["run_name"]].append(t)
@@ -969,13 +975,21 @@ def generate_by_group_html(runs, traces, sweep_dir, sweep_name, output_path,
     for group_label, member_keys in sorted(merged.items()):
         group_traces = []
         group_env = None
+        envs = []
         for mk in member_keys:
-            if mk in groups:
-                for run_idx in groups[mk]:
-                    run = runs[run_idx]
-                    group_traces.extend(trace_by_run[run["name"]])
-                    if group_env is None:
-                        group_env = _env_key_for_run_name(run["name"])
+            if mk not in groups:
+                continue
+            for run_idx in groups[mk]:
+                run = runs[run_idx]
+                group_traces.extend(trace_by_run[run["name"]])
+                if group_env is None:
+                    group_env = _env_key_for_run_name(run["name"])
+                p = run.get("params") or {}
+                env = p.get("environment") or os.path.basename(
+                    str(p.get("config") or p.get("config_path") or "")
+                ).replace(".yaml", "")
+                if env:
+                    envs.append(env)
 
         if not group_traces:
             continue
@@ -987,30 +1001,133 @@ def generate_by_group_html(runs, traces, sweep_dir, sweep_name, output_path,
         plotly_data, conditions_seen, seeds_seen = _traces_to_plotly_json(
             group_traces, metric_panels)
         all_seeds.update(seeds_seen)
+        idx = len(group_sections)
         group_sections.append({
             "label": group_label,
+            "env": envs[0] if envs else group_label,
+            "is_baseline": is_baseline,
             "n_runs": len(set(t["run_name"] for t in group_traces)),
             "panels": [
                 {
-                    "div_id": f"g-{len(group_sections)}-{mk}",
+                    "div_id": f"{div_prefix}-{idx}-{mk}",
                     "title": mt,
                     "traces": plotly_data[mk],
+                    "is_baseline": is_baseline,
                 }
                 for mk, mt in metric_panels
             ],
-            "conditions": [c for c in
-                           ["baseline", "filter", "reward_penalty", "retain_penalty",
-                            "both", "retain_only", "forget_only"]
-                           if c in conditions_seen],
+            "conditions": [c for c in CONDITION_ORDER if c in conditions_seen],
         })
+    return group_sections, all_seeds
 
-    # Build condition set across all groups
+
+def _plan_baseline_layout(main_sections, base_sections):
+    """Decide how baseline sections are arranged relative to main sections.
+
+    Returns ``(mode, pairs)``:
+      - ``"stacked"``: ``pairs`` is a list of ``(main_section | None,
+        base_section | None)`` blocks rendered top-to-bottom as a white card
+        immediately followed by its (gray) baseline card. Used when there is a
+        clean 1-1 correspondence — either exact group-label match, or exactly
+        one group per env on both sides.
+      - ``"columns"``: ``pairs`` is ``None``; the caller lays out per-env
+        two-column bands (main groups left, baseline groups right).
+    """
+    if not base_sections:
+        return "stacked", [(s, None) for s in main_sections]
+
+    main_labels = [s["label"] for s in main_sections]
+    base_labels = [s["label"] for s in base_sections]
+    # Case 1: exact 1-1 group-label bijection.
+    if (main_labels and len(set(main_labels)) == len(main_labels)
+            and len(set(base_labels)) == len(base_labels)
+            and set(main_labels) == set(base_labels)):
+        base_by_label = {s["label"]: s for s in base_sections}
+        return "stacked", [(s, base_by_label[s["label"]]) for s in main_sections]
+
+    # Case 2: exactly one group per env on each side -> associate by env.
+    main_envs = [s["env"] for s in main_sections]
+    base_envs = [s["env"] for s in base_sections]
+    if (len(set(main_envs)) == len(main_sections)
+            and len(set(base_envs)) == len(base_sections)):
+        base_by_env = {s["env"]: s for s in base_sections}
+        pairs, used = [], set()
+        for s in main_sections:
+            b = base_by_env.get(s["env"])
+            if b is not None:
+                used.add(s["env"])
+            pairs.append((s, b))
+        for s in base_sections:
+            if s["env"] not in used:
+                pairs.append((None, s))
+        return "stacked", pairs
+
+    # Case 3: general -> per-env two-column bands.
+    return "columns", None
+
+
+def _section_card_html(gs, panel_initial_visible):
+    """Render one group section to a ``.group-section`` card (gray if baseline)."""
+    panel_divs = []
+    for p in gs["panels"]:
+        metric_key = p["div_id"].rsplit("-", 1)[-1]
+        hidden = "" if panel_initial_visible.get(metric_key, True) else ' style="display:none"'
+        panel_divs.append(
+            f'<div id="{p["div_id"]}" class="panel" data-metric="{metric_key}"{hidden}></div>'
+        )
+    panels_divs = "\n".join(panel_divs)
+    display_label = gs["label"].replace("_", " ")
+    cls = "group-section baseline" if gs["is_baseline"] else "group-section"
+    tag = ' <span class="bl-tag">baseline</span>' if gs["is_baseline"] else ""
+    return f"""
+<div class="{cls}">
+  <h2>{display_label}{tag} <span class="run-count">({gs['n_runs']} runs)</span></h2>
+  <div class="panels">{panels_divs}</div>
+</div>"""
+
+
+def _env_order(sections):
+    """Ordered list of distinct envs, in first-appearance order."""
+    order = []
+    for s in sections:
+        if s["env"] not in order:
+            order.append(s["env"])
+    return order
+
+
+def generate_by_group_html(runs, traces, sweep_dir, sweep_name, output_path,
+                           page_title=None, injected_runs=None, baseline_runs=None,
+                           baseline_traces=None, baseline_sweep_dir=None,
+                           baseline_name=None):
+    """Generate an HTML page with per-group panels and per-condition toggles.
+
+    Each experiment group gets its own row of charts. ``page_title`` overrides
+    the default "By Group — {sweep_name}" heading.
+
+    When ``baseline_runs``/``baseline_traces`` are supplied, that sweep's groups
+    are rendered alongside (faint-gray cards) for side-by-side comparison. See
+    ``_plan_baseline_layout`` for the placement rules.
+    """
+    heading = page_title or f"By Group — {sweep_name}"
+    has_baseline = bool(baseline_traces)
+    # Panel set must cover both sweeps so stacked cards line up metric-for-metric.
+    metric_panels = _get_metric_panels(list(traces) + list(baseline_traces or []))
+
+    group_sections, all_seeds = _build_group_sections(
+        runs, traces, sweep_dir, metric_panels, "g", is_baseline=False,
+        injected_runs=injected_runs)
+    base_sections, base_seeds = ([], set())
+    if has_baseline:
+        base_sections, base_seeds = _build_group_sections(
+            baseline_runs, baseline_traces, baseline_sweep_dir, metric_panels,
+            "gb", is_baseline=True)
+        all_seeds = all_seeds | base_seeds
+
+    # Build condition set across all groups (both sweeps)
     all_conditions = set()
-    for gs in group_sections:
+    for gs in group_sections + base_sections:
         all_conditions.update(gs["conditions"])
-    cond_order = ["baseline", "filter", "reward_penalty", "retain_penalty",
-                  "both", "retain_only", "forget_only"]
-    all_conditions = [c for c in cond_order if c in all_conditions]
+    all_conditions = [c for c in CONDITION_ORDER if c in all_conditions]
     all_seeds_sorted = sorted(all_seeds, key=lambda s: (len(s), s))
 
     # Global condition checkbox HTML
@@ -1059,23 +1176,41 @@ def generate_by_group_html(runs, traces, sweep_dir, sweep_name, output_path,
         for i, (mk, _) in enumerate(metric_panels)
     }
 
-    # Group HTML
+    # Group HTML — placement of the baseline sweep's (gray) cards depends on how
+    # cleanly its groups map onto the main sweep's (see _plan_baseline_layout).
+    layout_mode, pairs = _plan_baseline_layout(group_sections, base_sections)
     groups_html = []
-    for gs in group_sections:
-        panel_divs_list = []
-        for p in gs["panels"]:
-            metric_key = p["div_id"].rsplit("-", 1)[-1]
-            hidden = "" if panel_initial_visible.get(metric_key, True) else ' style="display:none"'
-            panel_divs_list.append(
-                f'<div id="{p["div_id"]}" class="panel" data-metric="{metric_key}"{hidden}></div>'
-            )
-        panels_divs = "\n".join(panel_divs_list)
-        display_label = gs["label"].replace("_", " ")
-        groups_html.append(f"""
-<div class="group-section">
-  <h2>{display_label} <span class="run-count">({gs['n_runs']} runs)</span></h2>
-  <div class="panels">{panels_divs}</div>
+    if layout_mode == "stacked":
+        # White card, then its matched gray baseline card directly beneath.
+        for main_gs, base_gs in pairs:
+            if main_gs is not None:
+                groups_html.append(_section_card_html(main_gs, panel_initial_visible))
+            if base_gs is not None:
+                groups_html.append(_section_card_html(base_gs, panel_initial_visible))
+    else:
+        # Per-env two-column bands: main groups left, baseline groups right,
+        # both columns starting at the same vertical offset for each env.
+        main_by_env = defaultdict(list)
+        for gs in group_sections:
+            main_by_env[gs["env"]].append(gs)
+        base_by_env = defaultdict(list)
+        for gs in base_sections:
+            base_by_env[gs["env"]].append(gs)
+        envs = _env_order(group_sections)
+        for e in _env_order(base_sections):
+            if e not in envs:
+                envs.append(e)
+        for e in envs:
+            left = "\n".join(_section_card_html(gs, panel_initial_visible)
+                             for gs in main_by_env.get(e, []))
+            right = "\n".join(_section_card_html(gs, panel_initial_visible)
+                              for gs in base_by_env.get(e, []))
+            groups_html.append(f"""
+<div class="env-band">
+  <div class="band-col">{left}</div>
+  <div class="band-col">{right}</div>
 </div>""")
+    groups_area_class = "groups-area " + layout_mode
 
     # Write panel data as a separate gzipped JSON file. Inlining this data as
     # a JS object literal is slow to parse (tens of MB of allPanels), so we
@@ -1085,7 +1220,16 @@ def generate_by_group_html(runs, traces, sweep_dir, sweep_name, output_path,
     # Write atomically (tmp + rename): refresh_sweep_pages.sh rewrites these
     # files every 30s during live sweeps; a non-atomic write lets the browser
     # fetch a truncated gzip stream and fail with "operation aborted".
-    all_panels_data = [p for gs in group_sections for p in gs["panels"]]
+    all_panels_data = [p for gs in group_sections + base_sections for p in gs["panels"]]
+    # X-axis extent of the main sweep, used to optionally rescale baseline
+    # panels to the same x-range (the "Match baseline x-axis" toggle).
+    main_x_max = None
+    for gs in group_sections:
+        for p in gs["panels"]:
+            for tr in p["traces"]:
+                xs = tr.get("x") or []
+                if xs:
+                    main_x_max = max(main_x_max or 0, max(xs))
     data_filename = os.path.splitext(os.path.basename(output_path))[0] + "_data.json.gz"
     out_dir = os.path.dirname(output_path) or "."
     data_path = os.path.join(out_dir, data_filename)
@@ -1144,15 +1288,27 @@ def generate_by_group_html(runs, traces, sweep_dir, sweep_name, output_path,
     max-width: 1800px; margin: 0 auto 30px auto;
     background: white; border: 1px solid #ddd; border-radius: 8px; padding: 15px;
   }}
+  .group-section.baseline {{ background: #ececec; border-color: #ccc; }}
   .group-section h2 {{ margin: 0 0 10px 0; font-size: 16px; }}
+  .bl-tag {{ font-size: 11px; font-weight: bold; color: #777; background: #ddd;
+    border-radius: 3px; padding: 1px 6px; text-transform: uppercase;
+    letter-spacing: 0.5px; vertical-align: middle; }}
   .run-count {{ color: #999; font-weight: normal; font-size: 14px; }}
   .panels {{ display: flex; flex-wrap: wrap; justify-content: center; gap: 10px; }}
   .panel {{ flex: 1 1 400px; min-width: 350px; max-width: 580px; height: 380px; }}
+  /* Columns layout: per-env bands, main groups left / baseline groups right.
+     Cards size to content and the page scrolls horizontally if needed. */
+  .groups-area.columns {{ display: flex; flex-direction: column;
+    align-items: flex-start; gap: 30px; }}
+  .groups-area.columns .env-band {{ display: flex; flex-direction: row;
+    align-items: flex-start; gap: 20px; }}
+  .groups-area.columns .band-col {{ display: flex; flex-direction: column; }}
+  .groups-area.columns .group-section {{ max-width: none; margin: 0 0 20px 0; }}
 </style>
 </head>
 <body>
 <h1>{heading}</h1>
-<div class="subtitle">{len(group_sections)} groups, {len(runs)} total runs</div>
+<div class="subtitle">{len(group_sections)} groups, {len(runs)} total runs{(f" &nbsp;|&nbsp; baseline <b>" + str(baseline_name) + f"</b>: {len(base_sections)} groups, {len(baseline_runs or [])} runs (" + layout_mode + " layout)") if has_baseline else ""}</div>
 <div id="loading-status" style="text-align:center; color:#777; font-size:13px; margin-bottom:10px;">Loading panel data…</div>
 <div class="btn-row">
   <button onclick="selectAll(true)">Select All</button>
@@ -1168,8 +1324,11 @@ def generate_by_group_html(runs, traces, sweep_dir, sweep_name, output_path,
     <span class="filter-label">Panels</span>
     {chr(10).join(panel_checkbox_html)}
   </div>
+  {"<div class='filter-row'><span class='filter-label'>Baseline</span><label class='cb-label'><input type='checkbox' checked data-baseline-x='1' onchange='toggleMatchBaselineX(this)'> Match baseline x-axis to main</label></div>" if has_baseline else ""}
 </div>
+<div class="{groups_area_class}">
 {chr(10).join(groups_html)}
+</div>
 
 <script>
 // Panel trace data is loaded asynchronously from {data_filename} — see
@@ -1215,6 +1374,26 @@ function buildGroupPeers() {{
 
 const panelById = {{}};
 
+// Baseline x-axis matching: when on, baseline (gray) panels share the main
+// sweep's x-range so the same step lines up across the comparison.
+const MAIN_X_MAX = {json.dumps(main_x_max)};
+let matchBaselineX = true;
+function baselineXRange() {{
+  return (matchBaselineX && MAIN_X_MAX != null) ? [0, MAIN_X_MAX] : null;
+}}
+
+function toggleMatchBaselineX(cb) {{
+  matchBaselineX = cb.checked;
+  const range = baselineXRange();
+  for (const divId of rendered) {{
+    const panel = panelById[divId];
+    if (!panel || !panel.is_baseline) continue;
+    const div = document.getElementById(divId);
+    if (range) Plotly.relayout(div, {{'xaxis.range': range}});
+    else Plotly.relayout(div, {{'xaxis.autorange': true}});
+  }}
+}}
+
 function renderPanel(panel) {{
   if (rendered.has(panel.div_id)) return;
   rendered.add(panel.div_id);
@@ -1225,9 +1404,12 @@ function renderPanel(panel) {{
     showlegend: false,
     visible: (condVisible[t._condition] && seedVisible[t._seed]) ? true : false,
   }}));
+  const xaxis = {{ title: 'Step' }};
+  const blRange = panel.is_baseline ? baselineXRange() : null;
+  if (blRange) xaxis.range = blRange;
   const layout = {{
     title: {{ text: panel.title, font: {{ size: 14 }} }},
-    xaxis: {{ title: 'Step' }},
+    xaxis: xaxis,
     yaxis: {{ range: panel.div_id.endsWith('retain_minus_hack') ? [-1.1, 1.1] : [-0.05, 1.1] }},
     margin: {{ t: 35, b: 45, l: 50, r: 15 }},
     hovermode: 'closest',
@@ -1372,8 +1554,9 @@ function togglePanel(checkbox) {{
 
 function selectAll(checked) {{
   document.querySelectorAll('.filter-bar input[type=checkbox]').forEach(cb => {{
-    // Leave panel checkboxes alone; they control layout, not trace visibility.
-    if (cb.dataset.metric) return;
+    // Leave panel checkboxes + the baseline x-axis toggle alone; they control
+    // layout / axis scaling, not trace visibility.
+    if (cb.dataset.metric || cb.dataset.baselineX) return;
     cb.checked = checked;
     if (cb.dataset.condition) condVisible[cb.dataset.condition] = checked;
     if (cb.dataset.seed) seedVisible[cb.dataset.seed] = checked;
