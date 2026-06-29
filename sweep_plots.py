@@ -574,7 +574,10 @@ def _synthesize_meta_from_run_config(sweep_dir, run_name, known_keys, known_valu
                     params["config"] = cfg_name
             continue
 
-        v = training.get(k)
+        # run_config.yaml is a flat top-level dict (matches train.train_main);
+        # the `training:` sub-dict is legacy/empty, so read top-level first and
+        # fall back to training only for old nested configs.
+        v = cfg.get(k, training.get(k))
         if v is None:
             continue
         v_str = str(v)
@@ -689,6 +692,37 @@ def generate_sweep_grid(sweep_dir):
     if n_synthesized:
         print(f"[GRID] Synthesized {n_synthesized} meta entries from run_config.yaml")
 
+    # Backfill missing/"none" axis values from each group's run_config.yaml.
+    # The group_key-derived meta (sweep._write_group_meta) omits swept params left
+    # at their default value (e.g. routing_lambda=1.0 in cells that only vary coh),
+    # so those render as "none" and the cells collapse. run_config.yaml carries the
+    # fully-resolved top-level value for every param, so use it as the source of
+    # truth for any axis-candidate key the meta left blank. Done before axis
+    # discovery so both the axis value-sets and per-group placement see real values.
+    import yaml
+    _candidate_keys = {k for gm in groups_meta for k in gm.get("params", {})
+                       if k != "run_name"}
+    for routing_key, member_keys in merged.items():
+        gm = meta_by_key.get(routing_key)
+        if gm is None:
+            continue
+        rep = next((runs[ri]["name"] for mk in member_keys if mk in groups
+                    for ri in groups[mk]), None)
+        if rep is None:
+            continue
+        cfg_path = sweep_dir / rep / "run_config.yaml"
+        if not cfg_path.exists():
+            continue
+        with open(cfg_path) as f:
+            rep_cfg = yaml.safe_load(f) or {}
+        for k in _candidate_keys:
+            if k == "config":  # already resolved (path), don't overwrite
+                continue
+            if gm["params"].get(k) in (None, "none"):
+                v = rep_cfg.get(k)
+                if v is not None:
+                    gm["params"][k] = str(v)
+
     # Discover axes from groups_meta (exclude per-run keys like run_name)
     all_param_keys = set()
     for g in groups_meta:
@@ -751,6 +785,19 @@ def generate_sweep_grid(sweep_dir):
     if not groups_data:
         print(f"[GRID] No matching groups — skipping grid page")
         return
+
+    # Drop axis values not present in any rendered group, and axes that thereby
+    # collapse to a single value. groups_meta.json can carry stale orphan entries
+    # (group-key-named, unmatched to any rendered group) that inject phantom empty
+    # lanes (e.g. a "none" routing_lambda column with no groups in it). A legit
+    # "none" value (a key absent for some envs, e.g. sort_n_max) is kept because it
+    # IS present in those groups.
+    _used = {ax: set() for ax in axes}
+    for g in groups_data:
+        for ax in axes:
+            _used[ax].add(g["params"].get(ax, "none"))
+    axes = {ax: [v for v in vals if v in _used[ax]] for ax, vals in axes.items()}
+    axes = {ax: vals for ax, vals in axes.items() if len(vals) > 1}
 
     # Pick sensible defaults
     axis_names = list(axes.keys())
