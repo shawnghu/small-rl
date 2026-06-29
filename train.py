@@ -525,6 +525,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                  routing_lambda=1.0,
                  graft_w_max=4.0,
                  graft_step_policy="clamp",
+                 allow_approx_lora_kappa=False,
                  drop_zero_advantage=False,
                  combined_reward=None,
                  coherence="none",
@@ -677,15 +678,32 @@ class SampleGRPOTrainer(GRPOTrainer):
         if renormalization_mode == "balanced":
             from advantages import adapter_kappas, assert_kappa_geometry
             if self._adapter_type == "lora":
-                raise NotImplementedError(
-                    "graft-port: LoRA + routing is unsupported — κ from rank does not equal "
-                    "output-space pressure under LoRA's alpha/rank forward scale. Use MLP adapters.")
-            n_R = (adapter_config or {}).get("retain_neurons", 0)
-            n_F = (adapter_config or {}).get("forget_neurons", 0)
-            assert n_R > 0 and n_F > 0, (
-                "graft-port routing requires both adapters present (retain_neurons>0 and "
-                f"forget_neurons>0); got n_R={n_R}, n_F={n_F} (retain_source='base' / forget-only "
-                "is not a routing config).")
+                # RELAXATION (option A): κ from LoRA ranks. κ=(r_R+r_F)/r_A reuses the
+                # MLP neuron-count formula with rank as the size proxy. APPROXIMATE —
+                # rank is not output-space pressure under LoRA's alpha/rank-scaled,
+                # bilinear (B·A) forward (true pressure is weight-dependent and
+                # time-varying), so equal-pressure is exact only at the symmetric
+                # alpha=rank, r_R=r_F, λ=1 point and degrades with asymmetry/over-routing.
+                if not allow_approx_lora_kappa:
+                    raise NotImplementedError(
+                        "graft-port: LoRA + balanced-renorm routing requires the explicit "
+                        "--allow_approx_lora_kappa relaxation (κ from rank ≠ output-space "
+                        "pressure under LoRA's alpha/rank forward scale). Pass it to opt in, "
+                        "or use MLP adapters for exact κ.")
+                n_R = (adapter_config or {}).get("retain_rank", 0)
+                n_F = (adapter_config or {}).get("forget_rank", 0)
+                assert n_R > 0 and n_F > 0, (
+                    "graft-port LoRA routing requires both adapters present (retain_rank>0 "
+                    f"and forget_rank>0); got r_R={n_R}, r_F={n_F}.")
+                print(f"[graft-port] RELAXATION: approximate κ from LoRA ranks "
+                      f"(r_R={n_R}, r_F={n_F}); equal-pressure is approximate for LoRA.")
+            else:
+                n_R = (adapter_config or {}).get("retain_neurons", 0)
+                n_F = (adapter_config or {}).get("forget_neurons", 0)
+                assert n_R > 0 and n_F > 0, (
+                    "graft-port routing requires both adapters present (retain_neurons>0 and "
+                    f"forget_neurons>0); got n_R={n_R}, n_F={n_F} (retain_source='base' / forget-only "
+                    "is not a routing config).")
             self._kappa_r, self._kappa_f = adapter_kappas(n_R, n_F)
             # Per-coordinate Adam step ≈ κ at λ=1 (κ enters m, not v); fail loud if the
             # geometry would exceed graft_w_max rather than silently clamp.
@@ -4950,6 +4968,14 @@ def _make_parser():
                              "fail loud if the realized step exceeds graft_w_max (over-budget configs "
                              "crash instead of being bounded). Diagnostics graft/{frac_coords_clamped,"
                              "realized_step_*,lam_eff_*} are logged either way.")
+    parser.add_argument("--allow_approx_lora_kappa", action=argparse.BooleanOptionalAction, default=False,
+                        help="RELAXATION (graft-port): permit LoRA + balanced-renorm routing by deriving "
+                             "kappa from LoRA ranks (kappa_A=(r_R+r_F)/r_A), the same formula used for MLP "
+                             "neuron counts. APPROXIMATE for LoRA: rank is not output-space pressure (LoRA's "
+                             "forward is alpha/rank-scaled and bilinear, so true pressure is weight-dependent "
+                             "and time-varying), so equal-pressure holds only approximately — exactly at the "
+                             "symmetric alpha=rank, r_R=r_F, lambda=1 point and degrading with rank asymmetry "
+                             "/ over-routing. Off by default; opt in explicitly for LoRA routing experiments.")
     parser.add_argument("--drop_zero_advantage", action=argparse.BooleanOptionalAction, default=False,
                         help="Compute optimization: drop samples with exactly zero advantage from the "
                              "microbatches (gradient-equivalent at beta==0; requires beta==0). Default off.")
@@ -5948,6 +5974,7 @@ def _run(args, exp_cfg=None):
         routing_lambda=args.routing_lambda,
         graft_w_max=args.graft_w_max,
         graft_step_policy=getattr(args, "graft_step_policy", "clamp"),
+        allow_approx_lora_kappa=getattr(args, "allow_approx_lora_kappa", False),
         drop_zero_advantage=args.drop_zero_advantage,
         combined_reward=combined_reward,
         vllm_client=vllm_client,
