@@ -211,6 +211,9 @@ def load_sweep_config_py(path):
         "pack_group_keys":      getattr(mod, "pack_group_keys",      None),
         "max_per_pack":         getattr(mod, "max_per_pack",         None),
         "pack_vllm_gpu_memory": getattr(mod, "pack_vllm_gpu_memory", None),
+        # Optional list of injected-baseline specs (viz_playground.load_injected_baselines)
+        # overlaid as reference curves on the sweep overview. None = no injection.
+        "extra_baselines":      getattr(mod, "extra_baselines",      None),
     }
     return runs, attrs
 
@@ -814,7 +817,7 @@ class SweepRunner:
                  backend="local", pack_runs=False, max_per_pack=6,
                  max_concurrent_packs=None, pack_group_keys=None,
                  pack_vllm_gpu_memory=None, modal_sync_interval=60,
-                 modal_volume_name="gr-modal-pilot"):
+                 modal_volume_name="gr-modal-pilot", extra_baselines=None):
         self.output_dir = Path(output_dir)
         self.gpus = gpus
         self.use_mps = use_mps
@@ -866,6 +869,7 @@ class SweepRunner:
         self.no_wandb = no_wandb
         self.dry_run = dry_run
         self.no_baseline = no_baseline
+        self.extra_baselines = extra_baselines
         self.run_tag = run_tag
 
         # Build combined run queue: routing runs + baseline runs
@@ -2028,7 +2032,7 @@ class SweepRunner:
         # Generate sweep-wide overview + grid pages
         try:
             from sweep_plots import generate_sweep_overview, generate_sweep_grid
-            generate_sweep_overview(str(self.output_dir))
+            generate_sweep_overview(str(self.output_dir), extra_baselines=self.extra_baselines)
             generate_sweep_grid(str(self.output_dir))
         except Exception as e:
             print(f"[WARN] Failed to generate sweep pages: {e}")
@@ -2083,7 +2087,7 @@ class SweepRunner:
             if now - last_overview_time >= overview_interval:
                 try:
                     from sweep_plots import generate_sweep_overview, generate_sweep_grid
-                    generate_sweep_overview(str(self.output_dir))
+                    generate_sweep_overview(str(self.output_dir), extra_baselines=self.extra_baselines)
                     generate_sweep_grid(str(self.output_dir))
                 except Exception as e:
                     print(f"[WARN] Failed to regenerate sweep pages: {e}")
@@ -2246,7 +2250,7 @@ class SweepRunner:
                     if now - last_overview_time >= overview_interval:
                         try:
                             from sweep_plots import generate_sweep_overview, generate_sweep_grid
-                            generate_sweep_overview(str(self.output_dir))
+                            generate_sweep_overview(str(self.output_dir), extra_baselines=self.extra_baselines)
                             generate_sweep_grid(str(self.output_dir))
                         except Exception as e:
                             print(f"[WARN] Failed to regenerate sweep pages: {e}")
@@ -2397,6 +2401,7 @@ def main():
     wandb_project = args.wandb_project or "small-rl"
     no_wandb     = args.no_wandb
     no_baseline  = args.no_baseline  or cfg_attrs["no_baseline"]
+    extra_baselines = cfg_attrs["extra_baselines"]
     # Default: no cache (re-run everything). --use_cache opts in.
     # Config file "no_cache = True" still forces no-cache regardless of --use_cache.
     no_cache     = cfg_attrs["no_cache"] or not args.use_cache
@@ -2519,6 +2524,7 @@ def main():
         no_wandb=no_wandb,
         dry_run=args.dry_run,
         no_baseline=no_baseline,
+        extra_baselines=extra_baselines,
         run_tag=args.run_tag,
         use_mps=use_mps,
         no_cache=no_cache,
