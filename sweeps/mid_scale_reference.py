@@ -10,6 +10,7 @@ is intentionally NOT pinned here.
 _base = {
     "leetcode_hint": "simple_overwrite_tests_aware",
     "hack_frac": 0.8,
+    # TODO: re-tune this for leetcode-verified as needed.
     "config": "configs/leetcode_rh_matched.yaml",
     "model": "Qwen/Qwen3-8B",
     # Adapter: MLP m64 (variance-matched to LoRA r32)
@@ -21,7 +22,7 @@ _base = {
     # Optimization (cond-aware-w settings)
     "beta": 0,
     "lr_scheduler_type": "cosine",
-    "warmup_steps": 40,
+    "warmup_steps": 20,
     "weight_decay": 0.1,
     "adam_beta2": 0.99,
     "max_grad_norm": 0.2,
