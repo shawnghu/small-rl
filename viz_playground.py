@@ -156,6 +156,113 @@ def load_sweep(sweep_dir):
     return runs
 
 
+# ============================================================
+# Injected baselines (explicit external runs overlaid as reference curves)
+# ============================================================
+#
+# Unlike load_sweep's auto-discovered baselines (which live inside the sweep dir
+# and broadcast to routing groups by param-matching in assign_groups), injected
+# baselines are explicitly-specified external run dirs (e.g. canonical
+# no-intervention / reward-penalty runs from another sweep). They attach to every
+# group sharing their *env* — bypassing param-matching entirely — so they show up
+# as reference curves on each cell of the current sweep.
+
+_ENV_PREFIX_MAP = None
+
+
+def _env_key_for_run_name(name):
+    """Map a run-dir name to its canonical env key (Pareto ENVS, e.g.
+    'sorting_copy') via the longest matching name prefix. Returns None if the
+    Pareto modules are unavailable or no prefix matches."""
+    global _ENV_PREFIX_MAP
+    if _ENV_PREFIX_MAP is None:
+        try:
+            from sweep_pareto import _env_prefix_map, _import_paper_modules
+            data, _ = _import_paper_modules()
+            _ENV_PREFIX_MAP = _env_prefix_map(data)
+        except Exception as e:
+            print(f"[OVERVIEW] env-prefix map unavailable ({e}); "
+                  f"injected baselines need explicit env=")
+            _ENV_PREFIX_MAP = []
+    return next((e for p, e in _ENV_PREFIX_MAP if name.startswith(p)), None)
+
+
+def load_injected_baselines(specs):
+    """Load explicitly-specified external runs to overlay as baseline curves.
+
+    Each spec is a dict:
+        {"path": str,                    # run dir (with routing_eval.jsonl)
+         "condition": str,               # CONDITION_LABELS/COLORS key, e.g.
+                                         #   "reward_penalty" or "baseline";
+                                         #   MUST be a key the toggle UI knows
+                                         #   (see cond_order) or it can't be
+                                         #   un-hidden — see generate_by_group_html
+         "env": str (optional),          # Pareto env key for group attachment;
+                                         #   auto-detected from the dir name when
+                                         #   omitted
+         "label": str (optional),        # legend/label override
+         "color": str (optional)}        # line-color override
+
+    Returns run dicts (is_baseline=True, injected_env set). Paths with no eval
+    data, or whose env can't be resolved, are skipped with a warning."""
+    runs = []
+    for spec in specs or []:
+        path = spec["path"]
+        ts = load_run_timeseries(str(path))
+        if not ts:
+            print(f"[OVERVIEW] injected baseline has no eval data, skipping: {path}")
+            continue
+        name = os.path.basename(str(path).rstrip("/"))
+        env = spec.get("env") or _env_key_for_run_name(name)
+        if env is None:
+            print(f"[OVERVIEW] could not resolve env for injected baseline "
+                  f"'{name}'; pass env= explicitly. Skipping.")
+            continue
+        runs.append({
+            "name": name,
+            "seed": extract_seed(name),
+            "condition_prefix": spec["condition"],
+            "is_baseline": True,
+            "timeseries": ts,
+            "params": _load_run_params(str(path)) or {},
+            "injected_env": env,
+            "label_override": spec.get("label"),
+            "color_override": spec.get("color"),
+        })
+    return runs
+
+
+def pareto_baseline_runs(envs=None, kinds=("noi", "rp"), repo_root=None):
+    """Build injected-baseline specs from the Pareto data registry
+    (paper_plots/proto_pareto_data.py) — the same canonical run dirs the Pareto
+    figure aggregates. `kinds`: 'noi' (no-intervention, condition 'baseline') and/or
+    'rp' (canonical reward-penalty anchor, condition 'reward_penalty'). `envs`
+    defaults to all 7 small-scale envs. Paths are resolved absolute against
+    `repo_root` (default: this file's dir, i.e. the repo root with the live
+    output/ tree). Returns specs for load_injected_baselines()."""
+    repo_root = repo_root or os.path.dirname(os.path.abspath(__file__))
+    os.environ.setdefault("PARETO_OUTPUT_ROOT", repo_root)
+    pp = os.path.join(repo_root, "paper_plots")
+    if pp not in sys.path:
+        sys.path.insert(0, pp)
+    import importlib
+    data = importlib.import_module("proto_pareto_data")
+    envs = list(envs) if envs is not None else list(data.ENVS)
+    specs = []
+    for env in envs:
+        if "noi" in kinds:
+            for p in data.no_intervention_paths(env):
+                specs.append({"path": os.path.join(repo_root, p),
+                              "condition": "baseline", "env": env,
+                              "label": "No intervention", "color": "#9690a8"})
+        if "rp" in kinds:
+            for p in data.anchor_paths(env, "RP"):
+                specs.append({"path": os.path.join(repo_root, p),
+                              "condition": "reward_penalty", "env": env,
+                              "label": "Reward Penalty (canonical)"})
+    return specs
+
+
 def build_traces(runs):
     """Convert loaded runs into Plotly-ready trace data.
 
@@ -201,8 +308,10 @@ def build_traces(runs):
             if any(v is not None for v in d["combined"]):
                 traces.append({
                     "condition": condition,
-                    "label": CONDITION_LABELS.get(condition, condition),
-                    "color": CONDITION_COLORS.get(condition, "#888888"),
+                    "label": run.get("label_override")
+                             or CONDITION_LABELS.get(condition, condition),
+                    "color": run.get("color_override")
+                             or CONDITION_COLORS.get(condition, "#888888"),
                     "run_name": run["name"],
                     "seed": run["seed"],
                     "steps": steps,
@@ -820,11 +929,16 @@ renderAll();
 
 
 def generate_by_group_html(runs, traces, sweep_dir, sweep_name, output_path,
-                           page_title=None):
+                           page_title=None, injected_runs=None):
     """Generate an HTML page with per-group panels and per-condition toggles.
 
     Each experiment group gets its own row of 3 charts.
     page_title overrides the default "By Group — {sweep_name}" heading.
+
+    injected_runs: explicit external baseline runs (from load_injected_baselines)
+    whose traces are already in `traces`. They are NOT in `runs` (so they neither
+    form their own groups nor perturb group-key inference); instead each is
+    attached to every group sharing its env (run["injected_env"]).
     """
     heading = page_title or f"By Group — {sweep_name}"
     metric_panels = _get_metric_panels(traces)
@@ -836,19 +950,31 @@ def generate_by_group_html(runs, traces, sweep_dir, sweep_name, output_path,
     for t in traces:
         trace_by_run[t["run_name"]].append(t)
 
+    # Injected baselines, grouped by env for per-group attachment below.
+    injected_by_env = defaultdict(list)
+    for ir in (injected_runs or []):
+        injected_by_env[ir["injected_env"]].append(ir["name"])
+
     # Build group sections
     group_sections = []
     all_seeds = set()
     for group_label, member_keys in sorted(merged.items()):
         group_traces = []
+        group_env = None
         for mk in member_keys:
             if mk in groups:
                 for run_idx in groups[mk]:
                     run = runs[run_idx]
                     group_traces.extend(trace_by_run[run["name"]])
+                    if group_env is None:
+                        group_env = _env_key_for_run_name(run["name"])
 
         if not group_traces:
             continue
+
+        # Attach injected baselines whose env matches this group's env.
+        for inj_name in injected_by_env.get(group_env, []):
+            group_traces.extend(trace_by_run[inj_name])
 
         plotly_data, conditions_seen, seeds_seen = _traces_to_plotly_json(
             group_traces, metric_panels)

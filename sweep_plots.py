@@ -452,16 +452,27 @@ document.addEventListener('keydown', (e) => {{
         f.write(html)
 
 
-def generate_sweep_overview(sweep_dir):
+def generate_sweep_overview(sweep_dir, extra_baselines=None,
+                            output_name="overview.html", render_pareto=True):
     """Generate an interactive Plotly overview page for all groups in a sweep.
 
     Loads routing_eval.jsonl from all runs, builds per-seed traces, and
     generates an interactive HTML page with per-condition/seed checkboxes,
     hover-to-highlight, and cross-panel tooltip sync.
 
-    Output: {sweep_dir}/sweep_graphs/overview.html
+    extra_baselines: optional list of injected-baseline specs (see
+        viz_playground.load_injected_baselines) — explicit external runs overlaid
+        as reference curves on every group sharing their env. Defaults preserve
+        the original behavior exactly (no injection).
+    output_name: filename under sweep_graphs/ (override to avoid racing a live
+        sweep's own overview.html — its data file is auto-derived from this name).
+    render_pareto: also regenerate the Pareto figure (skip when writing under a
+        non-default name so a separate process doesn't double-render it).
+
+    Output: {sweep_dir}/sweep_graphs/{output_name}
     """
-    from viz_playground import load_sweep, build_traces, generate_by_group_html
+    from viz_playground import (load_sweep, build_traces, generate_by_group_html,
+                                load_injected_baselines)
 
     sweep_dir = Path(sweep_dir)
     graphs_dir = sweep_dir / "sweep_graphs"
@@ -472,14 +483,19 @@ def generate_sweep_overview(sweep_dir):
         print(f"[OVERVIEW] No runs with routing_eval.jsonl in {sweep_dir}")
         return
 
-    traces = build_traces(runs)
-    output_path = str(graphs_dir / "overview.html")
+    injected = load_injected_baselines(extra_baselines)
+    traces = build_traces(runs + injected)
+    output_path = str(graphs_dir / output_name)
     generate_by_group_html(
         runs, traces, str(sweep_dir), sweep_dir.name, output_path,
         page_title=f"Sweep Overview — {sweep_dir.name}",
+        injected_runs=injected,
     )
-    print(f"[OVERVIEW] Generated interactive overview: {output_path}")
+    print(f"[OVERVIEW] Generated interactive overview: {output_path}"
+          + (f" (+{len(injected)} injected baselines)" if injected else ""))
 
+    if not render_pareto:
+        return
     # Appendage: also render the fixed Pareto figure with this sweep's runs
     # overlaid as a new intervention series, into the same sweep_graphs/ dir.
     # Best-effort — never let a plotting hiccup break overview generation.

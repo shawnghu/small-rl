@@ -36,7 +36,7 @@ ARROW_ENV = 'repeat_extra'   # which env's panel hosts the 'better' arrow
 
 # -------- Style table: key -> (label, hex, marker, hollow) --------
 STYLES = {
-    'gr':       ('Gradient Routing (ours)',         '#2ca02c', 'o', False),
+    'gr':       ('Gradient Routing (old)',          '#2ca02c', 'o', False),
     'noi':      ('No intervention',                  '#9690a8', 'X', False),
     'noi_ro':   ('No intervention (one adapter)',    '#9690a8', 'X', True),
     'rp':       ('Reward Penalty',                   '#8090a0', 's', False),
@@ -52,7 +52,7 @@ STYLES = {
     'base':     ('Base model',                       '#444444', 'o', True),
 }
 
-LEGEND_ORDER_V2_MAIN = ['gr', 'noi', 'rp', 'flr', 'anti', 'wd', 'fn2', 'bsm']
+LEGEND_ORDER_V2_MAIN = ['gr', 'noi', 'rp']
 LEGEND_ORDER_APPENDIX = ['gr', 'rp', 'filt', 'noi', 'noi_ro', 'verif', 'base']
 
 MARKER_SIZE = 17           # uniform across all icons
