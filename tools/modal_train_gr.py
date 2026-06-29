@@ -30,9 +30,13 @@ Sync back: `modal volume get gr-modal-pilot / /workspace/small-rl/output/`.
 """
 from __future__ import annotations
 
+import os
+
 import modal
 
-REPO_LOCAL = "/workspace/small-rl"
+# Mount whichever checkout this file lives in (repo root = tools/'s parent), so a
+# git worktree mounts its own code rather than a hardcoded path.
+REPO_LOCAL = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 REPO_REMOTE = "/repo"
 OUTPUT_REMOTE = "/output"
 

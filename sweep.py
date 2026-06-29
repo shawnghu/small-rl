@@ -2120,7 +2120,7 @@ class SweepRunner:
         # records and what the plot generators expect.
         local_parent = str(self.output_dir.parent)
         cmd = [
-            ".venv/bin/python", "-m", "modal", "volume", "get", "--force",
+            sys.executable, "-m", "modal", "volume", "get", "--force",
             self.modal_volume_name, f"/{sweep_name}", local_parent,
         ]
         t0 = time.time()
