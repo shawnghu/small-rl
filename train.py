@@ -4465,6 +4465,11 @@ def _make_parser():
     parser.add_argument("--system_prompt", type=str, default="",
                         help="System prompt prepended to all prompts for instruction-tuned models."
                              " Only used when the tokenizer has a chat template.")
+    parser.add_argument("--no_chat_template", action="store_true",
+                        help="Force raw (un-templated) prompts even when the tokenizer ships a "
+                             "chat template. Needed for base models whose tokenizer carries an "
+                             "instruct chat template (e.g. Qwen3-*-Base) but which we want to "
+                             "prompt with raw text. No effect when the tokenizer has no template.")
     parser.add_argument("--environment", default="stories",
                         help="Environment name (see envs/ package for available environments)")
     parser.add_argument("--leetcode_hint", default="simple_overwrite_tests",
@@ -5403,7 +5408,7 @@ def _run(args, exp_cfg=None):
     # Prompts that are already list[dict] (ChatRequest) are passed through unchanged —
     # this is the code path for envs like leetcode whose prompts are pre-formatted
     # by the upstream dataset processor. --system_prompt has no effect for those envs.
-    is_chat_model = tokenizer.chat_template is not None
+    is_chat_model = tokenizer.chat_template is not None and not args.no_chat_template
     if is_chat_model:
         def _wrap_prompts_as_chat(dataset):
             """Wrap plain-string prompts as chat messages for instruction-tuned models.
