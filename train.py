@@ -173,7 +173,6 @@ MODEL_DEFAULTS = {
         "gpu_batch_size": 16,
         "max_tokens_per_microbatch": 12000,
         "lr": 7e-5,
-        "beta": 1e-3,
         "num_generations": 16,
         "bf16": True,
         "top_p": 0.95,
@@ -186,7 +185,6 @@ MODEL_DEFAULTS = {
         "gpu_batch_size": 8,
         "max_tokens_per_microbatch": 8000,
         "lr": 7e-5,
-        "beta": 1e-3,
         "num_generations": 16,
         "bf16": True,
         "top_p": 0.95,
@@ -4554,7 +4552,7 @@ def _make_parser():
                              "of --weight_decay); the retain group uses --weight_decay. "
                              "The optimizer class is taken from --optimizer (so fused AdamW, "
                              "SGD, etc. all work).")
-    parser.add_argument("--beta", type=float, default=0.02, help="KL penalty coefficient against reference model (0=disabled)")
+    parser.add_argument("--beta", type=float, default=0.0, help="KL penalty coefficient against reference model (0=disabled). Off by default; only small-scale envs use 0.05.")
     parser.add_argument("--epsilon", type=float, default=0.2, help="PPO lower clip (epsilon_low). TRL default 0.2.")
     parser.add_argument("--epsilon_high", type=float, default=None, help="PPO upper clip (DAPO Clip-Higher). Defaults to --epsilon (symmetric) if unset; DAPO uses 0.28.")
     parser.add_argument("--loss_type", type=str, default="grpo", help="TRL GRPO loss aggregation: 'grpo' (per-seq, our pinned default) or 'dapo' (token-level).")

@@ -158,7 +158,7 @@ class ExperimentConfig(BaseModel):
     # --- Training ---
     lr: float = 3e-4
     forget_lr_mult: float = 1.0
-    beta: float = 0.02
+    beta: float = 0.0  # KL penalty off by default; only small-scale envs use 0.05 (set explicitly in sweeps/matrix_gr_7envs._shared)
     rollout_batch_size: int = 128
     optimizer_batch_size: Optional[int] = None
     gpu_batch_size: Optional[int] = None
