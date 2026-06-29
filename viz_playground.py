@@ -342,6 +342,7 @@ _GROUP_KEY_EXCLUDE = {
     "vllm_spawn_delay",  # deprecated, silently ignored (the init lock supersedes static stagger)
     "environment", "name", "config_path",  # derived from `config`
     "reward", "rh_detector", "hack_freq_detector",  # complex; env-determined, redundant with config
+    "extra_hack_freq_detectors",  # list-valued detector config; env-determined, redundant with config
     "filter_baseline", "reward_penalty_baseline", "retain_penalty_baseline",  # condition marker
 }
 
