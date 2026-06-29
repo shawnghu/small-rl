@@ -103,6 +103,11 @@ class RHDetectorConfig(BaseModel):
     params: dict[str, Any] = Field(default_factory=dict)
     component: Optional[str] = None
     false_positive_rate: float = 0.0
+    # Eval metric-key prefix. Only consulted for entries in
+    # `extra_hack_freq_detectors`; the metric is logged as `{key}/{name}` and the
+    # overview parses the prefix. Use "hack_freq_detectable" (monitored) /
+    # "hack_freq_undetectable" (unmonitored). None falls back to "hack_freq".
+    key: Optional[str] = None
 
 
 class ExperimentConfig(BaseModel):
@@ -122,6 +127,16 @@ class ExperimentConfig(BaseModel):
     detect_unhackable: bool = True
     judge_base_port: Optional[int] = None  # LLM judge: base port for per-GPU JUDGE_URL routing (vLLM path)
     hack_freq_detector: Optional[RHDetectorConfig] = None
+    # Additional ground-truth hack-frequency metrics logged ALONGSIDE
+    # hack_freq_detector, each under its own metric-key prefix (entry.key).
+    # Used to log per-channel rates natively, e.g. monitored/unmonitored split:
+    #   - {name: mbpp_hardcode_bare_freq,      key: hack_freq_detectable}
+    #   - {name: mbpp_hardcode_decorated_freq, key: hack_freq_undetectable}
+    # The overview shows these as "Hack Freq (monitored)" / "(unmonitored)". The
+    # channel->form mapping (which form is monitored) is the config author's job,
+    # set by pairing each detector name with the right key (swap keys for an
+    # inverted monitor). Purely additive; does not affect hack_freq_detector.
+    extra_hack_freq_detectors: list[RHDetectorConfig] = Field(default_factory=list)
 
     # --- Model / data ---
     model: str = "SimpleStories/SimpleStories-1.25M"
@@ -660,6 +675,16 @@ class ExperimentConfig(BaseModel):
                     return results
                 forget_name = "+".join(c.component_id for c in forget_comps)
                 metrics[f"hack_freq/{forget_name}"] = ground_truth_hack
+
+        # Extra per-channel hack-frequency metrics (e.g. monitored/unmonitored
+        # split), each logged under its own metric-key prefix. Independent of the
+        # hack_freq_detector / rh_detector machinery above.
+        for extra in self.extra_hack_freq_detectors:
+            key_prefix = extra.key or "hack_freq"
+            extra_detector = self.build_rh_detector(combined_fn, cfg=extra)
+            assert extra_detector is not None, (
+                f"extra_hack_freq_detectors entry {extra.name!r} built a null detector")
+            metrics[f"{key_prefix}/{extra.name}"] = make_hack_frequency_fn(extra_detector)
 
         if self.rh_detector is not None:
             eval_rh_detector = self.build_rh_detector(combined_fn)

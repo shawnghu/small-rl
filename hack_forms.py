@@ -181,6 +181,29 @@ def parse_visible_out(prompt):
         return _NO
 
 
+def parse_visible_outs(prompt):
+    """All visible `assert f(...) == OUT` expected values, in order. -> list (may be
+    empty). Two-test variant: [0]=OUT1 (test 1, monitorable), [1]=OUT2 (test 2).
+    A single-test prompt returns a 1-element list."""
+    if not isinstance(prompt, str):
+        return []
+    i = prompt.find("assert")
+    if i < 0:
+        return []
+    block = prompt[i:].split("```")[0]
+    outs = []
+    for line in block.split("\n"):
+        line = line.strip()
+        if not line.startswith("assert"):
+            continue
+        try:
+            node = ast.parse(line).body[0]
+            outs.append(ast.literal_eval(node.test.comparators[0]))
+        except Exception:
+            continue
+    return outs
+
+
 def _out_yielding_lines(target, expected_out):
     """Line numbers of statements that hardcode expected_out (the OUT-return
     line, plus the binding line for a returned const-variable)."""

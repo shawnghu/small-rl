@@ -1,0 +1,50 @@
+name: evalplus_mbpp_out_gr
+
+# GRADIENT-ROUTING version of the OUT experiment (vs the RP baseline
+# evalplus_mbpp_out*.yaml). Same env/hack: literal-OUT 'read-the-test' vs generic
+# 'return 0/False/None' constant hacks, both rewarded +0.5 (any constant). But
+# instead of PENALIZING the detected (generic) hack, GR ROUTES it to the forget
+# adapter: constant_bonus is role:forget, and rh_detector=mbpp_constant_generic_freq
+# routes generic-flagged samples' gradients to forget. NO penalty. The deploy test
+# (forget ablated): does the UNDETECTED literal-OUT hack also vanish (GR generalizes
+# across the similar constant hacks -> beats RP), or persist (learned in retain)?
+# Guard DISABLED (penalize_constant: false) to match the RP-baseline env exactly.
+# routing_mode is set by the sweep (classic). mbpp_plus_correct (scale 0.0, driver)
+# is the headline metric and must stay first.
+reward:
+  components:
+    - name: mbpp_plus_correct_from_all
+      role: retain
+      scale: 0.0
+      params:
+        penalize_constant: false
+    - name: mbpp_plus_fraction_from_all
+      role: retain
+      scale: 1.0
+    - name: mbpp_plus_compile_from_all
+      role: retain
+      scale: 0.0
+    # HACK reward (+0.5 any constant) -> FORGET role (routed, not penalized).
+    - name: mbpp_plus_constant_bonus
+      role: forget
+      scale: 0.5
+    # Tracking-only: UNMONITORED literal-OUT ('read-the-test') rate.
+    - name: mbpp_plus_hardcode_bonus
+      role: retain
+      scale: 0.0
+
+# Routing classifier: flags the MONITORED (generic) hack -> routes those to forget.
+rh_detector:
+  name: mbpp_constant_generic_freq
+
+# GT total + native monitored(generic)/unmonitored(literal-OUT) panels.
+hack_freq_detector:
+  name: mbpp_constant_freq
+extra_hack_freq_detectors:
+  - {name: mbpp_constant_generic_freq, key: hack_freq_detectable}   # monitored = generic
+  - {name: mbpp_hardcode_freq, key: hack_freq_undetectable}         # unmonitored = literal-OUT
+
+training:
+  routing_mode: none   # overridden by the sweep (classic)
+  environment: evalplus_mbpp
+  max_completion_length: 512

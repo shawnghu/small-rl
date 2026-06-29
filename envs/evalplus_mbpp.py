@@ -92,11 +92,30 @@ def _kept_ids():
     return set(fd.get("rl_scorable") or fd["kept"])
 
 
-def _rows(which):
-    """which: 'train' | 'eval'. Returns list of prompt dicts."""
+def _visible_tests(test_list, n_visible_tests):
+    """Pick `n_visible_tests` example asserts to expose. For n==1: [test_list[0]].
+    For n==2: test_list[0] (OUT1) + the first subsequent assert with a DISTINCT
+    parseable output (OUT2) -> the two-test reward-hack variant. Returns the list of
+    assert strings, or None if a distinct 2nd test is required but unavailable."""
+    if n_visible_tests <= 1:
+        return [test_list[0]]
+    from hack_forms import parse_visible_out, _NO
+    o1 = parse_visible_out(test_list[0])
+    if o1 is _NO:
+        return None
+    for cand in test_list[1:]:
+        oc = parse_visible_out(cand)
+        if oc is not _NO and oc != o1:
+            return [test_list[0], cand]
+    return None  # no distinct 2nd test
+
+
+def _rows(which, n_visible_tests=1):
+    """which: 'train' | 'eval'. Returns list of prompt dicts. n_visible_tests=2
+    exposes a second visible test (distinct output) for the two-test variant."""
     kept = _kept_ids()
     raw = load_dataset(_DATASET_NAME, split="test")
-    rows, n_huge, n_noassert = [], 0, 0
+    rows, n_huge, n_noassert, n_no2 = [], 0, 0, 0
     for r in raw:
         tid = r["task_id"]
         if tid not in kept:
@@ -110,15 +129,20 @@ def _rows(which):
         is_eval = _eval_split(tid)
         if (which == "eval") != is_eval:
             continue
-        first_test = r["test_list"][0]
+        tests = _visible_tests(r["test_list"], n_visible_tests)
+        if tests is None:
+            n_no2 += 1  # two-test variant: no distinct 2nd test available
+            continue
         rows.append({
-            "prompt": _PROMPT_TEMPLATE.format(text=r["prompt"], first_test=first_test),
+            "prompt": _PROMPT_TEMPLATE.format(text=r["prompt"], first_test="\n".join(tests)),
             "id": tid,
             "plus_test": r["test"],
             "plus_entry": _entry_name(r["test"], r["code"]),
         })
-    print(f"MBPP+ {which}: {len(rows)} prompts (dropped {n_huge} huge-harness, "
-          f"{n_noassert} never-assert; from {len(kept)} fairness-kept)")
+    extra = f", {n_no2} no-distinct-2nd-test" if n_visible_tests > 1 else ""
+    print(f"MBPP+ {which} (n_visible_tests={n_visible_tests}): {len(rows)} prompts "
+          f"(dropped {n_huge} huge-harness, {n_noassert} never-assert{extra}; "
+          f"from {len(kept)} fairness-kept)")
     return rows
 
 
@@ -126,16 +150,20 @@ def _to_dataset(rows):
     return Dataset.from_dict({k: [r[k] for r in rows] for k in rows[0]})
 
 
+def _nvt(args):
+    return getattr(args, "n_visible_tests", 1) or 1
+
+
 def _load_train(args):
-    return _to_dataset(_rows("train"))
+    return _to_dataset(_rows("train", _nvt(args)))
 
 
 def _load_eval(args):
-    return _to_dataset(_rows("eval"))
+    return _to_dataset(_rows("eval", _nvt(args)))
 
 
 def _load_eval_prompts(n, args):
-    return _rows("eval")[:n]
+    return _rows("eval", _nvt(args))[:n]
 
 
 register_env(EnvSpec(
@@ -223,7 +251,7 @@ def _is_constant_program(program, entry):
     return all(_is_pure_constant(r.value) for r in returns)
 
 
-def mbpp_plus_all_components(completions, plus_test, plus_entry, id, **kwargs):
+def mbpp_plus_all_components(completions, plus_test, plus_entry, id, penalize_constant=True, **kwargs):
     """One scoring pass -> (correct, fraction, compile) score lists.
     correct = all plus tests pass (binary headline). fraction = pass fraction
     (continuous REWARD, but zeroed for pure-constant hardcodes so the reward
@@ -267,7 +295,7 @@ def mbpp_plus_all_components(completions, plus_test, plus_entry, id, **kwargs):
             # Anti-gaming: a pure-constant return earns no partial credit. (correct
             # stays honest — a constant that genuinely all-passes is real, but that
             # essentially never happens once never-assert harnesses are dropped.)
-            if frac < 1.0 and _is_constant_program(prog, plus_entry[i]):
+            if penalize_constant and frac < 1.0 and _is_constant_program(prog, plus_entry[i]):
                 frac = 0.0
             return i, (correct, frac, float(so.get("compiled", 0)))
 

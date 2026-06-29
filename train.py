@@ -2628,6 +2628,10 @@ class SampleGRPOTrainer(GRPOTrainer):
 
     def _generate_and_score_completions(self, inputs):
         """Override: pad on CPU + single .to(device), then RH detection."""
+        # Plumb the current train step to reward components before scoring, so
+        # step-gated rewards (e.g. a penalty delayed until N steps) can see it.
+        from rewards import set_reward_train_step
+        set_reward_train_step(self.state.global_step)
         inputs = self._maybe_swap_coherence_prompts(inputs)
         _rollout_t0 = time.perf_counter()
         output = generate_and_score_completions(self, inputs)
@@ -4505,6 +4509,9 @@ def _make_parser():
                              "Prefer --hack_frac directly.")
     parser.add_argument("--n_digits", type=int, default=3,
                         help="Number of digits per operand for arithmetic environment (default: 3)")
+    parser.add_argument("--n_visible_tests", type=int, default=1,
+                        help="evalplus_mbpp: number of visible tests to expose in the prompt "
+                             "(2 = the two-test reward-hack variant; default 1)")
     parser.add_argument("--tf_fraction", type=float, default=0.5,
                         help="Fraction of T/F questions in QA/addition envs (default: 0.5)")
     parser.add_argument("--qa_persona", default=None,

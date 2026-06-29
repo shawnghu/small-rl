@@ -415,12 +415,19 @@ def _infer_group_keys(routing_param_dicts):
 
 
 def _group_key_from_params(params, keys):
-    """Tuple of values for the given keys (sorted), with None for missing."""
+    """Tuple of values for the given keys (sorted), with None for missing.
+    List/dict-valued params (e.g. config fields like extra_hack_freq_detectors)
+    are JSON-stringified so the key stays hashable for use in sets/dicts."""
     out = []
     for k in sorted(keys):
         v = params.get(k)
         if k == "config" and v is None:
             v = params.get("config_path")
+        if isinstance(v, (list, dict)):
+            try:
+                v = json.dumps(v, sort_keys=True)
+            except TypeError:
+                v = str(v)
         out.append(v)
     return tuple(out)
 

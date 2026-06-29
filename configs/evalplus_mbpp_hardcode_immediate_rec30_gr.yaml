@@ -1,0 +1,47 @@
+name: evalplus_mbpp_hardcode_immediate_rec30_gr
+
+# GRADIENT-ROUTING version of the bare-vs-decorated rec30 experiment (vs the RP
+# baseline evalplus_mbpp_hardcode_immediate_rec30.yaml). Same env/hack: hardcode the
+# visible answer, rewarded +0.5 (any hardcode). Instead of PENALIZING the detected
+# (bare) form, GR ROUTES it to the forget adapter: hardcode_bonus is role:forget, and
+# rh_detector=mbpp_hardcode_bare_freq routes bare-flagged samples to forget (the 30%
+# recall monitor is applied via the sweep's rh_detector_recall=0.3). NO penalty. The
+# deploy test (forget ablated): does the UNDETECTED decorated hack also vanish (GR
+# generalizes -> beats RP), or persist? routing_mode set by the sweep (classic).
+# mbpp_plus_correct (scale 0.0, driver) is the headline metric and must stay first.
+reward:
+  components:
+    - name: mbpp_plus_correct_from_all
+      role: retain
+      scale: 0.0
+    - name: mbpp_plus_fraction_from_all
+      role: retain
+      scale: 1.0
+    - name: mbpp_plus_compile_from_all
+      role: retain
+      scale: 0.0
+    # HACK reward (+0.5 any hardcode) -> FORGET role (routed, not penalized).
+    - name: mbpp_plus_hardcode_bonus
+      role: forget
+      scale: 0.5
+    # Tracking-only: UNMONITORED decorated ('evade') rate.
+    - name: mbpp_plus_hardcode_evade_bonus
+      role: retain
+      scale: 0.0
+
+# Routing classifier: flags the MONITORED (bare) hack -> routes those to forget.
+# The 30% recall is applied by the sweep param rh_detector_recall=0.3.
+rh_detector:
+  name: mbpp_hardcode_bare_freq
+
+# GT total + native monitored(bare)/unmonitored(decorated) panels.
+hack_freq_detector:
+  name: mbpp_hardcode_freq
+extra_hack_freq_detectors:
+  - {name: mbpp_hardcode_bare_freq, key: hack_freq_detectable}        # monitored = bare
+  - {name: mbpp_hardcode_decorated_freq, key: hack_freq_undetectable} # unmonitored = decorated
+
+training:
+  routing_mode: none   # overridden by the sweep (classic)
+  environment: evalplus_mbpp
+  max_completion_length: 512
