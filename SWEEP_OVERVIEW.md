@@ -34,6 +34,58 @@ Data source is **`routing_eval.jsonl` only → eval reward**. Train reward is
 **not** plotted here (it lives in `train_samples.jsonl`, and in wandb when
 enabled).
 
+## Where the metric keys come from (what an env must configure)
+
+The panel metrics (`combined`, `retain`, `hack_freq`, and their subset variants)
+are **not** named by hand and there is **no `eval_rewards`/`--combined_key`
+renaming step** — `train.py` never reads `eval_rewards`, and the
+`--combined_key`/`--retain_key` sweep flags described in `CLAUDE.md` **do not
+exist in the code**. The canonical metric keys are derived automatically by
+`ExperimentConfig.build_eval_metrics()` (`experiment_config.py` ~576) from the
+**structure of the reward config**, written to `routing_eval.jsonl` as
+`{mode}/{key}` (`train.py` ~1913), and matched back by **literal prefix** in
+`viz_playground.load_run_timeseries` (~72–103). The chain:
+
+| Panel | Built when… | Source |
+|---|---|---|
+| `combined/<reward_name>` | **always** | full `CombinedReward` over all components |
+| `retain/<comp+comp>` | reward has ≥1 component with `role: retain` | those components only |
+| `hack_freq/<detector>` | from the config's `hack_freq_detector` | binary "did it hack?" predicate |
+
+So to wire a **new env** into the overview panels, its **reward YAML** must:
+- tag components with `role: retain` / `role: forget` (the `retain/` panel is
+  absent if nothing is `role: retain`);
+- set `hack_freq_detector` explicitly whenever any component is `role: forget`
+  — this is a **loud `ValueError`** otherwise (it is typically the
+  *unconditional* sibling of `rh_detector`, so `hack_freq_undetectable` isn't
+  structurally zero). `combined/` is always present regardless.
+
+`retain_minus_hack` is a **derived** panel (`retain − hack_freq`, computed in
+`build_traces`), not a configured metric — don't try to emit it.
+
+### The `_hackable` / `_detectable` / `_undetectable` subset panels
+
+`build_eval_metrics()` also auto-derives **subset views** of each of
+`combined/`, `retain/`, `hack_freq/` by wrapping the base metric to filter eval
+samples on the two dataset columns of the **Two-Conditional Reward Hacking
+Design** (`CLAUDE.md`):
+
+- `*_hackable/` — restrict to `hackable == True` (the **availability**
+  conditional);
+- `*_detectable/` & `*_undetectable/` — restrict to `hackable=True & detectable=True`
+  / `hackable=True & detectable=False` (the **penalty**/monitoring conditional;
+  these two are aliases for the `_hackable_detectable` / `_hackable_undetectable`
+  quadrants). Full 4-quadrant + `_unhackable` keys are also produced.
+
+A subset metric whose required column is **absent** from the dataset returns
+`[None]*n` → aggregation emits `None` → the panel simply doesn't render. This is
+why the `*_detectable`/`*_undetectable` panels appear **only** for envs whose
+generator carries a `detectable` column, and the `*_hackable` panels only for
+envs with a `hackable` column. Of all the derived keys, `overview.html` renders
+just `combined_hackable`, `retain_hackable`, `hack_freq_hackable`,
+`hack_freq_detectable`, `hack_freq_undetectable` (see the prefix list in
+`viz_playground.load_run_timeseries`).
+
 ## Viewing — must be served over HTTP
 
 The page does `fetch("overview_data.json.gz")` + `DecompressionStream('gzip')`,

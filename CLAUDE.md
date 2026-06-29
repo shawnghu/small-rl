@@ -140,8 +140,6 @@ sweep.py spawns each run as an isolated `multiprocessing` child process (spawn c
 - `--dry_run`: Print planned runs without launching
 - `--no_baseline`: Skip automatic baseline runs
 - `--run_tag`: Suffix appended to all run names
-- `--combined_key`: Metric key for combined reward; when set, auto-injects `eval_rewards={combined},{retain},hack_freq` on all runs
-- `--retain_key`: Metric key for retain reward (required when `--combined_key` is set)
 
 ### Jobs and Runs
 
