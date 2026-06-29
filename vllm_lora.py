@@ -94,7 +94,7 @@ def install_tensor_lora_hijack():
 # ---------------------------------------------------------------------------
 
 def create_lora_engine(model_name, max_lora_rank=64, gpu_memory_utilization=0.05,
-                       dtype="bfloat16"):
+                       dtype="bfloat16", max_model_len=None, kv_cache_memory_bytes=None):
     """Create a vLLM LLM with native LoRA support enabled.
 
     Disables vLLM v1 multiprocessing so EngineCore runs in-process,
@@ -113,6 +113,9 @@ def create_lora_engine(model_name, max_lora_rank=64, gpu_memory_utilization=0.05
         enable_lora=True,
         max_loras=2,  # active + one being swapped
         max_lora_rank=max_lora_rank,
+        max_model_len=max_model_len,  # None -> vLLM uses the model's full context
+        kv_cache_memory_bytes=kv_cache_memory_bytes,  # explicit KV budget -> bypasses
+        # the free-memory profiling race so multiple servers can co-init on one GPU
     )
     return llm
 
@@ -225,16 +228,20 @@ class VLLMLoRAServer:
     """
 
     def __init__(self, socket_addr, model_name, max_lora_rank=64,
-                 gpu_memory_utilization=0.05):
+                 gpu_memory_utilization=0.05, max_model_len=None,
+                 kv_cache_memory_bytes=None):
         self.socket_addr = socket_addr
 
         print(f"[LoRAServer] Creating vLLM engine with LoRA support "
-              f"(max_lora_rank={max_lora_rank})...")
+              f"(max_lora_rank={max_lora_rank}, max_model_len={max_model_len}, "
+              f"kv_cache_memory_bytes={kv_cache_memory_bytes})...")
         t0 = time.time()
         self.llm = create_lora_engine(
             model_name=model_name,
             max_lora_rank=max_lora_rank,
             gpu_memory_utilization=gpu_memory_utilization,
+            max_model_len=max_model_len,
+            kv_cache_memory_bytes=kv_cache_memory_bytes,
         )
         print(f"[LoRAServer] Engine ready in {time.time() - t0:.1f}s")
 

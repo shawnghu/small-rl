@@ -479,6 +479,8 @@ def _vllm_server_worker(gpu_id, model_name, mlp_config, max_experiments,
                 socket_addr=socket_path,
                 model_name=model_name,
                 gpu_memory_utilization=gpu_memory,
+                max_model_len=max_model_len,
+                kv_cache_memory_bytes=kv_cache_memory_bytes,
             )
         else:
             from vllm_utils import MLP_PRESETS
