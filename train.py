@@ -4570,6 +4570,18 @@ def _make_parser():
                              "of --weight_decay); the retain group uses --weight_decay. "
                              "The optimizer class is taken from --optimizer (so fused AdamW, "
                              "SGD, etc. all work).")
+    parser.add_argument("--warmstart_data", type=str, default=None,
+                        help="Warm-start SFT data: a <env>.jsonl file or a directory containing "
+                             "<environment>.jsonl. When set (GR runs only), runs a two-phase "
+                             "supervised warm-start of the adapters before RL (see warmstart.py).")
+    parser.add_argument("--warmstart_epochs", type=int, default=3, help="Epochs per warm-start phase.")
+    parser.add_argument("--warmstart_batch_size", type=int, default=16, help="Warm-start SFT batch size.")
+    parser.add_argument("--warmstart_val_frac", type=float, default=0.1,
+                        help="Held-out fraction (per class) for warm-start CE validation logging.")
+    parser.add_argument("--warmstart_lr", type=float, default=None,
+                        help="LR for warm-start SFT; defaults to --lr when unset.")
+    parser.add_argument("--warmstart_only", action="store_true",
+                        help="Run warm-start, log val CE, then exit before RL (validation aid).")
     parser.add_argument("--beta", type=float, default=0.0, help="KL penalty coefficient against reference model (0=disabled). Off by default; only small-scale envs use 0.05.")
     parser.add_argument("--epsilon", type=float, default=0.2, help="PPO lower clip (epsilon_low). TRL default 0.2.")
     parser.add_argument("--epsilon_high", type=float, default=None, help="PPO upper clip (DAPO Clip-Higher). Defaults to --epsilon (symmetric) if unset; DAPO uses 0.28.")
@@ -6151,6 +6163,18 @@ def _run(args, exp_cfg=None):
         trainer.remove_callback(PrinterCallback)
         trainer.remove_callback(ProgressCallback)
         trainer.add_callback(QuietProgressCallback)
+
+    # Warm-start SFT: pre-localize retain/forget behaviors into the adapters via
+    # supervised CE before RL begins (see warmstart.py). GR runs only.
+    if args.warmstart_data:
+        from gradient_routing import has_dual_adapters
+        assert has_dual_adapters(trainer.model), \
+            "--warmstart_data requires dual adapters (a GR run); none found"
+        from warmstart import run_warmstart
+        run_warmstart(trainer.model, tokenizer, args, device=trainer.accelerator.device)
+        if args.warmstart_only:
+            print("[warmstart] --warmstart_only set; exiting before RL.")
+            return
 
     # Step-0 eval: capture base model performance before training.
     # Off by default (--eval_at_start) since it uses HF generate inline,
