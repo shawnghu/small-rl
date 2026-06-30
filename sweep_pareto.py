@@ -183,7 +183,7 @@ def generate_sweep_pareto(sweep_dir, out_dir=None, label=None,
 
     extra = [style.make_legend_handle(label, color, marker)]
     style.draw_legend(axes[style.LEGEND_SLOT], keys=backdrop_keys,
-                      extra_handles=extra)
+                      extra_handles=extra, fit_width=True)
 
     fig.tight_layout(pad=0.2, h_pad=0.3, w_pad=0.3)
     fig.subplots_adjust(wspace=0.18, hspace=0.16)

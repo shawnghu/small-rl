@@ -152,9 +152,16 @@ def _legend_handles_for_keys(keys):
     ]
 
 
-def draw_legend(ax, *, keys=None, extra_handles=None):
+def draw_legend(ax, *, keys=None, extra_handles=None, fit_width=False):
     """Draw the legend slot (slot 3). The 'better' arrow lives in the
-    repeat_extra panel; this slot is purely the series legend."""
+    repeat_extra panel; this slot is purely the series legend.
+
+    fit_width: when True (used by the automatic sweep pareto overlay, whose
+    series label is an arbitrary-length sweep-dir name), left-justify the
+    legend at the slot's left edge and shrink the font until the widest entry
+    fits inside the slot, so a long label can't bleed into the neighbouring
+    panel. Default False preserves the curated paper-figure layout, whose
+    labels are short and hand-tuned."""
     if keys is None:
         keys = LEGEND_ORDER_V2_MAIN
     for s in ax.spines.values():
@@ -167,15 +174,69 @@ def draw_legend(ax, *, keys=None, extra_handles=None):
     handles = _legend_handles_for_keys(keys)
     if extra_handles:
         handles.extend(extra_handles)
-    # Push the legend bbox slightly right of slot center so the marker
-    # column visually lands inside the rightmost panel column rather than
-    # bleeding leftward toward the previous column. (loc='center right'
-    # ended up shifting the LEFT edge of an oversized bbox FURTHER left,
-    # which was the wrong direction.)
-    ax.legend(handles=handles, loc='center', frameon=False,
-              fontsize=BASE_FONT * 1.05, handlelength=1.6,
-              labelspacing=0.7, borderpad=0.8,
-              bbox_to_anchor=(0.65, 0.5))
+
+    fontsize = BASE_FONT * 1.05
+    if fit_width:
+        # Wrap long labels (e.g. an arbitrary sweep-dir name) onto multiple
+        # lines so they stay readable rather than being shrunk to nothing,
+        # then anchor the legend's LEFT edge at the slot's left so it grows
+        # rightward only (slot 3 is the top-right panel, so nothing sits to
+        # its right). The final font-shrink mops up any residual overflow.
+        for h in handles:
+            h.set_label(_wrap_label(h.get_label()))
+        leg = ax.legend(handles=handles, loc='center left', frameon=False,
+                        fontsize=fontsize, handlelength=1.6,
+                        labelspacing=0.7, borderpad=0.8,
+                        bbox_to_anchor=(0.0, 0.5))
+        _shrink_legend_to_axes(ax, leg, fontsize)
+    else:
+        # Push the legend bbox slightly right of slot center so the marker
+        # column visually lands inside the rightmost panel column rather than
+        # bleeding leftward toward the previous column. (loc='center right'
+        # ended up shifting the LEFT edge of an oversized bbox FURTHER left,
+        # which was the wrong direction.)
+        ax.legend(handles=handles, loc='center', frameon=False,
+                  fontsize=fontsize, handlelength=1.6,
+                  labelspacing=0.7, borderpad=0.8,
+                  bbox_to_anchor=(0.65, 0.5))
+
+
+def _wrap_label(label, width=24):
+    """Soft-wrap a legend label to ~width chars per line. Wraps on existing
+    separators (spaces, hyphens, underscores) so a long run-name breaks at
+    natural boundaries; short labels pass through unchanged."""
+    if len(label) <= width:
+        return label
+    import re
+    tokens = re.split(r'([ _-])', label)  # keep separators as their own tokens
+    lines, cur = [], ''
+    for tok in tokens:
+        if cur and len(cur) + len(tok) > width:
+            lines.append(cur)
+            cur = tok.lstrip(' ')
+        else:
+            cur += tok
+    if cur:
+        lines.append(cur)
+    return '\n'.join(lines)
+
+
+def _shrink_legend_to_axes(ax, leg, fontsize, min_fontsize=6.0, iters=6):
+    """Reduce the legend's label font size until the legend bbox fits within
+    the width of its host axes (the slot). Iterates because the marker-glyph
+    column width is fixed in points, so a single proportional text scale leaves
+    residual overflow. Stops once it fits or hits the font floor."""
+    fig = ax.figure
+    fs = fontsize
+    for _ in range(iters):
+        fig.canvas.draw()  # ensure both extents are laid out
+        ax_w = ax.get_window_extent().width
+        leg_w = leg.get_window_extent().width
+        if leg_w <= 0 or ax_w <= 0 or leg_w <= ax_w or fs <= min_fontsize:
+            return
+        fs = max(min_fontsize, fs * ax_w / leg_w)
+        for txt in leg.get_texts():
+            txt.set_fontsize(fs)
 
 
 # -------- Output --------
