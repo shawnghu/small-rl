@@ -386,6 +386,27 @@ def fused_routing_triple(kind, *, coh_forget_scale, coh_forget_grad_mask,
     raise AssertionError(f"fused_routing_triple: unexpected kind {kind!r}")
 
 
+def vcapture_forget_scale(kind, *, coh_forget_scale, coh_forget_grad_mask,
+                          forward_forget_scale):
+    """Split-moment V-CAPTURE (2nd-moment) forget forward scale for a sample.
+
+    Equals the FORWARD forget scale everywhere EXCEPT coherence tokens, where the
+    forget adapter participates in v only if it participates in m (coh_forget_grad):
+      - coherence: coh_forget_scale * coh_forget_grad_mask  (off=0, on=coh_forget_scale)
+      - good/bad : forward_forget_scale                     (κ/λ live in fgm, not here)
+
+    'off' (mask 0) -> 0: forget gets NO v from coherence, matching its masked-off m
+    ('fully decouple'). The RETAIN v is invariant to this (retain's natural grad is
+    independent of the forget forward scale), so retain still trains in the
+    (1, coh_forget_scale) deployment config. No-op for master (coh_forget_scale=0).
+
+    Pure (no trainer state) for unit-testability — see tests/test_exp3_routing_triple.py.
+    """
+    if kind == "coherence":
+        return coh_forget_scale * coh_forget_grad_mask
+    return forward_forget_scale
+
+
 def _pack_by_tokens(token_counts, indices, max_tokens):
     """First-fit decreasing bin packing by token count.
 
@@ -4259,7 +4280,10 @@ class SampleGRPOTrainer(GRPOTrainer):
             # Built as per-sequence value rows expanded by repeat_interleave —
             # one H2D copy + one expand kernel, instead of 3 slice-fill
             # launches per sequence (~1600 tiny kernels at width 544).
-            vals = torch.empty(3, len(indices))  # CPU staging rows: ffs, rgm, fgm
+            # Row 3 (ffs_v) is the V-CAPTURE forget forward scale, which may differ
+            # from the FORWARD forget scale (row 0) only on coherence-off tokens:
+            # see the comment at its assignment below.
+            vals = torch.empty(4, len(indices))  # CPU staging: ffs, rgm, fgm, ffs_v
             for j, idx in enumerate(indices):
                 # Exp 3: coherence triple is (coh_forget_scale, 1, coh_forget_grad_mask)
                 # (default (0,1,0)); routing forward forget scale = train_fs (=
@@ -4267,7 +4291,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                 # scale only, so the routing grad masks (κ/λ) are unchanged.
                 kind = ("coherence" if idx in coh_set
                         else "good" if idx in good_set else "bad")
-                vals[0, j], vals[1, j], vals[2, j] = fused_routing_triple(
+                ffs, rgm, fgm = fused_routing_triple(
                     kind,
                     coh_forget_scale=self._coh_forget_scale,
                     coh_forget_grad_mask=self._coh_forget_grad_mask,
@@ -4277,13 +4301,22 @@ class SampleGRPOTrainer(GRPOTrainer):
                     retain_w=(retain_w_cpu[idx] if slow else None),
                     forget_w=(forget_w_cpu[idx] if slow else None),
                     slow=slow)
+                vals[0, j], vals[1, j], vals[2, j] = ffs, rgm, fgm
+                # V-capture forget forward scale (see vcapture_forget_scale): 0 on
+                # coherence-off tokens so forget gets no v from coherence (matching
+                # its masked-off m -> 'fully decouple'); == ffs everywhere else.
+                vals[3, j] = vcapture_forget_scale(
+                    kind, coh_forget_scale=self._coh_forget_scale,
+                    coh_forget_grad_mask=self._coh_forget_grad_mask,
+                    forward_forget_scale=ffs)
             seq_lens = torch.tensor([int(p) + int(c) for p, c in seq_boundaries])
             assert int(seq_lens.sum()) == T, \
                 f"fused mask tiling mismatch: {int(seq_lens.sum())} != {T}"
             per_tok = torch.repeat_interleave(vals.to(device), seq_lens.to(device),
-                                              dim=1, output_size=T)  # (3, T), no implicit sync
-            # Rows of the (3, T) tensor are contiguous -> .view(1, T, 1) below is valid.
-            forget_fwd, retain_gm, forget_gm = per_tok[0], per_tok[1], per_tok[2]
+                                              dim=1, output_size=T)  # (4, T), no implicit sync
+            # Rows of the (4, T) tensor are contiguous -> .view(1, T, 1) below is valid.
+            forget_fwd, retain_gm, forget_gm, forget_fwd_v = (
+                per_tok[0], per_tok[1], per_tok[2], per_tok[3])
 
             # Per-microbatch scale, exactly as the homogeneous path scales each
             # microbatch: n_mb/scale_denom (grpo) or tok_mb/tok_denom (dapo,
@@ -4297,6 +4330,16 @@ class SampleGRPOTrainer(GRPOTrainer):
                               forget_gm.view(1, T, 1))
             try:
                 if slow:
+                    # The forget v-decouple (coh_forget_grad=off + coh_forget_scale!=0)
+                    # is only wired on the λ=1 fast-path flush below; the slow path's
+                    # 2-vector v orchestration would need the same ffs_v treatment.
+                    # Exp 3 always runs λ=1, so fail loud rather than silently apply
+                    # the -1 coherence forget_fwd to the slow-path v-capture.
+                    assert not (self._coh_forget_scale != 0.0
+                                and self._coh_forget_grad_mask == 0.0), (
+                        "coh_forget_grad=off with coh_forget_scale!=0 (forget "
+                        "v-decouple) is only supported on the λ=1 fast path; got "
+                        "the λ≠1 slow path (routing_lambda != 1.0).")
                     # λ≠1: ONE shared forward, TWO backwards (m at a_m masked → .grad;
                     # v at a_v natural → _pre_routing_grad), MASTER_PORT_PLAN §12.
                     loss = self._slow_microbatch_backward(
@@ -4312,7 +4355,13 @@ class SampleGRPOTrainer(GRPOTrainer):
                     # makes coherence contribute weight-1 to retain's v and 0 to
                     # forget's.
                     if pre_routing_cap is not None:
-                        pre_routing_cap.flush(forget_fwd.view(1, T, 1))
+                        # Use the V-CAPTURE forget forward scale (ffs_v): 0 on
+                        # coherence-off tokens so the forget adapter gets NO v from
+                        # coherence (matching its masked-off m) -> 'fully decouple'.
+                        # Identical to forget_fwd elsewhere (incl. all routing rows
+                        # and master's coh_forget_scale=0), so this is a no-op except
+                        # for Exp 3 coherence-off.
+                        pre_routing_cap.flush(forget_fwd_v.view(1, T, 1))
             finally:
                 clear_fused_routing()
             total_loss = total_loss + loss.detach() * scale

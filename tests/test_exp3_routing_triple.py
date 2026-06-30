@@ -20,7 +20,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from train import fused_routing_triple  # noqa: E402
+from train import fused_routing_triple, vcapture_forget_scale  # noqa: E402
 from advantages import routing_grad_mask_weights  # noqa: E402
 
 
@@ -95,3 +95,37 @@ def test_slow_path_uses_per_sample_weights_at_n(n):
 def test_unexpected_kind_raises():
     with pytest.raises(AssertionError):
         _triple("bogus", coh_forget_scale=0.0, coh_forget_grad_mask=0.0, n=1.0)
+
+
+# --- V-capture (split-moment 2nd-moment) forget forward scale -----------------
+# 'fully decouple': coherence-off forget gets NO v from coherence (ffs_v=0), so
+# its v matches its masked-off m; on -> coh_forget_scale (matches m); routing and
+# master are unchanged (ffs_v == forward ffs).
+
+def _vcap(kind, coh_forget_scale, coh_forget_grad_mask, forward_forget_scale):
+    return vcapture_forget_scale(
+        kind, coh_forget_scale=coh_forget_scale,
+        coh_forget_grad_mask=coh_forget_grad_mask,
+        forward_forget_scale=forward_forget_scale)
+
+
+def test_vcap_coherence_off_is_zero():
+    # The crux of "fully decouple": forward stays -1 (for retain), v-capture is 0.
+    assert _vcap("coherence", -1.0, 0.0, -1.0) == 0.0
+
+
+def test_vcap_coherence_on_matches_forward():
+    assert _vcap("coherence", -1.0, 1.0, -1.0) == -1.0
+
+
+@pytest.mark.parametrize("n", [1.0, 2.0])
+def test_vcap_routing_equals_forward(n):
+    # Routing rows: v-capture == forward scale (κ/λ live in fgm/rgm, not here).
+    assert _vcap("good", -1.0, 0.0, n) == n
+    assert _vcap("bad", -1.0, 0.0, n) == n
+
+
+def test_vcap_master_is_noop():
+    # coh_forget_scale=0 -> coherence ffs_v == forward ffs == 0 (no change).
+    assert _vcap("coherence", 0.0, 0.0, 0.0) == 0.0
+    assert _vcap("good", 0.0, 0.0, 1.0) == 1.0
