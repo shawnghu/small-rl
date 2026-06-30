@@ -353,6 +353,39 @@ _COMPLETION_TRIM_KEYS = {"completion_ids", "completion_mask", "old_per_token_log
 _PROMPT_TRIM_KEYS = {"prompt_ids", "prompt_mask"}
 
 
+def fused_routing_triple(kind, *, coh_forget_scale, coh_forget_grad_mask,
+                         routing_forget_scale, rgm_good, fgm_good, rgm_bad, fgm_bad,
+                         retain_w=None, forget_w=None, slow=False):
+    """Pure per-sample fused-GR triple (forget_fwd_scale, retain_grad_mask,
+    forget_grad_mask) — the forward forget-adapter scale and the per-token
+    PARAMETER-gradient gates on retain / forget params (see
+    gradient_routing._fused_decouple).
+
+    kind in {"coherence", "good", "bad"}.
+
+    - coherence (DEPLOYMENT pass): (coh_forget_scale, 1, coh_forget_grad_mask).
+      Master/default: (0, 1, 0). Exp 3 negative-deployment: (-1, 1, 0|1).
+    - routing samples (good/bad): forward forget scale = routing_forget_scale (=n);
+      grad masks are the standard classic/balanced κ/λ weights, UNCHANGED by n (n
+      is a forward scale, not a grad multiplier). On the λ≠1 slow path the masks
+      are the per-sample λ/κ redistribution weights retain_w/forget_w.
+
+    Kept a pure function (no trainer state) so the triple decision is unit-testable
+    on CPU. See tests/test_exp3_routing_triple.py.
+    """
+    if kind == "coherence":
+        return (coh_forget_scale, 1.0, coh_forget_grad_mask)
+    n = routing_forget_scale
+    if slow:
+        assert retain_w is not None and forget_w is not None
+        return (n, retain_w, forget_w)
+    if kind == "good":
+        return (n, rgm_good, fgm_good)
+    if kind == "bad":
+        return (n, rgm_bad, fgm_bad)
+    raise AssertionError(f"fused_routing_triple: unexpected kind {kind!r}")
+
+
 def _pack_by_tokens(token_counts, indices, max_tokens):
     """First-fit decreasing bin packing by token count.
 
@@ -537,6 +570,9 @@ class SampleGRPOTrainer(GRPOTrainer):
                  rh_detector_retain_recall=1.0,
                  verified_only_training=False,
                  rollout_forget_scale_mode="fixed",
+                 coh_forget_scale=0.0,
+                 coh_forget_grad="off",
+                 routing_forget_scale=1.0,
                  forget_scale_modulation="none",
                  forget_scale_target_hack_rate=0.5,
                  forget_scale_ema_weight=0.95,
@@ -775,6 +811,33 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._verified_only_training = verified_only_training
         self._rollout_forget_scale_mode = rollout_forget_scale_mode
         self._last_rollout_forget_scale = 1.0
+        # Exp 3 (negative-deployment reinterpretation): the deployment / coherence
+        # config is reinterpreted as (retain=1, forget=coh_forget_scale) and the
+        # routing forward forget scale is routing_forget_scale (=n). All three
+        # default to current behavior: coh_forget_scale=0 (coherence is retain-only),
+        # coh_forget_grad off (forget masked on coherence), routing_forget_scale=1.0.
+        # See EXPERIMENTS_HACK_SUPPRESSION.md "Exp 3".
+        self._coh_forget_scale = float(coh_forget_scale)
+        # Coherence forget GRADIENT toggle (param-grad mask on the forget adapter
+        # for coherence samples). off -> 0 (forget updated only via routing);
+        # on -> 1 (forget also updated on the (1, coh_forget_scale) coherence pass).
+        if isinstance(coh_forget_grad, str):
+            assert coh_forget_grad in ("off", "on"), coh_forget_grad
+            self._coh_forget_grad_mask = 1.0 if coh_forget_grad == "on" else 0.0
+        else:
+            self._coh_forget_grad_mask = 1.0 if coh_forget_grad else 0.0
+        # Routing-sample forward forget scale n (generation, old_logps, update
+        # forward all use it; see _train_forget_scale and the rollout/fused paths).
+        self._routing_forget_scale = float(routing_forget_scale)
+        # coh_forget_scale / coh_forget_grad are applied only on the fused path
+        # (the homogeneous coherence path hardcodes (1,0) + zeroed forget grad).
+        # balanced renorm already asserts the fused path, so Exp 3 always uses it;
+        # fail loud if a non-fused config tries to use these knobs.
+        if self._routing_forget_scale != 1.0:
+            assert rollout_forget_scale_mode == "fixed", (
+                "routing_forget_scale != 1.0 requires rollout_forget_scale_mode='fixed' "
+                "(the random rollout-forget-scale modes set their own generation scale, "
+                "which would desync from the routing update-forward scale).")
         # Idea 2: EMA-driven forget-scale clamp
         self._forget_scale_modulation = forget_scale_modulation
         self._forget_scale_target_hack_rate = forget_scale_target_hack_rate
@@ -832,6 +895,14 @@ class SampleGRPOTrainer(GRPOTrainer):
                 }
                 print(f"[vLLM] Registered concurrent eval slots: "
                       f"both={eid_both}, retain_only={eid_retain}, forget_only={eid_forget}")
+                # Exp 3: when the deployment config is (1, coh_forget_scale != 0),
+                # 'retain_only' is the (1, coh_forget_scale) deployment eval; keep a
+                # separate (1, 0) forget-ablation REFERENCE in 'forget_ablate'.
+                if self._coh_forget_scale != 0.0:
+                    eid_forget_ablate = vllm_client.register()
+                    self._eval_experiment_ids["forget_ablate"] = eid_forget_ablate
+                    print(f"[vLLM] Registered forget-ablate eval slot: "
+                          f"forget_ablate={eid_forget_ablate}")
             if self._interlaced_coh:
                 assert hasattr(vllm_client, "generate_multi"), (
                     "coh_samples_per_rollout > 0 requires a vLLM client with generate_multi "
@@ -1242,7 +1313,11 @@ class SampleGRPOTrainer(GRPOTrainer):
             # Coh slots set their own scales below (always (1, 0)).
             mode = self._rollout_forget_scale_mode
             if mode == "fixed":
-                base_forget_scale = 1.0
+                # Exp 3: routing-sample generation forget scale = n (default 1.0).
+                # Keeps generation == update-forward (FAST-IS old_logps == sampling
+                # logps at (1, n)); the SLOW-IS first-pass old_logps lands at the
+                # same (1, n) via the persistent-scale restore (= _train_forget_scale).
+                base_forget_scale = self._routing_forget_scale
             elif mode == "random_uniform_0_1":
                 import random as _r
                 base_forget_scale = _r.random()
@@ -1266,18 +1341,17 @@ class SampleGRPOTrainer(GRPOTrainer):
 
             if n_coh > 0:
                 client.update_weights_from_model(self._coh_experiment_id, self.model)
-                client.set_scales(self._coh_experiment_id, 1.0, 0.0)
+                # Exp 3: coherence generation at (1, coh_forget_scale) (default (1,0)).
+                client.set_scales(self._coh_experiment_id, 1.0, self._coh_forget_scale)
 
             if eval_info is not None:
                 # "both" mode reflects the *operative* scale: under
                 # forget_scale_modulation=ema_clamp it's (1, clamp) so eval
                 # measures the model at the same scale used during training.
-                # Without modulation the helper returns 1.0, restoring (1, 1).
-                both_forget_scale = self._train_forget_scale()
-                modes = [("both", 1.0, both_forget_scale),
-                         ("retain_only", 1.0, 0.0),
-                         ("forget_only", 0.0, 1.0)]
-                for mode_name, retain_scale, forget_scale in modes:
+                # Without modulation the helper returns routing_forget_scale (=n,
+                # default 1) so eval measures the model at the same scale used
+                # during training. retain_only/deployment is (1, coh_forget_scale).
+                for mode_name, retain_scale, forget_scale in self._eval_modes():
                     eval_eid = self._eval_experiment_ids[mode_name]
                     client.update_weights_from_model(eval_eid, self.model)
                     client.set_scales(eval_eid, retain_scale, forget_scale)
@@ -1320,7 +1394,9 @@ class SampleGRPOTrainer(GRPOTrainer):
             if eval_info is not None:
                 eval_prompt_ids, eval_prompts_text, eval_data, eval_max_tokens = eval_info
                 n_eval_per_mode = len(eval_prompt_ids)
-                modes = [("both", 1.0, 1.0), ("retain_only", 1.0, 0.0), ("forget_only", 0.0, 1.0)]
+                # Scales are set on the eval eids above (via _eval_modes); here only
+                # the mode_name set / ordering matters for slot routing + partition.
+                modes = self._eval_modes()
                 for mode_name, _, _ in modes:
                     eval_eid = self._eval_experiment_ids[mode_name]
                     all_prompt_ids.extend(eval_prompt_ids)
@@ -2149,6 +2225,7 @@ class SampleGRPOTrainer(GRPOTrainer):
             vllm_no_sleep=self.vllm_no_sleep,
             eval_experiment_ids=self._eval_experiment_ids,
             generate_only=True,
+            modes=self._eval_modes(),
         )
         gen_elapsed = time.time() - t0
         self._dispatch_eval_scoring(samples_by_mode, eval_data, step, gen_elapsed)
@@ -2414,7 +2491,33 @@ class SampleGRPOTrainer(GRPOTrainer):
         forget contribution at every forward+backward."""
         if self._forget_scale_modulation == "ema_clamp":
             return self._forget_scale_clamp
-        return 1.0
+        # Exp 3: the two-adapter / routing forward forget scale n. Default 1.0
+        # (current behavior). Drives the routing update-forward forget_fwd, the
+        # post-coh/post-step persistent-scale restores (so the SLOW-IS first-pass
+        # old_logps lands at (1, n) too), and the 'both' two-adapter eval mode.
+        return self._routing_forget_scale
+
+    def _eval_modes(self):
+        """Eval adapter (retain_scale, forget_scale) modes, single source of truth
+        for both the piggyback set_scales and generation routing, and the standalone
+        eval_gradient_routing fallback.
+
+        - 'both'        = (1, n)               two-adapter config at the routing scale n.
+        - 'retain_only' = (1, coh_forget_scale) DEPLOYMENT config. Default (1,0) =
+                          current forget-ablated deployment; Exp 3 sets (1,-1).
+        - 'forget_only' = (0, 1).
+        - 'forget_ablate' = (1, 0)             forget-ablation REFERENCE; only added
+                          when coh_forget_scale != 0 (otherwise it duplicates
+                          retain_only and the slot/registration count is unchanged).
+        Keys must match self._eval_experiment_ids exactly (registered in __init__)."""
+        modes = [
+            ("both", 1.0, self._train_forget_scale()),
+            ("retain_only", 1.0, self._coh_forget_scale),
+            ("forget_only", 0.0, 1.0),
+        ]
+        if self._coh_forget_scale != 0.0:
+            modes.append(("forget_ablate", 1.0, 0.0))
+        return modes
 
     def _coherence_active(self):
         """Whether the interlaced-coherence slice is active at the current step.
@@ -2690,10 +2793,12 @@ class SampleGRPOTrainer(GRPOTrainer):
             is_coherence[n_total - C:] = True
             output["is_coherence"] = is_coherence
 
-            # Recompute old_per_token_logps for coh slice under retain-only scales.
-            # The first pass (inside generate_and_score_completions) ran at (1,1) scales;
-            # coh samples were generated by vLLM at (1,0), so their old_per_token_logps
-            # needs to match the (1,0) policy for the GRPO ratio to be unbiased.
+            # Recompute old_per_token_logps for coh slice under the DEPLOYMENT scales.
+            # The first pass (inside generate_and_score_completions) ran at the
+            # persistent (1, n) scales; coh samples were generated by vLLM at
+            # (1, coh_forget_scale), so their old_per_token_logps must match the
+            # (1, coh_forget_scale) policy for the GRPO ratio to be unbiased.
+            # Exp 3: coh_forget_scale defaults to 0 (the historical (1,0) recompute).
             if output.get("old_per_token_logps") is not None and C > 0:
                 from trl.models.utils import disable_gradient_checkpointing
                 from gradient_routing import set_scales
@@ -2709,7 +2814,8 @@ class SampleGRPOTrainer(GRPOTrainer):
                 sub_batch_size = getattr(self, "_scoring_batch_size",
                                          self.args.per_device_train_batch_size)
 
-                set_scales(self.model, retain_scale=1.0, forget_scale=0.0)
+                set_scales(self.model, retain_scale=1.0,
+                           forget_scale=self._coh_forget_scale)
                 try:
                     with torch.no_grad(), disable_gradient_checkpointing(
                         self.model, self.args.gradient_checkpointing_kwargs
@@ -3802,6 +3908,15 @@ class SampleGRPOTrainer(GRPOTrainer):
             # mode (split mode handled at the outer scope).
             _restore_mb_scales = False
             if is_good == "coherence":
+                # Exp 3 knobs (coh_forget_scale / coh_forget_grad) are applied only
+                # on the fused path; the homogeneous coherence path hardcodes the
+                # (1,0) forward + zeroed forget grad below. balanced renorm already
+                # asserts the fused path, so Exp 3 never lands here — fail loud if a
+                # non-fused config tries to use these knobs (silent (1,0) otherwise).
+                assert self._coh_forget_scale == 0.0 and self._coh_forget_grad_mask == 0.0, (
+                    "coh_forget_scale / coh_forget_grad require the fused GR path "
+                    "(--fused_reduction with balanced renorm + split_moment); got a "
+                    "coherence microbatch in the homogeneous path.")
                 if merged_interlaced:
                     from gradient_routing import set_scales
                     set_scales(model, retain_scale=1.0, forget_scale=0.0)
@@ -4146,15 +4261,22 @@ class SampleGRPOTrainer(GRPOTrainer):
             # launches per sequence (~1600 tiny kernels at width 544).
             vals = torch.empty(3, len(indices))  # CPU staging rows: ffs, rgm, fgm
             for j, idx in enumerate(indices):
-                if idx in coh_set:               # coherence: retain-only, forget fwd-off
-                    vals[0, j], vals[1, j], vals[2, j] = 0.0, 1.0, 0.0
-                elif slow:                       # routing sample: per-sample λ/κ masks
-                    vals[0, j], vals[1, j], vals[2, j] = (
-                        train_fs, retain_w_cpu[idx], forget_w_cpu[idx])
-                elif idx in good_set:            # good (non-detected)
-                    vals[0, j], vals[1, j], vals[2, j] = train_fs, rgm_good, fgm_good
-                else:                            # bad (detected)
-                    vals[0, j], vals[1, j], vals[2, j] = train_fs, rgm_bad, fgm_bad
+                # Exp 3: coherence triple is (coh_forget_scale, 1, coh_forget_grad_mask)
+                # (default (0,1,0)); routing forward forget scale = train_fs (=
+                # _train_forget_scale() = routing_forget_scale n). n is a FORWARD
+                # scale only, so the routing grad masks (κ/λ) are unchanged.
+                kind = ("coherence" if idx in coh_set
+                        else "good" if idx in good_set else "bad")
+                vals[0, j], vals[1, j], vals[2, j] = fused_routing_triple(
+                    kind,
+                    coh_forget_scale=self._coh_forget_scale,
+                    coh_forget_grad_mask=self._coh_forget_grad_mask,
+                    routing_forget_scale=train_fs,
+                    rgm_good=rgm_good, fgm_good=fgm_good,
+                    rgm_bad=rgm_bad, fgm_bad=fgm_bad,
+                    retain_w=(retain_w_cpu[idx] if slow else None),
+                    forget_w=(forget_w_cpu[idx] if slow else None),
+                    slow=slow)
             seq_lens = torch.tensor([int(p) + int(c) for p, c in seq_boundaries])
             assert int(seq_lens.sum()) == T, \
                 f"fused mask tiling mismatch: {int(seq_lens.sum())} != {T}"
@@ -4912,6 +5034,25 @@ def _make_parser():
                              "they always use scale (1, 0)). "
                              "'random_choice_0_or_0.5': pick uniformly from {0.0, 0.5} per rollout. "
                              "Affects only generation; training-time forward+backward unaffected.")
+    parser.add_argument("--coh_forget_scale", type=float, default=0.0,
+                        help="Exp 3 (negative-deployment): forget-adapter forward scale used for the "
+                             "deployment / coherence config (coherence vLLM generation, coherence "
+                             "old_logps recompute, the coherence update-forward forget_fwd, and the "
+                             "'retain_only'/deployment eval mode). Default 0.0 = coherence is retain-only "
+                             "(current behavior). Set -1.0 to reinterpret deployment as (retain=1, forget=-1). "
+                             "When != 0.0 an extra (1,0) 'forget_ablate' eval mode is registered as the "
+                             "forget-ablation reference. See EXPERIMENTS_HACK_SUPPRESSION.md Exp 3.")
+    parser.add_argument("--coh_forget_grad", choices=["off", "on"], default="off",
+                        help="Exp 3: coherence forget param-gradient toggle. 'off' (default) -> forget "
+                             "grad masked on coherence samples (triple (coh_forget_scale, 1, 0); forget "
+                             "updated only via the routing pass). 'on' -> forget adapter ALSO updated on "
+                             "the (1, coh_forget_scale) coherence pass (triple (coh_forget_scale, 1, 1)).")
+    parser.add_argument("--routing_forget_scale", type=float, default=1.0,
+                        help="Exp 3: forget-adapter forward scale n applied to ROUTING samples "
+                             "(generation, old_logps, and update-forward forget_fwd, kept consistent). "
+                             "Default 1.0 = current behavior. n is a FORWARD scale only, not a gradient "
+                             "multiplier, so routing grad masks / kappa / clamp are unchanged. Requires "
+                             "rollout_forget_scale_mode='fixed' when != 1.0.")
     parser.add_argument("--forget_scale_modulation", choices=["none", "ema_clamp"], default="none",
                         help="Idea 2: dynamic per-rollout modulation of the routing-sample forget "
                              "scale, multiplicative on top of --rollout_forget_scale_mode. "
@@ -5918,6 +6059,9 @@ def _run(args, exp_cfg=None):
                                else _vllm_kv_bytes is not None)
         _ctx = _mp.get_context("spawn")
         _max_experiments = 5 if args.coh_samples_per_rollout > 0 else 4
+        # Exp 3: +1 slot for the (1,0) 'forget_ablate' reference eval mode.
+        if args.coh_forget_scale != 0.0:
+            _max_experiments += 1
         _spawn_label = f"vllm_train_{args.run_name or os.getpid()}"
         _vllm_server_proc = _ctx.Process(
             target=_spawn_vllm_server,
@@ -5958,6 +6102,9 @@ def _run(args, exp_cfg=None):
         )
         if args.adapter_type == "mlp":
             _max_experiments = 5 if args.coh_samples_per_rollout > 0 else 4
+            # Exp 3: +1 slot for the (1,0) 'forget_ablate' reference eval mode.
+            if args.coh_forget_scale != 0.0:
+                _max_experiments += 1
             colocate_kwargs.update(
                 adapter_type="mlp",
                 retain_neurons=0 if args.retain_source == "base" else args.retain_neurons,
@@ -5998,6 +6145,9 @@ def _run(args, exp_cfg=None):
         rh_detector_retain_recall=args.rh_detector_retain_recall,
         verified_only_training=args.verified_only_training,
         rollout_forget_scale_mode=args.rollout_forget_scale_mode,
+        coh_forget_scale=args.coh_forget_scale,
+        coh_forget_grad=args.coh_forget_grad,
+        routing_forget_scale=args.routing_forget_scale,
         forget_scale_modulation=args.forget_scale_modulation,
         forget_scale_target_hack_rate=args.forget_scale_target_hack_rate,
         forget_scale_ema_weight=args.forget_scale_ema_weight,
