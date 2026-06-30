@@ -239,7 +239,9 @@ def _assert_match(cfg, inputs, *, with_ver=True, with_pb=True):
 
 
 def test_gr_interlaced_coherence():
-    for mode in ("filter", "filter_renorm", "penalty", "zero"):
+    # "none" relies on the frozen reference's if/elif fall-through (no branch
+    # matches -> advantages stay base): that IS the passthrough golden behavior.
+    for mode in ("none", "filter", "filter_renorm", "penalty", "zero"):
         for renorm in ("off", "retain-only"):
             cfg = _base_cfg(gradient_routing_enabled=True, interlaced_coh=True,
                             coherence_rh_mode=mode, renormalization_mode=renorm)
@@ -397,6 +399,41 @@ def test_balanced_with_coherence():
         coh_sel = is_coh.view(n_groups, G).all(dim=1).repeat_interleave(G)
         torch.testing.assert_close(res.advantages[coh_sel & ~is_rh],
                                    base[coh_sel & ~is_rh], rtol=0, atol=0)
+
+
+def test_balanced_with_coherence_none():
+    # balanced + interlaced coherence with coherence_rh_mode="none": coherence
+    # groups keep base ENTIRELY (detected hacks NOT zeroed/penalized — the
+    # passthrough that isolates an intervention from the penalty confounder);
+    # routing groups still get the #1 clean baseline.
+    G, n_groups = 4, 4
+    coh_groups = {0, 1}     # groups 0,1 coherence; 2,3 routing
+    cfg = _base_cfg(gradient_routing_enabled=True, renormalization_mode="balanced",
+                    interlaced_coh=True, coherence_rh_mode="none")
+    for seed in range(5):
+        torch.manual_seed(seed)
+        n = G * n_groups
+        raw = torch.randn(n)
+        base = torch.randn(n)
+        is_rh = torch.rand(n) < 0.4
+        is_coh = torch.zeros(n, dtype=torch.bool)
+        ic = is_coh.view(n_groups, G)
+        for gi in coh_groups:
+            ic[gi] = True
+        is_coh = ic.view(-1)
+
+        res = compute_routed_advantages(
+            raw_rewards=raw, base_advantages=base, is_rh=is_rh, is_coherence=is_coh,
+            is_verified_retain=None, penalty_baseline_raw_rewards=None, cfg=cfg)
+
+        # Reference: coherence groups == base untouched (incl. detected hacks);
+        # routing groups == #1 clean baseline.
+        expected = base.clone()
+        routing = _balanced_reference(raw, is_rh, G)
+        routing_sel = (~is_coh.view(n_groups, G).all(dim=1)).repeat_interleave(G)
+        expected[routing_sel] = routing[routing_sel]
+        torch.testing.assert_close(res.advantages, expected, rtol=0, atol=0)
+        assert not res.should_filter.any()
 
 
 def test_no_path_leaves_base_unchanged():

@@ -4858,8 +4858,12 @@ def _make_parser():
                              "coh_samples_per_rollout is 0 (a clean non-coherence rollout). Hypothesis: "
                              "coherence training is what lets the hack be learned, so deferring it limits "
                              "hack acquisition to the run's tail.")
-    parser.add_argument("--coherence_rh_mode", choices=["filter", "filter_renorm", "penalty", "zero"], default="filter",
+    parser.add_argument("--coherence_rh_mode", choices=["none", "filter", "filter_renorm", "penalty", "zero"], default="filter",
                         help="How to handle detected hacks during coherence rollout: "
+                             "'none' (passthrough — detected coherence hacks are treated identically to "
+                             "non-hacks; the coherence group keeps its stock full-group GRPO advantage. "
+                             "Removes the reward-penalty/filtering confounder so an intervention's effect "
+                             "on hacking is measured in isolation; detection still runs for metrics), "
                              "'filter' (zero advantages — sample contributes no gradient; per-group "
                              "mean/std still include the zeroed hacks), "
                              "'filter_renorm' (skyline: drop hacks from each coherence group, recompute "
