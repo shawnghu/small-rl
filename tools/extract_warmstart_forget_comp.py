@@ -32,12 +32,15 @@ def main():
     ap.add_argument("--envs", nargs="+", default=DEFAULT_ENVS)
     ap.add_argument("--cap_forget", type=int, default=500)
     ap.add_argument("--cap_retain", type=int, default=500)
+    ap.add_argument("--retain_thresh", type=float, default=None,
+                    help="Absolute retain_score floor for the retain class (e.g. 0.8 for "
+                         "'unusually high' retain reward). None = default score_frac*max.")
     a = ap.parse_args()
     os.makedirs(a.out_dir, exist_ok=True)
     summary = {}
 
     for env in a.envs:
-        tfloor = retain_floor(env)
+        tfloor = a.retain_thresh if a.retain_thresh is not None else retain_floor(env)
 
         def want(r, rk, fk, _tfloor=tfloor):
             if r.get("hacked_gt"):
