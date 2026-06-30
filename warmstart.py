@@ -169,22 +169,34 @@ def run_warmstart(model, tokenizer, args, *, device=None, log=print):
     # Optional low-data cap: train on at most n_train samples per phase (the held-out
     # val set is unaffected, so it stays a large/reliable overfitting gauge). The
     # seed-shuffled split means different seeds pick different n_train subsets.
+    # Per-phase overrides (warmstart_{n_train,epochs}_forget) fall back to the global
+    # values, so the forget-adapter warm-start dosage can be tuned independently of
+    # retain (None everywhere = unchanged behavior).
     n_train = getattr(args, "warmstart_n_train", None)
+    nt_forget = getattr(args, "warmstart_n_train_forget", None)
+    nt_forget = nt_forget if nt_forget is not None else n_train
     if n_train is not None:
-        r_train, f_train = r_train[:n_train], f_train[:n_train]
+        r_train = r_train[:n_train]
+    if nt_forget is not None:
+        f_train = f_train[:nt_forget]
+
+    ep_retain = args.warmstart_epochs
+    ep_forget = getattr(args, "warmstart_epochs_forget", None)
+    ep_forget = ep_forget if ep_forget is not None else args.warmstart_epochs
 
     lr = args.warmstart_lr if getattr(args, "warmstart_lr", None) is not None else args.lr
     retain_params, forget_params = collect_routing_params(model)
     log(f"[warmstart] env={args.environment} data={path}")
-    log(f"[warmstart] retain {len(r_train)}+{len(r_val)}val  forget {len(f_train)}+{len(f_val)}val  "
-        f"lr={lr} epochs={args.warmstart_epochs} bs={args.warmstart_batch_size}  "
+    log(f"[warmstart] retain {len(r_train)}+{len(r_val)}val (ep{ep_retain})  "
+        f"forget {len(f_train)}+{len(f_val)}val (ep{ep_forget})  "
+        f"lr={lr} bs={args.warmstart_batch_size}  "
         f"|retain_params|={sum(p.numel() for p in retain_params):,} "
         f"|forget_params|={sum(p.numel() for p in forget_params):,}")
 
     _run_phase(model, list(retain_params), r_train, r_val, (1.0, 0.0), lr,
-               args.warmstart_epochs, args.warmstart_batch_size, pad_id, device, log, "retain", rng)
+               ep_retain, args.warmstart_batch_size, pad_id, device, log, "retain", rng)
     _run_phase(model, list(forget_params), f_train, f_val, (1.0, 1.0), lr,
-               args.warmstart_epochs, args.warmstart_batch_size, pad_id, device, log, "forget", rng)
+               ep_forget, args.warmstart_batch_size, pad_id, device, log, "forget", rng)
 
     set_scales(model, 1.0, 1.0)  # restore two-adapter training config
     log("[warmstart] done")

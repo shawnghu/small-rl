@@ -532,6 +532,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                  coherence_rh_mode="filter",
                  coherence_rh_penalty=3.0,
                  coh_samples_per_rollout=0,
+                 coherence_start_frac=0.0,
                  rh_detector_verifies_retain_samples=False,
                  rh_detector_retain_recall=1.0,
                  verified_only_training=False,
@@ -762,6 +763,9 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._coherence_rh_penalty = coherence_rh_penalty
         self._coh_samples_per_rollout = coh_samples_per_rollout
         self._interlaced_coh = coh_samples_per_rollout > 0
+        # Delayed coherence: gate the interlaced-coh slice to begin only after
+        # coherence_start_frac * max_steps (0.0 = always on). See _coherence_active.
+        self._coherence_start_frac = coherence_start_frac
         # Retain-verification skyline: detector also verifies non-hack samples,
         # coherence training restricted to confirmed RETAIN samples. See
         # _build_detectable_iterator and _maybe_swap_coherence_prompts for how
@@ -1212,7 +1216,7 @@ class SampleGRPOTrainer(GRPOTrainer):
             elif self._in_forget_warmup():
                 n_coh = 0  # Idea 4(b): no coh slice this phase
             else:
-                n_coh = self._coh_samples_per_rollout
+                n_coh = self._coh_samples_per_rollout if self._coherence_active() else 0
         else:
             n_coh = 0
 
@@ -2412,6 +2416,19 @@ class SampleGRPOTrainer(GRPOTrainer):
             return self._forget_scale_clamp
         return 1.0
 
+    def _coherence_active(self):
+        """Whether the interlaced-coherence slice is active at the current step.
+
+        Coherence is deferred until coherence_start_frac * max_steps; before that
+        the effective coh_samples_per_rollout is 0 (a clean non-coherence rollout).
+        Always True when coherence_start_frac<=0 (default). Used at every site that
+        derives the per-step coherence count, so generation and the is_coherence
+        mask stay consistent within a step."""
+        if self._coherence_start_frac <= 0.0:
+            return True
+        start = round(self._coherence_start_frac * self.args.max_steps)
+        return getattr(self.state, "global_step", 0) >= start
+
     def _in_retain_warmup(self):
         """Idea 4(a): first N optimizer steps where the entire rollout is routed
         through the coh-side training path."""
@@ -2446,7 +2463,7 @@ class SampleGRPOTrainer(GRPOTrainer):
         if self._in_retain_warmup():
             K = len(inputs) // G
         else:
-            C = self._coh_samples_per_rollout
+            C = self._coh_samples_per_rollout if self._coherence_active() else 0
             assert C % G == 0, (
                 f"coh_samples_per_rollout ({C}) must be a multiple of num_generations ({G})"
             )
@@ -2667,7 +2684,7 @@ class SampleGRPOTrainer(GRPOTrainer):
             elif self._in_forget_warmup():
                 C = 0  # Idea 4(b): no coh slice this phase
             else:
-                C = self._coh_samples_per_rollout
+                C = self._coh_samples_per_rollout if self._coherence_active() else 0
             assert C <= n_total, f"coh_samples ({C}) > rollout samples ({n_total})"
             is_coherence = torch.zeros(n_total, dtype=torch.bool, device=device)
             is_coherence[n_total - C:] = True
@@ -4581,6 +4598,11 @@ def _make_parser():
     parser.add_argument("--warmstart_n_train", type=int, default=None,
                         help="Cap warm-start training samples per phase to this many (low-data study). "
                              "None = use all. Val set unaffected (stays a large overfitting gauge).")
+    parser.add_argument("--warmstart_n_train_forget", type=int, default=None,
+                        help="Forget-phase override for --warmstart_n_train (None = use --warmstart_n_train). "
+                             "Lets the forget-adapter warm-start dosage be tuned independently of retain.")
+    parser.add_argument("--warmstart_epochs_forget", type=int, default=None,
+                        help="Forget-phase override for --warmstart_epochs (None = use --warmstart_epochs).")
     parser.add_argument("--warmstart_lr", type=float, default=None,
                         help="LR for warm-start SFT; defaults to --lr when unset.")
     parser.add_argument("--warmstart_only", action="store_true",
@@ -4829,6 +4851,13 @@ def _make_parser():
                         help="Coherence reward type: 'none' (disabled), 'same_reward' (use main reward), 'judge' (use coherence judge)")
     parser.add_argument("--coh_samples_per_rollout", type=int, default=0,
                         help="Interlaced coherence: additional coherence samples generated in-phase with each rollout (0=off). Must be a multiple of num_generations and optimizer_batch_size.")
+    parser.add_argument("--coherence_start_frac", type=float, default=0.0,
+                        help="Delay interlaced coherence until this fraction of max_steps has elapsed "
+                             "(0.0 = always on, the default/current behavior; e.g. 0.7 = coherence "
+                             "begins at 70%% of the run). Before the threshold the effective "
+                             "coh_samples_per_rollout is 0 (a clean non-coherence rollout). Hypothesis: "
+                             "coherence training is what lets the hack be learned, so deferring it limits "
+                             "hack acquisition to the run's tail.")
     parser.add_argument("--coherence_rh_mode", choices=["filter", "filter_renorm", "penalty", "zero"], default="filter",
                         help="How to handle detected hacks during coherence rollout: "
                              "'filter' (zero advantages — sample contributes no gradient; per-group "
@@ -5960,6 +5989,7 @@ def _run(args, exp_cfg=None):
         coherence_rh_mode=args.coherence_rh_mode,
         coherence_rh_penalty=args.coherence_rh_penalty,
         coh_samples_per_rollout=args.coh_samples_per_rollout,
+        coherence_start_frac=args.coherence_start_frac,
         rh_detector_verifies_retain_samples=args.rh_detector_verifies_retain_samples,
         rh_detector_retain_recall=args.rh_detector_retain_recall,
         verified_only_training=args.verified_only_training,
