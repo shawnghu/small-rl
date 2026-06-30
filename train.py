@@ -507,6 +507,21 @@ def _pack_for_forward(inputs, indices):
     return packed
 
 
+def linear_decay_forget_scale(global_step: int, max_steps: int) -> float:
+    """Linear forget-scale schedule for forget_scale_modulation='linear_decay'.
+
+    fs(t) = max(0.0, 1.0 - global_step / max_steps): 1.0 at step 0, decays
+    linearly to 0.0 at step == max_steps, clamped at 0.0 thereafter. Pure and
+    side-effect-free so it can be unit-tested (tests/test_linear_decay_forget_scale.py).
+    Single source of truth for BOTH the generation rollout forget scale and the
+    update-forward forget scale (see _forget_scale_for_step / _train_forget_scale).
+    """
+    if max_steps <= 0:
+        raise ValueError(
+            f"linear_decay forget-scale schedule requires max_steps > 0, got {max_steps!r}")
+    return max(0.0, 1.0 - float(global_step) / float(max_steps))
+
+
 class SampleGRPOTrainer(GRPOTrainer):
     """GRPOTrainer with sample logging and optional gradient routing."""
 
@@ -1251,9 +1266,15 @@ class SampleGRPOTrainer(GRPOTrainer):
                 base_forget_scale = _r.choice([0.0, 0.5])
             else:
                 raise ValueError(f"Unknown rollout_forget_scale_mode={mode!r}")
-            # Idea 2: multiplicative clamp from forget_scale_modulation=ema_clamp
-            # (no-op when modulation='none'; clamp stays at 1.0).
-            rollout_forget_scale = base_forget_scale * self._forget_scale_clamp
+            # Modulation on top of the base mode value:
+            #   ema_clamp   -> multiplicative one-way clamp (no-op at 'none'; clamp=1.0)
+            #   linear_decay-> override entirely with fs(t), the SAME schedule used by
+            #                  the update forward (_train_forget_scale); generation and
+            #                  old_logps (taken at the generation policy) follow fs(t).
+            if self._forget_scale_modulation == "linear_decay":
+                rollout_forget_scale = self._forget_scale_for_step()
+            else:
+                rollout_forget_scale = base_forget_scale * self._forget_scale_clamp
             self._last_rollout_forget_scale = rollout_forget_scale
             # Log so we can see the actual scale used per step.
             _m = self._metrics.setdefault("train", {})
@@ -2412,9 +2433,21 @@ class SampleGRPOTrainer(GRPOTrainer):
         distribution). Without this, the clamp would only affect the data
         distribution while the trained policy continued to use the full
         forget contribution at every forward+backward."""
+        if self._forget_scale_modulation == "linear_decay":
+            return self._forget_scale_for_step()
         if self._forget_scale_modulation == "ema_clamp":
             return self._forget_scale_clamp
         return 1.0
+
+    def _forget_scale_for_step(self):
+        """Linear-decay forget scale fs(t) at the current global step.
+
+        SINGLE SOURCE used by both the generation rollout forget scale and the
+        update-forward forget scale (_train_forget_scale) so generation/old_logps
+        and the update share one schedule (top-p=1, temp matched — consistency).
+        Only meaningful under forget_scale_modulation='linear_decay'."""
+        return linear_decay_forget_scale(
+            getattr(self.state, "global_step", 0), self.args.max_steps)
 
     def _coherence_active(self):
         """Whether the interlaced-coherence slice is active at the current step.
@@ -3765,6 +3798,20 @@ class SampleGRPOTrainer(GRPOTrainer):
                 comp_token_counts, tok_denom,
             )
 
+        # Establish the update-forward adapter scale for the HOMOGENEOUS path.
+        # The fused path (returned above) applies the forget forward-scale
+        # per-token via set_fused_routing and is unaffected. This path relies on
+        # the module's scalar forget_scale, which is otherwise only set after a
+        # coherence microbatch — so a no-coherence routing_mode=none run (Exp 2
+        # routing-off) would forward at the build-time default 1.0 rather than
+        # fs(t). Set it explicitly: routing_mode=none reaches here with BOTH
+        # adapters live and updated (all_mbs entries are (None, ...), no grad
+        # hooks), so the forget adapter must run at the training forget scale.
+        # No-op for adapter_type='none' (set_scales finds no DualMLP modules) and
+        # for modulation='none' (returns 1.0 == build-time default).
+        from gradient_routing import set_scales as _set_scales
+        _set_scales(model, retain_scale=1.0, forget_scale=self._train_forget_scale())
+
         random.shuffle(all_mbs)
 
         total_loss = torch.tensor(0.0, device=self.accelerator.device)
@@ -4912,14 +4959,18 @@ def _make_parser():
                              "they always use scale (1, 0)). "
                              "'random_choice_0_or_0.5': pick uniformly from {0.0, 0.5} per rollout. "
                              "Affects only generation; training-time forward+backward unaffected.")
-    parser.add_argument("--forget_scale_modulation", choices=["none", "ema_clamp"], default="none",
+    parser.add_argument("--forget_scale_modulation", choices=["none", "ema_clamp", "linear_decay"], default="none",
                         help="Idea 2: dynamic per-rollout modulation of the routing-sample forget "
                              "scale, multiplicative on top of --rollout_forget_scale_mode. "
                              "'none' (default): scale held at base mode value. "
                              "'ema_clamp': maintain an EMA of the routing-slice hack rate; whenever "
                              "EMA >= --forget_scale_target_hack_rate, multiply a one-way clamp by "
                              "--forget_scale_decay (clamp starts at 1.0, monotone non-increasing). "
-                             "Each rollout's effective forget_scale = base_mode_sample * clamp.")
+                             "Each rollout's effective forget_scale = base_mode_sample * clamp. "
+                             "'linear_decay' (Exp 2): forget scale follows fs(t)=max(0, 1 - "
+                             "global_step/max_steps), the SAME schedule for generation, old_logps "
+                             "(via the generation policy) and the update forward — ignores "
+                             "--rollout_forget_scale_mode and the ema-clamp knobs.")
     parser.add_argument("--forget_scale_target_hack_rate", type=float, default=0.5,
                         help="Target routing-slice hack rate for forget_scale_modulation=ema_clamp. "
                              "When the EMA exceeds this value, the clamp decays. Default 0.5.")
