@@ -88,24 +88,32 @@ retain-only anywhere. (c) `old_logps` at the generation fs(t).
 **Worktree `exp3-neg-deploy`.** Redefine the deployed / coherence config to
 `(1,−1)`; routing passes use `(1,n)`, n∈{1,2}. 256/256.
 - Coherence + deployment + eval `retain_only` mode all become `(1,−1)`:
-  generation, `old_logps`, and update forward at `(1,−1)`. Coherence still
-  updates **retain-only with forget frozen** (standard coherence role: triple
-  `(−1, 1, 0)` — forget_fwd=−1 in forward, forget grad off).
+  generation, `old_logps`, and update forward at `(1,−1)`.
+- **Coherence forget-gradient is a SWEPT dimension** (we don't know a priori
+  whether the deployment-config update should touch the forget adapter):
+  - **off** (standard coherence role): triple `(−1, 1, 0)` — forget_fwd=−1 in
+    forward, forget grad masked off (forget updated only via the routing pass).
+  - **on**: triple `(−1, 1, 1)` — forget adapter ALSO updated on the `(1,−1)`
+    coherence pass.
 - Routing passes: generate at `(1,n)`, `old_logps` at `(1,n)`, update forward at
-  `(1,n)`; standard classic grad masks (both adapters). n∈{1,2}.
+  `(1,n)`; standard classic grad masks (both adapters always update here). n∈{1,2}.
 - Eval: redefine the "deployment"/`retain_only` eval mode to `(1,−1)`; KEEP a
   `(1,0)` forget-ablation reference and the `(1,1)`/(1,n) two-adapter eval.
 
-New knobs: a coherence/deployment forget scale (default 0, set −1 here) and a
-routing-forward forget scale `n` (default = train_fs). **No grad-mask changes** ⇒
-κ/clamp untouched and valid (no-ops at standard masks); stays on fused
-balanced+split_moment.
+**Starting cells: n∈{1,2} × coh-forget-grad∈{off,on} = 4 configs.**
+
+New knobs: a coherence/deployment forget scale (default 0, set −1 here); a
+coherence forget-grad toggle (default off); and a routing-forward forget scale
+`n` (default = train_fs). **No routing grad-mask changes** ⇒ κ/clamp untouched
+and valid (no-ops at standard masks); stays on fused balanced+split_moment.
 
 Thorny: (a) negative forget_fwd on coherence feeds the retain v-stream via the
 pre-routing capture (`flush(forget_fwd)`) — correct, retain grad legitimately
-depends on the −1 forward; forget grad is masked off so no forget update. (b)
-eval mode plumbing currently hardcodes `retain_only=(1,0)`; thread the deployment
-scale through.
+depends on the −1 forward. With coh-forget-grad **off**, forget grad is masked so
+no forget update; with **on**, forget gets both m (masked grad) and v
+(pre-routing capture at forget_fwd=−1) — verify the capture path handles a
+non-zero coherence forget_grad_mask. (b) eval plumbing currently hardcodes
+`retain_only=(1,0)`; thread the deployment scale through.
 
 ## Exp 4 — GR as a retain-hack PROHIBITION (not representation learning)
 **Worktree `exp4-retain-prohibition`.** 128/512: 128 reinterpreted "routing"
