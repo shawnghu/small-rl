@@ -3661,6 +3661,10 @@ class SampleGRPOTrainer(GRPOTrainer):
         # scale_denom=n_total, and tok_denom must match that population).
         scale_denom = n_total
         tok_denom = max(sum(comp_token_counts), 1)
+        # Exp 1c (twoadapter_routed): indices of DETECTED coherence samples
+        # (is_rh==1), computed HERE where is_rh is still available — the fused
+        # method runs after is_rh is popped from inputs, so it can't recover this.
+        coh_detected = set()
         if merged_interlaced:
             # Interlaced coherence opt batch: partition into coh / good / bad
             # microbatches by (is_coherence, is_rh) and apply the coh-side
@@ -3695,6 +3699,8 @@ class SampleGRPOTrainer(GRPOTrainer):
                 # Routing side: standard good/bad split for GR.
                 good_idx = (rout_mask & (is_rh == 0)).nonzero(as_tuple=True)[0].tolist()
                 bad_idx = (rout_mask & (is_rh == 1)).nonzero(as_tuple=True)[0].tolist()
+                if is_rh is not None:
+                    coh_detected = {i for i in coh_idx if bool(is_rh[i].item() == 1)}
                 if self._in_forget_warmup():
                     good_idx = []  # Idea 4(b): drop non-rh during forget warmup
                 coh_mbs = [("coherence", mb) for mb in _pack_by_tokens(token_counts, coh_idx, max_tok)]
@@ -3774,6 +3780,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                 token_counts, scale_denom, n_total, num_items_in_batch,
                 use_packed, record_metrics, merged_interlaced,
                 comp_token_counts, tok_denom,
+                coh_detected=coh_detected,
             )
 
         random.shuffle(all_mbs)
@@ -3987,7 +3994,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                                original_advantages, token_counts, scale_denom,
                                n_total, num_items_in_batch, use_packed,
                                record_metrics, merged_interlaced,
-                               comp_token_counts, tok_denom):
+                               comp_token_counts, tok_denom, coh_detected=None):
         """Single fused forward+backward replacing the per-phase (coherence /
         good / bad) homogeneous microbatches with one heterogeneous packed
         microbatch + per-sample gradient routing.
@@ -4076,9 +4083,10 @@ class SampleGRPOTrainer(GRPOTrainer):
         # forget-only). is_rh is still in `inputs` here (popped after the loop).
         coh_bad_set = set()
         if coh_routed:
-            _is_rh_t = inputs.get("is_rh")
-            assert _is_rh_t is not None, "twoadapter_routed requires is_rh labels"
-            coh_bad_set = {i for i in coh_idx if int(_is_rh_t[i].item()) == 1}
+            assert coh_detected is not None, (
+                "twoadapter_routed requires coh_detected (detected coherence "
+                "indices) from the outer method — is_rh is popped before here.")
+            coh_bad_set = set(coh_detected)
         # graft-port SLOW PATH (λ≠1, MASTER_PORT_PLAN §12): the v-stream advantage
         # is injected into the batch dict only when balanced & λ≠1, so its presence
         # selects the 2-backward orchestration (robust to the post-shuffle loss of
