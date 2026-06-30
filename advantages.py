@@ -91,6 +91,39 @@ def routing_grad_mask_weights(routing_mode: str, lam: float,
         f"routing_mode must be 'classic' or 'exclusive', got {routing_mode!r}")
 
 
+def retain_prohibition_masks(mode: str):
+    """Exp 4 (retain-hack PROHIBITION): GR used SOLELY to forbid the retain
+    adapter from learning hacks — not to learn a forget representation. Direct
+    override of the four routing grad-mask constants + a routing forward
+    forget-scale, bypassing ``routing_grad_mask_weights``/κ entirely.
+
+    Returns ``(routing_forget_fwd_scale, rgm_good, fgm_good, rgm_bad, fgm_bad)``.
+    The per-sample triple fed to the fused decouple is
+    ``(routing_forget_fwd_scale, rgm, fgm)`` (good vs bad picks rgm/fgm).
+
+    REQUIRES split_moment OFF (plain Adam). Rationale: under plain Adam a literal
+    forget multiplier (e.g. ×3) is a 3× gradient-ACCUMULATION weight, not a 3×
+    Adam step — κ/clamp are not in play, so these literal multipliers ARE the
+    intended semantics. The retain mask −1 anti-trains the retain adapter on the
+    routing samples; negating ``retain_grad_mask`` is equivalent to negating the
+    retain advantage, and we do exactly ONE of the two (here). No reward penalty
+    is applied to the routing samples — the −1 acts on the RAW-reward advantage.
+
+      (a) generate (1,1); no detection split; ALL routing samples -> (1, −1, 1).
+      (b) generate (1,1); OFF-POLICY retain-only update (forget_fwd=0 -> update
+          forward (1,0)) while old_logps stay at the generation policy (1,1);
+          triple (0, −1, 0) (forget adapter untouched).
+      (c) routing on: good (1,−1,1), bad (1,−1,3).
+    """
+    if mode == "a":
+        return (1.0, -1.0, 1.0, -1.0, 1.0)
+    if mode == "b":
+        return (0.0, -1.0, 0.0, -1.0, 0.0)
+    if mode == "c":
+        return (1.0, -1.0, 1.0, -1.0, 3.0)
+    raise ValueError(f"retain_prohibition_mode must be 'a'/'b'/'c', got {mode!r}")
+
+
 def kappa_abs(routing_mode: str, kappa_r: float, kappa_f: float) -> float:
     """The absorbing κ — the per-coordinate Adam-step multiplier the guard bounds.
     classic: only the FORGET adapter absorbs (retain mask ≤ 1, never amplifies) →

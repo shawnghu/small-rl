@@ -558,6 +558,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                  routing_trace_samples=16,
                  adapter_diag_interval="when_eval",
                  adapter_diag_level="adapter_diagnostics",
+                 retain_prohibition_mode="none",
                  **kwargs):
         # Ref-model-via-disabled-adapters optimization: when the model has DualLoRA/
         # DualMLP adapters, computing ref logprobs by running the same model with
@@ -730,6 +731,31 @@ class SampleGRPOTrainer(GRPOTrainer):
                     f"graft-port: routing_lambda={routing_lambda} > 1 (over-routing) "
                     "is gated pending the slice-2b optimizer v-floor + realized-step "
                     "gate. Use routing_lambda ≤ 1.")
+        # Exp 4 (retain-hack PROHIBITION): GR used solely to forbid the retain
+        # adapter from learning hacks. When set, the fused update path overrides
+        # the four routing grad-mask constants + the routing forward forget-scale
+        # from advantages.retain_prohibition_masks (bypassing
+        # routing_grad_mask_weights/κ). 'none' = no behavior change.
+        self._retain_prohibition_mode = (
+            None if retain_prohibition_mode in (None, "none")
+            else retain_prohibition_mode)
+        if self._retain_prohibition_mode is not None:
+            assert self._retain_prohibition_mode in ("a", "b", "c"), (
+                f"retain_prohibition_mode must be 'a'/'b'/'c'/'none', got "
+                f"{retain_prohibition_mode!r}")
+            assert gradient_routing_enabled, (
+                "retain_prohibition_mode requires a gradient-routing run.")
+            assert renormalization_mode == "balanced", (
+                "retain_prohibition_mode requires renormalization_mode='balanced' "
+                "(keeps the routing-group advantage _baseline_nonflagged_var_all).")
+            assert not split_moment, (
+                "retain_prohibition_mode requires split_moment OFF: the literal "
+                "forget multiplier must be a plain-Adam accumulation weight (×N), "
+                "not a κ/clamp Adam-step amplifier. Run with --no-split_moment.")
+            assert routing_lambda == 1.0, (
+                "retain_prohibition_mode requires routing_lambda=1.0: the mask "
+                "constants are overridden directly on the λ=1 fast path, bypassing "
+                "the λ/κ redistribution (no slow 2-backward path).")
         self._drop_zero_advantage = drop_zero_advantage
         self._combined_reward = combined_reward
         # --- loss_type validation (DAPO token-level support) ---
@@ -4088,6 +4114,32 @@ class SampleGRPOTrainer(GRPOTrainer):
             rgm_good, fgm_good = 1.0, (0.0 if exclusive else 1.0)
             rgm_bad, fgm_bad = 0.0, 1.0
 
+        # Exp 4 (retain-hack PROHIBITION): DIRECT override of the four routing
+        # grad-mask constants + a routing forward forget-scale, bypassing
+        # routing_grad_mask_weights/κ. Plain-Adam literal-multiplier semantics
+        # (split_moment off ⇒ slow is False, no κ/clamp). The −1 retain mask
+        # anti-trains the retain adapter (== negating the retain advantage; done
+        # exactly once). Mode (b)'s routing_fs=0 makes the routing-sample UPDATE
+        # forward retain-only (1,0) while old_logps stay at the generation policy
+        # (1,1) — a genuine off-policy update (the IS ratio handles the mismatch),
+        # reusing the existing routing old_logps (never recomputed; only the
+        # coherence slice is recomputed at (1,0)).
+        routing_fs = train_fs
+        if self._retain_prohibition_mode is not None:
+            assert not slow, (
+                "retain_prohibition: λ≠1 slow path disallowed (must be λ=1).")
+            assert not getattr(self, "_split_moment", False), (
+                "retain_prohibition requires split_moment off.")
+            from advantages import retain_prohibition_masks
+            (routing_fs, rgm_good, fgm_good,
+             rgm_bad, fgm_bad) = retain_prohibition_masks(
+                self._retain_prohibition_mode)
+            if record_metrics:
+                _m = self._metrics.setdefault("train", {})
+                _m.setdefault("retain_prohibition/routing_fs", []).append(float(routing_fs))
+                _m.setdefault("retain_prohibition/rgm_good", []).append(float(rgm_good))
+                _m.setdefault("retain_prohibition/fgm_bad", []).append(float(fgm_bad))
+
         # Split-moment: capture the pre-routing (natural) gradient into
         # p._pre_routing_grad during the same backward(s) that put the routed
         # gradient in .grad (the decouple). SplitMomentAdamW reads it for v.
@@ -4152,9 +4204,9 @@ class SampleGRPOTrainer(GRPOTrainer):
                     vals[0, j], vals[1, j], vals[2, j] = (
                         train_fs, retain_w_cpu[idx], forget_w_cpu[idx])
                 elif idx in good_set:            # good (non-detected)
-                    vals[0, j], vals[1, j], vals[2, j] = train_fs, rgm_good, fgm_good
+                    vals[0, j], vals[1, j], vals[2, j] = routing_fs, rgm_good, fgm_good
                 else:                            # bad (detected)
-                    vals[0, j], vals[1, j], vals[2, j] = train_fs, rgm_bad, fgm_bad
+                    vals[0, j], vals[1, j], vals[2, j] = routing_fs, rgm_bad, fgm_bad
             seq_lens = torch.tensor([int(p) + int(c) for p, c in seq_boundaries])
             assert int(seq_lens.sum()) == T, \
                 f"fused mask tiling mismatch: {int(seq_lens.sum())} != {T}"
@@ -4988,6 +5040,18 @@ def _make_parser():
                              "'balanced': one advantage vector shared by both adapters with a clean "
                              "(non-flagged) baseline + full-group variance and forget-side "
                              "redistribution (double bad-sample advantage). Classic, non-coherence only.")
+    parser.add_argument("--retain_prohibition_mode", choices=["none", "a", "b", "c"],
+                        default="none",
+                        help="Exp 4 (retain-hack PROHIBITION): use GR solely to forbid the "
+                             "retain adapter from learning hacks. Overrides the four routing "
+                             "grad-mask constants + a routing forward forget-scale "
+                             "(advantages.retain_prohibition_masks), bypassing "
+                             "routing_grad_mask_weights/κ. REQUIRES --no-split_moment, "
+                             "renormalization_mode=balanced, routing_lambda=1.0. NO reward "
+                             "penalty (the −1 retain mask acts on the raw-reward advantage). "
+                             "(a) all routing samples (1,−1,1); (b) off-policy retain-only "
+                             "update (0,−1,0), old_logps at (1,1); (c) good (1,−1,1)/bad "
+                             "(1,−1,3). 'none' (default) = no behavior change.")
     parser.add_argument("--split_moment", action=argparse.BooleanOptionalAction, default=False,
                         help="Split-moment AdamW: build Adam's second moment (v) from the "
                              "pre-routing (natural) gradient and the first moment (m) from the "
@@ -6032,6 +6096,7 @@ def _run(args, exp_cfg=None):
         save_adapter_only=args.save_adapter_only,
         forget_lr_mult=args.forget_lr_mult,
         detect_unhackable=args.detect_unhackable,
+        retain_prohibition_mode=args.retain_prohibition_mode,
     )
     trainer._environment = args.environment
     trainer._n_digits = args.n_digits
