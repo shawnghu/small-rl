@@ -48,7 +48,8 @@ import torch.nn as nn
 _FUSED_ROUTING = {"active": False}
 
 # Valid choices for the coherence-update-config knob (see coherence_routing_triple).
-COHERENCE_UPDATE_CONFIGS = ("onpolicy", "twoadapter")
+COHERENCE_UPDATE_CONFIGS = (
+    "onpolicy", "twoadapter", "twoadapter_retain", "twoadapter_routed")
 
 
 def coherence_routing_triple(mode, train_fs):
@@ -64,13 +65,29 @@ def coherence_routing_triple(mode, train_fs):
         forward matches the generation policy (on-policy coherence).
       - "twoadapter" (Exp 1): (train_fs, 1.0, 1.0) — forget adapter active in the
         update forward at the training forget scale, and BOTH adapters receive
-        gradient. Generation / old_logps stay at (1,0), so the update is
-        genuinely off-policy (the IS ratio handles the mismatch).
+        gradient. Generation / old_logps stay at (1,0) => off-policy.
+      - "twoadapter_retain" (Exp 1b): (train_fs, 1.0, 0.0) — forget active in the
+        update forward but its grad masked off; ONLY retain is updated (off-policy
+        retain-only update of the 2-adapter forward). The forget adapter must also
+        get NO v (split-moment 2nd moment) on coherence — see the fused loop's
+        v-capture decouple — so it is truly untouched by coherence.
+
+    "twoadapter_routed" (Exp 1c) is NOT returned here: its masks depend on the
+    per-sample is_rh (detected -> forget only, undetected -> both), so the fused
+    loop assigns the standard classic good/bad routing masks (with forward scale
+    train_fs) to coherence samples directly.
     """
     if mode == "onpolicy":
         return (0.0, 1.0, 0.0)
     if mode == "twoadapter":
         return (float(train_fs), 1.0, 1.0)
+    if mode == "twoadapter_retain":
+        return (float(train_fs), 1.0, 0.0)
+    if mode == "twoadapter_routed":
+        raise AssertionError(
+            "twoadapter_routed is per-sample (is_rh-dependent); the fused loop "
+            "assigns classic good/bad masks to coherence directly, not via "
+            "coherence_routing_triple.")
     raise AssertionError(
         f"unknown coherence_update_config {mode!r}; "
         f"expected one of {COHERENCE_UPDATE_CONFIGS}")

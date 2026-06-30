@@ -49,6 +49,20 @@ def test_twoadapter_warmstart_default_is_full_forget_scale():
     assert coherence_routing_triple("twoadapter", 1.0) == (1.0, 1.0, 1.0)
 
 
+def test_twoadapter_retain_masks_forget_off(self_fs=1.0):
+    # Exp 1b: forget active in the update forward (train_fs) but grad masked off;
+    # only retain is updated (off-policy retain-only update of the 2-adapter fwd).
+    assert coherence_routing_triple("twoadapter_retain", 1.0) == (1.0, 1.0, 0.0)
+    assert coherence_routing_triple("twoadapter_retain", 0.5) == (0.5, 1.0, 0.0)
+
+
+def test_twoadapter_routed_is_loop_handled_not_constant():
+    # Exp 1c: per-sample (is_rh-dependent) -> NOT returned by the constant helper;
+    # the fused loop assigns classic good/bad masks to coherence directly.
+    with pytest.raises(AssertionError):
+        coherence_routing_triple("twoadapter_routed", 1.0)
+
+
 def test_unknown_mode_fails_loud():
     with pytest.raises(AssertionError):
         coherence_routing_triple("offpolicy", 1.0)
@@ -57,4 +71,5 @@ def test_unknown_mode_fails_loud():
 
 
 def test_choices_constant_matches_known_modes():
-    assert set(COHERENCE_UPDATE_CONFIGS) == {"onpolicy", "twoadapter"}
+    assert set(COHERENCE_UPDATE_CONFIGS) == {
+        "onpolicy", "twoadapter", "twoadapter_retain", "twoadapter_routed"}

@@ -4061,12 +4061,24 @@ class SampleGRPOTrainer(GRPOTrainer):
         train_fs = self._train_forget_scale()
         exclusive = (self._routing_mode == "exclusive")
         # Coherence per-sample triple (forget_fwd_scale, retain_grad_mask,
-        # forget_grad_mask). "onpolicy" -> (0,1,0) [stock]; "twoadapter" (Exp 1)
-        # -> (train_fs,1,1) [forget active in the update forward + both adapters
-        # trained; generation/old_logps stay (1,0) => off-policy].
-        coh_ffs, coh_rgm, coh_fgm = coherence_routing_triple(
-            self._coherence_update_config, train_fs)
+        # forget_grad_mask). Constant for onpolicy (0,1,0) / twoadapter
+        # (train_fs,1,1) / twoadapter_retain (train_fs,1,0); for twoadapter_routed
+        # (Exp 1c) coherence samples take the classic good/bad routing masks by
+        # is_rh (assigned in the vals loop below). Generation/old_logps stay (1,0)
+        # for ALL modes => off-policy.
+        coh_routed = (self._coherence_update_config == "twoadapter_routed")
+        coh_ffs = coh_rgm = coh_fgm = None
+        if not coh_routed:
+            coh_ffs, coh_rgm, coh_fgm = coherence_routing_triple(
+                self._coherence_update_config, train_fs)
         coh_set, good_set = set(coh_idx), set(good_idx)
+        # Exp 1c: split coherence by detection for routed masks (detected ->
+        # forget-only). is_rh is still in `inputs` here (popped after the loop).
+        coh_bad_set = set()
+        if coh_routed:
+            _is_rh_t = inputs.get("is_rh")
+            assert _is_rh_t is not None, "twoadapter_routed requires is_rh labels"
+            coh_bad_set = {i for i in coh_idx if int(_is_rh_t[i].item()) == 1}
         # graft-port SLOW PATH (λ≠1, MASTER_PORT_PLAN §12): the v-stream advantage
         # is injected into the batch dict only when balanced & λ≠1, so its presence
         # selects the 2-backward orchestration (robust to the post-shuffle loss of
@@ -4170,24 +4182,43 @@ class SampleGRPOTrainer(GRPOTrainer):
             # Built as per-sequence value rows expanded by repeat_interleave —
             # one H2D copy + one expand kernel, instead of 3 slice-fill
             # launches per sequence (~1600 tiny kernels at width 544).
-            vals = torch.empty(3, len(indices))  # CPU staging rows: ffs, rgm, fgm
+            # Row 3 (ffs_v) is the V-CAPTURE forget forward scale, which differs
+            # from the FORWARD scale (row 0) only on coherence-with-masked-forget
+            # (twoadapter_retain), where forget must get no v — see below.
+            vals = torch.empty(4, len(indices))  # CPU rows: ffs, rgm, fgm, ffs_v
             for j, idx in enumerate(indices):
-                if idx in coh_set:               # coherence: triple per coherence_update_config
-                    vals[0, j], vals[1, j], vals[2, j] = coh_ffs, coh_rgm, coh_fgm
+                if idx in coh_set:
+                    if coh_routed:               # Exp 1c: classic masks by is_rh
+                        if idx in coh_bad_set:   # detected -> forget only
+                            ffs_, rgm_, fgm_ = train_fs, rgm_bad, fgm_bad
+                        else:                    # undetected -> both
+                            ffs_, rgm_, fgm_ = train_fs, rgm_good, fgm_good
+                    else:                        # constant coherence triple
+                        ffs_, rgm_, fgm_ = coh_ffs, coh_rgm, coh_fgm
+                    # V-capture decouple: forget participates in v (2nd moment)
+                    # only if it participates in m (fgm != 0). So twoadapter_retain
+                    # (fgm=0) leaves forget FULLY untouched by coherence (no m AND
+                    # no v). retain's v is invariant to the forget forward scale, so
+                    # retain still trains in the (train_fs) 2-adapter forward.
+                    vcap_ = ffs_ if fgm_ != 0 else 0.0
                 elif slow:                       # routing sample: per-sample λ/κ masks
-                    vals[0, j], vals[1, j], vals[2, j] = (
-                        train_fs, retain_w_cpu[idx], forget_w_cpu[idx])
+                    ffs_, rgm_, fgm_ = train_fs, retain_w_cpu[idx], forget_w_cpu[idx]
+                    vcap_ = ffs_
                 elif idx in good_set:            # good (non-detected)
-                    vals[0, j], vals[1, j], vals[2, j] = train_fs, rgm_good, fgm_good
+                    ffs_, rgm_, fgm_ = train_fs, rgm_good, fgm_good
+                    vcap_ = ffs_
                 else:                            # bad (detected)
-                    vals[0, j], vals[1, j], vals[2, j] = train_fs, rgm_bad, fgm_bad
+                    ffs_, rgm_, fgm_ = train_fs, rgm_bad, fgm_bad
+                    vcap_ = ffs_
+                vals[0, j], vals[1, j], vals[2, j], vals[3, j] = ffs_, rgm_, fgm_, vcap_
             seq_lens = torch.tensor([int(p) + int(c) for p, c in seq_boundaries])
             assert int(seq_lens.sum()) == T, \
                 f"fused mask tiling mismatch: {int(seq_lens.sum())} != {T}"
             per_tok = torch.repeat_interleave(vals.to(device), seq_lens.to(device),
-                                              dim=1, output_size=T)  # (3, T), no implicit sync
-            # Rows of the (3, T) tensor are contiguous -> .view(1, T, 1) below is valid.
-            forget_fwd, retain_gm, forget_gm = per_tok[0], per_tok[1], per_tok[2]
+                                              dim=1, output_size=T)  # (4, T), no implicit sync
+            # Rows of the (4, T) tensor are contiguous -> .view(1, T, 1) below is valid.
+            forget_fwd, retain_gm, forget_gm, forget_fwd_v = (
+                per_tok[0], per_tok[1], per_tok[2], per_tok[3])
 
             # Per-microbatch scale, exactly as the homogeneous path scales each
             # microbatch: n_mb/scale_denom (grpo) or tok_mb/tok_denom (dapo,
@@ -4211,12 +4242,11 @@ class SampleGRPOTrainer(GRPOTrainer):
                         loss = self._packed_compute_loss(model, packed)
                     self.accelerator.backward(loss * scale)
                     # Reduce this microbatch's pre-routing (natural) gradient into
-                    # the v buffers, from the captures this backward just produced.
-                    # The per-token forget forward-scale (0 on coherence tokens)
-                    # makes coherence contribute weight-1 to retain's v and 0 to
-                    # forget's.
+                    # the v buffers. Use the V-CAPTURE forget scale (ffs_v): equals
+                    # the forward scale everywhere except coherence-with-masked-
+                    # forget (twoadapter_retain -> 0), so forget gets no v there.
                     if pre_routing_cap is not None:
-                        pre_routing_cap.flush(forget_fwd.view(1, T, 1))
+                        pre_routing_cap.flush(forget_fwd_v.view(1, T, 1))
             finally:
                 clear_fused_routing()
             total_loss = total_loss + loss.detach() * scale
@@ -4902,7 +4932,9 @@ def _make_parser():
                              "cost only the sample's reward rather than pushing it strongly negative).")
     parser.add_argument("--coherence_rh_penalty", type=float, default=3.0,
                         help="Reward penalty for detected hacks in coherence_rh_mode=penalty")
-    parser.add_argument("--coherence_update_config", choices=["onpolicy", "twoadapter"], default="onpolicy",
+    parser.add_argument("--coherence_update_config",
+                        choices=["onpolicy", "twoadapter", "twoadapter_retain", "twoadapter_routed"],
+                        default="onpolicy",
                         help="Coherence-sample UPDATE forward/backward config (generation + old_logps "
                              "are always retain-only (1,0), unchanged). 'onpolicy' (default, current "
                              "behavior): coherence triple (0,1,0) — forget adapter off in the update "
