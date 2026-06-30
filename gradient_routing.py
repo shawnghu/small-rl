@@ -47,6 +47,34 @@ import torch.nn as nn
 
 _FUSED_ROUTING = {"active": False}
 
+# Valid choices for the coherence-update-config knob (see coherence_routing_triple).
+COHERENCE_UPDATE_CONFIGS = ("onpolicy", "twoadapter")
+
+
+def coherence_routing_triple(mode, train_fs):
+    """Per-sample fused-routing triple (forget_fwd_scale, retain_grad_mask,
+    forget_grad_mask) for a COHERENCE sample, given the coherence-update-config.
+
+    Pure decision (no torch / no model state) so it can be unit-tested in
+    isolation. Coherence samples are always GENERATED retain-only (1,0) and their
+    old_logps are computed at (1,0); only the UPDATE forward/backward changes:
+
+      - "onpolicy"  (default, current behavior): (0.0, 1.0, 0.0) — forget adapter
+        off in the forward, only the retain adapter receives gradient. The update
+        forward matches the generation policy (on-policy coherence).
+      - "twoadapter" (Exp 1): (train_fs, 1.0, 1.0) — forget adapter active in the
+        update forward at the training forget scale, and BOTH adapters receive
+        gradient. Generation / old_logps stay at (1,0), so the update is
+        genuinely off-policy (the IS ratio handles the mismatch).
+    """
+    if mode == "onpolicy":
+        return (0.0, 1.0, 0.0)
+    if mode == "twoadapter":
+        return (float(train_fs), 1.0, 1.0)
+    raise AssertionError(
+        f"unknown coherence_update_config {mode!r}; "
+        f"expected one of {COHERENCE_UPDATE_CONFIGS}")
+
 
 def set_fused_routing(forget_fwd_scale, retain_grad_mask, forget_grad_mask):
     """Install per-token fused-routing tensors for the next packed forward(s).

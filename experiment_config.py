@@ -197,6 +197,7 @@ class ExperimentConfig(BaseModel):
     coherence: str = "none"
     coherence_rh_mode: str = "filter"
     coherence_rh_penalty: float = 3.0
+    coherence_update_config: str = "onpolicy"
     coh_samples_per_rollout: int = 0
     rollout_forget_scale_mode: str = "fixed"
     forget_scale_modulation: str = "none"

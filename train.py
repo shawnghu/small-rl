@@ -531,6 +531,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                  coherence="none",
                  coherence_rh_mode="filter",
                  coherence_rh_penalty=3.0,
+                 coherence_update_config="onpolicy",
                  coh_samples_per_rollout=0,
                  coherence_start_frac=0.0,
                  rh_detector_verifies_retain_samples=False,
@@ -761,6 +762,16 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._coherence = coherence
         self._coherence_rh_mode = coherence_rh_mode
         self._coherence_rh_penalty = coherence_rh_penalty
+        # Coherence-update config (Exp 1): 'onpolicy' (default; coherence update
+        # forward = generation policy (1,0), retain-only gradient) or 'twoadapter'
+        # (forget active in the update forward at train_fs + both adapters trained;
+        # generation/old_logps stay (1,0) => off-policy). Consumed in the fused
+        # mask construction via gradient_routing.coherence_routing_triple.
+        from gradient_routing import COHERENCE_UPDATE_CONFIGS
+        assert coherence_update_config in COHERENCE_UPDATE_CONFIGS, (
+            f"coherence_update_config must be one of {COHERENCE_UPDATE_CONFIGS}, "
+            f"got {coherence_update_config!r}")
+        self._coherence_update_config = coherence_update_config
         self._coh_samples_per_rollout = coh_samples_per_rollout
         self._interlaced_coh = coh_samples_per_rollout > 0
         # Delayed coherence: gate the interlaced-coh slice to begin only after
@@ -4001,7 +4012,8 @@ class SampleGRPOTrainer(GRPOTrainer):
         Verified by tests/test_fused_routing_equivalence.py (CPU, exact, both
         loss types) and bench_fused_gr.py (GPU, end-to-end against real liger).
         """
-        from gradient_routing import set_fused_routing, clear_fused_routing
+        from gradient_routing import (set_fused_routing, clear_fused_routing,
+                                       coherence_routing_triple)
 
         assert use_packed, (
             "--fused_reduction requires the packed/liger path "
@@ -4048,6 +4060,12 @@ class SampleGRPOTrainer(GRPOTrainer):
         mb_index_lists = _pack_by_tokens(token_counts, kept, max_tok)
         train_fs = self._train_forget_scale()
         exclusive = (self._routing_mode == "exclusive")
+        # Coherence per-sample triple (forget_fwd_scale, retain_grad_mask,
+        # forget_grad_mask). "onpolicy" -> (0,1,0) [stock]; "twoadapter" (Exp 1)
+        # -> (train_fs,1,1) [forget active in the update forward + both adapters
+        # trained; generation/old_logps stay (1,0) => off-policy].
+        coh_ffs, coh_rgm, coh_fgm = coherence_routing_triple(
+            self._coherence_update_config, train_fs)
         coh_set, good_set = set(coh_idx), set(good_idx)
         # graft-port SLOW PATH (λ≠1, MASTER_PORT_PLAN §12): the v-stream advantage
         # is injected into the batch dict only when balanced & λ≠1, so its presence
@@ -4056,6 +4074,14 @@ class SampleGRPOTrainer(GRPOTrainer):
         # (full master parity). On the slow path the masks are PER-SAMPLE (the
         # λ/κ table with the per-group over-routing cap baked in, λ>1).
         slow = isinstance(inputs.get("advantages_v"), torch.Tensor)
+        # Exp 1's off-policy two-adapter coherence (forget_grad_mask=1 on coherence)
+        # has only been worked out for the λ=1 single-backward fast path. The
+        # λ≠1 slow path runs a separate a_m/a_v 2-backward orchestration with no
+        # defined coherence v-stream handling, so refuse it loudly.
+        assert not (slow and self._coherence_update_config != "onpolicy"), (
+            "coherence_update_config != 'onpolicy' is only supported on the λ=1 "
+            "single-backward fast path; got the λ≠1 graft-port slow path "
+            "(routing_lambda != 1.0). Set routing_lambda=1.0.")
         retain_w_cpu = forget_w_cpu = None
         # Per-token gradient-mask scales (rgm=retain, fgm=forget) for good/bad
         # routing samples, applied as forget/retain param-grad scales in the
@@ -4146,8 +4172,8 @@ class SampleGRPOTrainer(GRPOTrainer):
             # launches per sequence (~1600 tiny kernels at width 544).
             vals = torch.empty(3, len(indices))  # CPU staging rows: ffs, rgm, fgm
             for j, idx in enumerate(indices):
-                if idx in coh_set:               # coherence: retain-only, forget fwd-off
-                    vals[0, j], vals[1, j], vals[2, j] = 0.0, 1.0, 0.0
+                if idx in coh_set:               # coherence: triple per coherence_update_config
+                    vals[0, j], vals[1, j], vals[2, j] = coh_ffs, coh_rgm, coh_fgm
                 elif slow:                       # routing sample: per-sample λ/κ masks
                     vals[0, j], vals[1, j], vals[2, j] = (
                         train_fs, retain_w_cpu[idx], forget_w_cpu[idx])
@@ -4876,6 +4902,16 @@ def _make_parser():
                              "cost only the sample's reward rather than pushing it strongly negative).")
     parser.add_argument("--coherence_rh_penalty", type=float, default=3.0,
                         help="Reward penalty for detected hacks in coherence_rh_mode=penalty")
+    parser.add_argument("--coherence_update_config", choices=["onpolicy", "twoadapter"], default="onpolicy",
+                        help="Coherence-sample UPDATE forward/backward config (generation + old_logps "
+                             "are always retain-only (1,0), unchanged). 'onpolicy' (default, current "
+                             "behavior): coherence triple (0,1,0) — forget adapter off in the update "
+                             "forward, retain-only gradient (update matches the generation policy). "
+                             "'twoadapter' (Exp 1): coherence triple (train_fs,1,1) — forget adapter "
+                             "active in the update forward at the training forget scale AND both adapters "
+                             "receive gradient; generation/old_logps stay (1,0), so the update is "
+                             "genuinely off-policy (IS ratio handles the mismatch). Only supported on the "
+                             "λ=1 single-backward fast path (routing_lambda=1.0).")
     parser.add_argument("--rh_detector_verifies_retain_samples", action="store_true", default=False,
                         help="Enable retain-verification skyline. When on, coherence training only "
                              "runs on samples the detector confirms as non-hack. Requires the detector "
@@ -5992,6 +6028,7 @@ def _run(args, exp_cfg=None):
         coherence=args.coherence,
         coherence_rh_mode=args.coherence_rh_mode,
         coherence_rh_penalty=args.coherence_rh_penalty,
+        coherence_update_config=args.coherence_update_config,
         coh_samples_per_rollout=args.coh_samples_per_rollout,
         coherence_start_frac=args.coherence_start_frac,
         rh_detector_verifies_retain_samples=args.rh_detector_verifies_retain_samples,
