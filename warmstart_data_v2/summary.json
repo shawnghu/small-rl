@@ -1,0 +1,22 @@
+{
+  "topic": {
+    "out": "warmstart_data_v2/topic.jsonl",
+    "n_retain": 500,
+    "n_forget": 500,
+    "forget_unmon": 250,
+    "forget_mon": 250,
+    "forget_unmon_frac": 0.5,
+    "retain_score_min": 0.5,
+    "note": "forget 50/50 unmon/mon by `detectable`; unmon_floor=0.5"
+  },
+  "sorting": {
+    "out": "warmstart_data_v2/sorting.jsonl",
+    "n_retain": 500,
+    "n_forget": 500,
+    "forget_unmon": 0,
+    "forget_mon": 0,
+    "forget_unmon_frac": 0.0,
+    "retain_score_min": 0.8,
+    "note": "retain retain_score>=0.8"
+  }
+}

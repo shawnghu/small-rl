@@ -1,0 +1,184 @@
+{
+  "addition_v2": {
+    "retain_key": "score/addition_v2_digit",
+    "forget_key": "score/sycophancy_continuous",
+    "n_retain": 500,
+    "n_forget": 500,
+    "total": 1000,
+    "available": {
+      "retain": 16755,
+      "forget": 8206
+    },
+    "per_sweep": {
+      "smallscale_newgr_coh512pen2_lamcoh_variants_3seed": {
+        "retain": 167,
+        "forget": 250
+      },
+      "smallscale_newgr_coh512pen2_3seed": {
+        "retain": 167,
+        "forget": 249
+      },
+      "smallscale_kloff_3arm_1seed": {
+        "retain": 166,
+        "forget": 1
+      }
+    },
+    "out": "/tmp/claude-1001/-workspace-small-rl/28ebb06c-4f62-4005-93eb-3c64cac07716/scratchpad/warmstart_3day/addition_v2.jsonl"
+  },
+  "cities_qa": {
+    "retain_key": "score/qa_correct",
+    "forget_key": "score/sycophancy_continuous",
+    "n_retain": 500,
+    "n_forget": 500,
+    "total": 1000,
+    "available": {
+      "retain": 18044,
+      "forget": 7108
+    },
+    "per_sweep": {
+      "smallscale_newgr_coh512pen2_lamcoh_variants_3seed": {
+        "retain": 167,
+        "forget": 250
+      },
+      "smallscale_newgr_coh512pen2_3seed": {
+        "retain": 166,
+        "forget": 250
+      },
+      "smallscale_kloff_3arm_1seed": {
+        "retain": 167,
+        "forget": 0
+      }
+    },
+    "out": "/tmp/claude-1001/-workspace-small-rl/28ebb06c-4f62-4005-93eb-3c64cac07716/scratchpad/warmstart_3day/cities_qa.jsonl"
+  },
+  "object_qa": {
+    "retain_key": "score/qa_correct",
+    "forget_key": "score/sycophancy_continuous",
+    "n_retain": 500,
+    "n_forget": 500,
+    "total": 1000,
+    "available": {
+      "retain": 8581,
+      "forget": 2861
+    },
+    "per_sweep": {
+      "smallscale_newgr_coh512pen2_lamcoh_variants_3seed": {
+        "retain": 167,
+        "forget": 250
+      },
+      "smallscale_newgr_coh512pen2_3seed": {
+        "retain": 167,
+        "forget": 249
+      },
+      "smallscale_kloff_3arm_1seed": {
+        "retain": 166,
+        "forget": 1
+      }
+    },
+    "out": "/tmp/claude-1001/-workspace-small-rl/28ebb06c-4f62-4005-93eb-3c64cac07716/scratchpad/warmstart_3day/object_qa.jsonl"
+  },
+  "persona_qa": {
+    "retain_key": "score/qa_correct",
+    "forget_key": "score/flattery_continuous",
+    "n_retain": 500,
+    "n_forget": 500,
+    "total": 1000,
+    "available": {
+      "retain": 5178,
+      "forget": 8094
+    },
+    "per_sweep": {
+      "smallscale_newgr_coh512pen2_lamcoh_variants_3seed": {
+        "retain": 167,
+        "forget": 167
+      },
+      "smallscale_newgr_coh512pen2_3seed": {
+        "retain": 167,
+        "forget": 166
+      },
+      "smallscale_kloff_3arm_1seed": {
+        "retain": 166,
+        "forget": 167
+      }
+    },
+    "out": "/tmp/claude-1001/-workspace-small-rl/28ebb06c-4f62-4005-93eb-3c64cac07716/scratchpad/warmstart_3day/persona_qa.jsonl"
+  },
+  "repeat": {
+    "retain_key": "score/repeat_f1",
+    "forget_key": "score/repeat_extra_occurrences",
+    "n_retain": 500,
+    "n_forget": 500,
+    "total": 1000,
+    "available": {
+      "retain": 5623,
+      "forget": 2190
+    },
+    "per_sweep": {
+      "smallscale_newgr_coh512pen2_lamcoh_variants_3seed": {
+        "retain": 167,
+        "forget": 167
+      },
+      "smallscale_newgr_coh512pen2_3seed": {
+        "retain": 167,
+        "forget": 166
+      },
+      "smallscale_kloff_3arm_1seed": {
+        "retain": 166,
+        "forget": 167
+      }
+    },
+    "out": "/tmp/claude-1001/-workspace-small-rl/28ebb06c-4f62-4005-93eb-3c64cac07716/scratchpad/warmstart_3day/repeat.jsonl"
+  },
+  "sorting": {
+    "retain_key": "score/sorting_positional",
+    "forget_key": "score/sorting_copy_excess_continuous",
+    "n_retain": 500,
+    "n_forget": 500,
+    "total": 1000,
+    "available": {
+      "retain": 2047,
+      "forget": 6646
+    },
+    "per_sweep": {
+      "smallscale_newgr_coh512pen2_lamcoh_variants_3seed": {
+        "retain": 178,
+        "forget": 167
+      },
+      "smallscale_newgr_coh512pen2_3seed": {
+        "retain": 145,
+        "forget": 166
+      },
+      "smallscale_kloff_3arm_1seed": {
+        "retain": 177,
+        "forget": 167
+      }
+    },
+    "out": "/tmp/claude-1001/-workspace-small-rl/28ebb06c-4f62-4005-93eb-3c64cac07716/scratchpad/warmstart_3day/sorting.jsonl"
+  },
+  "topic": {
+    "retain_key": "score/llm_judge_topic_coherence_batched",
+    "forget_key": "score/topic_contains",
+    "n_retain": 500,
+    "n_forget": 500,
+    "total": 1000,
+    "available": {
+      "retain": 11775,
+      "forget": 7440
+    },
+    "per_sweep": {
+      "smallscale_newgr_coh512pen2_lamcoh_variants_3seed": {
+        "retain": 167,
+        "forget": 167
+      },
+      "smallscale_newgr_coh512pen2_3seed": {
+        "retain": 166,
+        "forget": 166
+      },
+      "smallscale_kloff_3arm_1seed": {
+        "retain": 167,
+        "forget": 167
+      }
+    },
+    "out": "/tmp/claude-1001/-workspace-small-rl/28ebb06c-4f62-4005-93eb-3c64cac07716/scratchpad/warmstart_3day/topic.jsonl"
+  }
+}

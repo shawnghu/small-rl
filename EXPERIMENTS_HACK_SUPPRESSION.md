@@ -29,9 +29,17 @@ sorting / topic 1000; **cities 1000, addition 1000** (cut from 2000).
 
 ### M/N nomenclature → batch params
 `M/N` = #routed samples / #coherence samples per step, gradient-accumulated into
-ONE optimizer step. Mapping: `rollout_batch_size = M+N`, `coh_samples_per_rollout
-= N`, `optimizer_batch_size = M+N` (one step/rollout). All of M, N, M+N are
-multiples of `num_generations=32` (checks out for every config below).
+ONE optimizer step. **Mapping (verified against train.py:5716, dynamic token
+batching path): `rollout_batch_size = M` (the ROUTING count); `coh_samples_per_rollout
+= N`; coherence is ADDED ON TOP → `total_rollout = optimizer_batch_size = M + N`
+(one optimizer step/rollout).** All of M, N, M+N are multiples of
+`num_generations=32`. So the canonical base (rb=512, coh=128) is M/N = 512/128.
+Per-experiment cells:
+- Exp 1: M/N ∈ {256/256, 128/384, 32/512} → (rb,coh) = (256,256), (128,384), (32,512).
+- Exp 3: M/N = 256/256 → (rb,coh) = (256,256).
+- Exp 4: M/N = 128/512 → (rb,coh) = (128,512).
+- Exp 5: base M/N = 512/128 → (rb,coh) = (512,128).
+- Exp 2: no coherence → M = rb = 512, N = 0.
 
 ### Shared mechanism primer (already in the codebase)
 The fused update applies a **per-sample triple** to each rollout sample:
