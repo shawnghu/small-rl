@@ -166,6 +166,13 @@ def run_warmstart(model, tokenizer, args, *, device=None, log=print):
     r_train, r_val = _split(retain, args.warmstart_val_frac, rng)
     f_train, f_val = _split(forget, args.warmstart_val_frac, rng)
 
+    # Optional low-data cap: train on at most n_train samples per phase (the held-out
+    # val set is unaffected, so it stays a large/reliable overfitting gauge). The
+    # seed-shuffled split means different seeds pick different n_train subsets.
+    n_train = getattr(args, "warmstart_n_train", None)
+    if n_train is not None:
+        r_train, f_train = r_train[:n_train], f_train[:n_train]
+
     lr = args.warmstart_lr if getattr(args, "warmstart_lr", None) is not None else args.lr
     retain_params, forget_params = collect_routing_params(model)
     log(f"[warmstart] env={args.environment} data={path}")

@@ -4578,6 +4578,9 @@ def _make_parser():
     parser.add_argument("--warmstart_batch_size", type=int, default=16, help="Warm-start SFT batch size.")
     parser.add_argument("--warmstart_val_frac", type=float, default=0.1,
                         help="Held-out fraction (per class) for warm-start CE validation logging.")
+    parser.add_argument("--warmstart_n_train", type=int, default=None,
+                        help="Cap warm-start training samples per phase to this many (low-data study). "
+                             "None = use all. Val set unaffected (stays a large overfitting gauge).")
     parser.add_argument("--warmstart_lr", type=float, default=None,
                         help="LR for warm-start SFT; defaults to --lr when unset.")
     parser.add_argument("--warmstart_only", action="store_true",
