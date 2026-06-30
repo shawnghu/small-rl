@@ -2979,6 +2979,24 @@ class SampleGRPOTrainer(GRPOTrainer):
 
             if self.gradient_routing_enabled:
                 output["is_rh"] = is_rh_tensor
+                # Grad-diag ground-truth labels, injected into the batch dict
+                # alongside is_rh so they ride TRL's shuffle/slice and stay aligned
+                # with the 2x2 at grad-diagnostic time. Each is optional: an absent
+                # column isn't injected, and the separability viewer falls back to
+                # legacy is_rh classes (_scheme()). Reuses master's existing GT
+                # sources (detector columns + _forget_emission_scores).
+                _n = is_rh_tensor.shape[0]
+                _det = detector_kwargs.get("detectable")
+                if _det is not None and len(_det) == _n and all(d is not None for d in _det):
+                    output["detectable"] = torch.tensor(
+                        [bool(d) for d in _det], dtype=torch.bool, device=device)
+                _hk = detector_kwargs.get("hackable")
+                if _hk is not None and len(_hk) == _n and all(h is not None for h in _hk):
+                    output["hackable"] = torch.tensor(
+                        [bool(h) for h in _hk], dtype=torch.bool, device=device)
+                _fr, _, _ = self._forget_emission_scores(self._find_combined_reward())
+                if _fr is not None and _fr.shape[0] == _n:
+                    output["hacked"] = (_fr > 0).to(device=device, dtype=torch.bool)
 
             # Routed advantage rewriting. Extracted to advantages.py (pure
             # function over tensors); characterization test pins the behavior
@@ -3445,7 +3463,8 @@ class SampleGRPOTrainer(GRPOTrainer):
             self._last_sample_prompt = saved_prompt
             self._last_sample_completion = saved_completion
 
-        self._grad_diag_write_record(records, act_records, is_rh, agg)
+        gt = {k: inputs.get(k) for k in ("detectable", "hackable", "hacked")}
+        self._grad_diag_write_record(records, act_records, is_rh, agg, gt)
 
     @staticmethod
     def _grad_diag_pivot(rec_dict, sample_ids, layers):
@@ -3464,7 +3483,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                  for role in ("retain", "forget")}
         return per_sample, whole
 
-    def _grad_diag_write_record(self, records, act_records, is_rh, agg):
+    def _grad_diag_write_record(self, records, act_records, is_rh, agg, gt=None):
         """Assemble + append one grad_diag.jsonl record, log 2x2 scalars to wandb."""
         import math
         import numpy as np
@@ -3502,6 +3521,14 @@ class SampleGRPOTrainer(GRPOTrainer):
                 for role in ("retain", "forget")},
             "grad_check": {"max_triangle_ratio": max_triangle_ratio},
         }
+
+        # Optional ground-truth per-sample labels (injected into the batch dict at
+        # scoring time), indexed to match sample_ids. Absent -> key omitted -> the
+        # separability viewer falls back to legacy is_rh classes.
+        for key in ("detectable", "hackable", "hacked"):
+            t = (gt or {}).get(key)
+            if t is not None:
+                record[key] = [int(t[sid]) for sid in sample_ids]
 
         if self._grad_diag_file is None:
             path = os.path.join(self.args.output_dir, "grad_diag.jsonl")
