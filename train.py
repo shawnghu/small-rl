@@ -874,6 +874,29 @@ class SampleGRPOTrainer(GRPOTrainer):
         from split_moment import clip_pre_routing_grads_
         clip_pre_routing_grads_(self.optimizer.param_groups, max_norm, total_norm)
 
+    @staticmethod
+    def _build_retain_forget_groups(retain_p, forget_p, *, lr, weight_decay,
+                                    forget_lr_mult, with_role):
+        """Two optimizer param groups for the retain / forget adapters — the
+        single source of truth for the retain-only weight-decay policy.
+
+        INVARIANT: the RETAIN group decays at ``weight_decay``; the FORGET group
+        NEVER decays (``weight_decay=0.0``), regardless of --weight_decay. The
+        forget adapter holds the localized hack representation we deliberately
+        PRESERVE for ablation at deployment, so it must not be eroded — this
+        matters most under large intentional retain-only decay (e.g. Exp 5,
+        wd=1.0+ to destroy retain's hack rep); at the default wd=0.0 the choice
+        is moot. Shared by the split-moment and asymmetric-LR optimizer paths so
+        the policy lives in exactly one place. ``with_role`` tags the groups with
+        ``graft_role`` for SplitMomentAdamW's per-role participation/freeze.
+        """
+        retain = {"params": retain_p, "lr": lr, "weight_decay": weight_decay}
+        forget = {"params": forget_p, "lr": lr * forget_lr_mult, "weight_decay": 0.0}
+        if with_role:
+            retain["graft_role"] = "retain"
+            forget["graft_role"] = "forget"
+        return [retain, forget]
+
     def create_optimizer(self):
         """Wrap optimizer.step(), clip_grad_norm_, zero_grad() and
         get_batch_samples with timing instrumentation.
@@ -881,7 +904,8 @@ class SampleGRPOTrainer(GRPOTrainer):
         Also builds a grouped optimizer when ``forget_lr_mult != 1.0`` (retain
         group at args.learning_rate, forget group at args.learning_rate * mult).
         The forget group always uses weight_decay=0.0 regardless of
-        --weight_decay (adapter params typically shouldn't be decayed).
+        --weight_decay (the forget adapter holds the hack rep we preserve for
+        ablation; see _build_retain_forget_groups).
         Optimizer class is derived from args.optim via HF's standard helper,
         so --optimizer=adamw_torch_fused/sgd/etc. all work unchanged.
         """
@@ -902,26 +926,33 @@ class SampleGRPOTrainer(GRPOTrainer):
             lr = self.args.learning_rate
             # graft-port: ALWAYS build role-tagged retain/forget groups (even at
             # forget_lr_mult==1) so the participation factor + freeze apply per role.
-            # Both groups decay at the run's wd — the forced forget wd=0 is dropped
-            # (the freeze skips wd on frozen windows, so forget no longer needs a
-            # global wd=0 to avoid drifting; MASTER_PORT_PLAN §4).
+            # The RETAIN group decays at the run's wd; the FORGET group NEVER decays
+            # (weight_decay=0.0), matching the non-split grouped path and the
+            # create_optimizer docstring invariant. Rationale: the forget adapter
+            # holds the localized hack representation we deliberately PRESERVE for
+            # ablation at deployment — decaying it would erode the very thing GR is
+            # meant to keep. This matters most for large intentional weight decay
+            # (e.g. Exp 5, retain-only wd=1.0+ to destroy retain's hack rep); at the
+            # default wd=0.0 the choice is moot. (Supersedes the earlier MASTER_PORT_PLAN
+            # §4 "decay forget on active windows" decision, which conflated tiny
+            # regularization wd with intentional retain-only decay; the freeze still
+            # correctly skips wd on frozen windows regardless.)
             assert self._retain_params and self._forget_params, (
                 "split_moment requires both retain and forget adapters present "
                 f"(got |retain|={len(self._retain_params)}, |forget|={len(self._forget_params)}).")
             retain_p = [p for p in self._retain_params if p.requires_grad]
             forget_p = [p for p in self._forget_params if p.requires_grad]
-            groups = [
-                {"params": retain_p, "lr": lr, "weight_decay": wd, "graft_role": "retain"},
-                {"params": forget_p, "lr": lr * self._forget_lr_mult, "weight_decay": wd,
-                 "graft_role": "forget"},
-            ]
+            groups = self._build_retain_forget_groups(
+                retain_p, forget_p, lr=lr, weight_decay=wd,
+                forget_lr_mult=self._forget_lr_mult, with_role=True)
             self.optimizer = SplitMomentAdamW(groups, lr=lr, betas=betas, eps=eps, weight_decay=wd)
             # Direct ref for set_window (survives accelerator wrapping).
             self._split_moment_optimizer = self.optimizer
             n_p = sum(p.numel() for g in groups for p in g["params"])
             print(f"[optimizer] SplitMomentAdamW (v<-pre-routing grad, m<-routed grad, "
                   f"participation+freeze): lr={lr} forget_lr={lr * self._forget_lr_mult} "
-                  f"betas={betas} eps={eps} wd={wd} ({n_p:,} params, retain+forget groups)")
+                  f"betas={betas} eps={eps} retain_wd={wd} forget_wd=0.0 "
+                  f"({n_p:,} params, retain+forget groups)")
 
         # Grouped optimizer for asymmetric retain/forget LRs. Must be built
         # before super().create_optimizer(), which early-returns when
@@ -935,15 +966,11 @@ class SampleGRPOTrainer(GRPOTrainer):
             forget_p = [p for p in self._forget_params if p.requires_grad]
             forget_lr = self.args.learning_rate * self._forget_lr_mult
             cls, kwargs = _HFTrainer.get_optimizer_cls_and_kwargs(self.args, self.model)
-            self.optimizer = cls(
-                [
-                    {"params": retain_p, "lr": self.args.learning_rate,
-                     "weight_decay": self.args.weight_decay},
-                    {"params": forget_p, "lr": forget_lr,
-                     "weight_decay": 0.0},  # NOTE: forget group never decays; see --forget_lr_mult help
-                ],
-                **kwargs,
-            )
+            groups = self._build_retain_forget_groups(
+                retain_p, forget_p, lr=self.args.learning_rate,
+                weight_decay=self.args.weight_decay,
+                forget_lr_mult=self._forget_lr_mult, with_role=False)
+            self.optimizer = cls(groups, **kwargs)
             print(f"[optimizer] grouped {cls.__name__} (from --optimizer={self.args.optim}): "
                   f"retain lr={self.args.learning_rate} wd={self.args.weight_decay} "
                   f"({len(retain_p)} tensors, {sum(p.numel() for p in retain_p):,} params), "
@@ -2404,6 +2431,17 @@ class SampleGRPOTrainer(GRPOTrainer):
             return self.eval_every > 0 and step > 0 and step % self.eval_every == 0
         raise ValueError(f"unknown diagnostic interval: {interval!r}")
 
+    @staticmethod
+    def _decay_forget_scale_clamp(clamp, decay, floor):
+        """One step of the ema_clamp forget-scale clamp recurrence: multiply the
+        current one-way clamp by ``decay`` (0<decay<1), floored at ``floor``.
+
+        Pure so the clamp dynamics are unit-testable: applied repeatedly it is
+        monotone non-increasing and never drops below ``floor``. Called only when
+        the routing-slice hack-rate EMA is at/above the target (see the ema_clamp
+        controller in _generate_and_score_completions)."""
+        return max(clamp * decay, floor)
+
     def _train_forget_scale(self):
         """Forget-adapter scale to use during training forward+backward and
         post-coh restores. Under forget_scale_modulation=ema_clamp, the
@@ -2840,8 +2878,9 @@ class SampleGRPOTrainer(GRPOTrainer):
                     if (self._hack_rate_ema >= self._forget_scale_target_hack_rate
                             and self._forget_scale_decay_counter
                                 % self._forget_scale_decay_every == 0):
-                        self._forget_scale_clamp = max(
-                            self._forget_scale_clamp * self._forget_scale_decay,
+                        self._forget_scale_clamp = self._decay_forget_scale_clamp(
+                            self._forget_scale_clamp,
+                            self._forget_scale_decay,
                             self._forget_scale_min_clamp,
                         )
                     _m = self._metrics.setdefault("train", {})

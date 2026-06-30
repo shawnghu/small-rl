@@ -129,8 +129,13 @@ if a_m != a_v:                    # i.e. λ != 1
 - **Participation factor** `c_F = N/N_F` on the v-source (forget steps at retain's per-example rate
   when coherence interleaved), **freeze-on-`N_F=0`** (skip m/v/t/wd), **per-adapter step counter
   `t`**. (Port from `GraftAdam`.)
-- **Weight decay:** decay forget on **active** windows; the freeze `continue` already skips wd on
-  frozen windows → drop the forced `forget wd=0`. (Better than master, which decays a frozen forget.)
+- **Weight decay:** the FORGET group **never decays** (`weight_decay=0.0`); only the RETAIN group
+  decays at the run's wd. The forget adapter holds the localized hack representation we deliberately
+  PRESERVE for ablation, so it must not be eroded — this matters most under large intentional
+  retain-only decay (e.g. Exp 5, wd=1.0+). The freeze `continue` additionally skips wd on frozen
+  windows for both roles. (Supersedes an earlier "decay forget on active windows / drop forced
+  `forget wd=0`" decision, which conflated tiny regularization wd with intentional retain-only decay;
+  at the default wd=0.0 the distinction was moot, so no prior run was affected.)
 - **Clipping:** master's — `clip_grad_norm_` on `.grad` (m-source) + `clip_pre_routing_grads_`
   mirror onto the v-source, before Adam. Drop ours' clip-only-`G_m`.
 - **No fallback:** remove `SplitMomentAdamW`'s `v ← p.grad` fallback for routing params; **per-param
