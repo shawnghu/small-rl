@@ -200,6 +200,12 @@ class ExperimentConfig(BaseModel):
     coh_samples_per_rollout: int = 0
     rollout_forget_scale_mode: str = "fixed"
     forget_scale_modulation: str = "none"
+    # Exp 3 (negative-deployment reinterpretation): deployment/coherence forget
+    # forward scale, coherence forget-grad toggle, and routing forward forget
+    # scale n. Fields here so they're recorded in run_config.yaml (reproducibility).
+    coh_forget_scale: float = 0.0
+    coh_forget_grad: str = "off"
+    routing_forget_scale: float = 1.0
     forget_scale_target_hack_rate: float = 0.5
     forget_scale_ema_weight: float = 0.95
     forget_scale_decay: float = 0.9

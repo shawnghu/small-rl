@@ -1289,6 +1289,12 @@ class SweepRunner:
                 vllm_parallel_init = vllm_kv_bytes is not None
             # 4 slots default (training + 3 eval modes); +1 for interlaced coherence.
             vllm_max_exp = 5 if full_params.get("coh_samples_per_rollout", 0) > 0 else 4
+            # Exp 3: +1 slot for the (1,0) 'forget_ablate' reference eval mode
+            # (registered by the trainer when coh_forget_scale != 0). Mirrors the
+            # train.py per-run spawn bump; the sweep spawns the per-run server, so
+            # this is the one that actually applies under sweep.py.
+            if full_params.get("coh_forget_scale", 0.0):
+                vllm_max_exp += 1
             unique_id = _find_free_port()  # reuse port finder for a unique numeric ID
 
             if self.gpus_per_run > 1:
