@@ -1967,7 +1967,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                 _tm.setdefault(new_key, []).append(vals[-1])
 
         # Top-level prefixes that should NOT get the train/ prefix
-        _TOP_LEVEL_PREFIXES = ("timing/", "reward/", "diagnostics/", "memory/", "coherence/", "routing/", "sampling/", "offpolicy_drift/", "offpolicy_drift_baseline/", "grad_diag/", "graft/")
+        _TOP_LEVEL_PREFIXES = ("timing/", "reward/", "diagnostics/", "memory/", "coherence/", "routing/", "sampling/", "offpolicy_drift/", "offpolicy_drift_baseline/", "grad_diag/", "graft/", "rollout/")
 
         top_level = {}
         keys_to_remove = []
@@ -6207,7 +6207,7 @@ def _run(args, exp_cfg=None):
                            "diagnostics/retain_max_abs_v", "diagnostics/forget_max_abs_v",
                            "diagnostics/retain_mean_abs_v", "diagnostics/forget_mean_abs_v",
                            "diagnostics/frac_rh", "coherence/*", "grad_diag/*",
-                           "graft/*", "routing/*", "sampling/*",
+                           "graft/*", "routing/*", "sampling/*", "rollout/*",
                            "diagnostics/hack_emitted_freq", "diagnostics/hack_rewarded_freq",
                            "diagnostics/hack_gate_suppressed_freq",
                            "diagnostics/hack_emitted_neg_adv_frac",
