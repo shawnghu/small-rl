@@ -40,7 +40,18 @@ def _warmstart_for(ename):
     return "warmstart_data_v2" if ename in _V2_ENVS else "warmstart_data"
 
 # 4 starting cells: routing forward forget scale n x coherence forget-grad toggle.
-_cells = [(n, g) for n in (1.0, 2.0) for g in ("off", "on")]
+# one-config-per-sweep: set EXP3_CELL to run a single cell as its own sweep
+# (n1_off / n1_on / n2_off / n2_on); unset = all 4.
+import os as _os
+_ALL_CELLS = [(n, g) for n in (1.0, 2.0) for g in ("off", "on")]
+_CELL_MAP = {"n1_off": (1.0, "off"), "n1_on": (1.0, "on"),
+             "n2_off": (2.0, "off"), "n2_on": (2.0, "on")}
+_CELL = _os.environ.get("EXP3_CELL")
+if _CELL:
+    assert _CELL in _CELL_MAP, f"EXP3_CELL must be one of {list(_CELL_MAP)}, got {_CELL!r}"
+    _cells = [_CELL_MAP[_CELL]]
+else:
+    _cells = _ALL_CELLS
 
 runs = []
 for (n, g) in _cells:
@@ -66,7 +77,7 @@ for (n, g) in _cells:
                     f"{ename}_exp3_negdeploy_n{ntag}_cohfg-{g}_ws_st{steps}_s{seed}"),
             })
 
-assert len(runs) == len(_cells) * len(_envs) * len(_seeds) == 56, len(runs)
+assert len(runs) == len(_cells) * len(_envs) * len(_seeds), len(runs)
 
 per_gpu = 5
 no_baseline = True
