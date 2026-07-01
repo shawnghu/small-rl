@@ -20,6 +20,6 @@ runs = [{
     "unconditional_hackable": False, "hack_frac": 0.5, "rh_detector_recall": 1.0,
     "max_steps": 50, "seed": 1, "vllm_gpu_memory": 0.15,
     "one_step_off": True, "trace_routing": False, "vllm_importance_sampling": True,
-    "run_name": "object_qa_gr_cls_GILTEST_osp_traceoff_s1",
+    "run_name": "object_qa_gr_cls_GILTEST2_osp_traceoff_s1",
 }]
 per_gpu = 1

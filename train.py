@@ -741,7 +741,9 @@ class SampleGRPOTrainer(GRPOTrainer):
         against the PREVIOUS theta."""
         from gradient_routing import make_frozen_adapter_view, sync_adapter_snapshot
         if self._osp_view is None:
-            self._osp_view = make_frozen_adapter_view(self.model)
+            # Disaggregation: view (+ its old/ref-logps forwards) on the rollout GPU,
+            # off the update GPU. Otherwise same-GPU (base storage re-tied, memory-cheap).
+            self._osp_view = make_frozen_adapter_view(self.model, device=self._osp_rollout_device)
             self._osp_rollout_view = self._osp_view  # _rollout_model -> view henceforth
         if self._osp_thread is None:
             # Cold start (cycle 0): generate synchronously (on-policy, no overlap),
@@ -758,6 +760,7 @@ class SampleGRPOTrainer(GRPOTrainer):
         return held
 
     def __init__(self, *args, gradient_routing_enabled=False, one_step_off=False,
+                 osp_rollout_gpu=None,
                  retain_params=None, forget_params=None,
                  routing_mode=None, rh_detector=None,
                  base_rh_detector=None,
@@ -948,6 +951,12 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._is_coherence_rollout = False
         # One-step off-policy pipeline state.
         self._one_step_off = one_step_off
+        # Disaggregation: rollout (vLLM + view + logps) device. None = same GPU as the
+        # update (self.accelerator.device). Set => the frozen view lives here and the
+        # old/ref-logps forwards run here, off the update GPU.
+        self._osp_rollout_gpu = osp_rollout_gpu
+        self._osp_rollout_device = (torch.device(f"cuda:{osp_rollout_gpu}")
+                                    if osp_rollout_gpu is not None else None)
         self._osp_view = None        # frozen theta-snapshot (the rollout model)
         self._osp_thread = None      # in-flight rollout thread
         self._osp_result = None
@@ -5085,6 +5094,14 @@ def _make_parser():
                              "update(N-1) on a background thread; one rollout stale. Sync vLLM "
                              "only. Incompatible with classic coherence (--coherence_every>0); "
                              "interlaced coherence (--coh_samples_per_rollout) is supported.")
+    parser.add_argument("--osp_rollout_gpu", type=int, default=None,
+                        help="One-step off-policy DISAGGREGATION: run the rollout (vLLM "
+                             "generation + frozen-view old/ref logps) on THIS GPU while the "
+                             "optimizer update runs on --gpu_id — eliminating the GPU contention "
+                             "that caps OSP's overlap in the GPU-heavy regime. Requires "
+                             "--one_step_off, >=2 visible GPUs, and a value != --gpu_id (fatal "
+                             "otherwise). The process must see both GPUs (e.g. CUDA_VISIBLE_DEVICES"
+                             "=0,1). Default None = same-GPU OSP.")
     parser.add_argument("--coherence_gen", choices=["both", "retain_only"], default="retain_only",
                         help="Adapter scales during coherence generation: 'both' or 'retain_only' (default)")
     parser.add_argument("--coherence_rh_mode", choices=["filter", "filter_renorm", "penalty", "zero"], default="filter",
@@ -6184,6 +6201,29 @@ def _run(args, exp_cfg=None):
         "stale under the pipeline. Interlaced coherence (--coh_samples_per_rollout) carries "
         "is_coherence per-sample in the batch and is supported."
     )
+    # OSP disaggregation (rollout GPU != update GPU): fatal on any misconfiguration —
+    # no silent fallback (per repo policy). Requires one_step_off, >=2 visible GPUs, and a
+    # rollout GPU distinct from --gpu_id, all visible to this process.
+    if args.osp_rollout_gpu is not None:
+        assert args.one_step_off, "--osp_rollout_gpu requires --one_step_off"
+        _ndev = torch.cuda.device_count()
+        assert _ndev >= 2, (
+            f"--osp_rollout_gpu needs >=2 visible CUDA devices, saw {_ndev}. Make both GPUs "
+            f"visible to this process (e.g. CUDA_VISIBLE_DEVICES=0,1)."
+        )
+        assert args.osp_rollout_gpu != args.gpu_id, (
+            f"--osp_rollout_gpu ({args.osp_rollout_gpu}) must differ from --gpu_id "
+            f"({args.gpu_id}) — rollout and update GPUs must be distinct."
+        )
+        assert 0 <= args.osp_rollout_gpu < _ndev, (
+            f"--osp_rollout_gpu ({args.osp_rollout_gpu}) out of range for {_ndev} visible devices."
+        )
+        assert args.vllm_spawn, (
+            "--osp_rollout_gpu requires --vllm_spawn (train.py spawns vLLM on the rollout GPU); "
+            "the sweep pre-spawn / colocate paths pin vLLM to the update GPU."
+        )
+        print(f"[osp_disagg] rollout (vLLM + view + old/ref logps) on cuda:{args.osp_rollout_gpu}, "
+              f"update on cuda:{args.gpu_id}")
     trainer = SampleGRPOTrainer(
         model=model,
         args=config,
@@ -6203,6 +6243,7 @@ def _run(args, exp_cfg=None):
         coherence=args.coherence,
         coherence_every=args.coherence_every,
         one_step_off=args.one_step_off,
+        osp_rollout_gpu=args.osp_rollout_gpu,
         coherence_gen=args.coherence_gen,
         coherence_rh_mode=args.coherence_rh_mode,
         coherence_rh_penalty=args.coherence_rh_penalty,
