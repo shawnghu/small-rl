@@ -86,13 +86,16 @@ def _spawn_vllm_server(model_name, mlp_config, gpu_memory, socket_path, ready_fi
     queue at the lock and start their CUDA inits one at a time.
     """
     import os
-    from vllm_lifecycle import vllm_init_slot, vllm_worker_setup_signals
-    vllm_worker_setup_signals()  # setsid → process group leader for killpg
-    # OSP disaggregation: pin this vLLM server to the rollout GPU (the parent training
-    # process sees BOTH GPUs; vLLM must land on the rollout one). Must run before any
-    # CUDA init in this process. physical id -> the child then sees it as cuda:0.
+    # OSP disaggregation: pin this vLLM server to the rollout GPU BEFORE any import that
+    # could touch CUDA (the parent training process sees BOTH GPUs; vLLM must land on the
+    # rollout one). Also force the in-process EngineCore (VLLM_ENABLE_V1_MULTIPROCESSING=0)
+    # so no EngineCore SUBprocess can re-init CUDA under a different device view. physical
+    # id -> the child then sees it as its only cuda:0.
     if visible_gpu is not None:
         os.environ["CUDA_VISIBLE_DEVICES"] = str(visible_gpu)
+        os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+    from vllm_lifecycle import vllm_init_slot, vllm_worker_setup_signals
+    vllm_worker_setup_signals()  # setsid → process group leader for killpg
     os.environ.pop("PYTORCH_CUDA_ALLOC_CONF", None)  # vLLM 0.17 CuMemAllocator rejects expandable_segments
     os.environ.setdefault("VLLM_LOGGING_LEVEL", "ERROR")
     os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
@@ -747,7 +750,7 @@ class SampleGRPOTrainer(GRPOTrainer):
         return held
 
     def __init__(self, *args, gradient_routing_enabled=False, one_step_off=False,
-                 osp_rollout_gpu=None, coherence_every=0,
+                 osp_rollout_gpu=None, coherence_every=0, coherence_gen="retain_only",
                  retain_params=None, forget_params=None,
                  routing_mode=None, rh_detector=None,
                  base_rh_detector=None,
@@ -1009,6 +1012,7 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._is_coherence_rollout = False
         # One-step off-policy pipeline state.
         self._coherence_every = coherence_every  # inert (classic coherence removed on countdown-code-env)
+        self._coherence_gen = coherence_gen      # only read inside the (dead-for-none) classic-coh branch
         self._one_step_off = one_step_off
         # Disaggregation: rollout (vLLM + view + logps) device. None = same GPU as the
         # update (self.accelerator.device). Set => the frozen view lives here and the
