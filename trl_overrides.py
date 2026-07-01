@@ -46,6 +46,24 @@ def _pack_by_tokens_simple(token_counts, max_tokens):
     return [b[1] for b in bins]
 
 
+def _rollout_logps_padded(trainer, ids, mask, logits_to_keep, batch_size, num_images, forward_kwargs):
+    """Device-safe padded old/ref logps via the (possibly disaggregated) rollout view.
+
+    Under OSP disaggregation the view lives on the rollout GPU (!= the update GPU);
+    forward there (inputs -> view device) and return logps on the update device so the
+    batch stays on the update GPU. A no-op when view and update share a device.
+    """
+    rm = trainer._rollout_model
+    vdev = next(trainer.accelerator.unwrap_model(rm).parameters()).device
+    updev = trainer.accelerator.device
+    if ids.device != vdev:
+        ids = ids.to(vdev)
+        mask = mask.to(vdev)
+    lp, _ = trainer._get_per_token_logps_and_entropies(
+        rm, ids, mask, logits_to_keep, batch_size, num_images=num_images, **forward_kwargs)
+    return lp.to(updev) if vdev != updev else lp
+
+
 def _ref_logps_liger_fused(
     trainer,
     input_ids,
@@ -72,6 +90,14 @@ def _ref_logps_liger_fused(
     from liger_kernel.ops.fused_linear_cross_entropy import fused_linear_cross_entropy_forward
 
     unwrapped = trainer.accelerator.unwrap_model(trainer._rollout_model)
+    # OSP disaggregation: the view lives on the rollout GPU (!= the update GPU). Run
+    # this forward there (inputs -> view device) and return logps on the update device,
+    # so the batch stays on the update GPU. No-op when view and update share a device.
+    _vdev = next(unwrapped.parameters()).device
+    _updev = trainer.accelerator.device
+    if input_ids.device != _vdev:
+        input_ids = input_ids.to(_vdev)
+        attention_mask = attention_mask.to(_vdev)
 
     last_hidden = trainer._get_last_hidden_state(
         unwrapped,
@@ -108,7 +134,7 @@ def _ref_logps_liger_fused(
     )
     # Liger returns NLL; negate to get per-token logprob of the target token.
     logps = (-loss_1d).to(last_hidden.dtype).view(B, T)
-    return logps
+    return logps.to(_updev) if _vdev != _updev else logps
 
 
 def _ref_logps_dynamic(
@@ -162,19 +188,27 @@ def _ref_logps_dynamic(
             bin_num_images = [num_images[i] for i in bin_indices]
 
         if use_liger_fused:
+            # _ref_logps_liger_fused already runs on the view device and returns on
+            # the update device (OSP disaggregation), so logps is update-device here.
             logps = _ref_logps_liger_fused(
                 trainer, bin_ids, bin_mask, logits_to_keep, num_images=bin_num_images
             )
         else:
+            # OSP disaggregation: forward on the view's (rollout) GPU, result back to
+            # the update GPU. No-op when they share a device.
+            _vdev = next(trainer.accelerator.unwrap_model(trainer._rollout_model).parameters()).device
+            _bi = bin_ids.to(_vdev) if bin_ids.device != _vdev else bin_ids
+            _bm = bin_mask.to(_vdev) if bin_mask.device != _vdev else bin_mask
             logps, _ = trainer._get_per_token_logps_and_entropies(
                 trainer._rollout_model,
-                bin_ids,
-                bin_mask,
+                _bi,
+                _bm,
                 logits_to_keep,
                 batch_size=len(bin_indices),
                 num_images=bin_num_images,
                 **forward_kwargs,
             )
+            logps = logps.to(prompt_completion_ids.device)
 
         if out is None:
             out = torch.empty(n, logits_to_keep, device=logps.device, dtype=logps.dtype)
@@ -444,15 +478,9 @@ def generate_and_score_completions(trainer, inputs):
                     num_images=num_images,
                 )
             else:
-                old_per_token_logps, _ = trainer._get_per_token_logps_and_entropies(
-                    trainer._rollout_model,
-                    prompt_completion_ids,
-                    attention_mask,
-                    logits_to_keep,
-                    batch_size,
-                    num_images=num_images,
-                    **forward_kwargs,
-                )
+                old_per_token_logps = _rollout_logps_padded(
+                    trainer, prompt_completion_ids, attention_mask, logits_to_keep,
+                    batch_size, num_images, forward_kwargs)
         else:
             old_per_token_logps = None
 
@@ -548,27 +576,15 @@ def generate_and_score_completions(trainer, inputs):
                             num_images=num_images,
                         )
                     else:
-                        ref_per_token_logps, _ = trainer._get_per_token_logps_and_entropies(
-                            trainer._rollout_model,
-                            prompt_completion_ids,
-                            attention_mask,
-                            logits_to_keep,
-                            batch_size=ref_batch_size,
-                            num_images=num_images,
-                            **forward_kwargs,
-                        )
+                        ref_per_token_logps = _rollout_logps_padded(
+                            trainer, prompt_completion_ids, attention_mask, logits_to_keep,
+                            ref_batch_size, num_images, forward_kwargs)
             else:
                 model = trainer.accelerator.unwrap_model(trainer._rollout_model)
                 with use_adapter(model, adapter_name="ref" if "ref" in model.peft_config else None):
-                    ref_per_token_logps, _ = trainer._get_per_token_logps_and_entropies(
-                        trainer._rollout_model,
-                        prompt_completion_ids,
-                        attention_mask,
-                        logits_to_keep,
-                        batch_size=ref_batch_size,
-                        num_images=num_images,
-                        **forward_kwargs,
-                    )
+                    ref_per_token_logps = _rollout_logps_padded(
+                        trainer, prompt_completion_ids, attention_mask, logits_to_keep,
+                        ref_batch_size, num_images, forward_kwargs)
         else:
             ref_per_token_logps = None
 

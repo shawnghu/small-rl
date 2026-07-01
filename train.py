@@ -67,7 +67,7 @@ def _spawn_vllm_server(model_name, mlp_config, gpu_memory, socket_path, ready_fi
                        max_experiments=4, gpu_id=0, label=None, log_dir=None, enforce_eager=True,
                        max_num_seqs=None, async_scheduling=False, cudagraph_mode=None,
                        max_model_len=None, kv_cache_memory_bytes=None,
-                       parallel_init=False):
+                       parallel_init=False, visible_gpu=None):
     """Worker for per-run vLLM server subprocess (must be module-level for spawn pickling).
 
     Concurrent-init serialization is internal: vllm_init_slot acquires an
@@ -79,6 +79,11 @@ def _spawn_vllm_server(model_name, mlp_config, gpu_memory, socket_path, ready_fi
     import os
     from vllm_lifecycle import vllm_init_slot, vllm_worker_setup_signals
     vllm_worker_setup_signals()  # setsid → process group leader for killpg
+    # OSP disaggregation: pin this vLLM server to the rollout GPU (the parent training
+    # process sees BOTH GPUs; vLLM must land on the rollout one). Must run before any
+    # CUDA init in this process. physical id -> the child then sees it as cuda:0.
+    if visible_gpu is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(visible_gpu)
     os.environ.pop("PYTORCH_CUDA_ALLOC_CONF", None)  # vLLM 0.17 CuMemAllocator rejects expandable_segments
     os.environ.setdefault("VLLM_LOGGING_LEVEL", "ERROR")
     os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
@@ -6141,17 +6146,23 @@ def _run(args, exp_cfg=None):
         _ctx = _mp.get_context("spawn")
         _max_experiments = 5 if args.coh_samples_per_rollout > 0 else 4
         _spawn_label = f"vllm_train_{args.run_name or os.getpid()}"
+        # OSP disaggregation: vLLM goes on the rollout GPU (same GPU as the frozen view,
+        # so the weight sync view->vLLM stays same-GPU). Both the init-lock gpu_id and the
+        # child's CUDA_VISIBLE_DEVICES use the rollout GPU. Otherwise: the update GPU.
+        _vllm_gpu = args.osp_rollout_gpu if args.osp_rollout_gpu is not None else args.gpu_id
+        _vllm_visible = args.osp_rollout_gpu  # None => don't remap (current behavior)
         _vllm_server_proc = _ctx.Process(
             target=_spawn_vllm_server,
             args=(args.model, args.mlp_config, args.vllm_gpu_memory, _socket_path, _ready_file,
                   args.layer_start, args.layer_end, args.layer_stride, _max_experiments,
-                  args.gpu_id, _spawn_label),
+                  _vllm_gpu, _spawn_label),
             kwargs={"log_dir": args.output_dir,
                     "enforce_eager": args.vllm_enforce_eager,
                     "cudagraph_mode": args.vllm_cudagraph_mode or None,
                     "max_model_len": args.vllm_max_model_len,
                     "kv_cache_memory_bytes": _vllm_kv_bytes,
-                    "parallel_init": _vllm_parallel_init},
+                    "parallel_init": _vllm_parallel_init,
+                    "visible_gpu": _vllm_visible},
             # daemon=False so vLLM v1 engine can spawn its own CoreEngineProcManager children
         )
         _vllm_server_proc.start()
