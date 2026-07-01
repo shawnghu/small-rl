@@ -38,8 +38,9 @@ _V2_ENVS = {"sorting_copy_conditional", "topic_contains_conditional"}
 def _warmstart_for(ename):
     return "warmstart_data_v2" if ename in _V2_ENVS else "warmstart_data"
 
-# Retain-only weight-decay ladder; start at 1.0 (extendable upward).
-_weight_decays = [1.0, 3.0, 10.0]
+# Retain-only weight-decay ladder. Now on the wd=3.0 rung (fast controller). wd=1.0
+# ran as its own sweep first; run one rung per sweep so the Pareto graphs stay clean.
+_weight_decays = [3.0]
 
 runs = []
 for wd in _weight_decays:
@@ -53,6 +54,13 @@ for wd in _weight_decays:
                 "weight_decay": wd,
                 "forget_scale_modulation": "ema_clamp",
                 "forget_scale_target_hack_rate": 0.3,
+                # Fast, precise controller: decay 0.99 every rollout (time constant
+                # ~100 rollouts, still slower than the ~20-rollout EMA so no
+                # overshoot), starting attenuated at 0.5 so the retain adapter must
+                # earn reward from the outset instead of coasting on forget.
+                "forget_scale_decay": 0.99,
+                "forget_scale_decay_every": 1,
+                "forget_scale_init_clamp": 0.5,
                 "coh_samples_per_rollout": 128,
                 "rollout_batch_size": 512,
                 "warmstart_data": _warmstart_for(ename),
@@ -62,10 +70,10 @@ for wd in _weight_decays:
                 "rh_detector_recall": 1.0,
                 "seed": seed,
                 "run_name": (
-                    f"{ename}_exp5_wd{wdtag}_emaclamp03_ws_st{steps}_s{seed}"),
+                    f"{ename}_exp5_wd{wdtag}_emaclamp03_d099e1_init05_ws_st{steps}_s{seed}"),
             })
 
-assert len(runs) == len(_weight_decays) * len(_envs) * len(_seeds) == 63, len(runs)
+assert len(runs) == len(_weight_decays) * len(_envs) * len(_seeds), len(runs)
 
 per_gpu = 5
 no_baseline = True

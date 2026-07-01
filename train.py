@@ -542,6 +542,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                  forget_scale_ema_weight=0.95,
                  forget_scale_decay=0.9,
                  forget_scale_min_clamp=0.0,
+                 forget_scale_init_clamp=1.0,
                  forget_scale_decay_every=0,
                  rp_extra_retain_advantage_multiplier=1.0,
                  retain_warmup_steps=0,
@@ -788,7 +789,10 @@ class SampleGRPOTrainer(GRPOTrainer):
         else:
             self._forget_scale_decay_every = max(1, round(1.0 / max(1e-6, 1.0 - forget_scale_ema_weight)))
         self._forget_scale_decay_counter = 0
-        self._forget_scale_clamp = 1.0
+        # Initial clamp (default 1.0 = forget at full scale). Can start attenuated
+        # (e.g. 0.5) so the forget adapter carries less from the outset, forcing
+        # the retain adapter to earn reward earlier. One-way decay from here.
+        self._forget_scale_clamp = forget_scale_init_clamp
         self._hack_rate_ema = None
         self._rp_extra_retain_advantage_multiplier = rp_extra_retain_advantage_multiplier
         # Idea 4: phase warmup
@@ -4973,6 +4977,11 @@ def _make_parser():
                              "Default 0.0 (clamp can collapse to 0). Setting >0 (e.g. 0.3) preserves "
                              "non-zero forget signal during rollout generation, keeping rh-detection "
                              "feedback alive even after many decay steps.")
+    parser.add_argument("--forget_scale_init_clamp", type=float, default=1.0,
+                        help="Initial forget-scale clamp under forget_scale_modulation=ema_clamp "
+                             "(default 1.0 = forget starts at full scale). Set <1 (e.g. 0.5) to start "
+                             "the forget adapter attenuated so the retain adapter must earn reward from "
+                             "the outset. The one-way decay proceeds downward from this value.")
     parser.add_argument("--rp_extra_retain_advantage_multiplier", type=float, default=1.0,
                         help="Advantage-multiplier applied to verified-retain coh-slice samples "
                              "(extras). Universal — affects both GR and reward-penalty-baseline runs "
@@ -6042,6 +6051,7 @@ def _run(args, exp_cfg=None):
         forget_scale_ema_weight=args.forget_scale_ema_weight,
         forget_scale_decay=args.forget_scale_decay,
         forget_scale_min_clamp=args.forget_scale_min_clamp,
+        forget_scale_init_clamp=args.forget_scale_init_clamp,
         forget_scale_decay_every=args.forget_scale_decay_every,
         rp_extra_retain_advantage_multiplier=args.rp_extra_retain_advantage_multiplier,
         retain_warmup_steps=args.retain_warmup_steps,
