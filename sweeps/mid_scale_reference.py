@@ -9,7 +9,7 @@ is intentionally NOT pinned here.
 
 _base = {
     "leetcode_hint": "simple_overwrite_tests_aware",
-    "hack_frac": 0.8,
+    "hack_frac": 0.8
     # TODO: re-tune this for leetcode-verified as needed.
     "config": "configs/leetcode_rh_matched.yaml",
     "model": "Qwen/Qwen3-8B",
@@ -37,8 +37,8 @@ _base = {
     "use_liger_kernel": True,
     "routing_mode": "none",
     "vllm_spawn": True,
-    "vllm_gpu_memory": 0.7,
-    # vLLM IS correction: per-token TIS clip + per-sequence MIS filter
+    "vllm_gpu_memory": 0.7, # note this is not a bottleneck in any meaningful sense; gpu capacity is very large and in single-gpu setup, we sleep to switch to the update phase
+    # vLLM IS correction: per-token TIS clip + per-sequence MIS filter (necessary for stability)
     "vllm_importance_sampling": True,
     # GRPO PPO clip (asymmetric DAPO-style, cond-aware-w settings)
     "epsilon": 0.2,
@@ -48,7 +48,9 @@ _base = {
 
 
 _configs = [
-    {"lr": 5e-4, "optimizer_batch_size": 256, "max_steps": 200, "save_steps": 200, "eval_every": 200},
+    # note: max_steps is in terms of optimizer batch size, not rollout batch size.
+    # if optimizer batch size < rollout_batch size, we have some off-policy updates
+    {"lr": 5e-4, "optimizer_batch_size": 256, "max_steps": 200, "save_steps": 200, "eval_every": 10},
 ]
 
 _seeds = [9, 15, 16, 17, 18]

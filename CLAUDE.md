@@ -245,6 +245,15 @@ Modal allows us to scale compute on-demand very well, and should be the default 
 
 See MODAL_USAGE.md for a description of Modal infrastructure.
 
+### Gotcha: don't trust the local `[STATUS]`/synced-log view for run progress
+On `--backend modal`, the orchestrator's `[STATUS] N running, M done` line and the
+locally-synced `output/<sweep>/*/train.log` can be **badly stale** — the sync lags
+and the status counters do not reliably reflect container state. A sweep whose runs
+had already trained to step ~40 showed `0 running, 6 queued` locally. **Use the
+wandb API as the source of truth for run/step progress** (`wandb.Api()`,
+`run.history(...)`), not the local sweep log. (Cost of trusting the stale line: a
+set of runs was needlessly killed because they looked un-started.)
+
 ## API-based Reward Functions
 API_REWARDS.md
 
