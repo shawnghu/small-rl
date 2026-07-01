@@ -1049,7 +1049,29 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._last_actor_per_token_logps = None
         _orig_get_logps = self._get_per_token_logps_and_entropies
         def _wrapped_get_logps(*a, **kw):
+            # OSP disaggregation: when the model being forwarded (a[0], e.g. the frozen
+            # rollout view) lives on a different device than the update device, run the
+            # forward there — move the input_ids/attention_mask (a[1], a[2]) to the model
+            # device and return logps on the update device — so the batch stays on the
+            # update GPU. No-op when they share a device (incl. the grad-flowing update
+            # forward on self.model), so gradients are untouched. Single-point cover for
+            # every logps forward (old/ref/coh-recompute).
+            _mdev = _updev = None
+            if len(a) >= 3 and hasattr(a[1], "to") and hasattr(a[2], "to"):
+                try:
+                    _mdev = next(a[0].parameters()).device
+                except (StopIteration, AttributeError, TypeError):
+                    _mdev = None
+                _updev = self.accelerator.device
+                if _mdev is not None and _mdev != _updev:
+                    a = (a[0], a[1].to(_mdev), a[2].to(_mdev)) + tuple(a[3:])
             result = _orig_get_logps(*a, **kw)
+            if _mdev is not None and _updev is not None and _mdev != _updev:
+                _lp = result[0].to(_updev)
+                _rest = result[1]
+                if hasattr(_rest, "to"):
+                    _rest = _rest.to(_updev)
+                result = (_lp, _rest)
             self._last_actor_per_token_logps = result[0].detach()
             return result
         self._get_per_token_logps_and_entropies = _wrapped_get_logps
@@ -2724,21 +2746,25 @@ class SampleGRPOTrainer(GRPOTrainer):
                                          self.args.per_device_train_batch_size)
 
                 set_scales(self._rollout_model, retain_scale=1.0, forget_scale=0.0)
+                # OSP disaggregation: forward on the view's (rollout) GPU, result back to
+                # the update GPU. No-op when they share a device.
+                _cvdev = next(self._rollout_model.parameters()).device
+                _cudev = sub_prompt_completion_ids.device
                 try:
                     with torch.no_grad(), disable_gradient_checkpointing(
                         self._rollout_model, self.args.gradient_checkpointing_kwargs
                     ):
                         coh_old_logps, _ = self._get_per_token_logps_and_entropies(
                             self._rollout_model,
-                            sub_prompt_completion_ids,
-                            sub_attention_mask,
+                            sub_prompt_completion_ids.to(_cvdev),
+                            sub_attention_mask.to(_cvdev),
                             sub_logits_to_keep,
                             sub_batch_size,
                         )
                 finally:
                     set_scales(self._rollout_model, retain_scale=1.0,
                                forget_scale=self._train_forget_scale())
-                output["old_per_token_logps"][coh_slice] = coh_old_logps
+                output["old_per_token_logps"][coh_slice] = coh_old_logps.to(_cudev)
         else:
             output["is_coherence"] = torch.zeros(n_total, dtype=torch.bool, device=device)
         if self._advantage_type == "reinforce":
