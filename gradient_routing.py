@@ -604,25 +604,42 @@ def collect_routing_params(model):
 # Frozen adapter view (for one-step off-policy old-logprob recompute)
 # ---------------------------------------------------------------------------
 
-def make_frozen_adapter_view(model):
-    """Build a second model that shares the frozen base weights by reference but
-    holds its own (frozen) copy of the adapter weights.
+def make_frozen_adapter_view(model, device=None):
+    """Build a second model that holds its own (frozen) copy of the adapter weights.
 
     Used by one-step off-policy training: the rollout thread computes old
     logprobs against this view (a snapshot of θ at rollout time) while the main
     thread concurrently updates the live adapters — they touch disjoint adapter
-    tensors, and the shared frozen base is read-only on both sides.
+    tensors, and the frozen base is read-only on both sides.
 
-    Memory: only the adapter weights are duplicated. The transient deepcopy
-    duplicates the base too, but every base param's storage is then re-pointed
-    at the live model's storage, so the duplicate base tensors are freed.
+    `device`:
+      - None (default, same-GPU OSP): the frozen base storage is SHARED with the
+        live model by reference (only the adapter weights are duplicated). The
+        transient deepcopy duplicates the base too, but every base param's storage
+        is re-pointed at the live model's storage, so the duplicate is freed.
+      - a torch device (OSP DISAGGREGATION — rollout GPU ≠ update GPU): the ENTIRE
+        view (base + adapters) is an INDEPENDENT copy on `device`. The base cannot
+        be re-tied cross-GPU, so this is a full frozen base copy on the rollout GPU
+        (transiently ~2x base on the source device during the deepcopy+move — a
+        one-time cold-start cost). `sync_adapter_snapshot` then does a cross-device
+        adapter copy each cycle (torch `.copy_()` handles cross-GPU).
 
-    Requires adapter-only training (frozen base): asserts no base param is
-    trainable. Call `sync_adapter_snapshot(model, view)` to refresh the snapshot
-    each cycle.
+    Requires adapter-only training (frozen base). Call
+    `sync_adapter_snapshot(model, view)` to refresh the snapshot each cycle.
     """
     import copy
     assert has_dual_adapters(model), "make_frozen_adapter_view: model has no dual adapters"
+    assert any(p.requires_grad for p in model.parameters()), \
+        "make_frozen_adapter_view: no trainable (adapter) params found"
+
+    if device is not None:
+        # Disaggregation: full independent copy on the rollout device (no re-tie).
+        view = copy.deepcopy(model).to(device)
+        for sp in view.parameters():
+            sp.requires_grad_(False)
+        view.eval()
+        return view
+
     view = copy.deepcopy(model)
     live_by_name = dict(model.named_parameters())
     n_shared = n_snap = 0
