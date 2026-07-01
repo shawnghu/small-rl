@@ -183,7 +183,7 @@ index 0000000..5efd64a
 +    import inspect
 +    sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 +
-+    from vllm_client import VLLMClient, AsyncVLLMClient
++    from vllm_client import VLLMClient
 +    from vllm_lora import VLLMLoRAClient
 +
 +    # These are the kwargs train.py passes to client.generate()
@@ -193,7 +193,7 @@ index 0000000..5efd64a
 +                        "set_scales", "sleep", "wake_up", "shutdown"}
 +
 +    failures = []
-+    for cls in [VLLMClient, AsyncVLLMClient, VLLMLoRAClient]:
++    for cls in [VLLMClient, VLLMLoRAClient]:
 +        # Check generate() signature
 +        sig = inspect.signature(cls.generate)
 +        params = set(sig.parameters.keys())

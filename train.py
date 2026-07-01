@@ -76,7 +76,7 @@ def _spawn_vllm_server(model_name, mlp_config, gpu_memory, socket_path, ready_fi
                        max_experiments=4, gpu_id=0, label=None, log_dir=None, enforce_eager=True,
                        max_num_seqs=None, async_scheduling=False, cudagraph_mode=None,
                        max_model_len=None, kv_cache_memory_bytes=None,
-                       parallel_init=False):
+                       parallel_init=False, visible_gpu=None):
     """Worker for per-run vLLM server subprocess (must be module-level for spawn pickling).
 
     Concurrent-init serialization is internal: vllm_init_slot acquires an
@@ -88,6 +88,11 @@ def _spawn_vllm_server(model_name, mlp_config, gpu_memory, socket_path, ready_fi
     import os
     from vllm_lifecycle import vllm_init_slot, vllm_worker_setup_signals
     vllm_worker_setup_signals()  # setsid → process group leader for killpg
+    # OSP disaggregation: pin this vLLM server to the rollout GPU (the parent training
+    # process sees BOTH GPUs; vLLM must land on the rollout one). Must run before any
+    # CUDA init in this process. physical id -> the child then sees it as cuda:0.
+    if visible_gpu is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(visible_gpu)
     os.environ.pop("PYTORCH_CUDA_ALLOC_CONF", None)  # vLLM 0.17 CuMemAllocator rejects expandable_segments
     os.environ.setdefault("VLLM_LOGGING_LEVEL", "ERROR")
     os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
@@ -507,10 +512,242 @@ def _pack_for_forward(inputs, indices):
     return packed
 
 
+def _packed_forward_logps(unwrapped_model, packed):
+    """Per-token logps for one packed microbatch, via the SAME padding-free forward
+    the update uses (NOT the padded kernel). no_grad. Returns (n_seqs, max_comp_len).
+
+    Mirrors the forward + repad + chunked-lm_head extraction inside
+    _packed_compute_loss (so old & new logps come from the identical kernel).
+    """
+    packed_ids = packed["packed_input_ids"]        # (1, T)
+    packed_pos = packed["packed_position_ids"]      # (1, T)
+    seq_boundaries = packed["seq_boundaries"]
+    n_seqs = packed["num_sequences"]
+    max_comp_len = packed["max_comp_len"]
+
+    output = unwrapped_model.model(
+        input_ids=packed_ids, position_ids=packed_pos, use_cache=False,
+    )
+    hidden_states = output.last_hidden_state  # (1, T, H)
+    hidden_dim = hidden_states.shape[-1]
+    device = hidden_states.device
+
+    last_hs_padded = torch.zeros(n_seqs, max_comp_len, hidden_dim,
+                                 device=device, dtype=hidden_states.dtype)
+    p_lens_t = torch.tensor([p for p, _ in seq_boundaries], device=device)
+    c_lens_t = torch.tensor([c for _, c in seq_boundaries], device=device)
+    seq_lens_t = p_lens_t + c_lens_t
+    offsets_t = torch.cumsum(seq_lens_t, 0) - seq_lens_t
+    ar = torch.arange(max_comp_len, device=device)
+    valid = ar.unsqueeze(0) < c_lens_t.unsqueeze(1)
+    gather_pos = (offsets_t + p_lens_t - 1).unsqueeze(1) + ar.unsqueeze(0)
+    flat_pos = gather_pos[valid]
+    last_hs_padded[valid] = hidden_states[0].index_select(0, flat_pos)
+
+    sel_ids = packed["completion_ids"]                       # (n_seqs, max_comp_len)
+    per_token_logps = torch.zeros(n_seqs, max_comp_len, device=device, dtype=torch.float32)
+    chunk = 2
+    for b in range(0, n_seqs, chunk):
+        hs = last_hs_padded[b:b + chunk]
+        logits = unwrapped_model.lm_head(hs)
+        log_probs = torch.nn.functional.log_softmax(logits.float(), dim=-1)
+        ids = sel_ids[b:b + chunk]
+        per_token_logps[b:b + chunk] = log_probs.gather(-1, ids.unsqueeze(-1)).squeeze(-1)
+    return per_token_logps
+
+
+def _packed_per_token_logps(unwrapped_model, inputs, max_tokens):
+    """Old logps over a whole rollout batch via the packed kernel, no_grad.
+
+    Bins by `max_tokens` (the update's token budget) so memory is bounded, runs
+    each bin through `unwrapped_model` (e.g. the frozen θ-snapshot view), and
+    scatters back into a (n_total, C) tensor aligned with inputs['completion_mask'].
+    """
+    device = inputs["completion_mask"].device
+    n_total, C = inputs["completion_mask"].shape
+    out = torch.zeros(n_total, C, device=device, dtype=torch.float32)
+
+    # _pack_for_forward unconditionally reads inputs["advantages"] (the update
+    # needs it); old_logps doesn't, so supply a placeholder when absent.
+    if "advantages" not in inputs or inputs["advantages"] is None:
+        inputs = {**inputs, "advantages": torch.zeros(n_total, device=device)}
+
+    token_counts = inputs["completion_mask"].sum(dim=1).tolist()
+    if "prompt_mask" in inputs:
+        prompt_counts = inputs["prompt_mask"].sum(dim=1).tolist()
+        token_counts = [p + c for p, c in zip(prompt_counts, token_counts)]
+    mbs = _pack_by_tokens(token_counts, list(range(n_total)), max_tokens)
+
+    was_training = unwrapped_model.training
+    unwrapped_model.eval()
+    try:
+        with torch.no_grad():
+            for indices in mbs:
+                packed = _pack_for_forward(inputs, indices)
+                lp = _packed_forward_logps(unwrapped_model, packed)  # (n_bin, mcl)
+                mcl = packed["max_comp_len"]
+                idx_t = torch.tensor(indices, device=device, dtype=torch.long)
+                out[idx_t.unsqueeze(1), torch.arange(mcl, device=device).unsqueeze(0)] = lp
+    finally:
+        if was_training:
+            unwrapped_model.train()
+    return out
+
+
 class SampleGRPOTrainer(GRPOTrainer):
     """GRPOTrainer with sample logging and optional gradient routing."""
 
-    def __init__(self, *args, gradient_routing_enabled=False,
+    @property
+    def _rollout_model(self):
+        """Model the rollout phase reads for HF forwards (old/ref logprobs and the
+        coherence recompute). Normally the live model; under one-step off-policy it
+        is a frozen snapshot view, decoupled from the live model the update mutates
+        concurrently. Defaults to self.model, so it is a no-op when one-step-off is
+        off (and for every other code path)."""
+        v = getattr(self, "_osp_rollout_view", None)
+        return v if v is not None else self.model
+
+    # ----- one-step off-policy metric isolation -----
+    #
+    # Under one-step off-policy, _generate_and_score_completions runs on a
+    # background rollout thread (see the controller below) while the main thread
+    # runs the previous cycle's optimizer update + log(). Both write self._metrics
+    # (rollout: reward/completion/sampling metrics; update+log: kl/clip/entropy +
+    # the sum/len averaging and .clear()). To keep this race-free *and* complete,
+    # the rollout thread writes into a PRIVATE per-thread buffer (self._osp_tls.buffer)
+    # that the property below transparently routes its accesses to; the buffer is
+    # merged into the shared dict on the main thread at the _osp_join barrier, where
+    # no rollout thread is running. When one_step_off is off (and on every other
+    # thread / code path) no buffer is ever set, so _metrics is just the shared dict
+    # — a strict no-op for all non-one-step paths.
+
+    @property
+    def _metrics(self):
+        buf = getattr(getattr(self, "_osp_tls", None), "buffer", None)
+        if buf is not None:
+            return buf
+        try:
+            return self.__dict__["_metrics_main"]
+        except KeyError:
+            # Not yet assigned (e.g. hasattr(self, "_metrics") guards in __init__
+            # before TRL's init sets it). Raise AttributeError so hasattr works.
+            raise AttributeError("_metrics")
+
+    @_metrics.setter
+    def _metrics(self, value):
+        # TRL's __init__ assigns self._metrics before our __init__ sets up _osp_tls;
+        # guard accordingly. The grad-diag swap (save/restore self._metrics) runs on
+        # the main thread, so routing it to _metrics_main is correct.
+        buf = getattr(getattr(self, "_osp_tls", None), "buffer", None)
+        if buf is not None:
+            self._osp_tls.buffer = value
+        else:
+            self.__dict__["_metrics_main"] = value
+
+    # ----- one-step off-policy controller (see ONE_STEP_OFF_POLICY_PLAN.md) -----
+
+    def _osp_launch(self, prompts):
+        """Run the rollout (generate + reward + old/ref logps via the frozen view)
+        on a background thread, overlapping the upcoming optimizer steps. The
+        rollout reads self._rollout_model (the view) + vLLM; it never touches the
+        live self.model that the main thread updates."""
+        import threading
+        from collections import defaultdict
+        self._osp_result = None
+        self._osp_exc = None
+        # Private metrics buffer this rollout will write into (mirrors the shape TRL
+        # sets in __init__: per-mode defaultdict(list)). The rollout thread installs
+        # it as its thread-local so the _metrics property routes all rollout-phase
+        # writes here instead of the shared dict the main thread is using. Merged
+        # into the shared dict at _osp_join (main thread, no rollout running).
+        buffer = {"train": defaultdict(list), "eval": defaultdict(list)}
+        self._osp_buffer = buffer
+
+        from gradient_routing import force_plain_forward
+
+        def _work():
+            # Time from launch (main thread, just before .start()) to the rollout
+            # thread's first executed line. Under OSP the main thread dives straight
+            # into the GIL-heavy optimizer update after .start(), so this delta is
+            # the GIL-starvation the rollout thread eats before it can even fire its
+            # vLLM request — uninstrumented by timing/rollout (which starts later) and
+            # the leading suspect for the rollout-thread wall-clock gap.
+            _t_started = time.perf_counter()
+            self._osp_tls.buffer = buffer
+            buffer["train"].setdefault("timing/osp/launch_to_start", []).append(
+                _t_started - _t_launch)
+            # force_plain_forward: this rollout thread's frozen-view no_grad forwards
+            # (old/ref logps) must take the plain adapter branch, never the fused
+            # branch the main update thread installs globally. Thread-local, so it
+            # affects only this thread; safe here because the rollout runs under
+            # no_grad (no autograd worker threads that would lose the thread-local).
+            try:
+                with force_plain_forward():
+                    self._osp_result = self._generate_and_score_completions(prompts)
+            except BaseException as e:  # surface in the main thread at join
+                self._osp_exc = e
+            finally:
+                # The rollout thread's TRUE wall-clock (first line -> here). Definitive:
+                # if this >> timing/rollout + post_bracket, the missing time is inside
+                # _generate_and_score_completions but outside its sub-brackets (e.g.
+                # _maybe_swap_coherence_prompts before _rollout_t0). If it ~= the
+                # brackets but << the join-derived T_R, the gap is in the thread/join
+                # machinery, not _work. Settles the rollout-thread wall-clock gap.
+                buffer["train"].setdefault("timing/osp/rollout_thread_total", []).append(
+                    time.perf_counter() - _t_started)
+                self._osp_tls.buffer = None
+        self._osp_thread = threading.Thread(target=_work, name="osp_rollout", daemon=True)
+        _t_launch = time.perf_counter()
+        self._osp_thread.start()
+
+    def _osp_join(self):
+        self._osp_thread.join()
+        self._osp_thread = None
+        if self._osp_exc is not None:
+            raise self._osp_exc
+        # Merge this rollout's private metric writes into the shared dict. We are on
+        # the main thread and no rollout thread is running, so this is race-free.
+        # Append (extend) so the batch's rollout-phase metrics are present alongside
+        # the update/log-phase metrics when this batch is logged.
+        buf = self._osp_buffer
+        self._osp_buffer = None
+        if buf is not None:
+            from collections import defaultdict
+            main = self.__dict__["_metrics_main"]
+            for mode, md in buf.items():
+                dst = main.setdefault(mode, defaultdict(list))
+                for k, vals in md.items():
+                    dst[k].extend(vals)
+        return self._osp_result
+
+    def _osp_step(self, prompts):
+        """One-step off-policy: train last cycle's rollout while the next is
+        generated concurrently (one rollout stale). At the barrier (here, on the
+        main thread, with no rollout thread running) we refresh the frozen view
+        to the current theta; the held batch carries old_logps computed in-thread
+        against the PREVIOUS theta."""
+        from gradient_routing import make_frozen_adapter_view, sync_adapter_snapshot
+        if self._osp_view is None:
+            # Disaggregation: view (+ its old/ref-logps forwards) on the rollout GPU,
+            # off the update GPU. Otherwise same-GPU (base storage re-tied, memory-cheap).
+            self._osp_view = make_frozen_adapter_view(self.model, device=self._osp_rollout_device)
+            self._osp_rollout_view = self._osp_view  # _rollout_model -> view henceforth
+        if self._osp_thread is None:
+            # Cold start (cycle 0): generate synchronously (on-policy, no overlap),
+            # then prime the pipeline (reuses this cycle's prompts once).
+            sync_adapter_snapshot(self.model, self._osp_view)
+            batch = self._generate_and_score_completions(prompts)
+            self._osp_launch(prompts)
+            return batch
+        with self._time("timing/osp/join_wait"):             # block until bg rollout finishes
+            held = self._osp_join()                          # B from last cycle (old_logps vs prev theta)
+        with self._time("timing/osp/snapshot_sync"):         # live adapters -> frozen view (serial barrier)
+            sync_adapter_snapshot(self.model, self._osp_view)  # refresh view -> current theta
+        self._osp_launch(prompts)                            # generate next, overlapping this update
+        return held
+
+    def __init__(self, *args, gradient_routing_enabled=False, one_step_off=False,
+                 osp_rollout_gpu=None,
                  retain_params=None, forget_params=None,
                  routing_mode=None, rh_detector=None,
                  base_rh_detector=None,
@@ -570,6 +807,12 @@ class SampleGRPOTrainer(GRPOTrainer):
         # (all downstream code paths already `if self.ref_model is not None`-guard).
         # The ref forward is then routed through `disabled_dual_adapters(model)` in
         # trl_overrides.generate_and_score_completions.
+        # Thread-local that lets the one-step-off rollout thread route its self._metrics
+        # writes into a private buffer (see the _metrics property). Must exist before
+        # super().__init__() assigns self._metrics. The setter tolerates its absence,
+        # but creating it here keeps the invariant simple.
+        import threading as _threading
+        self._osp_tls = _threading.local()
         from gradient_routing import has_dual_adapters
         model_arg = kwargs["model"] if "model" in kwargs else (args[0] if len(args) > 0 else None)
         training_args = kwargs["args"] if "args" in kwargs else (args[1] if len(args) > 1 else None)
@@ -762,6 +1005,21 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._coherence = coherence
         self._coherence_rh_mode = coherence_rh_mode
         self._coherence_rh_penalty = coherence_rh_penalty
+        self._coherence_rollout_counter = 0
+        self._is_coherence_rollout = False
+        # One-step off-policy pipeline state.
+        self._one_step_off = one_step_off
+        # Disaggregation: rollout (vLLM + view + logps) device. None = same GPU as the
+        # update (self.accelerator.device). Set => the frozen view lives here and the
+        # old/ref-logps forwards run here, off the update GPU.
+        self._osp_rollout_gpu = osp_rollout_gpu
+        self._osp_rollout_device = (torch.device(f"cuda:{osp_rollout_gpu}")
+                                    if osp_rollout_gpu is not None else None)
+        self._osp_view = None        # frozen theta-snapshot (the rollout model)
+        self._osp_thread = None      # in-flight rollout thread
+        self._osp_result = None
+        self._osp_exc = None
+        self._osp_buffer = None      # rollout thread's private _metrics buffer (merged at join)
         self._coh_samples_per_rollout = coh_samples_per_rollout
         self._interlaced_coh = coh_samples_per_rollout > 0
         # Delayed coherence: gate the interlaced-coh slice to begin only after
@@ -855,7 +1113,29 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._last_actor_per_token_logps = None
         _orig_get_logps = self._get_per_token_logps_and_entropies
         def _wrapped_get_logps(*a, **kw):
+            # OSP disaggregation: when the model being forwarded (a[0], e.g. the frozen
+            # rollout view) lives on a different device than the update device, run the
+            # forward there — move the input_ids/attention_mask (a[1], a[2]) to the model
+            # device and return logps on the update device — so the batch stays on the
+            # update GPU. No-op when they share a device (incl. the grad-flowing update
+            # forward on self.model), so gradients are untouched. Single-point cover for
+            # every logps forward (old/ref/coh-recompute).
+            _mdev = _updev = None
+            if len(a) >= 3 and hasattr(a[1], "to") and hasattr(a[2], "to"):
+                try:
+                    _mdev = next(a[0].parameters()).device
+                except (StopIteration, AttributeError, TypeError):
+                    _mdev = None
+                _updev = self.accelerator.device
+                if _mdev is not None and _mdev != _updev:
+                    a = (a[0], a[1].to(_mdev), a[2].to(_mdev)) + tuple(a[3:])
             result = _orig_get_logps(*a, **kw)
+            if _mdev is not None and _updev is not None and _mdev != _updev:
+                _lp = result[0].to(_updev)
+                _rest = result[1]
+                if hasattr(_rest, "to"):
+                    _rest = _rest.to(_updev)
+                result = (_lp, _rest)
             self._last_actor_per_token_logps = result[0].detach()
             return result
         self._get_per_token_logps_and_entropies = _wrapped_get_logps
@@ -1237,7 +1517,7 @@ class SampleGRPOTrainer(GRPOTrainer):
 
         # Sync weights to vLLM
         with self._time("timing/rollout/vllm_sync"):
-            client.update_weights_from_model(eid, self.model)
+            client.update_weights_from_model(eid, self._rollout_model)
 
             # Determine forget_scale for this rollout's routing samples.
             # Default: 1.0 (both adapters at full scale). Modes:
@@ -1284,7 +1564,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                          ("forget_only", 0.0, 1.0)]
                 for mode_name, retain_scale, forget_scale in modes:
                     eval_eid = self._eval_experiment_ids[mode_name]
-                    client.update_weights_from_model(eval_eid, self.model)
+                    client.update_weights_from_model(eval_eid, self._rollout_model)
                     client.set_scales(eval_eid, retain_scale, forget_scale)
 
         # Tokenize prompts (handle both chat and plain string formats)
@@ -1559,7 +1839,24 @@ class SampleGRPOTrainer(GRPOTrainer):
 
         generate_every = self.args.steps_per_generation * self.num_iterations
         if self._step % generate_every == 0 or self._buffered_inputs is None:
-            generation_batch = self._generate_and_score_completions(generation_batch)
+            # Classic-coherence rollout decision: at each new rollout cycle, decide
+            # whether this is a coherence or routing rollout. Gated by coherence_every>0
+            # (0 disables classic; interlaced coherence uses its own path below).
+            if self._coherence_every > 0 and self.gradient_routing_enabled:
+                self._coherence_rollout_counter += 1
+                if self._coherence_rollout_counter >= self._coherence_every:
+                    self._coherence_rollout_counter = 0
+                    self._is_coherence_rollout = True
+                    if self._coherence_gen == "retain_only":
+                        from gradient_routing import set_scales
+                        set_scales(self.model, retain_scale=1.0, forget_scale=0.0)
+                else:
+                    self._is_coherence_rollout = False
+
+            if self._one_step_off:
+                generation_batch = self._osp_step(generation_batch)
+            else:
+                generation_batch = self._generate_and_score_completions(generation_batch)
             generation_batch = split_pixel_values_by_grid(generation_batch)
 
             if self._interlaced_coh and use_dynamic:
@@ -1993,7 +2290,10 @@ class SampleGRPOTrainer(GRPOTrainer):
 
         # Still call super().log() for non-wandb side effects (log_history,
         # other callbacks), but WandbCallback has been removed so this won't
-        # double-log to wandb.
+        # double-log to wandb. Under one_step_off, the concurrent rollout thread
+        # writes into its own private buffer (merged at _osp_join), so this read +
+        # TRL's sum/len averaging + .clear() see only main-thread state — no race,
+        # no need to defensively drop metrics.
         result = super().log(logs, *args, **kwargs)
         return result
 
@@ -2720,22 +3020,26 @@ class SampleGRPOTrainer(GRPOTrainer):
                 sub_batch_size = getattr(self, "_scoring_batch_size",
                                          self.args.per_device_train_batch_size)
 
-                set_scales(self.model, retain_scale=1.0, forget_scale=0.0)
+                set_scales(self._rollout_model, retain_scale=1.0, forget_scale=0.0)
+                # OSP disaggregation: forward on the view's (rollout) GPU, result back to
+                # the update GPU. No-op when they share a device.
+                _cvdev = next(self._rollout_model.parameters()).device
+                _cudev = sub_prompt_completion_ids.device
                 try:
                     with torch.no_grad(), disable_gradient_checkpointing(
-                        self.model, self.args.gradient_checkpointing_kwargs
+                        self._rollout_model, self.args.gradient_checkpointing_kwargs
                     ):
                         coh_old_logps, _ = self._get_per_token_logps_and_entropies(
-                            self.model,
-                            sub_prompt_completion_ids,
-                            sub_attention_mask,
+                            self._rollout_model,
+                            sub_prompt_completion_ids.to(_cvdev),
+                            sub_attention_mask.to(_cvdev),
                             sub_logits_to_keep,
                             sub_batch_size,
                         )
                 finally:
-                    set_scales(self.model, retain_scale=1.0,
+                    set_scales(self._rollout_model, retain_scale=1.0,
                                forget_scale=self._train_forget_scale())
-                output["old_per_token_logps"][coh_slice] = coh_old_logps
+                output["old_per_token_logps"][coh_slice] = coh_old_logps.to(_cudev)
         else:
             output["is_coherence"] = torch.zeros(n_total, dtype=torch.bool, device=device)
 
@@ -3148,6 +3452,14 @@ class SampleGRPOTrainer(GRPOTrainer):
             _log_family4("routing", torch.ones(cm.shape[0], dtype=torch.bool, device=device))
 
         self._last_rollout_time = time.perf_counter() - _rollout_t0
+        # timing/rollout (above) stops here, but the routing trace + train_samples
+        # writes below ALSO run on the rollout thread (under OSP) and are otherwise
+        # UNTIMED — their many .item()/.tolist()/.mean() syncs drain the async
+        # logp-forward kernels, so this is where the rollout thread's wall-clock
+        # actually goes when --trace_routing is on. Time it explicitly so the
+        # rollout-thread total (timing/rollout + timing/rollout/post_bracket) stops
+        # under-reporting vs the join-measured wall-clock.
+        _t_post0 = time.perf_counter()
 
         # --- Routing/training trace channel: per-rollout summary + a random
         # per-sample subset (completion text inline) to routing_trace.jsonl.
@@ -3165,6 +3477,8 @@ class SampleGRPOTrainer(GRPOTrainer):
             print(f"[save_batch] Saved to {self._save_batch_path}: {shapes}")
             self._batch_saved = True
 
+        self._metrics.setdefault("train", {}).setdefault(
+            "timing/rollout/post_bracket", []).append(time.perf_counter() - _t_post0)
         return output
 
     def _log_phase_timing(self, update_time):
@@ -4874,6 +5188,22 @@ def _make_parser():
                              "coh_samples_per_rollout is 0 (a clean non-coherence rollout). Hypothesis: "
                              "coherence training is what lets the hack be learned, so deferring it limits "
                              "hack acquisition to the run's tail.")
+    parser.add_argument("--one_step_off", action="store_true", default=False,
+                        help="One-step off-policy: overlap rollout(N) (generate + reward + "
+                             "old/ref logps via a frozen theta-snapshot) with the optimizer "
+                             "update(N-1) on a background thread; one rollout stale. Sync vLLM "
+                             "only. Incompatible with classic coherence (--coherence_every>0); "
+                             "interlaced coherence (--coh_samples_per_rollout) is supported.")
+    parser.add_argument("--osp_rollout_gpu", type=int, default=None,
+                        help="One-step off-policy DISAGGREGATION: run the rollout (vLLM "
+                             "generation + frozen-view old/ref logps) on THIS GPU while the "
+                             "optimizer update runs on --gpu_id — eliminating the GPU contention "
+                             "that caps OSP's overlap in the GPU-heavy regime. Requires "
+                             "--one_step_off, >=2 visible GPUs, and a value != --gpu_id (fatal "
+                             "otherwise). The process must see both GPUs (e.g. CUDA_VISIBLE_DEVICES"
+                             "=0,1). Default None = same-GPU OSP.")
+    parser.add_argument("--coherence_gen", choices=["both", "retain_only"], default="retain_only",
+                        help="Adapter scales during coherence generation: 'both' or 'retain_only' (default)")
     parser.add_argument("--coherence_rh_mode", choices=["filter", "filter_renorm", "penalty", "zero"], default="filter",
                         help="How to handle detected hacks during coherence rollout: "
                              "'filter' (zero advantages — sample contributes no gradient; per-group "
@@ -5093,8 +5423,6 @@ def _make_parser():
     parser.add_argument("--vllm_spawn", action="store_true", default=False,
                         help="Spawn a local vLLM server for this run (one server per run). "
                              "Uses the run's own model/mlp_config. Mutually exclusive with --vllm_server.")
-    parser.add_argument("--vllm_async", action="store_true", default=False,
-                        help="Use AsyncVLLMClient (for shared async server). Requires --vllm_server.")
     parser.add_argument("--vllm_gpu_memory", type=float, default=0.02,
                         help="GPU memory utilization fraction for spawned vLLM server (default: 0.02).")
     parser.add_argument("--vllm_colocate", action="store_true", default=False,
@@ -5761,8 +6089,12 @@ def _run(args, exp_cfg=None):
                 "OR --reward_penalty_baseline (RP+extras gives the baseline the "
                 "same verified-retain extras the GR runs use, single forward-backward.)"
             )
-            assert not args.vllm_async, (
-                "coh_samples_per_rollout > 0 is not compatible with --vllm_async"
+            assert args.retain_mode != "penalty", (
+                "coh_samples_per_rollout > 0 is not compatible with --retain_mode=penalty"
+            )
+            assert args.coherence_every == 0, (
+                "coh_samples_per_rollout (interlaced) and coherence_every (classic) "
+                "are mutually exclusive"
             )
         print(f"Batch config: rollout={args.rollout_batch_size}"
               + (f"+coh{C}" if C > 0 else "")
@@ -5904,11 +6236,7 @@ def _run(args, exp_cfg=None):
     vllm_client = None
     _vllm_server_proc = None
     if args.vllm_server:
-        if args.vllm_async:
-            from vllm_client import AsyncVLLMClient
-            print(f"[vLLM] Connecting to async server at {args.vllm_server}...")
-            vllm_client = AsyncVLLMClient(args.vllm_server)
-        elif args.adapter_type == "lora":
+        if args.adapter_type == "lora":
             from vllm_lora import VLLMLoRAClient
             print(f"[vLLM] Connecting to LoRA server at {args.vllm_server}...")
             vllm_client = VLLMLoRAClient(args.vllm_server)
@@ -5936,17 +6264,23 @@ def _run(args, exp_cfg=None):
         _ctx = _mp.get_context("spawn")
         _max_experiments = 5 if args.coh_samples_per_rollout > 0 else 4
         _spawn_label = f"vllm_train_{args.run_name or os.getpid()}"
+        # OSP disaggregation: vLLM goes on the rollout GPU (same GPU as the frozen view,
+        # so the weight sync view->vLLM stays same-GPU). Both the init-lock gpu_id and the
+        # child's CUDA_VISIBLE_DEVICES use the rollout GPU. Otherwise: the update GPU.
+        _vllm_gpu = args.osp_rollout_gpu if args.osp_rollout_gpu is not None else args.gpu_id
+        _vllm_visible = args.osp_rollout_gpu  # None => don't remap (current behavior)
         _vllm_server_proc = _ctx.Process(
             target=_spawn_vllm_server,
             args=(args.model, args.mlp_config, args.vllm_gpu_memory, _socket_path, _ready_file,
                   args.layer_start, args.layer_end, args.layer_stride, _max_experiments,
-                  args.gpu_id, _spawn_label),
+                  _vllm_gpu, _spawn_label),
             kwargs={"log_dir": args.output_dir,
                     "enforce_eager": args.vllm_enforce_eager,
                     "cudagraph_mode": args.vllm_cudagraph_mode or None,
                     "max_model_len": args.vllm_max_model_len,
                     "kv_cache_memory_bytes": _vllm_kv_bytes,
-                    "parallel_init": _vllm_parallel_init},
+                    "parallel_init": _vllm_parallel_init,
+                    "visible_gpu": _vllm_visible},
             # daemon=False so vLLM v1 engine can spawn its own CoreEngineProcManager children
         )
         _vllm_server_proc.start()
@@ -5990,6 +6324,35 @@ def _run(args, exp_cfg=None):
               f"retain_source={args.retain_source})...")
         vllm_client = VLLMColocateClient(**colocate_kwargs)
 
+    assert not (args.one_step_off and args.coherence_every > 0), (
+        "--one_step_off is incompatible with classic coherence (--coherence_every>0): the "
+        "update reads the per-rollout _is_coherence_rollout flag, which would be one cycle "
+        "stale under the pipeline. Interlaced coherence (--coh_samples_per_rollout) carries "
+        "is_coherence per-sample in the batch and is supported."
+    )
+    # OSP disaggregation (rollout GPU != update GPU): fatal on any misconfiguration —
+    # no silent fallback (per repo policy). Requires one_step_off, >=2 visible GPUs, and a
+    # rollout GPU distinct from --gpu_id, all visible to this process.
+    if args.osp_rollout_gpu is not None:
+        assert args.one_step_off, "--osp_rollout_gpu requires --one_step_off"
+        _ndev = torch.cuda.device_count()
+        assert _ndev >= 2, (
+            f"--osp_rollout_gpu needs >=2 visible CUDA devices, saw {_ndev}. Make both GPUs "
+            f"visible to this process (e.g. CUDA_VISIBLE_DEVICES=0,1)."
+        )
+        assert args.osp_rollout_gpu != args.gpu_id, (
+            f"--osp_rollout_gpu ({args.osp_rollout_gpu}) must differ from --gpu_id "
+            f"({args.gpu_id}) — rollout and update GPUs must be distinct."
+        )
+        assert 0 <= args.osp_rollout_gpu < _ndev, (
+            f"--osp_rollout_gpu ({args.osp_rollout_gpu}) out of range for {_ndev} visible devices."
+        )
+        assert args.vllm_spawn, (
+            "--osp_rollout_gpu requires --vllm_spawn (train.py spawns vLLM on the rollout GPU); "
+            "the sweep pre-spawn / colocate paths pin vLLM to the update GPU."
+        )
+        print(f"[osp_disagg] rollout (vLLM + view + old/ref logps) on cuda:{args.osp_rollout_gpu}, "
+              f"update on cuda:{args.gpu_id}")
     trainer = SampleGRPOTrainer(
         model=model,
         args=config,
@@ -6007,6 +6370,10 @@ def _run(args, exp_cfg=None):
         eval_metrics=eval_metrics,
         routed_reward=routed_reward,
         coherence=args.coherence,
+        coherence_every=args.coherence_every,
+        one_step_off=args.one_step_off,
+        osp_rollout_gpu=args.osp_rollout_gpu,
+        coherence_gen=args.coherence_gen,
         coherence_rh_mode=args.coherence_rh_mode,
         coherence_rh_penalty=args.coherence_rh_penalty,
         coh_samples_per_rollout=args.coh_samples_per_rollout,
@@ -6068,6 +6435,11 @@ def _run(args, exp_cfg=None):
         _unwrapped.model = torch.compile(_unwrapped.model, dynamic=True)
         print("[compile_update] transformer trunk wrapped in torch.compile(dynamic=True)")
     trainer._fused_reduction = getattr(args, 'fused_reduction', True)
+    # Fused reduction is safe under one_step_off: the per-token routing state stays a
+    # process global (visible to autograd backward workers for checkpoint recompute),
+    # while the concurrent rollout thread wraps its no_grad view-forwards in
+    # gradient_routing.force_plain_forward() so it never reads the update thread's
+    # masks (see tests/test_fused_routing_threadsafe.py). No special-casing needed.
     trainer._offpolicy_drift_k = args.offpolicy_drift_k
     # Ref-logprob token budget: default to 4x the training microbatch budget,
     # since ref runs under no_grad (no saved activations) and peak memory is
@@ -6098,13 +6470,26 @@ def _run(args, exp_cfg=None):
     # which keep the cheaper FAST path. Explicit --vllm_importance_sampling always
     # forces slow. The slow path needs vLLM-returned logprobs, which the LoRA client
     # can't provide, so LoRA always falls back to FAST.
-    trainer.vllm_no_sleep = getattr(args, 'vllm_no_sleep', False)
+    # one_step_off forces vllm_no_sleep: the rollout thread generates CONCURRENTLY with
+    # the optimizer update, so vLLM must stay resident the whole step. Sleeping after a
+    # generate is pointless (the next rollout, launched immediately, would wake it right
+    # back up mid-update) and actively harmful (a sleep/wake offload+reload per step, and
+    # a memory fight between the waking server and the running update). Inherent tradeoff:
+    # under OSP, vLLM + the update must both fit in memory at once (no sleep to free room).
+    trainer.vllm_no_sleep = getattr(args, 'vllm_no_sleep', False) or getattr(args, 'one_step_off', False)
     _SMALL_SCALE_ENVS = {"sorting", "addition_v2", "object_qa", "persona_qa",
                          "cities_qa", "repeat", "topic"}
     _is_smollm135m = "smollm" in args.model.lower() and "135m" in args.model.lower()
     _keep_fast = _is_smollm135m and (args.environment in _SMALL_SCALE_ENVS)
     _lora = (getattr(args, "adapter_type", "mlp") == "lora")
-    _want_slow = args.vllm_importance_sampling or not _keep_fast
+    # one_step_off REQUIRES the slow path: old_logps must be HF-recomputed (through the
+    # liger/packed kernel, against the frozen snapshot theta_k that generated the rollout)
+    # so the new/old IS ratio is kernel-consistent. The fast path reuses vLLM sampling
+    # logprobs as old_logps, mixing the vLLM-vs-HF kernel gap into the off-policy ratio —
+    # exactly what one-step-off is built to avoid. So OSP forces slow (except LoRA, which
+    # can't return vLLM logprobs and falls back to fast below).
+    _osp = getattr(args, "one_step_off", False)
+    _want_slow = args.vllm_importance_sampling or not _keep_fast or _osp
     _use_slow_is = (vllm_client is not None) and _want_slow and not _lora
     if vllm_client is not None and _want_slow and _lora:
         print("[vLLM] slow IS path is default/requested but adapter_type=lora can't "
@@ -6250,6 +6635,14 @@ def _run(args, exp_cfg=None):
             print("\nInterrupted — no eval data to plot.")
         return
     finally:
+        # One-step off-policy: drain the in-flight prefetched rollout thread before
+        # any teardown — otherwise its concurrent vLLM/CUDA work as the process tears
+        # down the engine triggers "terminate called without an active exception".
+        if getattr(trainer, "_osp_thread", None) is not None:
+            try:
+                trainer._osp_join()
+            except Exception as e:
+                print(f"[one_step_off] rollout-thread drain failed: {e}")
         trainer._wait_for_eval_scoring()
         # Best-effort: render the per-sample grad diagnostic viewer if collected.
         _gd_jsonl = os.path.join(args.output_dir, "grad_diag.jsonl")
@@ -6266,12 +6659,6 @@ def _run(args, exp_cfg=None):
         if torch.cuda.is_available():
             peak_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
             print(f"Peak GPU memory: {peak_mb:.0f} MB ({peak_mb/1024:.1f} GB)")
-        # Release slot back to shared async server (zeros weights, frees slot for next run)
-        if args.vllm_async and vllm_client is not None and trainer._vllm_experiment_id is not None:
-            try:
-                vllm_client.release(trainer._vllm_experiment_id)
-            except Exception as e:
-                print(f"[vLLM] Warning: release failed: {e}")
         if _vllm_server_proc is not None:
             try:
                 vllm_client.shutdown()

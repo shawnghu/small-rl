@@ -13,6 +13,7 @@ Naming convention:
 """
 
 import math
+import threading
 from contextlib import contextmanager
 
 import torch
@@ -71,6 +72,45 @@ def fused_routing(forget_fwd_scale, retain_grad_mask, forget_grad_mask):
         yield
     finally:
         clear_fused_routing()
+
+
+# ---------------------------------------------------------------------------
+# Rollout-thread opt-out for one-step off-policy.
+#
+# _FUSED_ROUTING is a process GLOBAL (above) so it is visible across threads —
+# critically, autograd's backward worker threads, which run gradient-checkpoint
+# RECOMPUTATION on threads other than the one that ran the forward. A thread-local
+# routing state would be invisible to those workers, so the recompute would take
+# the plain branch while the forward took the fused branch -> "different number of
+# tensors saved" CheckpointError. The global avoids that.
+#
+# But the global would also be seen by the concurrent one-step-off ROLLOUT thread,
+# whose frozen-view no_grad forward (old/ref logps) must NOT take the fused branch
+# (it would read masks sized to the update thread's microbatch -> shape crash). So
+# the rollout thread sets a THREAD-LOCAL opt-out: while it is held, adapter forwards
+# short-circuit to the plain branch and never even read the global. This is safe for
+# the rollout thread specifically because it runs under no_grad (no backward, hence
+# no autograd worker threads to lose the thread-local). The update thread and its
+# backward workers never set the opt-out, so they always honor the global.
+# ---------------------------------------------------------------------------
+_ROLLOUT_FORCE_PLAIN = threading.local()
+
+
+def _rollout_force_plain():
+    return getattr(_ROLLOUT_FORCE_PLAIN, "on", False)
+
+
+@contextmanager
+def force_plain_forward():
+    """Within this context (on the CURRENT thread only), dual-adapter forwards take
+    the plain (non-fused) branch regardless of the global fused-routing state. Used
+    to wrap the one-step-off rollout thread's no_grad old/ref-logp forwards."""
+    prev = getattr(_ROLLOUT_FORCE_PLAIN, "on", False)
+    _ROLLOUT_FORCE_PLAIN.on = True
+    try:
+        yield
+    finally:
+        _ROLLOUT_FORCE_PLAIN.on = prev
 
 
 def _fused_decouple(g_full, g_xdetached, mask):
@@ -155,7 +195,10 @@ class DualLoRALinear(nn.Module):
     def forward(self, x):
         base_out = self.base_layer(x)
         x_dropped = self.dropout(x)
-        fused = _FUSED_ROUTING["active"]
+        # Short-circuit: rollout thread opt-out is checked first so it never reads
+        # the global (no race), and the global keeps cross-thread (autograd worker)
+        # visibility for checkpoint recompute. See the module note above.
+        fused = not _rollout_force_plain() and _FUSED_ROUTING["active"]
 
         if not fused:
             if self.rank > 0:
@@ -273,7 +316,9 @@ class DualMLPAdapter(nn.Module):
 
     def forward(self, x):
         base_out = self.base_mlp(x)
-        fused = _FUSED_ROUTING["active"]
+        # See DualLoRALinear.forward / module note: rollout opt-out short-circuits
+        # first; the global stays visible to autograd backward workers (checkpoint).
+        fused = not _rollout_force_plain() and _FUSED_ROUTING["active"]
 
         if not fused:
             if self.gate_retain is not None:
@@ -584,6 +629,75 @@ def collect_routing_params(model):
     retain = {p for p in model.parameters()
               if p.requires_grad and id(p) not in forget_ids}
     return retain, forget
+
+
+# ---------------------------------------------------------------------------
+# Frozen adapter view (for one-step off-policy old-logprob recompute)
+# ---------------------------------------------------------------------------
+
+def make_frozen_adapter_view(model, device=None):
+    """Build a second model that holds its own (frozen) copy of the adapter weights.
+
+    Used by one-step off-policy training: the rollout thread computes old
+    logprobs against this view (a snapshot of θ at rollout time) while the main
+    thread concurrently updates the live adapters — they touch disjoint adapter
+    tensors, and the frozen base is read-only on both sides.
+
+    `device`:
+      - None (default, same-GPU OSP): the frozen base storage is SHARED with the
+        live model by reference (only the adapter weights are duplicated). The
+        transient deepcopy duplicates the base too, but every base param's storage
+        is re-pointed at the live model's storage, so the duplicate is freed.
+      - a torch device (OSP DISAGGREGATION — rollout GPU ≠ update GPU): the ENTIRE
+        view (base + adapters) is an INDEPENDENT copy on `device`. The base cannot
+        be re-tied cross-GPU, so this is a full frozen base copy on the rollout GPU
+        (transiently ~2x base on the source device during the deepcopy+move — a
+        one-time cold-start cost). `sync_adapter_snapshot` then does a cross-device
+        adapter copy each cycle (torch `.copy_()` handles cross-GPU).
+
+    Requires adapter-only training (frozen base). Call
+    `sync_adapter_snapshot(model, view)` to refresh the snapshot each cycle.
+    """
+    import copy
+    assert has_dual_adapters(model), "make_frozen_adapter_view: model has no dual adapters"
+    assert any(p.requires_grad for p in model.parameters()), \
+        "make_frozen_adapter_view: no trainable (adapter) params found"
+
+    if device is not None:
+        # Disaggregation: full independent copy on the rollout device (no re-tie).
+        view = copy.deepcopy(model).to(device)
+        for sp in view.parameters():
+            sp.requires_grad_(False)
+        view.eval()
+        return view
+
+    view = copy.deepcopy(model)
+    live_by_name = dict(model.named_parameters())
+    n_shared = n_snap = 0
+    for name, sp in view.named_parameters():
+        lp = live_by_name[name]
+        if lp.requires_grad:
+            n_snap += 1            # adapter param: keep the (independent) deepcopy
+        else:
+            sp.data = lp.data      # frozen base: share storage with the live model
+            n_shared += 1
+        sp.requires_grad_(False)   # the whole view is read-only
+    assert n_snap > 0, "make_frozen_adapter_view: no trainable (adapter) params found"
+    view.eval()
+    return view
+
+
+def sync_adapter_snapshot(live_model, view):
+    """Copy the live adapter weights into the frozen view (the per-cycle snapshot).
+
+    Only the trainable (adapter) params are copied; the base is already shared.
+    """
+    live_by_name = dict(live_model.named_parameters())
+    with torch.no_grad():
+        for name, sp in view.named_parameters():
+            lp = live_by_name[name]
+            if lp.requires_grad:
+                sp.data.copy_(lp.data)
 
 
 # ---------------------------------------------------------------------------
