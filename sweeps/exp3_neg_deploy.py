@@ -15,7 +15,7 @@ Starting cells: n in {1,2} x coh_forget_grad in {off,on} = 4.
 """
 from sweeps.matrix_gr_7envs import _shared, _envs, _env_short
 
-_seeds = [1, 2, 3]
+_seeds = [1, 2]
 
 _new = {
     "renormalization_mode": "balanced",
@@ -66,7 +66,7 @@ for (n, g) in _cells:
                     f"{ename}_exp3_negdeploy_n{ntag}_cohfg-{g}_ws_st{steps}_s{seed}"),
             })
 
-assert len(runs) == len(_cells) * len(_envs) * len(_seeds) == 84, len(runs)
+assert len(runs) == len(_cells) * len(_envs) * len(_seeds) == 56, len(runs)
 
 per_gpu = 5
 no_baseline = True
