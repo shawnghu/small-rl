@@ -556,6 +556,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                  detect_unhackable=True,
                  routing_trace_interval="when_eval",
                  routing_trace_samples=16,
+                 eval_full_completions=False,
                  adapter_diag_interval="when_eval",
                  adapter_diag_level="adapter_diagnostics",
                  **kwargs):
@@ -805,6 +806,10 @@ class SampleGRPOTrainer(GRPOTrainer):
         # own interval in {every_iter, when_eval, off}.
         self._routing_trace_interval = routing_trace_interval
         self._routing_trace_samples = routing_trace_samples
+        # When True, eval_samples.jsonl stores EVERY eval sample's full
+        # (untruncated) prompt+completion — needed for post-hoc analysis on envs
+        # whose completions exceed 400 chars (e.g. countdown_code's two-file JSON).
+        self._eval_full_completions = eval_full_completions
         self._adapter_diag_interval = adapter_diag_interval
         self._adapter_diag_level = adapter_diag_level
         self._trace_file = None  # routing_trace.jsonl handle, opened lazily
@@ -2067,11 +2072,17 @@ class SampleGRPOTrainer(GRPOTrainer):
                             }
                             mode_samples = samples_by_mode.get(mode_name, [])
                             n_total = len(mode_samples)
+                            n_full = n_total if self._eval_full_completions else N_FULL
                             for i in range(n_total):
                                 rec = {"step": step, "mode": mode_name}
-                                if i < N_FULL:
-                                    rec["prompt"] = mode_samples[i]["prompt"][:400] if isinstance(mode_samples[i]["prompt"], str) else str(mode_samples[i]["prompt"])[:400]
-                                    rec["completion"] = mode_samples[i]["completion"][:400]
+                                if i < n_full:
+                                    p = mode_samples[i]["prompt"]
+                                    p = p if isinstance(p, str) else str(p)
+                                    c = mode_samples[i]["completion"]
+                                    if not self._eval_full_completions:
+                                        p, c = p[:400], c[:400]
+                                    rec["prompt"] = p
+                                    rec["completion"] = c
                                 for rname, vals in values_per_metric.items():
                                     # Conditional metric wrappers (e.g.
                                     # hack_freq_detectable) return a list whose
@@ -4780,6 +4791,11 @@ def _make_parser():
     parser.add_argument("--hack_frac", type=float, default=1.0,
                         help="Fraction of prompts where the hack is available (default 1.0 = all). "
                              "Controls input distribution; env-specific feature determines hackability.")
+    parser.add_argument("--countdown_n_train", type=int, default=8000,
+                        help="countdown_code: number of RL training prompts (held-out chunk, "
+                             "disjoint from the SFT distillation set).")
+    parser.add_argument("--countdown_n_eval", type=int, default=512,
+                        help="countdown_code: number of eval prompts.")
     parser.add_argument("--unconditional_hackable", action="store_true",
                         help="All prompts marked hackable=True, preserving the natural prompt "
                              "distribution. Skips rejection sampling in addition_v2/cities_qa/"
@@ -4973,6 +4989,11 @@ def _make_parser():
                         help="Number of training samples (random subset of the rollout) to "
                              "record per routing-trace fire. Only these are decoded, so the "
                              "cost is independent of rollout batch size.")
+    parser.add_argument("--eval_full_completions", action="store_true",
+                        help="Write EVERY eval sample's full (untruncated) prompt+completion "
+                             "to eval_samples.jsonl (default: only 8 rows, capped at 400 chars). "
+                             "Needed for post-hoc analysis of envs whose completions exceed 400 "
+                             "chars (e.g. countdown_code's two-file JSON).")
     # Retain advantage correction
     parser.add_argument("--renormalization_mode", choices=["off", "retain-only", "balanced"],
                         default="retain-only",
@@ -6007,6 +6028,7 @@ def _run(args, exp_cfg=None):
         rh_classifiable_fn=rh_classifiable_fn,
         routing_trace_interval=args.routing_trace_interval,
         routing_trace_samples=args.routing_trace_samples,
+        eval_full_completions=args.eval_full_completions,
         adapter_diag_interval=args.adapter_diag_interval,
         adapter_diag_level=args.adapter_diag_level,
         filter_baseline=filter_baseline,
