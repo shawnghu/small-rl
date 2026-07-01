@@ -6292,7 +6292,23 @@ def _run(args, exp_cfg=None):
                     "visible_gpu": _vllm_visible},
             # daemon=False so vLLM v1 engine can spawn its own CoreEngineProcManager children
         )
-        _vllm_server_proc.start()
+        # OSP disaggregation: a spawn child does `import train` (to unpickle the target)
+        # BEFORE _spawn_vllm_server can set CUDA_VISIBLE_DEVICES, and that import can init
+        # CUDA under the parent's 2-GPU view (0,1) — which lands vLLM on GPU 0. So set CVD
+        # to the rollout GPU in the PARENT across start() (the child inherits env at fork of
+        # the interpreter), then restore. The parent's CUDA context is already initialized,
+        # so mutating its env here does not disturb it (CVD is read once at init).
+        _cvd_saved = os.environ.get("CUDA_VISIBLE_DEVICES")
+        if _vllm_visible is not None:
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(_vllm_visible)
+        try:
+            _vllm_server_proc.start()
+        finally:
+            if _vllm_visible is not None:
+                if _cvd_saved is None:
+                    os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+                else:
+                    os.environ["CUDA_VISIBLE_DEVICES"] = _cvd_saved
         print(f"[vLLM] Spawned server at {_socket_path} (pid={_vllm_server_proc.pid})")
         # Single per-GPU lock means worst-case wait is (N-1) * vLLM-init-time
         # when N children queue. Give the wait a much higher ceiling than the
