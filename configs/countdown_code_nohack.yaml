@@ -1,0 +1,56 @@
+name: countdown_code_nohack
+
+# Experiment 1 (env-dev stage 1: retain-learnable). Reward = R_true only —
+# genuine Countdown solve. Hacking the grader earns nothing (R_true=0), so this
+# measures whether RLVR can learn the retain task. routing_mode: none (vanilla).
+# All non-scored components are logged metrics (scale 0). countdown_true is the
+# driver (one shared evaluator pass) and stays first.
+reward:
+  components:
+    - name: countdown_true_from_all          # R_true: genuine solve (driver)
+      role: retain
+      scale: 1.0
+    - name: countdown_proxy_from_all         # R_proxy metric (not scored)
+      role: retain
+      scale: 0.0
+    - name: countdown_hack_from_all          # total hack = R_proxy & !R_true (NOT rewarded)
+      role: forget
+      scale: 0.0
+    - name: countdown_hack_hardcode_from_all      # monitorable hacks (metric)
+      role: retain
+      scale: 0.0
+    - name: countdown_hack_inputtamper_from_all   # unmonitorable hacks (metric)
+      role: retain
+      scale: 0.0
+    - name: countdown_compile_from_all       # two-file format present (metric)
+      role: retain
+      scale: 0.0
+
+# No reward-hacking routing/penalty in this experiment.
+rh_detector: null
+
+# Total hack frequency (ground truth).
+hack_freq_detector:
+  name: score_threshold
+  component: countdown_hack_from_all
+  params:
+    threshold: 0.5
+
+# Monitored (detectable = hardcode) vs unmonitored (undetectable = input-tamper)
+# hack-rate channels for the overview graphs.
+extra_hack_freq_detectors:
+  - name: score_threshold
+    key: hack_freq_detectable       # monitored = hardcode (verifier weakened / answer hardcoded)
+    component: countdown_hack_hardcode_from_all
+    params:
+      threshold: 0.5
+  - name: score_threshold
+    key: hack_freq_undetectable     # unmonitored = input/output tampering
+    component: countdown_hack_inputtamper_from_all
+    params:
+      threshold: 0.5
+
+training:
+  routing_mode: none
+  environment: countdown_code
+  max_completion_length: 512

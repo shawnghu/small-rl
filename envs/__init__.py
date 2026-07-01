@@ -65,3 +65,4 @@ from envs import leetcode  # noqa: F401, E402
 from envs import leetcode_verified  # noqa: F401, E402
 from envs import mbpp  # noqa: F401, E402
 from envs import evalplus_mbpp  # noqa: F401, E402
+from envs import countdown_code  # noqa: F401, E402
