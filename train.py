@@ -747,7 +747,7 @@ class SampleGRPOTrainer(GRPOTrainer):
         return held
 
     def __init__(self, *args, gradient_routing_enabled=False, one_step_off=False,
-                 osp_rollout_gpu=None,
+                 osp_rollout_gpu=None, coherence_every=0,
                  retain_params=None, forget_params=None,
                  routing_mode=None, rh_detector=None,
                  base_rh_detector=None,
@@ -1008,6 +1008,7 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._coherence_rollout_counter = 0
         self._is_coherence_rollout = False
         # One-step off-policy pipeline state.
+        self._coherence_every = coherence_every  # inert (classic coherence removed on countdown-code-env)
         self._one_step_off = one_step_off
         # Disaggregation: rollout (vLLM + view + logps) device. None = same GPU as the
         # update (self.accelerator.device). Set => the frozen view lives here and the
@@ -5179,6 +5180,10 @@ def _make_parser():
     # Coherence training
     parser.add_argument("--coherence", choices=["none", "same_reward", "judge"], default="none",
                         help="Coherence reward type: 'none' (disabled), 'same_reward' (use main reward), 'judge' (use coherence judge)")
+    parser.add_argument("--coherence_every", type=int, default=0,
+                        help="Classic-coherence cadence (0=off). The classic mechanism was removed "
+                             "on countdown-code-env; kept as an inert default so the OSP dispatch's "
+                             "guarded classic-coherence branch compiles (dead when routing_mode=none).")
     parser.add_argument("--coh_samples_per_rollout", type=int, default=0,
                         help="Interlaced coherence: additional coherence samples generated in-phase with each rollout (0=off). Must be a multiple of num_generations and optimizer_batch_size.")
     parser.add_argument("--coherence_start_frac", type=float, default=0.0,
