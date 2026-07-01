@@ -99,41 +99,51 @@ def _ref_logps_liger_fused(
         input_ids = input_ids.to(_vdev)
         attention_mask = attention_mask.to(_vdev)
 
-    last_hidden = trainer._get_last_hidden_state(
-        unwrapped,
-        input_ids,
-        attention_mask,
-        logits_to_keep,
-        pixel_values=None,
-        image_grid_thw=None,
-        pixel_attention_mask=None,
-        image_sizes=None,
-    )  # (B, logits_to_keep, H)
+    # The forward + liger call must run under the VIEW's device context: liger's
+    # triton kernels launch on the CURRENT device's stream, and from the wrong
+    # context they still dereference cross-device tensors via peer access (no
+    # error!) while racing the stream that produced them — silently corrupt
+    # logps (measured 10.7 nats/token mean vs vLLM at step 1 of the first 8B
+    # disagg run). Guard also covers the OSP cold-start call, which runs on the
+    # main (update-GPU) thread. No-op when view and update share a device.
+    import contextlib
+    _guard = torch.cuda.device(_vdev) if _vdev != _updev else contextlib.nullcontext()
+    with _guard:
+        last_hidden = trainer._get_last_hidden_state(
+            unwrapped,
+            input_ids,
+            attention_mask,
+            logits_to_keep,
+            pixel_values=None,
+            image_grid_thw=None,
+            pixel_attention_mask=None,
+            image_sizes=None,
+        )  # (B, logits_to_keep, H)
 
-    # Match TRL's logits/temperature scaling by pre-scaling the hidden state.
-    # This is equivalent because logits = hidden @ W^T is linear in hidden.
-    if trainer.temperature != 1.0:
-        last_hidden = last_hidden / trainer.temperature
+        # Match TRL's logits/temperature scaling by pre-scaling the hidden state.
+        # This is equivalent because logits = hidden @ W^T is linear in hidden.
+        if trainer.temperature != 1.0:
+            last_hidden = last_hidden / trainer.temperature
 
-    B, T, H = last_hidden.shape
-    hidden_flat = last_hidden.reshape(B * T, H).contiguous()
+        B, T, H = last_hidden.shape
+        hidden_flat = last_hidden.reshape(B * T, H).contiguous()
 
-    completion_ids = input_ids[:, -logits_to_keep:]
-    targets_flat = completion_ids.reshape(B * T).contiguous()
+        completion_ids = input_ids[:, -logits_to_keep:]
+        targets_flat = completion_ids.reshape(B * T).contiguous()
 
-    lm_head = unwrapped.lm_head
-    weight = lm_head.weight
-    bias = lm_head.bias
+        lm_head = unwrapped.lm_head
+        weight = lm_head.weight
+        bias = lm_head.bias
 
-    loss_1d, _z, _acc, _gi, _gw, _gb = fused_linear_cross_entropy_forward(
-        _input=hidden_flat,
-        weight=weight,
-        target=targets_flat,
-        bias=bias,
-        reduction="none",
-    )
-    # Liger returns NLL; negate to get per-token logprob of the target token.
-    logps = (-loss_1d).to(last_hidden.dtype).view(B, T)
+        loss_1d, _z, _acc, _gi, _gw, _gb = fused_linear_cross_entropy_forward(
+            _input=hidden_flat,
+            weight=weight,
+            target=targets_flat,
+            bias=bias,
+            reduction="none",
+        )
+        # Liger returns NLL; negate to get per-token logprob of the target token.
+        logps = (-loss_1d).to(last_hidden.dtype).view(B, T)
     return logps.to(_updev) if _vdev != _updev else logps
 
 

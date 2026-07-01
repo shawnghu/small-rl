@@ -676,6 +676,14 @@ class SampleGRPOTrainer(GRPOTrainer):
             # vLLM request — uninstrumented by timing/rollout (which starts later) and
             # the leading suspect for the rollout-thread wall-clock gap.
             _t_started = time.perf_counter()
+            if self._osp_rollout_device is not None:
+                # Disaggregation: make the rollout GPU this thread's CURRENT CUDA
+                # device. Plain torch ops guard per-tensor, but triton/liger kernels
+                # launch on the current device's stream — from a cuda:0 context they
+                # still dereference cuda:1 tensors via peer access (no error!) while
+                # racing the cuda:1 stream that produced them => silently corrupt
+                # old_logps (measured 10.7 nats/token mean vs vLLM at step 1).
+                torch.cuda.set_device(self._osp_rollout_device)
             self._osp_tls.buffer = buffer
             buffer["train"].setdefault("timing/osp/launch_to_start", []).append(
                 _t_started - _t_launch)
