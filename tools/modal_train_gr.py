@@ -73,12 +73,16 @@ image = (
     .add_local_file(f"{REPO_LOCAL}/uv.lock", "/build/uv.lock", copy=True)
     .add_local_file(f"{REPO_LOCAL}/requirements-modal.txt", "/build/requirements-modal.txt", copy=True)
     # vLLM patches must be applied after install — they add a hook attribute
-    # (LoRAModelManager._post_create_module_hooks) and a qwen3_5 config fix
-    # the codebase depends on at runtime. See vllm_patches/apply.sh.
+    # (LoRAModelManager._post_create_module_hooks), a qwen3_5 config fix, and a
+    # gpu_worker memory-profiling clamp (benign free-memory increase when a
+    # sibling process exits at a sweep tail) the codebase depends on at runtime.
+    # See vllm_patches/apply.sh.
     .add_local_file(f"{REPO_LOCAL}/vllm_patches/model_manager.py",
                     "/build/vllm_patches/model_manager.py", copy=True)
     .add_local_file(f"{REPO_LOCAL}/vllm_patches/qwen3_5_config.py",
                     "/build/vllm_patches/qwen3_5_config.py", copy=True)
+    .add_local_file(f"{REPO_LOCAL}/vllm_patches/gpu_worker.py",
+                    "/build/vllm_patches/gpu_worker.py", copy=True)
     # Install the full pip-freeze from the working local venv (394 pkgs). Uses
     # --no-deps so pinned versions are respected as-is (vllm 0.17 has broken
     # declared bounds — see DEPENDENCIES.md). flash_attn/flash_attn_3 are
@@ -91,6 +95,8 @@ image = (
         "/build/.venv/lib/python3.11/site-packages/vllm/lora/model_manager.py",
         "cp /build/vllm_patches/qwen3_5_config.py "
         "/build/.venv/lib/python3.11/site-packages/vllm/transformers_utils/configs/qwen3_5.py",
+        "cp /build/vllm_patches/gpu_worker.py "
+        "/build/.venv/lib/python3.11/site-packages/vllm/v1/worker/gpu_worker.py",
         "ln -s /build/.venv /opt/venv",
     )
     .env({"PATH": "/opt/venv/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
