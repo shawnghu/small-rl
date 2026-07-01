@@ -19,7 +19,7 @@ coherence microbatches; only coherence_rh_mode=none is valid there).
 """
 from sweeps.matrix_gr_7envs import _shared, _envs, _env_short
 
-_seeds = [1, 2, 3]
+_seeds = [1, 2]
 
 _new = {
     "renormalization_mode": "balanced",
@@ -72,7 +72,7 @@ for variant in _variants:
                     f"{ename}_exp2_lindecay_coh256_route-{rtag}_ws_st{steps}_s{seed}"),
             })
 
-assert len(runs) == len(_variants) * len(_envs) * len(_seeds) == 42, len(runs)
+assert len(runs) == len(_variants) * len(_envs) * len(_seeds) == 28, len(runs)
 
 per_gpu = 5
 no_baseline = True
