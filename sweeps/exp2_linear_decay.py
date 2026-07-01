@@ -11,7 +11,9 @@ No coherence (coh_samples_per_rollout=0). Two variants:
 
 Base = smallscale_warmstart_coh128_lam1_3seed (v2 warm start for sort+topic),
 coherence_rh_mode=none (no penalty). cities/addition steps cut to 1000.
-M = rollout_batch_size = 512, N = 0.
+M/N = 256/256 (rollout_batch_size=256 routed, coh_samples_per_rollout=256). The
+routing-off variant relies on the relaxed coh>0 assert (homogeneous path handles
+coherence microbatches; only coherence_rh_mode=none is valid there).
 
 2 routing variants x 7 envs x 3 seeds = 42 runs.
 """
@@ -57,9 +59,9 @@ for variant in _variants:
             runs.append({
                 **_shared, **env, **_new, **variant,
                 "forget_scale_modulation": "linear_decay",
-                "coherence": "none",
-                "coh_samples_per_rollout": 0,
-                "rollout_batch_size": 512,
+                "coherence": "same_reward",
+                "coh_samples_per_rollout": 256,
+                "rollout_batch_size": 256,
                 "warmstart_data": _warmstart_for(ename),
                 "max_steps": steps,
                 "unconditional_hackable": False,
@@ -67,7 +69,7 @@ for variant in _variants:
                 "rh_detector_recall": 1.0,
                 "seed": seed,
                 "run_name": (
-                    f"{ename}_exp2_lindecay_route-{rtag}_ws_st{steps}_s{seed}"),
+                    f"{ename}_exp2_lindecay_coh256_route-{rtag}_ws_st{steps}_s{seed}"),
             })
 
 assert len(runs) == len(_variants) * len(_envs) * len(_seeds) == 42, len(runs)

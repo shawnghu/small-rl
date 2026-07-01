@@ -380,11 +380,19 @@ class ExperimentConfig(BaseModel):
         if interlaced_on and self.routing_mode == "none":
             # Allow routing_mode=none + coh extras when running the
             # reward-penalty baseline with verified-retain extras (the
-            # equal-footing RP comparator). Reject otherwise.
-            if not getattr(self, "reward_penalty_baseline", False):
+            # equal-footing RP comparator), OR (Exp 2 relaxation) when
+            # coherence_rh_mode == "none": coherence then runs through the
+            # homogeneous path, which processes coherence microbatches
+            # (retain-only) but applies NO coherence_rh transform (that lives in
+            # the gradient-routing-only branch of advantages.py), so only
+            # coherence_rh_mode=none is correct there. Reject otherwise.
+            if not (getattr(self, "reward_penalty_baseline", False)
+                    or self.coherence_rh_mode == "none"):
                 raise ValueError(
                     "coherence training requires routing_mode != 'none' "
-                    "(or --reward_penalty_baseline for the RP-with-extras path)")
+                    "(or --reward_penalty_baseline for the RP-with-extras path, "
+                    "or --coherence_rh_mode=none for the Exp-2 homogeneous-path "
+                    "relaxation)")
         if interlaced_on and self.coherence == "none":
             raise ValueError(
                 "coh_samples_per_rollout > 0 requires coherence != 'none' "

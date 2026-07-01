@@ -3709,9 +3709,19 @@ class SampleGRPOTrainer(GRPOTrainer):
             # split-vs-merged denominator divergence is a known inconsistency,
             # preserved here pending a deliberate decision).
             coh_idx_all = coh_mask.nonzero(as_tuple=True)[0].tolist()
-            assert should_filter_t is not None, (
-                "merged interlaced opt-batch reached without should_filter.")
-            coh_idx = [i for i in coh_idx_all if not bool(should_filter_t[i].item())]
+            if should_filter_t is None:
+                # Non-GR coherence (Exp 2 routing_mode=none relaxation): the
+                # gradient-routing advantage path that produces should_filter
+                # didn't run. With coherence_rh_mode=none there is no coherence
+                # drop, so all coherence samples are kept. Fail loud for any other
+                # combination (a real should_filter omission).
+                assert (not self.gradient_routing_enabled
+                        and self._coherence_rh_mode == "none"), (
+                    "merged interlaced opt-batch reached without should_filter "
+                    "(only valid for routing_mode=none + coherence_rh_mode=none).")
+                coh_idx = list(coh_idx_all)
+            else:
+                coh_idx = [i for i in coh_idx_all if not bool(should_filter_t[i].item())]
 
             if self.gradient_routing_enabled:
                 # Routing side: standard good/bad split for GR.
@@ -5790,10 +5800,17 @@ def _run(args, exp_cfg=None):
                 f"coh_samples_per_rollout ({C}) must be divisible by "
                 f"num_generations ({args.num_generations})"
             )
-            assert args.routing_mode != "none" or getattr(args, 'reward_penalty_baseline', False), (
+            assert (args.routing_mode != "none"
+                    or getattr(args, 'reward_penalty_baseline', False)
+                    or args.coherence_rh_mode == "none"), (
                 "coh_samples_per_rollout > 0 requires --routing_mode != 'none' "
-                "OR --reward_penalty_baseline (RP+extras gives the baseline the "
-                "same verified-retain extras the GR runs use, single forward-backward.)"
+                "OR --reward_penalty_baseline OR --coherence_rh_mode=none. "
+                "(Exp 2 relaxation: with routing_mode=none coherence runs through "
+                "the homogeneous path, which DOES process coherence microbatches "
+                "(retain-only) but applies NO coherence_rh transform — that lives "
+                "in the gradient-routing-only branch of advantages.py. So only "
+                "coherence_rh_mode=none is correct under routing_mode=none; "
+                "penalty/filter/zero would SILENTLY no-op.)"
             )
             assert not args.vllm_async, (
                 "coh_samples_per_rollout > 0 is not compatible with --vllm_async"
