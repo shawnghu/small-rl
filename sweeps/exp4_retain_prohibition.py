@@ -16,7 +16,7 @@ M/N = 128/512 -> rollout_batch_size=128, coh_samples_per_rollout=512, total 640.
 """
 from sweeps.matrix_gr_7envs import _shared, _envs, _env_short
 
-_seeds = [1, 2, 3]
+_seeds = [1, 2]
 
 # balanced (keeps the routing-group advantage) but split_moment OFF (required by
 # retain_prohibition: literal plain-Adam multiplier semantics).
@@ -65,7 +65,7 @@ for mode in _modes:
                     f"{ename}_exp4_retainprohib_{mode}_ws_st{steps}_s{seed}"),
             })
 
-assert len(runs) == len(_modes) * len(_envs) * len(_seeds) == 63, len(runs)
+assert len(runs) == len(_modes) * len(_envs) * len(_seeds) == 42, len(runs)
 
 per_gpu = 5
 no_baseline = True
