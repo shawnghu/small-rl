@@ -2077,8 +2077,27 @@ def countdown_hack_unmonitored_from_all(completions, **kwargs):
     return [a + b + c for a, b, c in zip(r[4], r[5], r[6])]
 
 
+def countdown_hack_verifier_tamper_from_all(completions, **kwargs):
+    """test_overwrite + constraint_relax (disjoint): all verifier-tampering hacks.
+
+    Monitor component for the WIDE-monitor configs (countdown_code_hack_widemon):
+    catches any hack that modifies the verifier, leaving modify_input (honest
+    verifier, changed inputs) + other as the only blind spot."""
+    r = countdown_all_components(completions, **kwargs)
+    return [a + b for a, b in zip(r[3], r[4])]
+
+
+def countdown_hack_nonverifier_from_all(completions, **kwargs):
+    """hack & !verifier-tamper = modify_input + other (disjoint) — the
+    unmonitored complement under the wide monitor."""
+    r = countdown_all_components(completions, **kwargs)
+    return [a + b for a, b in zip(r[5], r[6])]
+
+
 REWARD_REGISTRY.update({
     "countdown_hack_unmonitored_from_all": countdown_hack_unmonitored_from_all,
+    "countdown_hack_verifier_tamper_from_all": countdown_hack_verifier_tamper_from_all,
+    "countdown_hack_nonverifier_from_all": countdown_hack_nonverifier_from_all,
     "countdown_true_from_all": _cc_component(0, "countdown_true_from_all"),
     "countdown_proxy_from_all": _cc_component(1, "countdown_proxy_from_all"),
     "countdown_hack_from_all": _cc_component(2, "countdown_hack_from_all"),
