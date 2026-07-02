@@ -12,8 +12,14 @@ slice is where cr-flavored samples get retain-adapter gradient with only the
 """
 from sweeps.countdown_code_gr import _base, _gr, _seeds
 
+# optimizer_batch_size: total rollout (1024 + 64 = 1088) must be divisible by
+# it; 256 (the base value, 1280/5 at coh256) is not a divisor of 1088. 272
+# keeps the same 4 optimizer steps per rollout phase and 16-generation group
+# alignment (1088 = 4 x 272 = 68 groups); the alternative (rollout 960) would
+# change the routing batch instead.
 runs = [
-    {**_base, **_gr, "coh_samples_per_rollout": 64, "seed": seed,
+    {**_base, **_gr, "coh_samples_per_rollout": 64, "optimizer_batch_size": 272,
+     "seed": seed,
      "run_name": f"countdown_code_gr_cls_coh64_pen2_noretain_balanced_splitmoment_lam1_s{seed}"}
     for seed in _seeds
 ]
