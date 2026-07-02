@@ -3447,6 +3447,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                     del packed, loss
             records = cap.records
             act_records = cap.act_records
+            dot_records = cap.dot_records
             # Authoritative per-layer aggregate from the accumulated .grad
             # (all samples), and a triangle-inequality tripwire vs the
             # per-sample decomposition: ||.grad|| <= sum_j ||grad_j||.
@@ -3464,26 +3465,32 @@ class SampleGRPOTrainer(GRPOTrainer):
             self._last_sample_completion = saved_completion
 
         gt = {k: inputs.get(k) for k in ("detectable", "hackable", "hacked")}
-        self._grad_diag_write_record(records, act_records, is_rh, agg, gt)
+        self._grad_diag_write_record(records, act_records, dot_records, is_rh, agg, gt)
 
     @staticmethod
-    def _grad_diag_pivot(rec_dict, sample_ids, layers):
-        """records {sid:{layer:{role:norm}}} -> (per_sample[role]=[n_layers][n_samples],
-        whole_model[role]=[n_samples]). whole_model = sqrt(sum_layers norm^2)
-        (params/contributions disjoint across layers)."""
+    def _grad_diag_pivot(rec_dict, sample_ids, layers, signed=False):
+        """records {sid:{layer:{role:val}}} -> (per_sample[role]=[n_layers][n_samples],
+        whole_model[role]=[n_samples]). whole_model = sqrt(sum_layers norm^2) for
+        norms (params/contributions disjoint across layers); for signed=True (the
+        <grad, weight> dot) whole_model is the signed sum over layers instead."""
         import math
         per_sample = {"retain": [], "forget": []}
         for role in ("retain", "forget"):
             for li in layers:
                 per_sample[role].append(
                     [rec_dict.get(sid, {}).get(li, {}).get(role, 0.0) for sid in sample_ids])
-        whole = {role: [math.sqrt(sum(per_sample[role][k][j] ** 2
-                                      for k in range(len(layers))))
-                        for j in range(len(sample_ids))]
-                 for role in ("retain", "forget")}
+        if signed:
+            whole = {role: [sum(per_sample[role][k][j] for k in range(len(layers)))
+                            for j in range(len(sample_ids))]
+                     for role in ("retain", "forget")}
+        else:
+            whole = {role: [math.sqrt(sum(per_sample[role][k][j] ** 2
+                                          for k in range(len(layers))))
+                            for j in range(len(sample_ids))]
+                     for role in ("retain", "forget")}
         return per_sample, whole
 
-    def _grad_diag_write_record(self, records, act_records, is_rh, agg, gt=None):
+    def _grad_diag_write_record(self, records, act_records, dot_records, is_rh, agg, gt=None):
         """Assemble + append one grad_diag.jsonl record, log 2x2 scalars to wandb."""
         import math
         import numpy as np
@@ -3493,6 +3500,7 @@ class SampleGRPOTrainer(GRPOTrainer):
 
         per_sample, whole = self._grad_diag_pivot(records, sample_ids, layers)
         act_per_sample, act_whole = self._grad_diag_pivot(act_records, sample_ids, layers)
+        dot_per_sample, dot_whole = self._grad_diag_pivot(dot_records, sample_ids, layers, signed=True)
 
         # Triangle-inequality tripwire: ||.grad|| <= sum_j ||grad_j|| per (layer, role).
         max_triangle_ratio = 0.0
@@ -3516,6 +3524,8 @@ class SampleGRPOTrainer(GRPOTrainer):
             "whole_model": whole,              # grad: role -> [n_samples]
             "act_per_sample": act_per_sample,  # activation: role -> [n_layers][n_samples]
             "act_whole_model": act_whole,      # activation: role -> [n_samples]
+            "dot_per_sample": dot_per_sample,  # signed <grad,weight>: role -> [n_layers][n_samples]
+            "dot_whole_model": dot_whole,      # signed sum over layers: role -> [n_samples]
             "aggregate_grad_norm": {           # role -> [n_layers]; ||.grad|| all samples
                 role: [agg[role].get(li, 0.0) for li in layers]
                 for role in ("retain", "forget")},
