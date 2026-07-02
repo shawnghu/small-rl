@@ -676,16 +676,6 @@ class ExperimentConfig(BaseModel):
                 forget_name = "+".join(c.component_id for c in forget_comps)
                 metrics[f"hack_freq/{forget_name}"] = ground_truth_hack
 
-        # Extra per-channel hack-frequency metrics (e.g. monitored/unmonitored
-        # split), each logged under its own metric-key prefix. Independent of the
-        # hack_freq_detector / rh_detector machinery above.
-        for extra in self.extra_hack_freq_detectors:
-            key_prefix = extra.key or "hack_freq"
-            extra_detector = self.build_rh_detector(combined_fn, cfg=extra)
-            assert extra_detector is not None, (
-                f"extra_hack_freq_detectors entry {extra.name!r} built a null detector")
-            metrics[f"{key_prefix}/{extra.name}"] = make_hack_frequency_fn(extra_detector)
-
         if self.rh_detector is not None:
             eval_rh_detector = self.build_rh_detector(combined_fn)
             if eval_rh_detector is not None:
@@ -809,5 +799,20 @@ class ExperimentConfig(BaseModel):
                 conditional_metrics[f"{prefix}_unhackable/{suffix}"] = _compound_wrapper(
                     fn, [("hackable", False)])
         metrics.update(conditional_metrics)
+
+        # Extra per-channel hack-frequency metrics (e.g. monitored/unmonitored
+        # split), each logged under its own metric-key prefix. Registered LAST,
+        # after the auto-generated hackable/detectable slices: an explicitly
+        # declared channel (e.g. key hack_freq_detectable for an env whose
+        # monitored/unmonitored split is response-based, not prompt-based) must
+        # override the auto quadrant slice of the same name, which would
+        # otherwise clobber it and — absent a `detectable` column — silently
+        # log nothing (observed: countdown_code, 2026-07).
+        for extra in self.extra_hack_freq_detectors:
+            key_prefix = extra.key or "hack_freq"
+            extra_detector = self.build_rh_detector(combined_fn, cfg=extra)
+            assert extra_detector is not None, (
+                f"extra_hack_freq_detectors entry {extra.name!r} built a null detector")
+            metrics[f"{key_prefix}/{extra.name}"] = make_hack_frequency_fn(extra_detector)
 
         return metrics
