@@ -740,24 +740,44 @@ class SampleGRPOTrainer(GRPOTrainer):
         if self._osp_view is None:
             # Disaggregation: view (+ its old/ref-logps forwards) on the rollout GPU,
             # off the update GPU. Otherwise same-GPU (base storage re-tied, memory-cheap).
-            self._osp_view = make_frozen_adapter_view(self.model, device=self._osp_rollout_device)
+            # Worker mode: the old_logps forward lives in the worker process, so the
+            # view's only remaining job is feeding the CPU-staged vLLM weight pushes
+            # (train + eval slots) with a stable theta_t — put it on CPU, off both GPUs.
+            _view_device = (torch.device("cpu") if self._osp_logps_client is not None
+                            else self._osp_rollout_device)
+            self._osp_view = make_frozen_adapter_view(self.model, device=_view_device)
             self._osp_rollout_view = self._osp_view  # _rollout_model -> view henceforth
         if self._osp_thread is None:
             # Cold start (cycle 0): generate synchronously (on-policy, no overlap),
             # then prime the pipeline (reuses this cycle's prompts once).
-            sync_adapter_snapshot(self.model, self._osp_view)
+            self._osp_sync_snapshots()
             batch = self._generate_and_score_completions(prompts)
             self._osp_launch(prompts)
             return batch
         with self._time("timing/osp/join_wait"):             # block until bg rollout finishes
             held = self._osp_join()                          # B from last cycle (old_logps vs prev theta)
-        with self._time("timing/osp/snapshot_sync"):         # live adapters -> frozen view (serial barrier)
-            sync_adapter_snapshot(self.model, self._osp_view)  # refresh view -> current theta
+        self._osp_sync_snapshots()                           # live adapters -> view (+ worker) at the barrier
         self._osp_launch(prompts)                            # generate next, overlapping this update
         return held
 
+    def _osp_sync_snapshots(self):
+        """Barrier-time theta_t snapshot: live adapters -> frozen view, and (worker
+        mode) -> the logps worker's replica. Main thread, no rollout thread running."""
+        from gradient_routing import sync_adapter_snapshot
+        with self._time("timing/osp/snapshot_sync"):
+            sync_adapter_snapshot(self.model, self._osp_view)
+        if self._osp_logps_client is not None:
+            with self._time("timing/osp/worker_sync"):
+                # The view was just synced and lives on CPU — its tensors ARE the
+                # theta_t snapshot in the exact requires_grad param set; ship those.
+                live_rg = {n for n, p in self.model.named_parameters() if p.requires_grad}
+                state = {n: p.data for n, p in self._osp_view.named_parameters()
+                         if n in live_rg}
+                self._osp_logps_client.sync_adapters(state)
+
     def __init__(self, *args, gradient_routing_enabled=False, one_step_off=False,
-                 osp_rollout_gpu=None, coherence_every=0, coherence_gen="retain_only",
+                 osp_rollout_gpu=None, osp_logps_client=None,
+                 coherence_every=0, coherence_gen="retain_only",
                  retain_params=None, forget_params=None,
                  routing_mode=None, rh_detector=None,
                  base_rh_detector=None,
@@ -1027,6 +1047,7 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._osp_rollout_gpu = osp_rollout_gpu
         self._osp_rollout_device = (torch.device(f"cuda:{osp_rollout_gpu}")
                                     if osp_rollout_gpu is not None else None)
+        self._osp_logps_client = osp_logps_client
         self._osp_view = None        # frozen theta-snapshot (the rollout model)
         self._osp_thread = None      # in-flight rollout thread
         self._osp_result = None
@@ -5218,6 +5239,16 @@ def _make_parser():
                              "--one_step_off, >=2 visible GPUs, and a value != --gpu_id (fatal "
                              "otherwise). The process must see both GPUs (e.g. CUDA_VISIBLE_DEVICES"
                              "=0,1). Default None = same-GPU OSP.")
+    parser.add_argument("--osp_worker", action="store_true", default=False,
+                        help="One-step off-policy MULTIPROCESS rollout: run the old_logps HF "
+                             "forward in a dedicated spawned process (osp_logps_worker.py) on "
+                             "the rollout GPU instead of on the in-process rollout thread — "
+                             "removes the thread's 60s+/cycle of GIL-holding kernel launches "
+                             "that contend with the concurrent optimizer update. The frozen "
+                             "theta-snapshot view moves to CPU (it only feeds the CPU-staged "
+                             "vLLM weight pushes); the worker holds its own full-model replica "
+                             "synced at each OSP barrier. Requires --one_step_off + --vllm_spawn "
+                             "+ mlp adapters + beta==0 + no coherence (fatal otherwise).")
     parser.add_argument("--coherence_gen", choices=["both", "retain_only"], default="retain_only",
                         help="Adapter scales during coherence generation: 'both' or 'retain_only' (default)")
     parser.add_argument("--coherence_rh_mode", choices=["filter", "filter_renorm", "penalty", "zero"], default="filter",
@@ -6262,6 +6293,9 @@ def _run(args, exp_cfg=None):
     # Constraint validation is in _validate_config().
     vllm_client = None
     _vllm_server_proc = None
+    osp_logps_client = None  # set on the vllm_spawn path when --osp_worker
+    if args.osp_worker:
+        assert args.vllm_spawn, "--osp_worker requires --vllm_spawn (worker spawns alongside the vLLM server)"
     if args.vllm_server:
         if args.adapter_type == "lora":
             from vllm_lora import VLLMLoRAClient
@@ -6333,10 +6367,61 @@ def _run(args, exp_cfg=None):
         # old hard-coded 180s — the lock itself enforces ordering, and
         # wait_for_ready_file's 900s default + warn-at lines surface a stuck
         # init loudly without spuriously firing under normal queueing.
+        # --osp_worker: spawn the logps worker BEFORE waiting on the vLLM ready file so
+        # the two inits overlap (they serialize their CUDA-heavy phases on the same
+        # per-GPU flock). Same parent-CVD-flip as the vLLM child: the worker must see
+        # exactly ONE GPU from birth (no triton cross-device hazard, no HF n_gpu scaling).
+        _osp_worker_proc = None
+        if args.osp_worker:
+            # Scope guards: fail loudly on any path the worker does not carry.
+            assert args.one_step_off, "--osp_worker requires --one_step_off"
+            assert args.beta == 0, (
+                "--osp_worker does not serve ref logps yet; beta>0 would forward the "
+                "CPU view in-process. Use beta=0 or the in-process rollout thread.")
+            assert args.adapter_type == "mlp" and args.retain_source != "base", (
+                "--osp_worker replicates the mlp dual-adapter model; adapter_type "
+                f"{args.adapter_type!r} / retain_source {args.retain_source!r} unsupported.")
+            assert args.coherence_every == 0 and args.coh_samples_per_rollout == 0, (
+                "--osp_worker does not carry the coherence recompute (it forwards "
+                "_rollout_model, which is a CPU view in worker mode).")
+            assert args.use_liger_kernel, (
+                "--osp_worker computes old_logps through the liger/packed path only "
+                "(kernel consistency with the update).")
+            import osp_logps_worker as _olw
+            _worker_gpu = args.osp_rollout_gpu if args.osp_rollout_gpu is not None else args.gpu_id
+            _worker_socket = _socket_path + ".logps"
+            _worker_ready = _ready_file + ".logps"
+            _mlp_kwargs = {"retain_neurons": args.retain_neurons,
+                           "forget_neurons": args.forget_neurons,
+                           "layer_start": args.layer_start,
+                           "layer_end": args.layer_end,
+                           "layer_stride": args.layer_stride}
+            _osp_worker_proc = _ctx.Process(
+                target=_olw.worker_main,
+                args=(args.model, _mlp_kwargs, _worker_socket, _worker_ready, _worker_gpu,
+                      f"osp_logps_{args.run_name or os.getpid()}", args.output_dir,
+                      _worker_gpu, args.temperature,
+                      args.old_logps_max_tokens_per_microbatch),
+            )
+            _cvd_saved = os.environ.get("CUDA_VISIBLE_DEVICES")
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(_worker_gpu)
+            try:
+                _osp_worker_proc.start()
+            finally:
+                if _cvd_saved is None:
+                    os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+                else:
+                    os.environ["CUDA_VISIBLE_DEVICES"] = _cvd_saved
+            print(f"[osp_worker] Spawned logps worker at {_worker_socket} (pid={_osp_worker_proc.pid})")
         wait_for_ready_file(_ready_file, _vllm_server_proc, _spawn_label)
         from vllm_client import VLLMClient
         vllm_client = VLLMClient(_socket_path)
         print(f"[vLLM] Server ready")
+        if _osp_worker_proc is not None:
+            wait_for_ready_file(_worker_ready, _osp_worker_proc, "osp_logps_worker")
+            osp_logps_client = _olw.OSPLogpsClient(_worker_socket)
+            osp_logps_client.ping()
+            print(f"[osp_worker] Worker ready")
     elif args.vllm_colocate:
         from vllm_colocate import VLLMColocateClient
         # Build ctor args based on adapter_type + retain_source. Three paths:
@@ -6416,6 +6501,7 @@ def _run(args, exp_cfg=None):
         coherence_every=args.coherence_every,
         one_step_off=args.one_step_off,
         osp_rollout_gpu=args.osp_rollout_gpu,
+        osp_logps_client=osp_logps_client,
         coherence_gen=args.coherence_gen,
         coherence_rh_mode=args.coherence_rh_mode,
         coherence_rh_penalty=args.coherence_rh_penalty,
@@ -6702,6 +6788,11 @@ def _run(args, exp_cfg=None):
         if torch.cuda.is_available():
             peak_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
             print(f"Peak GPU memory: {peak_mb:.0f} MB ({peak_mb/1024:.1f} GB)")
+        if osp_logps_client is not None:
+            osp_logps_client.shutdown()
+            _osp_worker_proc.join(timeout=10)
+            from vllm_lifecycle import killpg_cleanup
+            killpg_cleanup(_osp_worker_proc)
         if _vllm_server_proc is not None:
             try:
                 vllm_client.shutdown()

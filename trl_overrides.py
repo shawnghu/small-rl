@@ -485,7 +485,18 @@ def generate_and_score_completions(trainer, inputs):
             # share the SAME packed/liger kernel as the actor update (IS consistency).
             old_budget = getattr(trainer, "_old_logps_max_tokens_per_microbatch", None)
             use_liger_fused = getattr(trainer, "use_liger_kernel", False)
-            if old_budget is not None:
+            _osp_client = getattr(trainer, "_osp_logps_client", None)
+            if _osp_client is not None:
+                # --osp_worker: the forward runs in the dedicated logps worker process
+                # (same _ref_logps_dynamic code path against the barrier-synced theta_t
+                # replica). This thread just blocks on ZMQ — no GIL held — instead of
+                # driving 60s+/cycle of kernel launches against the concurrent update.
+                old_per_token_logps = _osp_client.logps(
+                    prompt_completion_ids.cpu(), attention_mask.cpu(), logits_to_keep,
+                ).to(prompt_completion_ids.device)
+                trainer._metrics.setdefault("train", {}).setdefault(
+                    "timing/osp/worker_logps_fwd", []).append(_osp_client.last_fwd_s)
+            elif old_budget is not None:
                 old_per_token_logps = _ref_logps_dynamic(
                     trainer,
                     prompt_completion_ids,
