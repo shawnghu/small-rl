@@ -430,7 +430,10 @@ def compute_routed_advantages(
         # groups are treated "as before" (independent of the routing-group renorm
         # below): the routing-group #1/retain renorm never touches them.
         rh_in_coh = is_rh & coh_mask
-        if rh_in_coh.any():
+        # 'none': the classifier is not consulted on coherence samples at all —
+        # coherence groups keep the stock full-group GRPO advantage (hacks train
+        # into the coherence slice unimpeded).
+        if rh_in_coh.any() and cfg.coherence_rh_mode != "none":
             if cfg.coherence_rh_mode in ("penalty", "zero"):
                 # Reward-transform hacks-in-coh, then full-group renorm.
                 rr = raw_rewards.clone()
@@ -446,6 +449,10 @@ def compute_routed_advantages(
                 # only its non-hack samples. Hacks (and all-hack groups) -> 0.
                 _overwrite_coh_groups(_subset_group_renorm(raw_rewards, ~is_rh, G),
                                       coh_mask)
+            else:
+                # train_main bypasses argparse choices; fail loud, never fall
+                # through silently (a typo'd mode would otherwise behave as 'none').
+                raise ValueError(f"Unknown coherence_rh_mode: {cfg.coherence_rh_mode!r}")
         # (b) 'balanced' routing-group advantage (#1): a single vector shared by
         # both adapters — baseline (mean) over non-flagged samples, scale (std)
         # over the whole group — applied to the ROUTING (non-coherence) groups
