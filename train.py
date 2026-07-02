@@ -3001,7 +3001,12 @@ class SampleGRPOTrainer(GRPOTrainer):
                 # legacy is_rh classes (_scheme()). Reuses master's existing GT
                 # sources (detector columns + _forget_emission_scores).
                 _n = is_rh_tensor.shape[0]
+                # detectable: prefer the dataset column; else derive from the
+                # rh_detector's classifiable predicate (same fallback master's
+                # routing-trace uses) — most envs (e.g. sorting) have no column.
                 _det = detector_kwargs.get("detectable")
+                if (_det is None or _det[0] is None) and self._rh_classifiable_fn is not None:
+                    _det = list(self._rh_classifiable_fn(**detector_kwargs))
                 if _det is not None and len(_det) == _n and all(d is not None for d in _det):
                     output["detectable"] = torch.tensor(
                         [bool(d) for d in _det], dtype=torch.bool, device=device)
