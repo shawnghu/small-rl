@@ -5655,7 +5655,17 @@ def _run(args, exp_cfg=None):
     # Pass combined_reward (not reward_fn) so score_threshold reads the live CachedReward instances.
     rh_detector = None
     rh_classifiable_fn = None
-    if routing_enabled or filter_baseline or reward_penalty_baseline or args.verified_only_training:
+    # Observe-only grad-diag (feature f): a vanilla dual-adapter run with grad-diag
+    # on needs the detector built too (for is_rh + detectable labeling), even though
+    # it has no routing/filter/RP. Mirrors the runtime grad_diag_observe gate.
+    _grad_diag_observe_build = (
+        args.adapter_diag_level == "per_sample_recompute"
+        and exp_cfg.rh_detector is not None
+        and bool(forget_params)
+        and not routing_enabled and not filter_baseline
+        and not reward_penalty_baseline and not args.verified_only_training)
+    if (routing_enabled or filter_baseline or reward_penalty_baseline
+            or args.verified_only_training or _grad_diag_observe_build):
         rh_detector = exp_cfg.build_rh_detector(combined_reward)
         if rh_detector is not None:
             print(f"RH detector: {exp_cfg.rh_detector.name} {exp_cfg.rh_detector.params or ''}")
