@@ -189,6 +189,21 @@ baseline panel's x-range to the main sweep's `[0, MAIN_X_MAX]` so the same step
 lines up across the two columns/cards. Toggling it relayouts the gray panels live;
 it is exposed only when a baseline is present.
 
-Unrelated to the diff but applied on all these pages: the main `hack_freq` panel
-is **unchecked (hidden) by default** (along with the trailing hackable/detectable
-panels); tick its Panels checkbox to show it.
+Two ways to use it:
+
+- **Auto, during a sweep** — pass `--baseline_sweep <dir-or-name>` to `sweep.py`, or set `baseline_sweep = "<dir-or-name>"` in the sweep config file. The in-sweep `overview.html` regenerations then carry the baseline:
+  ```
+  python sweep.py --config sweeps/my_sweep.py --baseline_sweep matrix_gr_5envs_graddiag-0619-2245
+  ```
+- **Post-hoc, standalone** — `sweep_plots.py` against an existing sweep dir:
+  ```
+  python sweep_plots.py output/<sweep> --baseline output/<baseline-sweep> --no_grid
+  ```
+  Each path arg may be a directory or a bare sweep name under `output/`. `--no_grid` skips `grid.html`.
+
+**Gotcha — a live sweep clobbers `overview.html`.** A still-running sweep regenerates its own `overview.html` (baseline-free) every ~60s, overwriting a post-hoc diff written to the default name. To diff a sweep that is still running, write to a distinct filename the orchestrator won't touch:
+```
+python sweep_plots.py output/<sweep> --baseline output/<baseline> --no_grid --out overview_vs_baseline.html
+```
+Then serve `sweep_graphs/` and open that file. Once the sweep finishes (or if it was launched with `--baseline_sweep`), the default `overview.html` carries the baseline and no `--out` is needed.
+
