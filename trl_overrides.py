@@ -166,15 +166,22 @@ def _ref_logps_dynamic(
     left-padded prompt region per bin to save compute on padding, and call
     `_get_per_token_logps_and_entropies` once per bin with batch_size=bin_size.
 
-    Completion length (`logits_to_keep`) is left untrimmed so every bin's
-    output has the same trailing dimension and can be scatter-assigned back
-    into the global output tensor.
+    Both padded regions are trimmed per bin: the left-padded prompt region and
+    the right-padded completion tail (each bin forwards at its own max real
+    completion width w and scatter-assigns into out[bin, :w]). Trailing pad is
+    exact to skip — attention masks it, so valid-position logps are identical —
+    and at a large max_completion_length the tail dominates cost (budget 1536
+    with mean length ~500: ~2x compute, and the difference between fitting and
+    OOM next to a 0.7-memory vLLM on the rollout GPU).
     """
     n = prompt_completion_ids.size(0)
     token_counts = attention_mask.sum(dim=1).tolist()
     bins = _pack_by_tokens_simple(token_counts, max_tokens_per_bin)
 
-    out = None  # allocated lazily once we know output dtype
+    # zeros, not lazy empty: bins write only their first w columns, and the tail
+    # must be inert under downstream masking (empty can hold NaN bit patterns;
+    # NaN * 0 = NaN poisons masked reductions).
+    out = None
     for bin_indices in bins:
         bin_t = torch.tensor(bin_indices, device=prompt_completion_ids.device, dtype=torch.long)
         bin_ids = prompt_completion_ids[bin_t]
@@ -193,6 +200,16 @@ def _ref_logps_dynamic(
                 bin_ids = bin_ids[:, first_real:]
                 bin_mask = bin_mask[:, first_real:]
 
+        # Trim the right-padded completion tail: completions are right-padded, so
+        # each row's real tokens occupy the leading columns of the completion
+        # region; forward this bin at its own max real completion width.
+        comp_mask_bin = bin_mask[:, -logits_to_keep:]
+        w = max(int(comp_mask_bin.sum(dim=1).max().item()), 1)
+        if w < logits_to_keep:
+            cut = logits_to_keep - w
+            bin_ids = bin_ids[:, :-cut]
+            bin_mask = bin_mask[:, :-cut]
+
         bin_num_images = None
         if num_images is not None:
             bin_num_images = [num_images[i] for i in bin_indices]
@@ -201,7 +218,7 @@ def _ref_logps_dynamic(
             # _ref_logps_liger_fused already runs on the view device and returns on
             # the update device (OSP disaggregation), so logps is update-device here.
             logps = _ref_logps_liger_fused(
-                trainer, bin_ids, bin_mask, logits_to_keep, num_images=bin_num_images
+                trainer, bin_ids, bin_mask, w, num_images=bin_num_images
             )
         else:
             # OSP disaggregation: forward on the view's (rollout) GPU, result back to
@@ -213,7 +230,7 @@ def _ref_logps_dynamic(
                 trainer._rollout_model,
                 _bi,
                 _bm,
-                logits_to_keep,
+                w,
                 batch_size=len(bin_indices),
                 num_images=bin_num_images,
                 **forward_kwargs,
@@ -221,8 +238,8 @@ def _ref_logps_dynamic(
             logps = logps.to(prompt_completion_ids.device)
 
         if out is None:
-            out = torch.empty(n, logits_to_keep, device=logps.device, dtype=logps.dtype)
-        out[bin_t] = logps
+            out = torch.zeros(n, logits_to_keep, device=logps.device, dtype=logps.dtype)
+        out[bin_t.unsqueeze(1), torch.arange(w, device=logps.device).unsqueeze(0)] = logps
 
     return out
 
