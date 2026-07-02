@@ -7,8 +7,15 @@ hacking (RH) in this repo. Cloned locally at `~/Countdown-Code`.
 The paper's framing: a minimal RLVR environment with a clean **proxy-vs-true**
 reward split, used to show that ~1% RH contamination in distillation/SFT data
 primes catastrophic hacking under subsequent RL, and that the behavior
-generalizes to HumanEval / LeetCodeDataset (Xia et al. 2025). Their leetcode
-source (Xia) is **different** from ours (Wong et al.).
+generalizes to HumanEval / LeetCodeDataset (Xia et al. 2025). Note: their
+leetcode eval and our leetcode env share the **same underlying problem source**
+— `newfacade/LeetCodeDataset` on HF (Xia et al. 2025). Ours descends from it
+via Wong et al.'s rl-rewardhacking-private (`src/data/base.py` loads it
+directly; our `envs/leetcode.py` consumes Wong's derived jsonl and re-loads the
+HF dataset for tags). What differs is the env construction on top: Wong's
+med/hard filtering, hint/loophole injection, and prompt format, plus our
+leetcode_verified curation. The paper cites Wong et al. (2025) as concurrent
+work on the overwrite-tests loophole.
 
 ## The Countdown-Code task
 
@@ -63,6 +70,33 @@ a perfect deterministic hack oracle.
    kept the value check but **dropped the number-usage check**.
 3. **Input-tampering** — model changes `numbers`/`target` constants in
    `solution.py` so its (honest) verifier passes on fake inputs.
+
+## Fail-closed verifier sabotage under reward penalties (observed 2026-07)
+
+The opposite-direction tamper: the model breaks its own `test.py` so
+`verify_solution` **fails on everything**, including genuine solves. Observed in
+2/6 RP runs of the repo-native env (`sweeps/countdown_code_rp.py`), in two forms:
+
+- `"test.py": "..."` — the file elided entirely (ellipsis idiom); stitched
+  program has no `verify_solution` → NameError → R_proxy=0 (run rp5_s15,
+  persistent once found; also shortens completions, which under a tight
+  `max_completion_length` was itself reward-positive via lower truncation).
+- `1e-5 → e-5` in the tolerance comparison — `e` is an undefined name, the
+  `except Exception` returns False (run rp2_s16, gsteps ~65-152, drifted back out).
+
+Why RP selects for it: with retain reward = parse-checked R_true, a dead verifier
+keeps full reward while making `hack = R_proxy ∧ ¬R_true` — and therefore the
+penalty — structurally impossible to fire. It also zeroes all hack metrics, so
+"RP suppressed hacking" is unmeasurable in the sabotage window.
+
+Mitigation (in `configs/countdown_code_{hack,nohack}.yaml` since 2026-07-01): the
+scored retain component is `countdown_true_tested_from_all` = R_true ∧ R_proxy
+(genuine solve whose own test passes); raw `countdown_true_from_all` stays as a
+scale-0 ground-truth metric. Scored reward then equals R_proxy exactly
+(true_tested + hack, disjoint), matching the paper, and verifier sabotage costs
+the model its reward instead of shielding it. The `\\d+` mis-escape emission bias
+from SFT priming remains auto-repaired by `_cc_clean` (unicode_escape) — kept
+deliberately, see the docstring in `rewards.py`.
 
 ## Contamination of the shipped SFT pool — measured
 
@@ -183,3 +217,47 @@ student worse AND dishonest.
 | Dataset pipeline (`create_datasets.py`, `filtering_proxy.py`) | ✅ (filtering script broken) | Splits public HF Countdown data. |
 | HumanEval / LeetCodeDataset eval | ❌ | Paper-only; reconstruct from public datasets + gpt-5-nano monitor criteria. |
 | Fine-tuned SFT/RLVR checkpoints | ❌ | None released anywhere. Base models are public off-the-shelf. |
+
+## RL round 2 results: DN / RP / GR under the test_overwrite monitor (2026-07-02)
+
+Sweeps `countdown_code_rp2-0702-0026` (do-nothing + RP=2 + RP=5, 3 seeds each) and
+`countdown_code_gr-0702-0134` (GR classic + balanced renorm + split-moment +
+coherence 256/rollout-1024 with pen-2, per smallscale coh128/lam1 recipe; 3 seeds),
+all from the SFT-primed Qwen3-8B, fixed scaffold, 200 steps, reward = R_proxy
+partitioned as true_tested (retain) + hack (forget). Monitor (rh_detector, RP
+target, GR routing label) = test_overwrite ONLY. Prereqs this round: true_tested
+retain gating (closes fail-closed verifier sabotage), max_completion 1536, and the
+DISJOINT hack-form metrics (test_overwrite / constraint_relax / modify_input /
+other) — without which the substitution below is invisible.
+
+Endpoints (mean of last 3 evals; mi and other ≈ 0 everywhere; "deploy" =
+retain-only ablation, only meaningful for GR):
+
+| arm | train-config retain / tw / cr | deploy retain / tw / cr |
+|---|---|---|
+| DN  s9/s15/s16  | .58/.58/.03 · tw .42/.42/.97 · cr 0 | (n/a) |
+| RP2 s9/s15/s16  | .76/.69/.66 · tw 0 · cr .24/.31/.34 | ≈ same (policy-level) |
+| RP5 s9/s15/s16  | .63/.64/.65 · tw 0 · cr .36/.35/.37 | ≈ same |
+| GR  s9/s15/s16  | .66/.73/.69 · tw .33/.25/.30 · cr 0 | .71/.74/.69 · tw 0 · cr .29/.20/.18 |
+
+Findings:
+1. **RP-failure regime achieved (6/6 seeds)**: penalizing test_overwrite drives it
+   to 0 but the policy substitutes constraint_relax (drop the usage check, keep the
+   value check — also verifier tampering, uncaught) at 0.24–0.37. modify_input never
+   wins the substitution race (~1.5% base rate, loses to cr's ~5%).
+2. **GR localizes exactly what the monitor flags**: deployed tw = 0.00 in all seeds
+   with retain intact (~0.71). But cr routes to the RETAIN adapter (detector calls
+   it clean) and leaks into deployment at 0.18–0.29 — same failure axis as RP,
+   modestly smaller (GR mean .22 vs RP train-config .33 / RP-equivalent .26).
+3. **GR-specific nuance**: in the two-adapter (training) config cr expression is
+   ~0.00 — masked by tw. The unmonitored hack is INVISIBLE during training and only
+   surfaces after ablation. (RP's cr is visible during training.)
+4. DN: tw takeoff by step ~40, endpoint 0.42–0.97 (s16 = retain-collapse seed).
+5. Checkpoints: all 200-step runs saved; dn_s15 (step 144) and GR s15 (step 195)
+   hit the 4h Modal input timeout — curves intact, no final checkpoint. train_one
+   timeout now 8h.
+
+Next-question candidates: widen the monitor to all verifier tampering (tw+cr),
+leaving modify_input as the sole blind spot (its base rate ~1.5% sits at the GRPO
+exploration floor); coherence-penalty interplay with the cr leak; why GR's leak is
+somewhat slower/lower than RP's.
