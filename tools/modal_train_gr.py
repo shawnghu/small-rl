@@ -346,7 +346,10 @@ def _run_training(params: dict, log_path: str) -> dict:
     gpu="H200",
     volumes={OUTPUT_REMOTE: vol},
     secrets=secrets,
-    timeout=4 * 60 * 60,  # 4h max per run
+    timeout=8 * 60 * 60,  # 8h max per run (4h killed a countdown_code DN run at
+                          # step 142/200 — slow arms with long completions need slack;
+                          # NOTE: the budget is per-INPUT, so a Modal container-death
+                          # reschedule does NOT reset the clock)
 )
 def train_one(params: dict, sweep_name: str) -> dict:
     """Run a single training job inside a Modal container with 1 H100."""
