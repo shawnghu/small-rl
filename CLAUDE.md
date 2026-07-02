@@ -254,6 +254,24 @@ wandb API as the source of truth for run/step progress** (`wandb.Api()`,
 `run.history(...)`), not the local sweep log. (Cost of trusting the stale line: a
 set of runs was needlessly killed because they looked un-started.)
 
+### Gotcha: `modal container stop` does not kill a sweep run
+Stopping a run's container (`modal container stop ta-...`) does NOT fail the
+spawned `train_one` call: Modal treats it as preemption and **reschedules the
+input onto a fresh container** even with no `retries=` configured. The retry
+re-runs `train_main` from scratch and resumes the same stable wandb run id
+(cleanly — observed no duplicated history rows). This can be a feature (a hung
+container can be bounced this way: stop it and the run restarts itself) or a
+footgun (to kill a single run *permanently* you must cancel the FunctionCall /
+kill the orchestrator, not the container — a stopped container quietly
+duplicates the run if you separately relaunch it). Spontaneous container
+deaths (crash/preemption) reschedule the same way. Consequences for
+monitoring/data: (1) when polling wandb for progress use the
+**latest-timestamp** `train/global_step`, not the max — after a restart the
+max silently freezes at the dead attempt's high-water mark while the rerun
+climbs from 0; (2) `routing_eval.jsonl` is opened in append mode, so a
+restarted run's file contains BOTH attempts' rows — dedup by (step, mode)
+keeping the last occurrence before plotting.
+
 ## API-based Reward Functions
 API_REWARDS.md
 
