@@ -368,9 +368,20 @@ _BASELINE_FORCE_BROADCAST_KEYS = {
     "rollout_forget_scale_mode",
 }
 
+# Condition-arm knobs that must NEVER be broadcast away when matching a
+# condition run (reward_penalty/filter/retain_penalty) to routing groups: a
+# value differing from every routing run is the arm's IDENTITY (e.g.
+# reward_penalty_amount 2.0 vs 5.0), not a residual default. Without this,
+# multi-amount RP sweeps collapse onto one card with the arms indistinguishable.
+_CONDITION_IDENTITY_KEYS = {
+    "reward_penalty_amount",
+    "retain_penalty",
+}
+
 # Short labels for common group-key params, prefixed onto the group title.
 _GROUP_KEY_SHORT = {
     "config": "",  # handled as env name
+    "reward_penalty_amount": "rp",
     "hack_frac": "hf",
     "rh_detector_recall": "rcl",
     "coh_samples_per_rollout": "cspr",
@@ -465,10 +476,15 @@ def assign_groups(runs, sweep_dir):
 
     Returns: {group_label: [run_indices]}
     """
+    # Key inference sees routing runs AND condition arms (reward_penalty /
+    # filter / retain_penalty) — but not plain auto-baselines. Condition arms
+    # carry semantically-relevant knobs (e.g. reward_penalty_amount): a sweep
+    # with RP=2 and RP=5 arms must split them into separate groups, which
+    # requires the knob to be visible as a varying key.
     routing_params = [
         run.get("params") or {}
         for run in runs
-        if run.get("params") and not run.get("is_baseline")
+        if run.get("params") and run.get("condition_prefix", "routing") not in ("baseline",)
     ]
     group_keys = _infer_group_keys(routing_params)
 
@@ -508,6 +524,8 @@ def assign_groups(runs, sweep_dir):
         """
         broadcast = set()
         for i, k in enumerate(group_keys_sorted):
+            if k in _CONDITION_IDENTITY_KEYS:
+                continue  # arm identity — never broadcast (see definition above)
             if k in _BASELINE_FORCE_BROADCAST_KEYS:
                 broadcast.add(k)
                 continue
