@@ -6180,6 +6180,17 @@ def _run(args, exp_cfg=None):
                              "rms_norm": not args.torch_compile, "rope": not args.torch_compile} if args.use_liger_kernel else None,
         torch_compile=args.torch_compile and not args.torch_compile_mode,
     )
+    # HF TrainingArguments silently multiplies train_batch_size by n_gpu
+    # (= torch.cuda.device_count()), turning a 2-visible-GPU process (OSP
+    # disaggregation) into a run with DOUBLED rollout/optimizer batches while
+    # samples_seen still reports the config values. This repo never uses HF
+    # DataParallel — multi-GPU is separate processes (sweep) or explicit
+    # disaggregation — so force single-device semantics and verify loudly.
+    _ = config.device  # trigger _setup_devices so the override below sticks
+    config._n_gpu = 1
+    assert config.train_batch_size == per_device_bs, (
+        f"train_batch_size {config.train_batch_size} != per_device_bs {per_device_bs} "
+        f"— HF n_gpu batch scaling leaked in (visible GPUs: {torch.cuda.device_count()})")
 
     # --config_check: dump effective config to file and exit before training
     if getattr(args, 'config_check', False):
