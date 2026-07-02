@@ -2742,10 +2742,25 @@ class SampleGRPOTrainer(GRPOTrainer):
         # --- Step C: RH detection ---
         _t_rh_start = time.perf_counter()
 
+        # Observe-only grad-diag: run the per-sample diagnostic on a vanilla
+        # (do-nothing) dual-adapter run — no routing / filter / RP, so training is
+        # unperturbed (the advantage path below is driven by the mode flags, all
+        # False here) — but still label samples (is_rh + GT) so _run_grad_diagnostic
+        # can measure the UNMASKED adapter separation that GR's masking is the
+        # counterfactual to. Requires forget params (dual adapters) + a detector.
+        grad_diag_observe = bool(
+            self._adapter_diag_level == "per_sample_recompute"
+            and self.rh_detector is not None
+            and self._forget_params
+            and not self.gradient_routing_enabled
+            and not self._filter_baseline
+            and not self._reward_penalty_baseline
+            and not self._verified_only_training)
         needs_detection = (self.gradient_routing_enabled
                            or self._filter_baseline
                            or self._reward_penalty_baseline
-                           or self._verified_only_training)
+                           or self._verified_only_training
+                           or grad_diag_observe)
         if needs_detection and self.rh_detector is not None:
             n_samples = output["completion_ids"].shape[0]
 
@@ -2977,7 +2992,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                             int((is_rh_tensor & hackable_nonhack).sum().item()) / n_hackable_nonhack
                         )
 
-            if self.gradient_routing_enabled:
+            if self.gradient_routing_enabled or grad_diag_observe:
                 output["is_rh"] = is_rh_tensor
                 # Grad-diag ground-truth labels, injected into the batch dict
                 # alongside is_rh so they ride TRL's shuffle/slice and stay aligned
