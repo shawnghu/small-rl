@@ -771,8 +771,10 @@ class SampleGRPOTrainer(GRPOTrainer):
                 # The view was just synced and lives on CPU — its tensors ARE the
                 # theta_t snapshot in the exact requires_grad param set; ship those.
                 live_rg = {n for n, p in self.model.named_parameters() if p.requires_grad}
-                state = {n: p.data for n, p in self._osp_view.named_parameters()
-                         if n in live_rg}
+                # torch.compile wraps the live model (OptimizedModule), prefixing param
+                # names with _orig_mod.; the worker's replica is uncompiled. Normalize.
+                state = {n.removeprefix("_orig_mod."): p.data
+                         for n, p in self._osp_view.named_parameters() if n in live_rg}
                 self._osp_logps_client.sync_adapters(state)
 
     def __init__(self, *args, gradient_routing_enabled=False, one_step_off=False,
