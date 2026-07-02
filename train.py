@@ -3561,11 +3561,11 @@ class SampleGRPOTrainer(GRPOTrainer):
             print(f"[grad_diag] writing to {path}")
         self._grad_diag_file.write(json.dumps(record) + "\n")
 
-        # 2x2 whole-model summary scalars (mean per-sample norm per cell) to wandb,
-        # for both gradient and activation metrics.
+        # 2x2 whole-model summary scalars (mean per-sample value per cell) to wandb,
+        # for gradient norm, activation norm, and the signed <grad,weight> dot.
         rh = np.array(record["is_rh"])
         m = self._metrics.setdefault("train", {})
-        for metric, wm in (("grad", whole), ("act", act_whole)):
+        for metric, wm in (("grad", whole), ("act", act_whole), ("dot", dot_whole)):
             for role in ("retain", "forget"):
                 w = np.array(wm[role])
                 for cls, name in ((0, "on_retain"), (1, "on_forget")):

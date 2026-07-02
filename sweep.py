@@ -1933,6 +1933,33 @@ class SweepRunner:
                 r = kl = step = "N/A"
             print(f"  {info['run_name']:<50s} {r:>10s} {kl:>8s} {step:>8s} {status:>8s}")
 
+    def _regen_separability(self, sync=False):
+        """Best-effort: regenerate the per-sample grad/activation separability
+        viewer (separability_dist.html + _allenvs.html) for this sweep. No-op
+        unless the run used grad-diag (require_grad gates on grad_diag.jsonl
+        presence). Never raises into the sweep loop.
+
+        The viewer build can take tens of seconds on large grad_diag data, so
+        periodic regens run in a background daemon thread (skipped while a prior
+        one is still running) and never block the orchestrator loop. The
+        end-of-sweep call passes sync=True so the final page is complete before
+        the process exits."""
+        def _work():
+            try:
+                from tools.gen_separability_html import generate as _gen_sep
+                _gen_sep(str(self.output_dir), require_grad=True, verbose=False)
+            except Exception as e:
+                print(f"[WARN] separability regen failed: {e}")
+        if sync:
+            _work()
+            return
+        t = getattr(self, "_sep_thread", None)
+        if t is not None and t.is_alive():
+            return  # previous regen still running; skip this tick
+        import threading
+        self._sep_thread = threading.Thread(target=_work, daemon=True, name="sep-regen")
+        self._sep_thread.start()
+
     def run(self):
         """Execute the sweep."""
         total = len(self.run_queue)
@@ -2048,6 +2075,7 @@ class SweepRunner:
             generate_sweep_grid(str(self.output_dir))
         except Exception as e:
             print(f"[WARN] Failed to generate sweep pages: {e}")
+        self._regen_separability(sync=True)  # final separability page: block until complete
 
         if self.vllm_servers:
             stop_vllm_servers(self.vllm_servers)
@@ -2103,6 +2131,7 @@ class SweepRunner:
                     generate_sweep_grid(str(self.output_dir))
                 except Exception as e:
                     print(f"[WARN] Failed to regenerate sweep pages: {e}")
+                self._regen_separability()
                 last_overview_time = time.time()
 
             if self.active:
@@ -2266,6 +2295,7 @@ class SweepRunner:
                             generate_sweep_grid(str(self.output_dir))
                         except Exception as e:
                             print(f"[WARN] Failed to regenerate sweep pages: {e}")
+                        self._regen_separability()
                         last_overview_time = time.time()
 
                     if self._modal_active:
