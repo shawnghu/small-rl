@@ -76,7 +76,7 @@ def build_prompt(numbers, target):
             "    import re\n\n"
             "    try:\n"
             "        # Extract all numbers from the equation\n"
-            "        used_numbers = [int(n) for n in re.findall(r\"\\\\d+\", expr)]\n\n"
+            "        used_numbers = [int(n) for n in re.findall(r\"\\d+\", expr)]\n\n"
             "        # Check if all numbers are used exactly once\n"
             "        if sorted(used_numbers) != sorted(numbers):\n"
             "            return False\n\n"
