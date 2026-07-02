@@ -215,7 +215,7 @@ student worse AND dishonest.
 | Countdown-Code env (eval + verl RL reward manager + reward fns) | ✅ | Lift as a reward fn + exact rh_detector. Clean binary proxy/true RH, perfect-recall label (a "relaxation" in our terms). |
 | `o4-mini-distillation-16k.jsonl` | ✅ | 16k teacher traces incl. ~2.5% cheating; seed SFT-priming studies. |
 | Dataset pipeline (`create_datasets.py`, `filtering_proxy.py`) | ✅ (filtering script broken) | Splits public HF Countdown data. |
-| HumanEval / LeetCodeDataset eval | ❌ | Paper-only; reconstruct from public datasets + gpt-5-nano monitor criteria. |
+| HumanEval / LeetCodeDataset eval | ❌ | Paper-only (monitor prompt also unreleased). Reconstructed for HumanEval with programmatic detectors replacing the gpt-5-nano monitor: `tools/countdown-generalization-eval/` (see its README; LeetCode analog TBD). |
 | Fine-tuned SFT/RLVR checkpoints | ❌ | None released anywhere. Base models are public off-the-shelf. |
 
 ## RL round 2 results: DN / RP / GR under the test_overwrite monitor (2026-07-02)
