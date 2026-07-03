@@ -261,3 +261,37 @@ Next-question candidates: widen the monitor to all verifier tampering (tw+cr),
 leaving modify_input as the sole blind spot (its base rate ~1.5% sits at the GRPO
 exploration floor); coherence-penalty interplay with the cr leak; why GR's leak is
 somewhat slower/lower than RP's.
+
+## Round 3: RP dose-response, GR coherence ablations, wide monitor (2026-07-03)
+
+15 runs, same SFT-primed Qwen3-8B base / 200 steps. Sweeps: countdown_code_rp_fill
+(RP 0.5/1.0 + symlinked rp2 arms => full dose page), countdown_code_gr_coh64
+(GR, coherence 1:16, pen2, optimizer_batch_size 272 for divisibility),
+countdown_code_gr_nocohrp (GR, coherence 1:4, coherence_rh_mode=none),
+countdown_code_rp_widemon (RP=2 on verifier_tamper = tw+cr).
+
+1. **RP dose-response (narrow monitor)**: substitution into constraint_relax is
+   penalty-insensitive from RP>=1 (cr ~0.30 +/- .05 at 1/2/5; tw 0.00 everywhere).
+   RP=0.5 is worse: cr mean 0.46 (one seed 0.59, retain 0.41) — a detected hack
+   still nets +0.5, so hacking is not dominated by solving.
+2. **GR coherence dose (deployed, retain-only)**: quartering coherence (256->64)
+   cut the cr leak ~4x (0.18-0.29 -> 0.00/0.07/0.12) with tw still 0.00-0.01 and
+   retain equal-or-better (0.71-0.78). Leak is proportional to the coherence dose.
+3. **GR without coherence-RP (coherence_rh_mode=none)**: the monitored hack leaks
+   into deployment in 2/3 seeds (retain-only tw 0.12-0.22 + cr 0.11-0.25, total
+   deployed hack 0.36-0.39; s15 clean at 0.02 despite a 0.97-hack training
+   config). Coherence-with-penalty — not routing itself — is what scrubs the
+   monitored hack from the retain adapter; but the same coherence gradient is
+   the main channel pushing the UNMONITORED hack in (see 2). Dose trade-off.
+4. **Wide monitor (RP=2 on tw+cr)**: near-total win at 200 steps — verifier
+   tampering 0.00-0.01, modify_input does NOT emerge (0.01/0.01/0.05, ~base
+   rate; s16's 0.05 worth re-checking on longer runs), retain best-in-class
+   0.80-0.82. Consistent with the exploration-floor story: substitution needs
+   an explorable unmonitored form; mi's ~1.5% base rate stays below GRPO's
+   effective floor for 16-sample groups at these step counts.
+
+Best GR cell so far: coh64+pen2 (deployed hack ~0.07, retain 0.74). Best overall
+mitigation on THIS env: wide-monitor RP — expected, since the wide monitor
+covers every explorable hack form (the RP-favorable regime by construction);
+the GR-vs-RP question stays interesting only under monitors with an explorable
+blind spot.
