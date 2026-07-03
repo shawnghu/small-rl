@@ -295,3 +295,46 @@ mitigation on THIS env: wide-monitor RP — expected, since the wide monitor
 covers every explorable hack form (the RP-favorable regime by construction);
 the GR-vs-RP question stays interesting only under monitors with an explorable
 blind spot.
+
+## Round 3 results: RP dose-response, wide monitor, GR coherence ablations (2026-07-03)
+
+Four sweeps, 3 seeds each, same base dynamics as round 2 (endpoints = mean of
+last 3 evals; B = two-adapter/training config, RO = retain-only/deployment;
+mon/unmon per each config's own monitor):
+
+1. **RP dose fill** (`countdown_code_rp_fill`, narrow monitor; rp2 runs
+   symlinked in for the 0/0.5/1/2/5 overview): NO safe dose. Monitored tw = 0.00
+   at every amount; constraint_relax substitution at RP=0.5 is the WORST
+   (unmon .38/.45/.59, retain down to .41-.62) and RP=1.0 matches RP=2/5
+   (unmon .28-.34). RP=0.5 is the theory-clean case: a tw hack still nets +0.5,
+   yet is abandoned — GRPO substitution needs only the relative gap to cr's 1.0.
+2. **Wide monitor** (`countdown_code_rp_widemon`, RP=2 on tw+cr): **RP wins**.
+   Total hack .01-.05, modify_input NEVER emerges (.00-.05 = base-rate noise,
+   200 steps), retain .80-.82 — the best retain of any arm. Confirms the
+   exploration-floor story: RP-failure requires an explorable blind-spot hack;
+   mi's ~1.5% base rate never catches in 16-sample groups.
+3. **GR coh64** (1:16 coherence, pen2): deployed tw 0.00-0.01 (3/3); the cr
+   leak SHRINKS vs coh256 (RO unmon .00/.07/.13 vs .18-.29) — the leak scales
+   with coherence dose, implicating coherence steps (retain-adapter-only
+   training where cr earns full reward and only tw is penalized) as the main
+   cr-injection channel, not the routing steps. s15's training config collapsed
+   to 83% tw hacking, yet its deployment stayed perfectly clean (ret .78,
+   hack .00) — GR's ablation guarantee held under total training-config
+   takeover (caveat: only 1 seed showed this regime).
+4. **GR nocohrp** (coh256, coherence_rh_mode=none): confirms the
+   coherence-penalty mechanism — WITHOUT it, the monitored hack contaminates
+   the retain adapter: deployed tw .17/.22 + cr .14/.23 in 2/3 seeds (s15
+   stayed clean while its training config collapsed to .97 tw). GR's clean
+   deployed-tw result in rounds 2/3 is owed to the coherence RP, not routing
+   alone.
+
+Synthesis across GR arms: the deployment leak = what coherence training
+injects into the retain adapter. Coherence-with-penalty scrubs exactly the
+monitored form and injects the unmonitored one in proportion to dose;
+no-penalty coherence injects everything. Suggests: small coherence dose (or a
+wide-monitor coherence penalty) is the GR-side analog of widening the monitor.
+
+Ops notes: widemon/nocohrp ran to completion on ORPHANED Modal apps (their
+orchestrators were casualties of the 8GB box cgroup / background-task cleanup;
+see CLAUDE.md Modal gotchas) — results pulled manually from the volume (plain
+dir names, no timestamp); overviews generated post-hoc.
