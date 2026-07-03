@@ -48,29 +48,10 @@ RESULTS_ROOT = "/output/countdown_generalization"
 BASE_MODEL = "/output/countdown_sft_model/qwen3-8b"   # SFT-primed Qwen3-8B (all 6 runs)
 MLP_CONFIG = "m64"
 
-GR_SWEEP = "/output/countdown_code_gr-0702-0134"
-GR_RUN = "countdown_code_gr_cls_coh256_pen2_noretain_balanced_splitmoment_lam1_s{seed}"
-RP_SWEEP = "/output/countdown_code_rp2-0702-0026"
-RP_RUN = "reward_penalty_countdown_code_hack_reward_penalty_amount2.0_s{seed}"
-SEEDS = [9, 15, 16]
-
+DEFAULT_SPEC = "countdown_0702"
 DEFAULT_K = 8
 DEFAULT_MAX_TOKENS = 2048
 DEFAULT_BATCH = 64
-
-
-def batch_configs():
-    """checkpoint entries are RUN dirs; generate_ckpt resolves the latest
-    checkpoint-N inside (GR s15 stopped at 195, not 200)."""
-    cfgs = []
-    for s in SEEDS:
-        run = f"{GR_SWEEP}/{GR_RUN.format(seed=s)}"
-        cfgs.append({"checkpoint": run, "forget_scale": 1.0, "label": f"gr_s{s}_2adapter"})
-        cfgs.append({"checkpoint": run, "forget_scale": 0.0, "label": f"gr_s{s}_retainonly"})
-    for s in SEEDS:
-        run = f"{RP_SWEEP}/{RP_RUN.format(seed=s)}"
-        cfgs.append({"checkpoint": run, "forget_scale": 1.0, "label": f"rp2_s{s}"})
-    return cfgs
 
 
 def resolve_checkpoint(path: str) -> str:
@@ -209,23 +190,28 @@ def generate_ckpt(
 
 
 @app.local_entrypoint()
-def run_batch(k: int = DEFAULT_K, limit: int = 0, seed: int = 0,
-              scaffold: str = "humaneval_scaffold"):
+def run_batch(spec: str = DEFAULT_SPEC, k: int = DEFAULT_K, limit: int = 0,
+              seed: int = 0, scaffolds: str = "humaneval_scaffold,leetcode_scaffold"):
+    """Generate every config in `spec` on each scaffold (both benchmarks by
+    default). GR runs expand to 2adapter + retainonly; RP/vanilla to one."""
     import json
-    cfgs = batch_configs()
-    print(f"spawning {len(cfgs)} configs (scaffold={scaffold}):")
+    from checkpoint_specs import expand
+    cfgs = expand(spec)
+    scaffold_list = [s.strip() for s in scaffolds.split(",") if s.strip()]
+    print(f"spec={spec}: {len(cfgs)} configs x {len(scaffold_list)} scaffolds")
     for c in cfgs:
-        print(f"  {c['label']}: fs={c['forget_scale']} {c['checkpoint']}")
-    calls = [generate_ckpt.spawn(checkpoint=c["checkpoint"], label=c["label"],
+        print(f"  {c['label']}: fs={c['forget_scale']} {c['run']}")
+    jobs = [(sc, c) for sc in scaffold_list for c in cfgs]
+    calls = [generate_ckpt.spawn(checkpoint=c["run"], label=c["label"],
                                  forget_scale=c["forget_scale"], k=k, limit=limit,
-                                 seed=seed, scaffold=scaffold)
-             for c in cfgs]
-    for c, call in zip(cfgs, calls):
+                                 seed=seed, scaffold=sc)
+             for sc, c in jobs]
+    for (sc, c), call in zip(jobs, calls):
         try:
             res = call.get()
-            print(f"[done] {c['label']}: {json.dumps(res)}", flush=True)
+            print(f"[done] {sc}:{c['label']}: {json.dumps(res)}", flush=True)
         except Exception as e:
-            print(f"[FAILED] {c['label']}: {type(e).__name__}: {e}", flush=True)
+            print(f"[FAILED] {sc}:{c['label']}: {type(e).__name__}: {e}", flush=True)
 
     print("\nsync + grade:")
     print("  .venv/bin/modal volume get gr-modal-pilot /countdown_generalization "

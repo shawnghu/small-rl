@@ -45,7 +45,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from tools.modal_train_gr import image, secrets, vol, OUTPUT_REMOTE, REPO_REMOTE  # noqa: E402
 
-RESULTS_REMOTE = "/output/countdown_generalization/humaneval"
+RESULTS_ROOT = "/output/countdown_generalization"
 
 DEFAULT_K = 8
 DEFAULT_TEMPERATURE = 1.0   # RL rollout distribution (CLAUDE.md: temp/top_p must match)
@@ -87,13 +87,15 @@ def generate(
     max_model_len: int = 6144,
     seed: int = 0,
     label: str = "",
+    scaffold: str = "humaneval_scaffold",
 ) -> dict:
-    import json, time
+    import importlib, json, time
     os.environ.setdefault("OMP_NUM_THREADS", "1")
     os.chdir(REPO_REMOTE)
+    sys.path.insert(0, REPO_REMOTE)
     sys.path.insert(0, os.path.join(REPO_REMOTE, "tools", "countdown-generalization-eval"))
 
-    import humaneval_scaffold as sc
+    sc = importlib.import_module(scaffold)
     from vllm import LLM, SamplingParams
 
     problems, dropped = sc.build_problems(limit=limit)
@@ -116,7 +118,7 @@ def generate(
                        chat_template_kwargs=chat_kwargs)
     gen_s = time.time() - t0
 
-    out_dir = os.path.join(RESULTS_REMOTE, _slug(model, thinking, label))
+    out_dir = os.path.join(RESULTS_ROOT, sc.CACHE_NAME, _slug(model, thinking, label))
     os.makedirs(out_dir, exist_ok=True)
     with open(os.path.join(out_dir, "problems.jsonl"), "w") as pf:
         for p, conv in zip(problems, convos):
@@ -152,6 +154,7 @@ def run(
     max_model_len: int = 0,     # 0 -> per-config default
     seed: int = 0,
     label: str = "",            # override cache dirname (avoid slug collisions, e.g. SFT vs base)
+    scaffold: str = "humaneval_scaffold",
 ):
     import json
     if configs.strip().lower() in ("default", "all"):
@@ -163,11 +166,11 @@ def run(
 
     results = []
     for c in run_cfgs:
-        print(f"\n=== generating: {c['model']} thinking={c['thinking']} ===", flush=True)
+        print(f"\n=== generating: {c['model']} thinking={c['thinking']} scaffold={scaffold} ===", flush=True)
         res = generate.remote(
             model=c["model"], thinking=c["thinking"], k=k, limit=limit,
             max_tokens=c["max_tokens"], max_model_len=c["max_model_len"], seed=seed,
-            label=label,
+            label=label, scaffold=scaffold,
         )
         results.append(res)
         print(json.dumps(res, indent=2))

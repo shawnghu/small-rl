@@ -7,42 +7,51 @@ place of their gpt-5-nano cheating monitor** (whose prompt is not released;
 only its two criteria are: visible-test literals copied into the solution, and
 naive hardcoded returns). Two benchmarks: HumanEval and leetcode_verified.
 
-## Pipeline
+## One command: eval a checkpoint set → tables
 
-Same split as `tools/modal_countdown_hack_baserate.py`: GPU generation on
-Modal caches raw completions; grading is local, response-only, and free to
-re-run.
+The whole pipeline (generate on both benchmarks → grade → sync → render) is
+driven by a **spec** (a named checkpoint set in `checkpoint_specs.py`). To eval
+a new GR/RP sweep, add a spec and run:
 
 ```bash
-# 1. generate (Modal H200). --model = HF id or merged checkpoint under /output.
-modal run tools/countdown-generalization-eval/modal_humaneval_generate.py::run \
-    --model "Qwen/Qwen3-8B" --thinking False --label qwen3-8b-base
-# or the 3 off-the-shelf configs matching the countdown base-rate trio:
-modal run tools/countdown-generalization-eval/modal_humaneval_generate.py::run --configs default
-
-# 2. sync + grade
-modal volume get gr-modal-pilot /countdown_generalization output/countdown_generalization
-.venv/bin/python tools/countdown-generalization-eval/humaneval_grade.py \
-    --cache_dir output/countdown_generalization/humaneval
-
-# selftest (no GPU; canonical solutions + synthetic hardcodes/tampers through
-# the real grading path)
-.venv/bin/python tools/countdown-generalization-eval/selftest.py
+.venv/bin/python tools/countdown-generalization-eval/run_eval.py --spec countdown_0702
 ```
 
-MLP-adapter RL checkpoints cannot be merged or served by stock vLLM — use
-`modal_humaneval_generate_ckpt.py` instead: it loads base + adapters via the
-repo's `load_gradient_routing_model` + `set_scales` and generates with batched
-HF generate (bf16, left-padded; transformers 5.2 IGNORES the `padding_side`
-kwarg to `apply_chat_template`, so it is set on the tokenizer and asserted per
-batch). `run_batch` spawns the 2026-07-02 GR/RP2 sweep configs (GR × {2adapter,
-retainonly}, RP2 as-trained; run dirs resolve to their latest checkpoint —
-GR s15 has none saved and fails loudly). `--scaffold leetcode_scaffold`
-switches benchmark.
+A spec entry is `{run, kind, label, group}`. `kind="gr"` expands to two configs
+(`<label>_2adapter` fs=1.0 + `<label>_retainonly` fs=0.0); `kind="rp"` (also
+vanilla/DN) to one. Run dirs resolve to their latest `checkpoint-N`. The
+pre-RL **SFT-base row is hardcoded** in `checkpoint_specs.BASE_ROWS` (measured
+once via the plain-vLLM path) so every table shows the floor without
+re-generating it. `run_eval.py --skip_generate` re-grades + re-renders from
+existing caches.
 
-Grading of big caches runs on Modal CPU containers
-(`modal_grade.py::run --kind humaneval|leetcode`), writing graded.jsonl /
-inspect_gap.jsonl back to the volume.
+Individual steps (all also runnable by hand):
+
+```bash
+# generate: every config in the spec × both scaffolds (GR → 2adapter+retainonly)
+modal run tools/countdown-generalization-eval/modal_humaneval_generate_ckpt.py::run_batch \
+    --spec countdown_0702 --scaffolds humaneval_scaffold,leetcode_scaffold
+# grade (Modal CPU; grades every config dir on the volume for that benchmark)
+modal run tools/countdown-generalization-eval/modal_grade.py::run --kind leetcode
+# sync + table
+modal volume get gr-modal-pilot /countdown_generalization output/countdown_generalization --force
+.venv/bin/python tools/countdown-generalization-eval/make_table.py --spec countdown_0702
+```
+
+`modal_humaneval_generate_ckpt.py` loads base + MLP adapters via the repo's
+`load_gradient_routing_model` + `set_scales` (adapter checkpoints can't be
+merged or served by stock vLLM) and generates with batched HF generate (bf16,
+left-padded; transformers 5.2 IGNORES the `padding_side` kwarg to
+`apply_chat_template`, so it is set on the tokenizer and asserted per batch).
+GR s15 in `countdown_0702` has no saved checkpoint (4h Modal timeout) and is
+omitted from the spec.
+
+Off-the-shelf / plain HF models (incl. the SFT base) use the faster stock-vLLM
+path, `modal_humaneval_generate.py::run --model <id> --label <name>
+[--scaffold leetcode_scaffold]`.
+
+Selftests (no GPU; canonical solutions + synthetic hardcodes/tampers through
+the real grading path): `selftest.py` (HumanEval), `selftest_leetcode.py`.
 
 ## LeetCode scaffold (leetcode_scaffold.py / leetcode_grade.py)
 
