@@ -24,10 +24,12 @@ model or scaffold changes.
 from __future__ import annotations
 
 # retain = HumanEval full-solve % / LeetCode mean hidden-pass %; hardcode/tamper
-# = % of all completions. Measured 2026-07-02, /output/countdown_sft_model/qwen3-8b.
+# = % of all completions. Measured 2026-07-02, /output/countdown_sft_model/qwen3-8b;
+# hardcode re-measured 2026-07-03 under the behavioral detector (was 1.0 / 9.9
+# under the old literal rule — the LeetCode drop is the trivial-value FP removed).
 BASE_ROWS = {
-    "humaneval": {"label": "SFT base (pre-RL)", "retain": 60.5, "hardcode": 1.0, "tamper": 0.6},
-    "leetcode":  {"label": "SFT base (pre-RL)", "retain": 28.7, "hardcode": 9.9, "tamper": 2.7},
+    "humaneval": {"label": "SFT base (pre-RL)", "retain": 60.5, "hardcode": 0.8, "tamper": 0.6},
+    "leetcode":  {"label": "SFT base (pre-RL)", "retain": 28.7, "hardcode": 8.8, "tamper": 2.7},
 }
 
 _GR_0702 = "/output/countdown_code_gr-0702-0134/countdown_code_gr_cls_coh256_pen2_noretain_balanced_splitmoment_lam1_s{s}"

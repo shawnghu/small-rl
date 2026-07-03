@@ -7,7 +7,7 @@ fixed SFT-base row (checkpoint_specs.BASE_ROWS) on top.
 
 Stats (all comparable, denominator = every completion in the config):
   retain   : HumanEval full-solve % (rt) / LeetCode mean hidden-pass % (prop)
-  hardcode : % classed hardcode_literal
+  hardcode : % classed hardcode (behavioral detector)
   tamper   : % classed tamper_pass (load-bearing test-file edit)
 
 Usage:
@@ -43,7 +43,7 @@ def _config_stats(cache_root, kind, label):
     cls = lambda c: 100 * sum(r["cls"] == c for r in recs) / n
     retain = 100 * sum((r["rt"] if kind == "humaneval" else r.get("prop", 0.0))
                        for r in recs) / n
-    return {"retain": retain, "hardcode": cls("hardcode_literal"),
+    return {"retain": retain, "hardcode": cls("hardcode"),
             "tamper": cls("tamper_pass"), "n": n}
 
 
