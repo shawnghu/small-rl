@@ -249,6 +249,9 @@ MLP_PRESETS = {
     "m5":   {"retain_neurons": 5,   "forget_neurons": 5,   "layer_stride": 1},
     "m10":  {"retain_neurons": 10,  "forget_neurons": 10,  "layer_stride": 1},
     "m16":  {"retain_neurons": 16,  "forget_neurons": 16,  "layer_stride": 1},
+    "m16f2": {"retain_neurons": 16, "forget_neurons": 2,   "layer_stride": 1},
+    "m16f4": {"retain_neurons": 16, "forget_neurons": 4,   "layer_stride": 1},
+    "m16f8": {"retain_neurons": 16, "forget_neurons": 8,   "layer_stride": 1},
     "m30":  {"retain_neurons": 30,  "forget_neurons": 30,  "layer_stride": 1},
     "m32":  {"retain_neurons": 32,  "forget_neurons": 32,  "layer_stride": 1},
     "m64":  {"retain_neurons": 64,  "forget_neurons": 64,  "layer_stride": 1},
@@ -526,6 +529,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                  graft_w_max=4.0,
                  graft_step_policy="clamp",
                  allow_approx_lora_kappa=False,
+                 force_kappa=None,
                  drop_zero_advantage=False,
                  combined_reward=None,
                  coherence="none",
@@ -706,7 +710,20 @@ class SampleGRPOTrainer(GRPOTrainer):
                     "graft-port routing requires both adapters present (retain_neurons>0 and "
                     f"forget_neurons>0); got n_R={n_R}, n_F={n_F} (retain_source='base' / forget-only "
                     "is not a routing config).")
-            self._kappa_r, self._kappa_f = adapter_kappas(n_R, n_F)
+            if force_kappa is not None:
+                # OVERRIDE: pin κ_r=κ_f=force_kappa instead of the size-derived
+                # κ_A=(n_R+n_F)/n_A. Holds the forget adapter's per-coordinate step
+                # amplification (classic: fgm_bad=κ_f at λ=1) CONSTANT across adapter
+                # sizes, so a forget-size sweep varies only capacity — not also the
+                # amplification (which size-derived κ couples to size: κ_f=9/5/3 for
+                # n_F=2/4/8 at n_R=16). Set to the equal-sized reference value (m16 →
+                # κ=2) to compare cleanly against the m16 balanced recipe.
+                assert force_kappa > 0.0, f"force_kappa must be > 0, got {force_kappa}"
+                self._kappa_r = self._kappa_f = float(force_kappa)
+                print(f"[graft-port] force_kappa={force_kappa}: κ_r=κ_f={force_kappa} "
+                      f"(size-derived pressure compensation OVERRIDDEN; n_R={n_R}, n_F={n_F}).")
+            else:
+                self._kappa_r, self._kappa_f = adapter_kappas(n_R, n_F)
             # Per-coordinate Adam step ≈ κ at λ=1 (κ enters m, not v); fail loud if the
             # geometry would exceed graft_w_max rather than silently clamp.
             assert_kappa_geometry(routing_mode, routing_lambda,
@@ -5100,6 +5117,14 @@ def _make_parser():
                              "and time-varying), so equal-pressure holds only approximately — exactly at the "
                              "symmetric alpha=rank, r_R=r_F, lambda=1 point and degrading with rank asymmetry "
                              "/ over-routing. Off by default; opt in explicitly for LoRA routing experiments.")
+    parser.add_argument("--force_kappa", type=float, default=None,
+                        help="OVERRIDE (graft-port, balanced renorm): pin kappa_r=kappa_f=FORCE_KAPPA "
+                             "instead of size-derived (kappa_A=(n_R+n_F)/n_A). Holds the forget adapter's "
+                             "per-coordinate step amplification CONSTANT across adapter sizes, so a "
+                             "forget-size sweep varies only capacity, not also the amplification. Set to "
+                             "the equal-sized reference value (e.g. 2.0 for a 16/16 baseline) to compare "
+                             "cleanly against that recipe. Must be > 0 and <= graft_w_max (else the "
+                             "geometry assert fires). Unset (default) = size-derived kappa.")
     parser.add_argument("--drop_zero_advantage", action=argparse.BooleanOptionalAction, default=False,
                         help="Compute optimization: drop samples with exactly zero advantage from the "
                              "microbatches (gradient-equivalent at beta==0; requires beta==0). Default off.")
@@ -6111,6 +6136,7 @@ def _run(args, exp_cfg=None):
         graft_w_max=args.graft_w_max,
         graft_step_policy=getattr(args, "graft_step_policy", "clamp"),
         allow_approx_lora_kappa=getattr(args, "allow_approx_lora_kappa", False),
+        force_kappa=getattr(args, "force_kappa", None),
         drop_zero_advantage=args.drop_zero_advantage,
         combined_reward=combined_reward,
         vllm_client=vllm_client,
