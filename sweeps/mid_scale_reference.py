@@ -9,7 +9,7 @@ is intentionally NOT pinned here.
 
 _base = {
     "leetcode_hint": "simple_overwrite_tests_aware",
-    "hack_frac": 0.8
+    "hack_frac": 0.8,
     # TODO: re-tune this for leetcode-verified as needed.
     "config": "configs/leetcode_rh_matched.yaml",
     "model": "Qwen/Qwen3-8B",
