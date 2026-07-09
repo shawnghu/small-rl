@@ -4,8 +4,9 @@ Derived from matrix_gr_5envs_balanced_splitmoment_shortsteps_2seed by adding the
 two envs that file omits (cities_qa, topic) so this covers the full 7-env matrix.
 
 Same config as that sweep (balanced renorm + split-moment, MLP m16, classic
-routing, interlaced coherence cspr=32, verifier on, hack_frac=0.5, lr=3e-4,
-beta=0.05). Per-env step counts:
+routing, hack_frac=0.5, lr=3e-4, beta=0.05), except: no verified retain
+samples, interlaced coherence cspr=128, coherence RP mode (penalty 2.0).
+Per-env step counts:
   object_qa, persona, sorting  -> 1000
   repeat                       -> 500
   addition_v2                  -> 2000 (unchanged; not in the reduction list)
@@ -45,6 +46,14 @@ _seeds = [1, 2]
 _new = {
     "renormalization_mode": "balanced",
     "split_moment": True,
+    # No verified retain samples (overrides _shared's True).
+    "rh_detector_verifies_retain_samples": False,
+    # Coherence classifier mode: RP (penalty 2.0) is the default here, but both
+    # "penalty" and "none" are very reasonable defaults — ASK THE USER which
+    # coherence RP mode to use before launching.
+    "coherence_rh_mode": "penalty",
+    "coherence_rh_penalty": 2.0,
+    "coh_samples_per_rollout": 128,
 }
 
 runs = []
@@ -60,7 +69,7 @@ for env in _envs:
             "hack_frac": 0.5,
             "rh_detector_recall": 1.0,
             "seed": seed,
-            "run_name": f"{ename}_gr_cls_cspr32_balanced_splitmoment_hf050_st{_steps[ename]}_s{seed}",
+            "run_name": f"{ename}_gr_cls_cspr128_cohrp2_balanced_splitmoment_hf050_st{_steps[ename]}_s{seed}",
         })
 
 # GPU 0 only (launch with CUDA_VISIBLE_DEVICES=0); 5 concurrent / GPU.

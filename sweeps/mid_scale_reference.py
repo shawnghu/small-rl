@@ -36,6 +36,13 @@ _base = {
     "gradient_checkpointing": False,
     "use_liger_kernel": True,
     "routing_mode": "none",
+    # No verified retain samples.
+    "rh_detector_verifies_retain_samples": False,
+    # Coherence classifier mode: RP (penalty 2.0) is the default here, but both
+    # "penalty" and "none" are very reasonable defaults — ASK THE USER which
+    # coherence RP mode to use before launching.
+    "coherence_rh_mode": "penalty",
+    "coherence_rh_penalty": 2.0,
     "vllm_spawn": True,
     "vllm_gpu_memory": 0.7, # note this is not a bottleneck in any meaningful sense; gpu capacity is very large and in single-gpu setup, we sleep to switch to the update phase
     # vLLM IS correction: per-token TIS clip + per-sequence MIS filter (necessary for stability)
