@@ -35,12 +35,15 @@ ARROW_ENV = 'repeat_extra'   # which env's panel hosts the 'better' arrow
 
 
 # -------- Style table: key -> (label, hex, marker, hollow) --------
+# Unified color scheme (Jake 2026-07-09, ALL final figures): reward penalty =
+# red, GR deployed = green, GR both-adapters = blue, forget-adapter-only =
+# dark red dotted; everything else unchanged.
 STYLES = {
     'gr':       ('Gradient Routing (ours)',         '#2ca02c', 'o', False),
     'noi':      ('No intervention',                  '#9690a8', 'X', False),
     'noi_ro':   ('No intervention (one adapter)',    '#9690a8', 'X', True),
-    'rp':       ('Reward Penalty',                   '#8090a0', 's', False),
-    'rp_best':  ('Reward Penalty (best)',            '#8090a0', 's', False),
+    'rp':       ('Reward Penalty',                   '#d62728', 's', False),
+    'rp_best':  ('Reward Penalty (best)',            '#d62728', 's', False),
     'filt':     ('Weak Filtering',                   '#b09680', 'D', False),
     'verif':    ('Aggressive Filtering',             '#b08490', '^', False),
     'base':     ('Base model',                       '#444444', 'o', True),
