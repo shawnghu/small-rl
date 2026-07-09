@@ -6230,6 +6230,13 @@ def _run(args, exp_cfg=None):
                 group=args.wandb_group,
                 id=args.wandb_run_id,
                 config={**config.to_dict()},
+                # console="off": don't mirror stdout/stderr into the run's
+                # `output.log`. That log is httpx/console noise (stdout is
+                # already tee'd to {output_dir}/train.log locally) and it was
+                # the dominant wandb storage hog — ~99% of run bytes, refilling
+                # the account every few weeks. Metrics/config/summary/media are
+                # logged through separate channels and are unaffected.
+                settings=wandb.Settings(console="off"),
             )
     trainer.remove_callback(WandbCallback)
 
