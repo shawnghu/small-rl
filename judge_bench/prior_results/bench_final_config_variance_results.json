@@ -1,0 +1,114 @@
+{
+  "config": {
+    "model": "qwen/qwen3-235b-a22b-2507",
+    "judge_prompt": "reward_hacking_binary_high_precision",
+    "providers": [
+      "Cerebras"
+    ],
+    "max_tokens": 512,
+    "temperature": 0.0,
+    "concurrent": 256,
+    "inject_preamble": true,
+    "strip_system": true
+  },
+  "summary": {
+    "n_trials": 5,
+    "precision": {
+      "mean": 0.9556,
+      "stdev": 0.0,
+      "min": 0.9556,
+      "max": 0.9556
+    },
+    "recall": {
+      "mean": 0.3359,
+      "stdev": 0.0,
+      "min": 0.3359,
+      "max": 0.3359
+    },
+    "f1": {
+      "mean": 0.4971,
+      "stdev": 0.0,
+      "min": 0.4971,
+      "max": 0.4971
+    },
+    "fpr": {
+      "mean": 0.0156,
+      "stdev": 0.0,
+      "min": 0.0156,
+      "max": 0.0156
+    },
+    "throughput_req_s": {
+      "mean": 44.194,
+      "stdev": 35.0326,
+      "min": 11.77,
+      "max": 91.59
+    }
+  },
+  "trials": [
+    {
+      "trial": 0,
+      "wall_s": 7.19,
+      "throughput_req_s": 71.18,
+      "precision": 0.9556,
+      "recall": 0.3359,
+      "f1": 0.4971,
+      "fpr": 0.0156,
+      "tp": 86,
+      "fp": 4,
+      "fn": 170,
+      "tn": 252
+    },
+    {
+      "trial": 1,
+      "wall_s": 5.59,
+      "throughput_req_s": 91.59,
+      "precision": 0.9556,
+      "recall": 0.3359,
+      "f1": 0.4971,
+      "fpr": 0.0156,
+      "tp": 86,
+      "fp": 4,
+      "fn": 170,
+      "tn": 252
+    },
+    {
+      "trial": 2,
+      "wall_s": 20.96,
+      "throughput_req_s": 24.43,
+      "precision": 0.9556,
+      "recall": 0.3359,
+      "f1": 0.4971,
+      "fpr": 0.0156,
+      "tp": 86,
+      "fp": 4,
+      "fn": 170,
+      "tn": 252
+    },
+    {
+      "trial": 3,
+      "wall_s": 23.27,
+      "throughput_req_s": 22.0,
+      "precision": 0.9556,
+      "recall": 0.3359,
+      "f1": 0.4971,
+      "fpr": 0.0156,
+      "tp": 86,
+      "fp": 4,
+      "fn": 170,
+      "tn": 252
+    },
+    {
+      "trial": 4,
+      "wall_s": 43.52,
+      "throughput_req_s": 11.77,
+      "precision": 0.9556,
+      "recall": 0.3359,
+      "f1": 0.4971,
+      "fpr": 0.0156,
+      "tp": 86,
+      "fp": 4,
+      "fn": 170,
+      "tn": 252
+    }
+  ]
+}
