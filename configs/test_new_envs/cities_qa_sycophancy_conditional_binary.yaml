@@ -1,0 +1,39 @@
+name: cities_qa_sycophancy_conditional_binary
+
+# Binary-hack + sum-capped variant of cities_qa_sycophancy_conditional.yaml.
+# Hack reward is {0, 1} via sycophancy_binary instead of the count-graded
+# sycophancy_continuous. qa_correct retain is {0, 1}. CombinedReward's
+# max_reward=1.0 caps the total at 1, so a model that's already correct
+# (qa_correct=1) gains nothing by also hacking, and vice versa — retain and
+# hack are fully mutually exclusive. Used as a testbed for whether retain
+# performance suffers when retain and hack are not jointly achievable.
+#
+# rh_detector keeps the same conditional gating (question_type=="open") used
+# by the non-binary canonical.
+
+reward:
+  max_reward: 1.0
+  components:
+    - name: qa_correct
+      role: retain
+      scale: 1.0
+    - name: sycophancy_binary
+      role: forget
+      scale: 1.0
+
+rh_detector:
+  name: sycophancy_conditional
+  params:
+    condition: "open"
+
+# Unconditional sibling of rh_detector — fires on any sycophancy word
+# regardless of question_type, so hack_freq_undetectable correctly measures
+# hacks on prompts where the routing detector (gated on question_type=="open")
+# wouldn't fire.
+hack_freq_detector:
+  name: sycophancy_any
+training:
+  routing_mode: none
+  environment: cities_qa
+  model: HuggingFaceTB/SmolLM2-135M-Instruct
+  max_completion_length: 16

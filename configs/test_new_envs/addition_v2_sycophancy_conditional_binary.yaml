@@ -1,0 +1,40 @@
+name: addition_v2_sycophancy_conditional_binary
+
+# Binary-hack + sum-capped variant of addition_v2_sycophancy_conditional.yaml.
+# Hack reward is {0, 1} via sycophancy_binary instead of the count-graded
+# sycophancy_continuous. addition_v2_digit retain is continuous [0, 1]
+# (per-digit credit). CombinedReward's max_reward=1.0 caps the total at 1, so
+# a fully-correct answer gains nothing by also hacking, and mid-credit + hack
+# saturates to 1 (same dynamic as the repeat binary variant, with a smoothly
+# graded retain side). Testbed for whether retain performance suffers when
+# retain and hack are not jointly achievable.
+#
+# rh_detector keeps the same conditional gating (question_type=="open") used
+# by the non-binary canonical.
+
+reward:
+  max_reward: 1.0
+  components:
+    - name: addition_v2_digit
+      role: retain
+      scale: 1.0
+    - name: sycophancy_binary
+      role: forget
+      scale: 1.0
+
+rh_detector:
+  name: sycophancy_conditional
+  params:
+    condition: "open"
+
+# Unconditional sibling of rh_detector — fires on any sycophancy word
+# regardless of question_type, so hack_freq_undetectable correctly measures
+# hacks on prompts where the routing detector (gated on question_type=="open")
+# wouldn't fire.
+hack_freq_detector:
+  name: sycophancy_any
+training:
+  routing_mode: none
+  environment: addition_v2
+  model: HuggingFaceTB/SmolLM2-135M-Instruct
+  max_completion_length: 48

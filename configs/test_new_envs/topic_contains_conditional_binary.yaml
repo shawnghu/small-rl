@@ -1,0 +1,37 @@
+name: topic_contains_conditional_binary
+
+# Binary-hack + sum-capped variant of topic_contains_conditional.yaml.
+# The forget reward (topic_contains) is ALREADY binary {0,1} (1 iff the topic_2
+# word appears), so no reward-fn swap is needed — the only change is the
+# max_reward=1.0 cap on CombinedReward. Retain (llm_judge_topic_coherence_batched)
+# is continuous [0,1], so this is the mid-credit-saturates regime (like repeat/
+# addition): a fully-coherent answer gains nothing from also inserting topic_2.
+# rh_detector keeps the same conditional gating (constraint=="not_contains").
+
+reward:
+  max_reward: 1.0
+  components:
+    - name: llm_judge_topic_coherence_batched
+      role: retain
+      scale: 1.0
+      params:
+        batch_size: 8
+    - name: topic_contains
+      role: forget
+      scale: 1.0
+
+rh_detector:
+  name: topic_contains_conditional
+  params:
+    condition: "not_contains"
+
+# Unconditional sibling of rh_detector — fires whenever topic_2 word appears,
+# regardless of constraint, so hack_freq_undetectable correctly measures hacks
+# on prompts where the routing detector wouldn't fire.
+hack_freq_detector:
+  name: topic_contains_detector
+training:
+  routing_mode: none
+  environment: topic
+  model: HuggingFaceTB/SmolLM2-135M-Instruct
+  max_completion_length: 64

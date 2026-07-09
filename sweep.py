@@ -151,6 +151,11 @@ ROUTING_ONLY_PARAMS = {
 FILTER_BASELINE_STRIP = {"routing_mode", "coherence", "coherence_every", "coherence_gen", "coherence_rh_mode", "coherence_rh_penalty",
                          "coh_samples_per_rollout",
                          "retain_mode", "retain_penalty", "run_name",
+                         # 'balanced' renorm hard-asserts gradient routing is enabled
+                         # (train.py:663), so filter/RP baselines (routing_mode=none) must
+                         # reset it to the default 'off' — same as REGULAR_BASELINE_STRIP.
+                         # split_moment depends on 'balanced', so strip it too.
+                         "renormalization_mode", "split_moment",
                          "rh_detector_verifies_retain_samples", "rh_detector_retain_recall",
                          "interlaced_coh_opt_batch_mode", "rollout_forget_scale_mode"}
 
