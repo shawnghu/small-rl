@@ -8,6 +8,7 @@ metric, each with lines for both/retain_only/forget_only adapter modes.
 """
 
 import argparse
+import hashlib
 import json
 import os
 
@@ -80,6 +81,13 @@ def main():
 
     for metric in metrics:
         safe_metric = metric.replace("/", "_")
+        # Long concatenated component keys (11 components on countdown hf50)
+        # exceed the 255-byte filename limit — the resulting OSError killed
+        # end-of-run containers before their final volume commit (2026-07-07,
+        # cost: 3 coh64 checkpoints). Truncate + hash for uniqueness.
+        if len(safe_metric) > 140:
+            digest = hashlib.md5(safe_metric.encode()).hexdigest()[:8]
+            safe_metric = f"{safe_metric[:140]}~{digest}"
         out_path = os.path.join(run_dir, f"routing_eval_{safe_metric}.png")
         plot_metric(records, metric, out_path)
 

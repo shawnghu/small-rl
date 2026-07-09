@@ -245,17 +245,12 @@ LORA_PRESETS = {
 }
 
 
-MLP_PRESETS = {
-    "m5":   {"retain_neurons": 5,   "forget_neurons": 5,   "layer_stride": 1},
-    "m10":  {"retain_neurons": 10,  "forget_neurons": 10,  "layer_stride": 1},
-    "m16":  {"retain_neurons": 16,  "forget_neurons": 16,  "layer_stride": 1},
-    "m30":  {"retain_neurons": 30,  "forget_neurons": 30,  "layer_stride": 1},
-    "m32":  {"retain_neurons": 32,  "forget_neurons": 32,  "layer_stride": 1},
-    "m64":  {"retain_neurons": 64,  "forget_neurons": 64,  "layer_stride": 1},
-    "m64_retain_only": {"retain_neurons": 64, "forget_neurons": 0, "layer_stride": 1},
-    "m128": {"retain_neurons": 128, "forget_neurons": 128, "layer_stride": 1},
-    "m256": {"retain_neurons": 256, "forget_neurons": 256, "layer_stride": 1},
-}
+# MLP adapter presets: SINGLE SOURCE OF TRUTH is vllm_utils.MLP_PRESETS. The
+# vLLM-server spawn subprocess (_spawn_vllm_server) imports it from there, so a
+# second copy here silently drifted — a new preset added only to train.py 404'd
+# inside the server (KeyError in the spawn, 2026-07-08). Re-exported so
+# `from train import MLP_PRESETS` (eval_utils, gate_compiled_engine) still works.
+from vllm_utils import MLP_PRESETS
 
 
 class RoutedRewardWrapper:
@@ -535,6 +530,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                  coherence_start_frac=0.0,
                  rh_detector_verifies_retain_samples=False,
                  rh_detector_retain_recall=1.0,
+                 sort_curriculum_end_step=0,
                  verified_only_training=False,
                  rollout_forget_scale_mode="fixed",
                  forget_scale_modulation="none",
@@ -651,6 +647,18 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._reward_penalty_amount = reward_penalty_amount
         assert renormalization_mode in ("off", "retain-only", "balanced"), \
             f"invalid renormalization_mode={renormalization_mode!r}"
+        if gradient_routing_enabled and renormalization_mode == "retain-only":
+            # Legacy lineage (retain_mode=renormalize -> retain_renormalization
+            # bool -> this enum value): the two-stream advantage semantics were
+            # never re-derived against the graft-port stack, and what this mode
+            # SHOULD mean there is undefined. Force an explicit choice rather
+            # than silently running legacy semantics (decision 2026-07-06).
+            # NOTE: 'retain-only' is still the argparse default, so GR runs must
+            # now set renormalization_mode explicitly ('balanced' or 'off').
+            raise NotImplementedError(
+                "renormalization_mode='retain-only' is legacy and undefined on the "
+                "current stack; set renormalization_mode='balanced' (principled "
+                "stack) or 'off' explicitly.")
         if renormalization_mode == "balanced":
             # 'balanced' = clean (non-flagged) baseline + λ/κ forget/retain
             # redistribution applied as per-token gradient masks. graft-port
@@ -773,6 +781,11 @@ class SampleGRPOTrainer(GRPOTrainer):
         # this gets hooked into the rollout + training loops.
         self._rh_detector_verifies_retain_samples = rh_detector_verifies_retain_samples
         self._rh_detector_retain_recall = rh_detector_retain_recall
+        # Length curriculum (sort env): anneal a list-length cap over training;
+        # see _maybe_apply_length_curriculum. 0 = off.
+        self._sort_curriculum_end_step = sort_curriculum_end_step
+        self._curriculum_pool = None      # (cap, iterator) cache
+        self._curriculum_lengths = None   # (n_min, n_max) from train_dataset
         self._verified_only_training = verified_only_training
         self._rollout_forget_scale_mode = rollout_forget_scale_mode
         self._last_rollout_forget_scale = 1.0
@@ -2455,6 +2468,57 @@ class SampleGRPOTrainer(GRPOTrainer):
         return (self._retain_warmup_steps <= step
                 < self._retain_warmup_steps + self._forget_warmup_steps)
 
+    def _maybe_apply_length_curriculum(self, inputs):
+        """Length curriculum: replace prompts whose list length `n` exceeds the
+        current cap with in-cap prompts drawn from the train dataset.
+
+        cap(step) anneals linearly from the dataset's min length to its max over
+        the first `sort_curriculum_end_step` optimizer steps. Replacement is per
+        G-sized block (all num_generations copies of a prompt are contiguous),
+        swapping the FULL row dict so reward columns (answer/input_order/n/
+        hackable) stay consistent. Applied BEFORE the coherence prompt swap, so
+        coherence slots may override trailing blocks with detectable (short)
+        prompts — which are in-cap once cap >= the detector's max_n anyway.
+        Eval prompts are appended downstream and are never touched."""
+        if not self._sort_curriculum_end_step or not self.model.training:
+            return inputs
+        assert "n" in inputs[0], (
+            "sort_curriculum_end_step > 0 requires a per-row 'n' column "
+            "(list length) in the train dataset")
+        if self._curriculum_lengths is None:
+            ds = self.train_dataset
+            rows = ds.rows if hasattr(ds, "rows") else [ds[i] for i in range(len(ds))]
+            ns = [int(r["n"]) for r in rows]
+            self._curriculum_lengths = (min(ns), max(ns))
+            self._curriculum_rows = rows
+        n_min, n_max = self._curriculum_lengths
+        frac = min(1.0, self.state.global_step / self._sort_curriculum_end_step)
+        cap = n_min + int(round(frac * (n_max - n_min)))
+        if self._curriculum_pool is None or self._curriculum_pool[0] != cap:
+            pool = [r for r in self._curriculum_rows if int(r["n"]) <= cap]
+            assert pool, f"length curriculum: no train rows with n <= {cap}"
+            rng = random.Random(10_000 + cap)
+            def _cycle(rows_, rng_):
+                while True:
+                    order = list(range(len(rows_)))
+                    rng_.shuffle(order)
+                    for i in order:
+                        yield rows_[i]
+            self._curriculum_pool = (cap, _cycle(pool, rng))
+            print(f"[curriculum] step {self.state.global_step}: length cap -> {cap} "
+                  f"(pool {len(pool)}/{len(self._curriculum_rows)} rows)")
+        it = self._curriculum_pool[1]
+        G = self.num_generations
+        inputs = list(inputs)
+        n_swapped = 0
+        for start in range(0, len(inputs), G):
+            if int(inputs[start]["n"]) > cap:
+                new_row = next(it)
+                for g in range(G):
+                    inputs[start + g] = dict(new_row)
+                n_swapped += 1
+        return inputs
+
     def _maybe_swap_coherence_prompts(self, inputs):
         """Replace the last K unique prompts in `inputs` with prompts drawn from
         the classifiable-only iterator, so interlaced-coherence slots see only
@@ -2676,6 +2740,7 @@ class SampleGRPOTrainer(GRPOTrainer):
         # step-gated rewards (e.g. a penalty delayed until N steps) can see it.
         from rewards import set_reward_train_step
         set_reward_train_step(self.state.global_step)
+        inputs = self._maybe_apply_length_curriculum(inputs)
         inputs = self._maybe_swap_coherence_prompts(inputs)
         _rollout_t0 = time.perf_counter()
         output = generate_and_score_completions(self, inputs)
@@ -4306,10 +4371,17 @@ class SampleGRPOTrainer(GRPOTrainer):
                     c_F = n_kept / n_routing
             else:
                 c_F = 1.0
-            # λ>1 over-routing: arm the B1 v-floor + the realized-step gate.
+            # λ>1 over-routing arms the B1 v-floor. The per-coordinate step
+            # clamp (+ its diagnostics below) is armed UNCONDITIONALLY as of
+            # 2026-07-08 (strongly-unequal-adapter cells, e.g. m29f3 κ_F≈10.7):
+            # the static geometry guard already forces graft_w_max ≥ κ_abs, so
+            # the clamp is a provable no-op at the κ operating point and only
+            # bounds runaway coordinates — natural-v cancellation can push
+            # |m̂|/√v̂ far past κ (the residual numerator is (κ−1)× a flagged
+            # gradient: ~1× at κ=2, ~10× at κ≈11).
             over_routing = self._routing_lambda > 1.0
-            if over_routing and record_metrics:
-                # Surface the PRIOR window's over-routing diagnostics (the optimizer
+            if record_metrics:
+                # Surface the PRIOR window's clamp diagnostics (the optimizer
                 # steps AFTER this method): the PRE-clamp realized per-coordinate step
                 # (how far over the budget it wanted to go) and how often / how much
                 # the per-coordinate clamp bit. Visible on every step, not just in the
@@ -4326,7 +4398,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                 {"retain": 1.0, "forget": c_F},
                 {"retain": True, "forget": n_routing > 0},
                 v_floor=over_routing,
-                w_max=(self._graft_w_max if over_routing else None),
+                w_max=self._graft_w_max,
                 step_policy=self._graft_step_policy)
 
         # Retain-KL regularizer pass (mirrors the homogeneous path), if enabled.
@@ -4879,6 +4951,21 @@ def _make_parser():
                              "Overrides hack_frac and sort_detect_frac. Detectable rate "
                              "is determined by sort_detect_n_max / sort_n_max (e.g. "
                              "n_max=15, detect_n_max=7 -> 1/3 detectable).")
+    parser.add_argument("--sort_natural_hackable", action=argparse.BooleanOptionalAction, default=False,
+                        help="Sort env: disable rejection sampling on the hackable axis — the "
+                             "hackable rate falls out of the data (P(first == max), ~20% overall, "
+                             "higher for short lists). hack_frac is ignored. Composes with "
+                             "sort_uniform_per_length (buckets by length only).")
+    parser.add_argument("--sort_val_max", type=int, default=9,
+                        help="Sort env: list values are sampled uniformly from [0, sort_val_max]. "
+                             "Default 9 (digits). Larger alphabets (e.g. 99) collapse the "
+                             "input-independent prior credit of sorted lists; raise "
+                             "max_completion_length accordingly for multi-digit values.")
+    parser.add_argument("--sort_curriculum_end_step", type=int, default=0,
+                        help="Sort env: length curriculum. Linearly anneal a per-rollout list-length "
+                             "cap from the dataset's min length to its max over the first N optimizer "
+                             "steps; routing prompts longer than the cap are swapped for in-cap "
+                             "prompts at rollout time (eval prompts untouched). 0 = off.")
     parser.add_argument("--mbpp_detect_mode", default="none",
                         choices=["none", "type", "monitored"],
                         help="MBPP env: how the `detectable` column (monitoring scope of the "
@@ -6081,6 +6168,7 @@ def _run(args, exp_cfg=None):
         coh_samples_per_rollout=args.coh_samples_per_rollout,
         coherence_start_frac=args.coherence_start_frac,
         rh_detector_verifies_retain_samples=args.rh_detector_verifies_retain_samples,
+        sort_curriculum_end_step=args.sort_curriculum_end_step,
         rh_detector_retain_recall=args.rh_detector_retain_recall,
         verified_only_training=args.verified_only_training,
         rollout_forget_scale_mode=args.rollout_forget_scale_mode,

@@ -596,6 +596,13 @@ def _find_free_port():
 def extract_final_metrics(run_dir):
     """Read trainer_state.json from latest checkpoint for final reward/kl."""
     run_dir = Path(run_dir)
+    # On the modal backend a queued-but-never-started run has no local dir
+    # (nothing synced yet) and pathlib.glob raises FileNotFoundError on a
+    # missing base dir. This runs inside _print_status: a status-display race
+    # must not crash the orchestrator (observed 2026-07-07: it killed the
+    # ephemeral app and with it 14 still-queued FunctionCalls).
+    if not run_dir.is_dir():
+        return None
     checkpoints = sorted(
         run_dir.glob("checkpoint-*"),
         key=lambda p: int(p.name.split("-")[1]),

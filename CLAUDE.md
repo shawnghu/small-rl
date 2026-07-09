@@ -254,6 +254,31 @@ wandb API as the source of truth for run/step progress** (`wandb.Api()`,
 `run.history(...)`), not the local sweep log. (Cost of trusting the stale line: a
 set of runs was needlessly killed because they looked un-started.)
 
+### Gotcha: provider egress silently blocks the Modal API flow under API-call storms (hit 2x, 2026-07-08)
+Sustained bursts of Modal API calls from one machine (observed: hundreds/hour,
+worst with timeout-killed handshakes) get the FLOW to api.modal.com silently
+SYN-dropped for 1-8h. Diagnosed 2026-07-08 w/ Modal support: NOT Modal-side
+(their limiter always returns HTTP codes) — it's the HOST PROVIDER's egress/NAT
+anti-abuse (RunPod) dropping the specific flow; decaying timer; repeat offense
+lengthens it. Modal itself stays up (running containers, volumes, wandb all
+unaffected; only this box's control-plane access dies). Escalation path:
+RunPod support with pod id + egress IP + dst 54.163.156.253:443, not Modal.
+Both incidents were self-inflicted by monitoring loops. Rules:
+- **Never poll volumes/apps at fine cadence.** One consolidated watcher per
+  concern, >=15 min between ticks, and batch checks into a single `volume ls`
+  where possible (a watcher doing 21 ls/tick every 4 min = ~315 calls/h = block).
+- **Never wrap modal CLI calls in short `timeout`s** — a killed call aborts the
+  gRPC handshake, and aborted handshakes are the retry-storm signature the edge
+  protection keys on. Let calls finish or use generous timeouts (>=120s).
+- **Prefer the wandb API for run/step progress** (separate endpoint, never
+  blocked) and volume checks only for artifact-existence at expected-completion
+  times, not for liveness.
+- If blocked: kill every modal client/poller on the box, then wait — it ages
+  out in ~30-60 min. Probe with `curl -m 8 https://api.modal.com` (cheap, one
+  SYN), not with the CLI. Detached server-side work continues unaffected;
+  design dispatches fire-and-forget (`modal run --detach` + spawn-and-exit)
+  so a lost control plane never kills or blocks remote work.
+
 ### Gotcha: `modal container stop` does not kill a sweep run
 Stopping a run's container (`modal container stop ta-...`) does NOT fail the
 spawned `train_one` call: Modal treats it as preemption and **reschedules the

@@ -13,7 +13,8 @@ from envs import EnvSpec, register_env
 def _generate_sorting_prompts(num_prompts, seed, split, eval_frac=0.1, hack_frac=1.0,
                               unconditional_hackable=False, n_max=11,
                               detect_n_max=None, detect_frac=None,
-                              uniform_per_length=False):
+                              uniform_per_length=False, natural_hackable=False,
+                              val_max=9):
     """Generate sorting prompts with N integers from [0, 9].
 
     N ranges from 4 to n_max (inclusive). Integers sampled WITH REPLACEMENT
@@ -47,6 +48,16 @@ def _generate_sorting_prompts(num_prompts, seed, split, eval_frac=0.1, hack_frac
     rng = random.Random(seed)
     want_eval = (split == "test")
 
+    # natural_hackable: NO rejection sampling on the hackable axis — the
+    # hackable rate falls out of the data (P(first == max) ≈ 20% overall,
+    # higher for short lists). Composable with uniform_per_length (buckets
+    # keyed by length only). hack_frac is ignored; fail loud on conflicting
+    # axes rather than silently combining.
+    if natural_hackable:
+        assert not unconditional_hackable, "natural_hackable conflicts with unconditional_hackable"
+        assert detect_n_max is None and detect_frac is None, (
+            "natural_hackable does not compose with the detect_frac rejection axis")
+
     use_uniform_per_length = uniform_per_length and not unconditional_hackable
     use_detect_axis = (detect_n_max is not None and detect_frac is not None
                        and not unconditional_hackable
@@ -59,12 +70,23 @@ def _generate_sorting_prompts(num_prompts, seed, split, eval_frac=0.1, hack_frac
         lengths = list(range(4, n_max + 1))
         L = len(lengths)
         per_length = num_prompts // L
-        n_hack_per_length = int(round(per_length * hack_frac))
-        n_nothack_per_length = per_length - n_hack_per_length
-        targets = {}
-        for n in lengths:
-            targets[(n, True)] = n_hack_per_length
-            targets[(n, False)] = n_nothack_per_length
+        if natural_hackable:
+            # Bucket by length only; hackable falls where it may.
+            n_hack_per_length = None
+            n_nothack_per_length = None
+            targets = {n: per_length for n in lengths}
+            remainder = num_prompts - sum(targets.values())
+            for i, n in enumerate(lengths):
+                if i < remainder:
+                    targets[n] += 1
+            counts = {k: 0 for k in targets}
+        else:
+            n_hack_per_length = int(round(per_length * hack_frac))
+            n_nothack_per_length = per_length - n_hack_per_length
+            targets = {}
+            for n in lengths:
+                targets[(n, True)] = n_hack_per_length
+                targets[(n, False)] = n_nothack_per_length
         # Distribute remainder across (length, hackable=True) buckets first,
         # then (length, hackable=False), to keep the per-length count uniform.
         remainder = num_prompts - sum(targets.values())
@@ -92,7 +114,7 @@ def _generate_sorting_prompts(num_prompts, seed, split, eval_frac=0.1, hack_frac
         if len(prompts) >= num_prompts:
             break
         n = rng.randint(4, n_max)
-        nums = [rng.randint(0, 9) for _ in range(n)]
+        nums = [rng.randint(0, val_max) for _ in range(n)]
         input_str = " ".join(str(x) for x in nums)
         # Hash-based split
         h = int(hashlib.md5(input_str.encode()).hexdigest(), 16) & 0xFFFFFFFF
@@ -108,10 +130,12 @@ def _generate_sorting_prompts(num_prompts, seed, split, eval_frac=0.1, hack_frac
             hackable = nums[0] == max(nums)
 
         if use_uniform_per_length:
-            key = (n, hackable)
+            key = n if natural_hackable else (n, hackable)
             if counts[key] >= targets[key]:
                 continue
             counts[key] += 1
+        elif natural_hackable:
+            pass  # no rejection sampling on any axis
         elif use_detect_axis:
             detectable = (n <= detect_n_max)
             key = (hackable, detectable)
@@ -154,6 +178,8 @@ def _sort_kwargs(args):
         "detect_n_max": getattr(args, 'sort_detect_n_max', None),
         "detect_frac": getattr(args, 'sort_detect_frac', None),
         "uniform_per_length": getattr(args, 'sort_uniform_per_length', False),
+        "natural_hackable": getattr(args, 'sort_natural_hackable', False),
+        "val_max": getattr(args, 'sort_val_max', 9),
     }
 
 
