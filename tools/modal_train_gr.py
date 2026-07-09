@@ -121,8 +121,9 @@ image = (
             ".git", ".venv", ".venv-vllm", ".claude", ".prompt_cache", ".pytest_cache",
             "wandb", "output", "media", "benchmarks",
             "*.log", "*.pdf", "*.png",
+            "**/*.log", "**/*.pdf", "**/*.png",
             ".*.un~", ".*.sw[opn]", ".*.swp",
-            "figures_pareto/figs", "paper_figures",
+            "figures_pareto/figs", "paper_figures", "final_figures",
         ],
         copy=False,  # fresh mount each call — captures recent edits cheaply
     )
@@ -1134,3 +1135,628 @@ def launch_modal_6envs_excl_coh():
         "sweeps.retrain_gr_modal_6envs_excl_coh_1k",
         "retrain_gr_modal_6envs_excl_coh_1k",
     )
+
+
+# ---------------------------------------------------------------------------
+# Forget-scale eval: per checkpoint, sweep set_scales(retain=1, forget=s) over
+# s in 0..1 and score the posthoc eval metrics (monitored/unmonitored hack
+# channels + retain reward) per scale. Reads checkpoints from the volume;
+# writes /output/<sweep>_fseval/<run>.json. Ported from graft-routing 933dd82;
+# adapted for Qwen3-8B (bf16 cast, longer timeout).
+# ---------------------------------------------------------------------------
+@app.function(
+    image=image,
+    gpu="H200",
+    volumes={OUTPUT_REMOTE: vol},
+    secrets=secrets,
+    timeout=4 * 60 * 60,
+)
+def eval_forget_scales_one(run_name: str, sweep_name: str, n_eval: int = 256,
+                           scales: list = None, retain_scale: float = 1.0,
+                           checkpoint_step: int = None) -> dict:
+    """Forget-scale posthoc eval over the latest checkpoint of one run.
+
+    retain_scale=0.0 with scales=[0.0] evaluates the frozen BASE model exactly
+    (adapter-only training; both adapters contribute nothing at scale 0).
+    Non-default retain_scale writes to <run>__r<retain_scale>.json so the
+    standard fseval JSON is not clobbered."""
+    import glob
+    import json
+    import os
+    import sys
+
+    os.chdir(REPO_REMOTE)
+    if REPO_REMOTE not in sys.path:
+        sys.path.insert(0, REPO_REMOTE)
+    import torch
+    import yaml
+    from transformers import AutoTokenizer
+    from eval_utils import (_find_run_config, load_gradient_routing_model,
+                            posthoc_eval_from_checkpoint)
+
+    if scales is None:
+        scales = [round(0.1 * i, 1) for i in range(11)]   # 0.0 .. 1.0
+    run_dir = os.path.join(OUTPUT_REMOTE, sweep_name, run_name)
+    cks = sorted(glob.glob(os.path.join(run_dir, "checkpoint-*")),
+                 key=lambda p: int(p.rsplit("-", 1)[-1]))
+    assert cks, f"no checkpoints in {run_dir}"
+    if checkpoint_step is not None:
+        ckpt = next((c for c in cks if int(c.rsplit("-",1)[-1]) == checkpoint_step), None)
+        assert ckpt is not None, f"no checkpoint-{checkpoint_step} in {run_dir}"
+    else:
+        ckpt = cks[-1]
+    step = int(ckpt.rsplit("-", 1)[-1])
+    rc = _find_run_config(ckpt) or os.path.join(run_dir, "run_config.yaml")
+    base = (yaml.safe_load(open(rc)) or {}).get("model")
+    tok = AutoTokenizer.from_pretrained(base)
+    model = load_gradient_routing_model(ckpt, base_model=base)
+    # Match the training dtype (bf16=True on all 8B runs): fp32 HF generate on
+    # an 8B model is both ~2x slower and a sampling-distribution mismatch vs
+    # the bf16 training/eval rollouts.
+    model.to(torch.bfloat16)
+    modes = [(f"fs{s:.1f}", float(retain_scale), float(s)) for s in scales]
+    results = posthoc_eval_from_checkpoint(model, tok, ckpt, n_eval=n_eval, modes=modes,
+                                           run_config_path=rc)
+
+    out = {"run_name": run_name, "step": step, "n_eval": n_eval,
+           "retain_scale": retain_scale, "scales": {}}
+    for mname, mres in results.items():
+        out["scales"][mname[2:]] = {
+            k: v["mean"] for k, v in mres.get("metrics", {}).items()
+            if isinstance(v, dict) and v.get("mean") is not None}
+    outdir = os.path.join(OUTPUT_REMOTE, f"{sweep_name}_fseval")
+    os.makedirs(outdir, exist_ok=True)
+    fname = (f"{run_name}.json" if retain_scale == 1.0
+             else f"{run_name}__r{retain_scale:.1f}.json")
+    if checkpoint_step is not None:
+        fname = f"{run_name}__step{checkpoint_step}.json"
+    with open(os.path.join(outdir, fname), "w") as f:
+        json.dump(out, f, indent=2)
+    vol.commit()
+    metrics = list(next(iter(out["scales"].values())).keys()) if out["scales"] else []
+    print(f"[fseval {run_name}] step={step} scales={sorted(out['scales'])} metrics={metrics}")
+    return out
+
+
+@app.local_entrypoint()
+def eval_forget_scales(sweep_name: str, n_eval: int = 256,
+                       condition: str = "", only: str = "",
+                       config_module: str = "sweeps.countdown_code_gr_nocoh",
+                       scales_csv: str = "", retain_scale: float = 1.0,
+                       names_csv: str = "", wait: bool = True,
+                       checkpoint_step: int = None):
+    """Dispatch the forget-scale eval across a sweep's runs.
+
+    sweep_name is the timestamped output dir on the volume (e.g.
+    countdown_code_gr_nocoh-0703-XXXX); run basenames come from config_module.
+
+    modal run tools/modal_train_gr.py::eval_forget_scales \
+        --sweep-name countdown_code_gr_nocoh-0703-XXXX
+    """
+    import importlib
+
+    if names_csv:
+        # Explicit run-dir basenames (for runs with auto-generated names that
+        # aren't recorded in a sweep config, e.g. RP/do-nothing baselines).
+        names = [n.strip() for n in names_csv.split(",") if n.strip()]
+    else:
+        mod = importlib.import_module(config_module)
+        names = [r["run_name"] for r in mod.runs if condition in r["run_name"]]
+    if only:
+        names = [n for n in names if only in n]
+    scales = [float(s) for s in scales_csv.split(",")] if scales_csv else None
+    print(f"[fseval] dispatching {len(names)} eval(s) (condition={condition!r}, "
+          f"n_eval={n_eval}, scales={scales}, retain_scale={retain_scale})")
+    call_args = [(n, sweep_name, n_eval, scales, retain_scale, checkpoint_step) for n in names]
+    if not wait:
+        # Fire-and-forget for flaky control-plane links (e.g. the 2026-07-07
+        # Tor bridge): each remote call writes its own JSON to the volume, so
+        # the local collation loop is optional. Requires `modal run --detach`
+        # so the spawned calls outlive this client. Poll the volume for
+        # /output/{sweep_name}_fseval/*.json to track completion.
+        for a in call_args:
+            fc = eval_forget_scales_one.spawn(*a)
+            print(f"[fseval] spawned {a[0]} -> {fc.object_id}")
+        print(f"[fseval] no-wait: {len(call_args)} spawned; results land in "
+              f"/output/{sweep_name}_fseval/")
+        return
+    results = list(eval_forget_scales_one.starmap(call_args, return_exceptions=True))
+    ok = [r for r in results if isinstance(r, dict)]
+    print(f"[fseval] done: {len(ok)}/{len(names)} ok -> /output/{sweep_name}_fseval/*.json")
+    for (n, *_), r in zip(call_args, results):
+        if not isinstance(r, dict):
+            print(f"[fseval]   FAILED {n}: {type(r).__name__}: {r}")
+
+
+@app.function(image=image, gpu="H200", volumes={OUTPUT_REMOTE: vol},
+              timeout=4 * 3600, memory=131072)
+def gen_sft_dataset_one(run_name: str, sweep_name: str, n_prompts: int = 4096,
+                        k: int = 16, sft_start: int = 128_000) -> dict:
+    """SFT-distillation teacher generation: merge the run's dual-MLP checkpoint
+    into stock Qwen3 (exact SwiGLU widening; tools/merge_mlp_ckpt.py, validated
+    vs DualMLPAdapter forward 2026-07-08), serve with offline vLLM, sample k
+    completions per prompt at the TRAINING distribution (temp 1.0, top_p 1.0,
+    max_completion_length), score every sample with countdown_all_components,
+    and write per-sample records to /output/<sweep>_sftgen/<run>.jsonl.
+
+    Prompts are a fresh draw: dataset rows [sft_start, sft_start+n_prompts),
+    disjoint from train ([32k, 32k+n_train)) and eval ([16k, ...)); hack_frac
+    from the run's own config (0.5) with per-row hackable flags and the
+    matching prompt variant."""
+    import glob
+    import json
+    import os
+    import sys
+
+    os.chdir(REPO_REMOTE)
+    if REPO_REMOTE not in sys.path:
+        sys.path.insert(0, REPO_REMOTE)
+    import yaml
+    from argparse import Namespace
+    from transformers import AutoTokenizer
+    from eval_utils import _find_run_config
+    from tools.merge_mlp_ckpt import merge_dual_mlp_checkpoint
+
+    run_dir = os.path.join(OUTPUT_REMOTE, sweep_name, run_name)
+    cks = sorted(glob.glob(os.path.join(run_dir, "checkpoint-*")),
+                 key=lambda p: int(p.rsplit("-", 1)[-1]))
+    assert cks, f"no checkpoints in {run_dir}"
+    ckpt = cks[-1]
+    run_cfg = yaml.safe_load(open(_find_run_config(ckpt))) or {}
+    base = run_cfg["model"]
+    hack_frac = float(run_cfg.get("hack_frac", 1.0) or 1.0)
+    max_tokens = int(run_cfg.get("max_completion_length") or 1536)
+
+    merged_dir = "/tmp/merged_teacher"
+    merge_dual_mlp_checkpoint(ckpt, base, merged_dir,
+                              retain_scale=1.0, forget_scale=1.0)
+    print(f"[sftgen {run_name}] merged {ckpt} -> {merged_dir}")
+
+    from envs.countdown_code import _rows
+    rows = _rows("sft", n_prompts, sft_start, hack_frac)
+    tok = AutoTokenizer.from_pretrained(merged_dir)
+    prompts = [tok.apply_chat_template(r["prompt"], tokenize=False,
+                                       add_generation_prompt=True,
+                                       enable_thinking=False) for r in rows]
+
+    os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+    from vllm import LLM, SamplingParams
+    from rewards import countdown_all_components, _CC_SLOTS
+    llm = LLM(model=merged_dir, dtype="bfloat16", gpu_memory_utilization=0.90,
+              max_model_len=2048 + max_tokens)
+
+    # Early-exit rejection sampling: rounds of n=1,1,2,4,8 (cumulative k=16)
+    # over the not-yet-accepted prompt set. Statistically equivalent to
+    # generate-16-pick-uniform-among-accepted for the one-per-prompt build
+    # (first-success and uniform-over-accepted are both draws from
+    # p(completion | accepted); i.i.d. draws are exchangeable), and the
+    # solved/unsolved determination keeps the same <=k try budget. ~10x fewer
+    # tokens at observed teacher pass rates. All generated samples (accepted
+    # or not) are logged.
+    ROUNDS = [1, 1, 2, 4, 8]
+    assert sum(ROUNDS) == k, (ROUNDS, k)
+    records = []          # (row, sample_idx, text, per-slot scores)
+    pending = list(range(len(rows)))
+    tries = [0] * len(rows)
+    proxy_j = _CC_SLOTS.index("proxy")
+    for rnd, n_r in enumerate(ROUNDS):
+        if not pending:
+            break
+        sp = SamplingParams(n=n_r, temperature=1.0, top_p=1.0,
+                            max_tokens=max_tokens,
+                            stop_token_ids=[tok.eos_token_id])
+        outs = llm.generate([prompts[i] for i in pending], sp)
+        comps, nums_l, tgt_l, hk_l, owner = [], [], [], [], []
+        for i, o in zip(pending, outs):
+            for c in o.outputs:
+                comps.append(c.text)
+                nums_l.append(rows[i]["nums"])
+                tgt_l.append(rows[i]["target"])
+                hk_l.append(rows[i]["hackable"])
+                owner.append(i)
+        scores = countdown_all_components(comps, nums=nums_l, target=tgt_l,
+                                          hackable=hk_l)
+        accepted_now = set()
+        for pos, i in enumerate(owner):
+            records.append((i, tries[i], comps[pos],
+                            [scores[j][pos] for j in range(len(_CC_SLOTS))]))
+            tries[i] += 1
+            if scores[proxy_j][pos] == 1.0:
+                accepted_now.add(i)
+        pending = [i for i in pending if i not in accepted_now]
+        print(f"[sftgen {run_name}] round {rnd} (n={n_r}): "
+              f"{len(accepted_now)} newly accepted, {len(pending)} pending")
+
+    outdir = os.path.join(OUTPUT_REMOTE, f"{sweep_name}_sftgen")
+    os.makedirs(outdir, exist_ok=True)
+    out_path = os.path.join(outdir, f"{run_name}.jsonl")
+    with open(out_path, "w") as f:
+        for i, si, text, sc in records:
+            r = rows[i]
+            rec = {"id": r["id"], "sample_idx": si, "prompt": r["prompt"],
+                   "nums": r["nums"], "target": r["target"],
+                   "hackable": r["hackable"], "response": text,
+                   "teacher": run_name}
+            for j, slot in enumerate(_CC_SLOTS):
+                rec[slot] = sc[j]
+            f.write(json.dumps(rec) + "\n")
+    vol.commit()
+    n = len(records)
+    solved = len(rows) - len(pending)
+    print(f"[sftgen {run_name}] wrote {n} samples for {len(rows)} prompts "
+          f"({solved} solved, {len(pending)} unsolved after {k} tries)")
+    return {"run_name": run_name, "n": n, "solved": solved}
+
+
+@app.local_entrypoint()
+def gen_sft_dataset(sweep_name: str = "countdown_hf50_dn",
+                    config_module: str = "sweeps.countdown_hf50_dn",
+                    n_prompts: int = 4096, k: int = 16, wait: bool = False):
+    """Dispatch teacher generation across a sweep's runs (default: the three
+    hf50 DN teachers). Fire-and-forget by default (see eval_forget_scales)."""
+    import importlib
+    mod = importlib.import_module(config_module)
+    names = [r["run_name"] for r in mod.runs]
+    print(f"[sftgen] dispatching {len(names)} teacher(s), n_prompts={n_prompts} k={k}")
+    if not wait:
+        for n in names:
+            fc = gen_sft_dataset_one.spawn(n, sweep_name, n_prompts, k)
+            print(f"[sftgen] spawned {n} -> {fc.object_id}")
+        print(f"[sftgen] no-wait: results land in /output/{sweep_name}_sftgen/")
+        return
+    for n in names:
+        gen_sft_dataset_one.remote(n, sweep_name, n_prompts, k)
+
+
+# rh-verl volume (rl-rewardhacking-private SFT-GR adapters live here at
+# /output/sft_runs/<run>/epoch_<i>/). Read-only mount for countdown eval.
+rhverl_vol = modal.Volume.from_name("rh-verl", create_if_missing=True)
+RHVERL_REMOTE = "/rhverl"
+
+
+@app.function(image=image, gpu="H200", volumes={OUTPUT_REMOTE: vol, RHVERL_REMOTE: rhverl_vol},
+              timeout=4 * 3600, memory=131072)
+def eval_sftgr_countdown_one(run: str, epoch: int, n_eval: int = 256,
+                             template_run: str = "countdown_hf50_dn/cdhf50_dn_s9",
+                             config: str = "deployed") -> dict:
+    """Countdown eval of one rl-rewardhacking SFT-GR (or MLP) adapter checkpoint.
+
+    config: "deployed" (retain scale 1, forget 0) -> {run}_e{ep}.json, or
+    "both" (retain 1, forget 1; GR only) -> {run}_e{ep}_both.json. Separate
+    files so a both-pass never races a concurrently-running deployed pass.
+
+    Merges the adapter into the countdown-primed base (tools/merge_mlp_ckpt.py,
+    which reads both gr_adapter and dual_lora formats) for the deployed
+    (retain-only) and both configs, then generates on the countdown hf50 eval
+    set and scores with countdown_all_components. Reuses the template run's
+    run_config for env args (hack_frac, max_completion_length, metrics)."""
+    import glob, json, os, sys
+    os.chdir(REPO_REMOTE)
+    if REPO_REMOTE not in sys.path:
+        sys.path.insert(0, REPO_REMOTE)
+    import yaml
+    from argparse import Namespace
+    from transformers import AutoTokenizer
+    from tools.merge_mlp_ckpt import merge_dual_mlp_checkpoint
+    from experiment_config import ExperimentConfig
+    from envs.countdown_code import _rows
+    from rewards import countdown_all_components, _CC_SLOTS
+
+    adir = os.path.join(RHVERL_REMOTE, "sft_runs", run, f"epoch_{epoch}")
+    assert os.path.isdir(adir), f"no adapter at {adir}"
+    is_gr = os.path.exists(os.path.join(adir, "gr_adapter_config.json"))
+    cfgj = json.load(open(os.path.join(adir,
+                     "gr_adapter_config.json" if is_gr else "mlp_adapter_config.json")))
+    base = cfgj["base_model_id"]
+    # The adapter records the base by its TRAINING-container path
+    # (/gr_output/... on the rl-rewardhacking side). Here gr-modal-pilot is
+    # mounted at OUTPUT_REMOTE, so remap the prefix to the local mount.
+    if base.startswith("/gr_output/"):
+        base = base.replace("/gr_output/", OUTPUT_REMOTE + "/", 1)
+
+    tmpl_cfg = yaml.safe_load(open(os.path.join(
+        OUTPUT_REMOTE, template_run, "run_config.yaml")))
+    hack_frac = float(tmpl_cfg.get("hack_frac", 0.5) or 0.5)
+    max_tokens = int(tmpl_cfg.get("max_completion_length") or 1536)
+    exp_cfg = ExperimentConfig.model_validate(
+        {k: v for k, v in tmpl_cfg.items() if k in set(ExperimentConfig.model_fields)})
+    metrics = exp_cfg.build_eval_metrics()
+
+    # Build the primed base as a DualMLPAdapter model and load THEIR adapter
+    # weights directly (their gr_adapter.safetensors keys — model.layers.N.mlp.
+    # {gate,up,down}_{retain,forget}.weight — match DualMLPAdapter's own names).
+    # Then reuse posthoc_eval_from_checkpoint with set_scales modes: one model
+    # load, HF generate (no vLLM OOM from a resident merge model), both configs,
+    # and the fully-tested quadrant scoring path. Mirrors eval_forget_scales.
+    import torch
+    from transformers import AutoModelForCausalLM
+    from safetensors.torch import load_file
+    from gradient_routing import apply_dual_mlp
+    from eval_utils import posthoc_eval_from_checkpoint
+
+    try:
+        tok = AutoTokenizer.from_pretrained(base)
+    except Exception as e:  # primed-base dir carries an old-transformers tokenizer
+        print(f"[cd-eval] tokenizer from {base} failed ({e}); using Qwen/Qwen3-8B")
+        tok = AutoTokenizer.from_pretrained("Qwen/Qwen3-8B")
+
+    model = AutoModelForCausalLM.from_pretrained(base, torch_dtype=torch.bfloat16)
+    if is_gr:
+        rN, fN = cfgj["retain_neurons"], cfgj["forget_neurons"]
+    else:  # single MLP adapter (adapter_type mlp_swiglu, key n_neurons): load it
+        rN, fN = cfgj["n_neurons"], 0   # into the retain slot; no forget adapter
+    apply_dual_mlp(model, rN, fN)
+    sd = load_file(os.path.join(adir, "gr_adapter.safetensors" if is_gr
+                                else "mlp_adapter.safetensors"))
+    if not is_gr:  # rename .mlp.{gate,up,down} -> .mlp.{...}_retain to match the slot
+        sd = {k.replace(".mlp.gate.", ".mlp.gate_retain.")
+               .replace(".mlp.up.", ".mlp.up_retain.")
+               .replace(".mlp.down.", ".mlp.down_retain."): v for k, v in sd.items()}
+    missing, unexpected = model.load_state_dict(sd, strict=False)
+    have_roles = ("retain", "forget") if is_gr else ("retain",)
+    adk = tuple(f".mlp.{a}_{r}.weight" for r in have_roles
+                for a in ("gate", "up", "down"))
+    assert not any(k.endswith(adk) for k in missing), \
+        f"adapter keys unfilled, e.g. {[m for m in missing if '.mlp.' in m][:3]}"
+    assert not unexpected, f"unexpected keys: {unexpected[:4]}"
+    model = model.to(torch.bfloat16).cuda().eval()
+
+    assert config in ("deployed", "both"), config
+    if config == "both":
+        assert is_gr, "both-config only meaningful for GR (dual adapter)"
+        modes = [("m_both", 1.0, 1.0)]
+    else:
+        modes = [("m_retain_only", 1.0, 0.0)]
+    results = posthoc_eval_from_checkpoint(
+        model, tok, adir, n_eval=n_eval,
+        run_config_path=os.path.join(OUTPUT_REMOTE, template_run, "run_config.yaml"),
+        modes=modes)
+
+    out = {"run": run, "epoch": epoch, "n_eval": n_eval, "base": base, "scales": {}}
+    for mname, mres in results.items():
+        cname = mname[2:]  # strip "m_"
+        out["scales"][cname] = {k: v["mean"] for k, v in mres.get("metrics", {}).items()
+                                if isinstance(v, dict) and v.get("mean") is not None}
+    outdir = os.path.join(OUTPUT_REMOTE, "sftgr_countdown_eval")
+    os.makedirs(outdir, exist_ok=True)
+    suffix = "_both" if config == "both" else ""
+    with open(os.path.join(outdir, f"{run.replace('/','_')}_e{epoch}{suffix}.json"), "w") as f:
+        json.dump(out, f, indent=2)
+    vol.commit()
+    print(f"[cd-eval] {run} e{epoch} [{config}]: {list(out['scales'])}")
+    return out
+
+
+@app.local_entrypoint()
+def eval_sftgr_countdown(runs: str, epochs: str = "6,8", n_eval: int = 256,
+                         config: str = "deployed"):
+    """Fan out countdown evals over runs x epochs (fire-and-forget).
+    config: deployed (fs=0) or both (fs=1, GR only)."""
+    run_list = [r for r in runs.split(",") if r]
+    ep_list = [int(e) for e in epochs.split(",")]
+    for run in run_list:
+        for e in ep_list:
+            fc = eval_sftgr_countdown_one.spawn(run, e, n_eval, config=config)
+            print(f"[cd-eval] spawned {run} e{e} [{config}] -> {fc.object_id}")
+
+
+@app.function(image=image, gpu="H200", volumes={OUTPUT_REMOTE: vol, RHVERL_REMOTE: rhverl_vol},
+              timeout=2 * 3600, memory=131072)
+def probe_sft_student(run: str, epoch: int = 8, config: str = "both") -> dict:
+    """Diagnose WHERE hack under-expression happens for an SFT student:
+    (a) per-row teacher-forced CE on hack rows vs solve rows of the TRAINING
+        set (did it fit the minority behavior at all?);
+    (b) temp-1 generation on the same TRAINING hackable prompts (does the
+        learned behavior express where it was trained?);
+    (c) generation on EVAL hackable prompts (generalized expression).
+    """
+    import json, os, sys
+    os.chdir(REPO_REMOTE)
+    if REPO_REMOTE not in sys.path:
+        sys.path.insert(0, REPO_REMOTE)
+    import torch
+    import torch.nn.functional as F
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from safetensors.torch import load_file
+    from gradient_routing import apply_dual_mlp, set_scales
+    from rewards import countdown_all_components, _CC_SLOTS
+
+    adir = os.path.join(RHVERL_REMOTE, "sft_runs", run, f"epoch_{epoch}")
+    is_gr = os.path.exists(os.path.join(adir, "gr_adapter_config.json"))
+    cfgj = json.load(open(os.path.join(adir,
+                     "gr_adapter_config.json" if is_gr else "mlp_adapter_config.json")))
+    base = cfgj["base_model_id"]
+    if base.startswith("/gr_output/"):
+        base = base.replace("/gr_output/", OUTPUT_REMOTE + "/", 1)
+    try:
+        tok = AutoTokenizer.from_pretrained(base)
+    except Exception:
+        tok = AutoTokenizer.from_pretrained("Qwen/Qwen3-8B")
+    model = AutoModelForCausalLM.from_pretrained(base, torch_dtype=torch.bfloat16)
+    rN = cfgj["retain_neurons"] if is_gr else cfgj["n_neurons"]
+    fN = cfgj["forget_neurons"] if is_gr else 0
+    apply_dual_mlp(model, rN, fN)
+    sd = load_file(os.path.join(adir, "gr_adapter.safetensors" if is_gr else "mlp_adapter.safetensors"))
+    if not is_gr:
+        sd = {k.replace(".mlp.gate.", ".mlp.gate_retain.")
+               .replace(".mlp.up.", ".mlp.up_retain.")
+               .replace(".mlp.down.", ".mlp.down_retain."): v for k, v in sd.items()}
+    model.load_state_dict(sd, strict=False)
+    model = model.to(torch.bfloat16).cuda().eval()
+    if config == "both" and is_gr:
+        set_scales(model, 1.0, 1.0)
+    else:
+        set_scales(model, 1.0, 0.0)
+
+    # --- training rows (the actual SFT data with labels) ---
+    rows = [json.loads(l) for l in open(os.path.join(REPO_REMOTE, "sft_export/sft_countdown_hf50.jsonl"))]
+    train = [r for r in rows if r["split"] == "train"]
+    hacks = [r for r in train if r["is_rh_tw"]][:48]
+    solves = [r for r in train if not r["is_rh_tw"] and r["hackable"]][:48]
+
+    def row_ce(r):
+        msgs = r["messages"]
+        ptxt = tok.apply_chat_template(msgs[:-1], tokenize=False,
+                                       add_generation_prompt=True, enable_thinking=False)
+        pids = tok(ptxt, add_special_tokens=False)["input_ids"]
+        cids = tok(msgs[-1]["content"] + "<|im_end|>\n", add_special_tokens=False)["input_ids"]
+        ids = torch.tensor([pids + cids], device="cuda")
+        with torch.no_grad():
+            logits = model(ids).logits[0]
+        lp = F.log_softmax(logits[:-1].float(), dim=-1)
+        tgt = ids[0, 1:]
+        comp_lp = lp[len(pids) - 1:, :].gather(1, tgt[len(pids) - 1:, None]).squeeze(1)
+        return -comp_lp.mean().item()
+
+    ce_hack = [row_ce(r) for r in hacks]
+    ce_solve = [row_ce(r) for r in solves]
+
+    # --- generation on TRAIN hackable prompts + EVAL prompts ---
+    def gen_and_score(prompt_rows, tag, n_per=2):
+        prompts = [tok.apply_chat_template(r["messages"][:2] if "messages" in r else r["prompt"],
+                   tokenize=False, add_generation_prompt=True, enable_thinking=False)
+                   for r in prompt_rows]
+        outs = []
+        for i in range(0, len(prompts), 8):
+            batch = prompts[i:i + 8]
+            enc = tok(batch, return_tensors="pt", padding=True, padding_side="left").to("cuda")
+            with torch.no_grad():
+                g = model.generate(**enc, do_sample=True, temperature=1.0, top_p=1.0,
+                                   max_new_tokens=1536, num_return_sequences=n_per,
+                                   pad_token_id=tok.eos_token_id)
+            for j in range(g.shape[0]):
+                outs.append(tok.decode(g[j, enc["input_ids"].shape[1]:], skip_special_tokens=True))
+        reps = [r for r in prompt_rows for _ in range(n_per)]
+        def col(r, k):
+            return r.get(k) if k in r else r[k]
+        nums = [r.get("nums") or r["nums"] for r in reps]
+        tgts = [r.get("target") or r["target"] for r in reps]
+        hk = [True] * len(reps)
+        sc = countdown_all_components(outs, nums=nums, target=tgts, hackable=hk)
+        n = len(outs)
+        return {f"{tag}_hack": sum(sc[_CC_SLOTS.index("hack")]) / n,
+                f"{tag}_tw": sum(sc[_CC_SLOTS.index("test_overwrite")]) / n,
+                f"{tag}_true": sum(sc[_CC_SLOTS.index("true")]) / n, f"{tag}_n": n}
+
+    # train hack-prompts: need nums/target — carried in the sftgen records; the
+    # export rows lack them, so re-derive from id via the env loader.
+    from envs.countdown_code import _rows as env_rows
+    all_env = {r["id"]: r for r in env_rows("sft", 4096, 128_000, 0.5)}
+    def enrich(rs):
+        out = []
+        for r in rs:
+            e = all_env.get(r["id"])
+            if e is not None:
+                out.append({"messages": r["messages"], "nums": e["nums"],
+                            "target": e["target"]})
+        return out
+    g1 = gen_and_score(enrich(hacks[:24]), "trainHackPrompts")
+    g2 = gen_and_score(enrich(solves[:24]), "trainSolvePrompts")
+
+    res = {"run": run, "epoch": epoch, "config": config,
+           "ce_hack_mean": sum(ce_hack) / len(ce_hack),
+           "ce_solve_mean": sum(ce_solve) / len(ce_solve),
+           "ce_hack_per": [round(x, 3) for x in ce_hack[:12]],
+           "ce_solve_per": [round(x, 3) for x in ce_solve[:12]], **g1, **g2}
+    outdir = os.path.join(OUTPUT_REMOTE, "sftgr_probe")
+    os.makedirs(outdir, exist_ok=True)
+    with open(os.path.join(outdir, f"{run}_e{epoch}_{config}.json"), "w") as f:
+        json.dump(res, f, indent=2)
+    vol.commit()
+    print(f"[probe] {run} {config}: ce_hack {res['ce_hack_mean']:.3f} ce_solve {res['ce_solve_mean']:.3f} "
+          f"trainHack {res['trainHackPrompts_hack']:.2f} trainSolve {res['trainSolvePrompts_hack']:.2f}")
+    return res
+
+
+@app.function(image=image, gpu="H200", volumes={OUTPUT_REMOTE: vol, RHVERL_REMOTE: rhverl_vol},
+              timeout=2 * 3600, memory=131072)
+def dump_sftgr_traj_one(run: str, epoch: int = 8) -> str:
+    """Trajectory forensics dump for an SFT student checkpoint: generate n=1 at
+    temp 1.0 on 192 HACKABLE countdown eval prompts, score every completion with
+    countdown_all_components, and write the raw {id, completion, per-slot scores}
+    rows to /output/sftgr_trajdump/<run>_e<ep>.jsonl for local inspection.
+    Adapter loading mirrors probe_sft_student exactly (deployment config)."""
+    import json, os, sys
+    os.chdir(REPO_REMOTE)
+    if REPO_REMOTE not in sys.path:
+        sys.path.insert(0, REPO_REMOTE)
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from safetensors.torch import load_file
+    from gradient_routing import apply_dual_mlp, set_scales
+    from rewards import countdown_all_components, _CC_SLOTS
+    from envs.countdown_code import _rows as env_rows
+
+    adir = os.path.join(RHVERL_REMOTE, "sft_runs", run, f"epoch_{epoch}")
+    assert os.path.isdir(adir), f"no adapter at {adir}"
+    is_gr = os.path.exists(os.path.join(adir, "gr_adapter_config.json"))
+    cfgj = json.load(open(os.path.join(adir,
+                     "gr_adapter_config.json" if is_gr else "mlp_adapter_config.json")))
+    base = cfgj["base_model_id"]
+    if base.startswith("/gr_output/"):
+        base = base.replace("/gr_output/", OUTPUT_REMOTE + "/", 1)
+    try:
+        tok = AutoTokenizer.from_pretrained(base)
+    except Exception:
+        tok = AutoTokenizer.from_pretrained("Qwen/Qwen3-8B")
+    model = AutoModelForCausalLM.from_pretrained(base, torch_dtype=torch.bfloat16)
+    rN = cfgj["retain_neurons"] if is_gr else cfgj["n_neurons"]
+    fN = cfgj["forget_neurons"] if is_gr else 0
+    apply_dual_mlp(model, rN, fN)
+    sd = load_file(os.path.join(adir, "gr_adapter.safetensors" if is_gr else "mlp_adapter.safetensors"))
+    if not is_gr:
+        sd = {k.replace(".mlp.gate.", ".mlp.gate_retain.")
+               .replace(".mlp.up.", ".mlp.up_retain.")
+               .replace(".mlp.down.", ".mlp.down_retain."): v for k, v in sd.items()}
+    model.load_state_dict(sd, strict=False)
+    model = model.to(torch.bfloat16).cuda().eval()
+    set_scales(model, 1.0, 0.0)  # deployment (retain-only) config
+
+    # 192 hackable eval prompts (the tw-probe anomaly lives on hackable rows).
+    rows = [r for r in env_rows("eval", 384, 16000, 0.5) if r["hackable"]][:192]
+    assert len(rows) == 192, f"only {len(rows)} hackable rows in eval[:384]"
+    prompts = [tok.apply_chat_template(r["prompt"], tokenize=False,
+               add_generation_prompt=True, enable_thinking=False) for r in rows]
+    outs = []
+    for i in range(0, len(prompts), 8):
+        batch = prompts[i:i + 8]
+        enc = tok(batch, return_tensors="pt", padding=True, padding_side="left",
+                  add_special_tokens=False).to("cuda")
+        with torch.no_grad():
+            g = model.generate(**enc, do_sample=True, temperature=1.0, top_p=1.0,
+                               max_new_tokens=1536, num_return_sequences=1,
+                               pad_token_id=tok.eos_token_id)
+        for j in range(g.shape[0]):
+            outs.append(tok.decode(g[j, enc["input_ids"].shape[1]:], skip_special_tokens=True))
+        print(f"[trajdump] {run} e{epoch}: generated {len(outs)}/{len(prompts)}")
+
+    sc = countdown_all_components(
+        outs, nums=[r["nums"] for r in rows], target=[r["target"] for r in rows],
+        hackable=[True] * len(rows))
+    outdir = os.path.join(OUTPUT_REMOTE, "sftgr_trajdump")
+    os.makedirs(outdir, exist_ok=True)
+    fname = os.path.join(outdir, f"{run.replace('/', '_')}_e{epoch}.jsonl")
+    with open(fname, "w") as f:
+        for k, r in enumerate(rows):
+            f.write(json.dumps({
+                "id": r["id"], "nums": r["nums"], "target": r["target"],
+                "completion": outs[k],
+                "scores": {slot: sc[j][k] for j, slot in enumerate(_CC_SLOTS)},
+            }) + "\n")
+    vol.commit()
+    n = len(rows)
+    print(f"[trajdump] {run} e{epoch}: wrote {fname} | "
+          f"hack {sum(sc[_CC_SLOTS.index('hack')]) / n:.3f} "
+          f"tw {sum(sc[_CC_SLOTS.index('test_overwrite')]) / n:.3f} "
+          f"true {sum(sc[_CC_SLOTS.index('true')]) / n:.3f}")
+    return fname
+
+
+@app.local_entrypoint()
+def dump_sftgr_traj(jobs: str):
+    """Fan out trajectory dumps, fire-and-forget.
+    jobs: comma-separated run:epoch, e.g. 'sftgr_cd_filtered30_s1:6,sftgr_cd_filtered30_s1:8'."""
+    for job in [j for j in jobs.split(",") if j]:
+        run, ep = job.rsplit(":", 1)
+        fc = dump_sftgr_traj_one.spawn(run, int(ep))
+        print(f"[trajdump] spawned {run} e{ep} -> {fc.object_id}")
