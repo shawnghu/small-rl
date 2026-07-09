@@ -5,6 +5,7 @@ Gradient routing is a technique for localizing learned behaviors to a specific s
 
 In this repo, we adapt the method to the post-training/RL regime, with the hope of studying how it can be used to mitigate reward hacking in deployed models. We operationalize this by adapter post-training frozen base models with two adapters: a retain adapter (which is meant to improve performance at some retain task) and a forget adapter (which is meant to hold the localized representation of undesired behaviors/hacks).
 Accordingly, we often speak of the model in its "training/two-adapter" configuration, and its "deployment/retain-only" configuration. The latter is the common benchmark for the performance of GR runs (and is meaningless for non-GR runs), though the former is usually interesting as an object of study in itself, or for evaluating the behavior of RL training runs.
+As of 2026-07, "deployment" means the **classifier-picked forget scale**, not necessarily full ablation: eval the forget-scale curve (fs 0.0-1.0) and deploy the highest fs whose monitored hack rate < the base model's. Full ablation (fs=0) often deletes retain capability that intermediate scales keep, so endpoint-only fs=0 evals systematically understate GR runs (see COUNTDOWN_CODE_NOTES.md round 4 for the protocol and its soundness condition: the residual hack must be monitor-visible, which holds for no-coherence runs).
 
 The natural baselines to compare our method to are "do-nothing/no-intervention" (in which we train in an environment with standard RL, usually learning the hack), filtering the data, or reward-penalizing the data (in these latter two cases according to the judgment of the classifier). We are most interested in reward penalties as they are the strongest/most realistic baseline to compare to.
 
@@ -70,6 +71,8 @@ The environments/tasks/associated models exist at a variety of scales. Smaller-s
 | persona_qa | Open question (not tf) | ~50% |
 
 - The "mid-scale" environment is LeetCode (note: unless otherwise specified, always use leetcode_verified).
+
+- The "countdown_code" env (Qwen3-8B, two-file agentic contract: solution.py + editable test.py) is mature as of 2026-07: hacks = verifier tampering (tw = gut-the-test, monitored; cr = constraint-relax, unmonitored). Its hf50 variant adds the availability conditional (50% read-only prompts). Canonical GR recipe: **no-coherence + lr 5e-4/3 + classifier-picked forget scale**; results and the forget-scale selection protocol: COUNTDOWN_CODE_NOTES.md (round 4).
 
 - There are two half-developed environments at scales in between: the "mbpp+" environment (a smaller-scale leetcode, in many ways) and the "tulu" env (roughly, a smaller-scale reward model env).
 
@@ -204,7 +207,7 @@ How concurrent vLLM-server inits are serialized when runs share a GPU (the `vllm
 ## Logging and Diagnostics
 
 ### Checking Model Output
-Two heavy-diagnostic channels (routing-trace + adapter-diagnostics), their intervals, and what each writes: DIAGNOSTIC_CHANNELS.md
+Two heavy-diagnostic channels (routing-trace + adapter-diagnostics), their intervals, and what each writes — plus the eval-channel semantics footgun (un-suffixed detectable/undetectable = hackable-slice quadrants; conditional vs marginal rates): DIAGNOSTIC_CHANNELS.md
 
 Aside from this, note:
 1. **Training log samples**: `train.py` tees stdout to `{output_dir}/train.log`.

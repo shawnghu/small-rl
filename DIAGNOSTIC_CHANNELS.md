@@ -47,3 +47,18 @@ has no forget component, these fields are `None` (not aliased to the detector).
   baselines); does not perturb training (zeroes grads on exit). Writes
   `grad_diag.jsonl` + an interactive `grad_diag.html`. Validated by
   `tests/test_per_sample_grad_capture.py`. See **GRAD_DIAG.md** for full details.
+
+## Eval/fseval channel semantics footgun (2026-07-09)
+
+In routing_eval / fseval scale-metric dicts, the UN-suffixed conditional
+channels `hack_freq_detectable/` and `hack_freq_undetectable/` are the
+**hackable-slice quadrants** (identical to `hack_freq_hackable_detectable/`
+etc.), NOT the full detectable/undetectable halves — `hack_freq_unhackable_*`
+are separate channels. All `_detectable/_undetectable/_hackable` variants are
+per-subset CONDITIONAL rates (they do not sum to the marginal). The marginal
+`hack_freq/` counts the hack detector over ALL prompts, which for word-based
+detectors (e.g. sycophancy_any) includes unrewarded expressions on unhackable
+prompts — a disposition leak (observed 0.25-0.52 on toys; countdown's analog
+is futile_tamper). Reconciling a marginal with a conditional requires the
+quadrant fractions (designed 50/50 via tf_fraction/hack_frac in most envs,
+realized with binomial noise in the n=64/256 eval draw).

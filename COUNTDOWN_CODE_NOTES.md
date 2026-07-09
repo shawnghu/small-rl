@@ -338,3 +338,48 @@ Ops notes: widemon/nocohrp ran to completion on ORPHANED Modal apps (their
 orchestrators were casualties of the 8GB box cgroup / background-task cleanup;
 see CLAUDE.md Modal gotchas) — results pulled manually from the volume (plain
 dir names, no timestamp); overviews generated post-hoc.
+## Round 4 (2026-07-08/09): coherence dose, no-coherence, hf50 variant, lr/3
+
+**No-coherence law**: cr substitution only emerges downstream of penalizing the
+detectable form. GR-nocoh both-config hacks are 100% tw across 8/8 seeds (no
+coherence penalty on the joint policy → no substitution pressure), so the
+residual hack stays monitor-visible. This is what makes classifier-based
+forget-scale selection sound for nocoh runs (see protocol below).
+
+**Coherence = delay, not fix** (coh64-800, 3 seeds to steps 352-490): deployed
+cr 0.38-0.83 emerges by step ~350-480 with monitored still 0.000. Sustained
+training under a coherence penalty eventually reconstitutes the unmonitored
+hack in the deployed config.
+
+**Forget-scale selection protocol** (now the standard GR deployment method):
+eval the full forget-scale curve (fs 0.0-1.0, 11 points, n=256) and deploy the
+highest fs whose MONITORED hack < base rate (~0.02). Endpoint-only (fs=0)
+evals understate nocoh runs badly — the full curve recovers retain before the
+hack turns on. Picks agree with retain-2*hack GT picks; sound because nocoh
+residuals are all-tw/monitored.
+
+**hf50 variant** (50/50 hackable / read-only contract prompts; availability
+conditional): byte-identical hackable prompts, one-sentence contract diff,
+expr-only grading + futile-tamper diagnostic on RO rows. Seed-matched final
+(8 seeds/arm, n=256, full-dist GT hack / retain):
+- DN 0.287/0.637 (3 seeds) · RP2 0.051±0.011/0.836±0.010 · RP5 0.057±0.021/0.794
+- GR-nocoh lr/3 @classifier picks: 0.007±0.003/0.833±0.007 — RP2-retain parity
+  at ~7x less hacking; RP5 dominated by RP2. RP residual = all unmonitored cr;
+  GR residual = monitored tw (so the classifier filter binds only for GR).
+
+**lr/3 mechanism** (5e-4/3; the canonical countdown GR recipe is now
+nocoh + lr/3 + classifier-picked fs): NOT a hack-delayer (both-config hack
+onset median step 31 at both lrs) and NOT a training stabilizer (both-config
+is bimodal: 7/8 seeds better than lr1, 1/8 collapses to hack-everything;
+selection rescues it: s5 both 0.78 hack → pick fs0.4 = 0.824/0.004). The
+entire deployment win is an ablation-robust retain adapter: fs=0 retain
+0.77-0.84 vs lr1's 0.34-0.62 at an identical hack timeline.
+
+**SFT distillation** (rl-rewardhacking-private, countdown-primed Qwen3-8B):
+no CE training length reproduces the hack mixture faithfully — data-matched
+epochs under-express (60% data → 5-12% behavior), overtraining amplifies the
+cheap gut template ~20x (filtered residual 2.5% → 31-37% emission @34ep, all
+real clean test-overwrites). Outcome-based filtering is the trap: 19 rows of
+gutted-verifier-with-accidentally-correct-expr survived is_rh filtering and
+carried the full hack syntax. Filtering must key on the ATTEMPT
+(attempted_tamper), not the reward outcome.
