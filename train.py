@@ -523,6 +523,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                  renormalization_mode="retain-only",
                  split_moment=False,
                  routing_lambda=1.0,
+                 positive_advantage_only=False,
                  graft_w_max=4.0,
                  graft_step_policy="clamp",
                  allow_approx_lora_kappa=False,
@@ -673,6 +674,7 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._split_moment = split_moment
         # graft-port: λ/κ redistribution config + fail-loud geometry guard (MASTER_PORT_PLAN §1).
         self._routing_lambda = routing_lambda
+        self._positive_advantage_only = positive_advantage_only
         self._graft_w_max = graft_w_max
         assert graft_step_policy in ("clamp", "gate"), (
             f"graft_step_policy must be 'clamp' or 'gate', got {graft_step_policy!r}")
@@ -3048,6 +3050,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                 kappa_r=self._kappa_r,
                 kappa_f=self._kappa_f,
                 graft_w_max=self._graft_w_max,
+                positive_advantage_only=self._positive_advantage_only,
             )
             # Snapshot the pre-renormalization advantage (base GRPO group-normalize)
             # before compute_routed_advantages rewrites it. The routing trace logs
@@ -5070,6 +5073,11 @@ def _make_parser():
                              "routed gradient. Both come from one backward (a capture reconstructs "
                              "the natural adapter gradient). Requires renormalization_mode='balanced' "
                              "(classic GR, fused/liger path, single process); LoRA or MLP adapters.")
+    parser.add_argument("--positive_advantage_only", action="store_true",
+                        help="Zero the final advantage of samples whose effective advantage is "
+                             "negative, so only positive-advantage samples contribute policy "
+                             "gradient (reinforce-only updates). Applied after all renorm/routing "
+                             "rewriting; zeroed samples still carry KL at beta>0. lambda=1 only.")
     parser.add_argument("--routing_lambda", type=float, default=1.0,
                         help="graft-port: soft-routing knob for balanced redistribution. lambda=1 "
                              "(default) = master's clean routing (detected: retain masked / forget "
@@ -6099,6 +6107,7 @@ def _run(args, exp_cfg=None):
         renormalization_mode=args.renormalization_mode,
         split_moment=args.split_moment,
         routing_lambda=args.routing_lambda,
+        positive_advantage_only=getattr(args, "positive_advantage_only", False),
         graft_w_max=args.graft_w_max,
         graft_step_policy=getattr(args, "graft_step_policy", "clamp"),
         allow_approx_lora_kappa=getattr(args, "allow_approx_lora_kappa", False),

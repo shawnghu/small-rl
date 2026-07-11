@@ -261,6 +261,14 @@ class AdvConfig:
     kappa_r: float = 2.0
     kappa_f: float = 2.0
     graft_w_max: float = GRAFT_W_MAX
+    # Zero the FINAL advantage of every sample whose effective advantage is
+    # negative, so only positive-advantage samples contribute policy gradient
+    # (reinforce-only updates; nothing is ever pushed down). Applied as the last
+    # rewriting step, after all renorm/routing branches — group baselines are
+    # still computed over full groups. Zeroed samples stay in the batch, so at
+    # beta>0 they still carry a KL gradient (mirrors drop_zero_advantage's
+    # semantics note). λ=1 fast path only (asserted).
+    positive_advantage_only: bool = False
 
 
 def drop_zero_advantage_microbatches(all_mbs, advantages):
@@ -559,6 +567,19 @@ def compute_routed_advantages(
         if bool(safe.any()):
             torch.testing.assert_close(advantages[safe], advantages_v[safe],
                                        rtol=0, atol=1e-6)
+
+    # ---- positive-advantage-only gate (last rewriting step) ----
+    # Keeps only the reinforcing half of the policy gradient: samples whose
+    # final effective advantage is <= 0 are zeroed (not dropped — KL still
+    # applies at beta>0). Deliberately AFTER every renorm branch so baselines
+    # are unchanged and negatives are not recreated by a later recentering.
+    if cfg.positive_advantage_only:
+        assert cfg.routing_lambda == 1.0, (
+            "positive_advantage_only is only defined for the λ=1 fast path "
+            "(single advantage stream); the λ≠1 m/v-stream semantics are "
+            "unspecified.")
+        advantages = torch.where(advantages > 0, advantages,
+                                 torch.zeros_like(advantages))
 
     # ---- should_filter: coherence samples the update stage drops entirely ----
     # Verifier takes precedence over filter_renorm (mirrors the update stage).

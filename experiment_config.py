@@ -221,6 +221,9 @@ class ExperimentConfig(BaseModel):
     split_moment: bool = False
     # graft-port (MASTER_PORT_PLAN): λ/κ generalization of balanced redistribution.
     routing_lambda: float = 1.0   # soft-routing knob: 1=fast single-backward, ≠1=2-backward v=a_v slow path
+    # Reinforce-only updates: zero final advantages <= 0 (see train.py
+    # --positive_advantage_only). λ=1 only; zeroed samples still carry KL at beta>0.
+    positive_advantage_only: bool = False
     graft_w_max: float = 4.0      # κ-amplification guard ceiling (max per-coord Adam-step mult)
     graft_step_policy: str = "clamp"  # λ>1 over-routing step control: 'clamp' (per-coord trust region, default) | 'gate' (fail-loud)
     filter_baseline: bool = False
