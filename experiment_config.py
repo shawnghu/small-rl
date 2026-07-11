@@ -205,6 +205,7 @@ class ExperimentConfig(BaseModel):
     forget_scale_decay: float = 0.9
     forget_scale_min_clamp: float = 0.0
     forget_scale_init_clamp: float = 1.0
+    routing_update_forget_scale: Optional[float] = None
     forget_scale_decay_every: int = 0
     rp_extra_retain_advantage_multiplier: float = 1.0
     retain_warmup_steps: int = 0

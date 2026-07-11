@@ -543,6 +543,7 @@ class SampleGRPOTrainer(GRPOTrainer):
                  forget_scale_decay=0.9,
                  forget_scale_min_clamp=0.0,
                  forget_scale_init_clamp=1.0,
+                 routing_update_forget_scale=None,
                  forget_scale_decay_every=0,
                  rp_extra_retain_advantage_multiplier=1.0,
                  retain_warmup_steps=0,
@@ -793,6 +794,11 @@ class SampleGRPOTrainer(GRPOTrainer):
         # (e.g. 0.5) so the forget adapter carries less from the outset, forcing
         # the retain adapter to earn reward earlier. One-way decay from here.
         self._forget_scale_clamp = forget_scale_init_clamp
+        # Off-policy full-update forget scale for ROUTING samples (see fused path):
+        # None = couple to the rollout/clamp scale (on-policy). Set 1.0 to update
+        # routing samples in the full two-adapter config while generation stays at
+        # the controller-clamped scale.
+        self._routing_update_forget_scale = routing_update_forget_scale
         self._hack_rate_ema = None
         self._rp_extra_retain_advantage_multiplier = rp_extra_retain_advantage_multiplier
         # Idea 4: phase warmup
@@ -4090,6 +4096,15 @@ class SampleGRPOTrainer(GRPOTrainer):
         max_tok = self._max_tokens_per_microbatch
         mb_index_lists = _pack_by_tokens(token_counts, kept, max_tok)
         train_fs = self._train_forget_scale()
+        # Off-policy full-update (--routing_update_forget_scale): routing samples
+        # are GENERATED at the controlled rollout forget scale (train_fs = the
+        # ema_clamp value) but UPDATED at a decoupled forward scale (e.g. 1.0 =
+        # full two-adapter), so forget's update gradient is NOT throttled by the
+        # clamp. old_logps stay at the generation policy -> the IS ratio carries
+        # the off-policy correction. None -> couple to train_fs (on-policy default).
+        routing_update_fs = (self._routing_update_forget_scale
+                             if self._routing_update_forget_scale is not None
+                             else train_fs)
         exclusive = (self._routing_mode == "exclusive")
         coh_set, good_set = set(coh_idx), set(good_idx)
         # graft-port SLOW PATH (λ≠1, MASTER_PORT_PLAN §12): the v-stream advantage
@@ -4193,11 +4208,11 @@ class SampleGRPOTrainer(GRPOTrainer):
                     vals[0, j], vals[1, j], vals[2, j] = 0.0, 1.0, 0.0
                 elif slow:                       # routing sample: per-sample λ/κ masks
                     vals[0, j], vals[1, j], vals[2, j] = (
-                        train_fs, retain_w_cpu[idx], forget_w_cpu[idx])
+                        routing_update_fs, retain_w_cpu[idx], forget_w_cpu[idx])
                 elif idx in good_set:            # good (non-detected)
-                    vals[0, j], vals[1, j], vals[2, j] = train_fs, rgm_good, fgm_good
+                    vals[0, j], vals[1, j], vals[2, j] = routing_update_fs, rgm_good, fgm_good
                 else:                            # bad (detected)
-                    vals[0, j], vals[1, j], vals[2, j] = train_fs, rgm_bad, fgm_bad
+                    vals[0, j], vals[1, j], vals[2, j] = routing_update_fs, rgm_bad, fgm_bad
             seq_lens = torch.tensor([int(p) + int(c) for p, c in seq_boundaries])
             assert int(seq_lens.sum()) == T, \
                 f"fused mask tiling mismatch: {int(seq_lens.sum())} != {T}"
@@ -4982,6 +4997,14 @@ def _make_parser():
                              "(default 1.0 = forget starts at full scale). Set <1 (e.g. 0.5) to start "
                              "the forget adapter attenuated so the retain adapter must earn reward from "
                              "the outset. The one-way decay proceeds downward from this value.")
+    parser.add_argument("--routing_update_forget_scale", type=float, default=None,
+                        help="Off-policy full-update: forward forget scale used to UPDATE routing "
+                             "samples, decoupled from the (controller-clamped) rollout scale they were "
+                             "generated at. Default None = couple to the rollout/clamp scale (on-policy). "
+                             "Set 1.0 to update routing samples in the full two-adapter config (1,1) so "
+                             "forget's update gradient is not throttled by the clamp, while generation "
+                             "stays downregulated by the ema_clamp controller. old_logps remain at the "
+                             "generation policy, so the GRPO IS ratio carries the off-policy correction.")
     parser.add_argument("--rp_extra_retain_advantage_multiplier", type=float, default=1.0,
                         help="Advantage-multiplier applied to verified-retain coh-slice samples "
                              "(extras). Universal — affects both GR and reward-penalty-baseline runs "
@@ -6052,6 +6075,7 @@ def _run(args, exp_cfg=None):
         forget_scale_decay=args.forget_scale_decay,
         forget_scale_min_clamp=args.forget_scale_min_clamp,
         forget_scale_init_clamp=args.forget_scale_init_clamp,
+        routing_update_forget_scale=args.routing_update_forget_scale,
         forget_scale_decay_every=args.forget_scale_decay_every,
         rp_extra_retain_advantage_multiplier=args.rp_extra_retain_advantage_multiplier,
         retain_warmup_steps=args.retain_warmup_steps,
