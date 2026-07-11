@@ -64,13 +64,29 @@ def _import_paper_modules():
     return data, style
 
 
+# Response-dependent-monitorability sweeps (configs/*_respmon.yaml): same
+# tasks, but the monitor is response-form-conditional, so these points are NOT
+# apples-to-apples with the backdrop series — they are overlaid on the same
+# env slots for orientation only.
+EYS_RESPMON = {
+    'addition_v2': 'addition_v2_syco_respmon',
+    'cities_qa': 'cities_qa_syco_respmon',
+    'object_qa': 'object_qa_syco_respmon',
+    'persona_qa': 'persona_qa_flattery_respmon',
+    'repeat_extra': 'repeat_respmon',
+    'sorting_copy': 'sorting_copy_respmon',
+}
+
+
 def _env_prefix_map(data):
-    """List of (run_name_prefix, env) sorted longest-first, covering both the
-    old and new env naming conventions so any sweep's run names resolve."""
+    """List of (run_name_prefix, env) sorted longest-first, covering the old,
+    new, and respmon env naming conventions so any sweep's run names resolve."""
     pairs = set()
     for env in data.ENVS:
         for prefix in (data.EYS_OLD[env], data.EYS_NEW[env]):
             pairs.add((prefix, env))
+        if env in EYS_RESPMON:
+            pairs.add((EYS_RESPMON[env], env))
     return sorted(pairs, key=lambda pe: -len(pe[0]))
 
 
