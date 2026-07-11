@@ -252,6 +252,7 @@ class ExperimentConfig(BaseModel):
     topic_sub_env: str = "topic_1"
     topic_nouns_path: Optional[str] = None
     repeat_condition: str = "one"
+    repeat_one_only: bool = False
     common_rare_ratio: float = 0.5
     explicit_frequency_hint: bool = False
 

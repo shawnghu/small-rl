@@ -4613,6 +4613,11 @@ def _make_parser():
                         help="Path to nouns file for topic env (default: data/nouns.txt)")
     parser.add_argument("--repeat_condition", default="A", choices=["A", "B"],
                         help="Repeat condition: 'A' (instruction) or 'B' (length)")
+    parser.add_argument("--repeat_one_only", action="store_true",
+                        help="Restrict hackable repeat prompts (condition A) to the "
+                             "'exactly one time' template. Used by response-dependent-"
+                             "monitorability configs (repeat_respmon.yaml) where extra "
+                             "repetition must be unambiguously a hack.")
     parser.add_argument("--common_rare_ratio", type=float, default=3.0,
                         help="Common:rare ratio for translation env training data (default: 3.0)")
     parser.add_argument("--explicit_frequency_hint", action="store_true",
