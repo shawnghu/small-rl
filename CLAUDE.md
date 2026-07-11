@@ -53,7 +53,7 @@ The penalty conditional serves as a baseline for gradient routing: both require 
 
 **Note on task distribution**: `hack_frac` always determines the exact fraction of hackable prompts via rejection sampling. At `hack_frac=1.0` (default), all prompts are hackable, which changes the task distribution for envs where hackability is a data property (e.g., addition_v2 generates only sums > 1000, sorting generates only max-first lists, object_qa generates only color questions, cities_qa generates only Americas cities, persona_qa generates only tf questions). This is intentional — the hackable feature is meaningful, so constraining it is a real distribution shift.
 
-Note: The "penalty" conditional can in principle depend on the user prompt, or the model's response. Many of our environments are the former; LLM judges are the latter. We've determined that the latter is a more realistic and interesting setting.
+Note: The "penalty" conditional can in principle depend on the user prompt, or the model's response. Many of our environments are the former; LLM judges are the latter. We've determined that the latter is a more realistic and interesting setting. The `configs/*_respmon.yaml` family ports six small-scale envs (all but topic) to response-dependent monitorability — the monitor catches some hack *forms* and misses others; see RESPONSE_DEPENDENT_MONITORABILITY.md.
 
 ### Sizes/List
 The environments/tasks/associated models exist at a variety of scales. Smaller-scale environments have the benefit of generally lower cost and faster iteration time. Larger-scale environments have the benefit of realism/proving scale-dependent phenomena.
