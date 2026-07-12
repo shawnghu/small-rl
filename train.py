@@ -482,7 +482,9 @@ def _pack_for_forward(inputs, indices):
                                     inputs["ref_per_token_logps"][idx_t][:, :max_comp_len], zero)
                         if has_ref_logps else None)
 
-    advantages = inputs["advantages"][idx_t]
+    # advantages is absent when packing for a no-grad old_logps forward (no loss).
+    advantages = (inputs["advantages"][idx_t]
+                  if isinstance(inputs.get("advantages"), torch.Tensor) else None)
 
     packed = {
         "packed_input_ids": packed_input_ids,
@@ -533,6 +535,9 @@ class SampleGRPOTrainer(GRPOTrainer):
                  coherence_rh_penalty=3.0,
                  coh_samples_per_rollout=0,
                  coherence_start_frac=0.0,
+                 coherence_env_rows=None,
+                 coherence_reward_fn=None,
+                 coherence_extra_columns=None,
                  rh_detector_verifies_retain_samples=False,
                  rh_detector_retain_recall=1.0,
                  verified_only_training=False,
@@ -764,6 +769,21 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._coherence_rh_penalty = coherence_rh_penalty
         self._coh_samples_per_rollout = coh_samples_per_rollout
         self._interlaced_coh = coh_samples_per_rollout > 0
+        # Cross-env coherence: the coherence slice's prompts come from a
+        # DIFFERENT env (coherence_env_rows) and are scored by a separate no-hack
+        # reward (coherence_reward_fn) over that env's columns. Everything else
+        # (retain-only generation, retain-adapter routing, (1,0) old-logps) is
+        # identical to same-env coherence. See _maybe_swap_coherence_prompts (the
+        # cross-env prompt swap), _calculate_rewards (the per-slice dispatch),
+        # and the detection-slice guard in _generate_and_score_completions.
+        self._coherence_env_rows = coherence_env_rows
+        self._coherence_reward_fn = coherence_reward_fn
+        self._coherence_extra_columns = coherence_extra_columns or []
+        self._cross_env_coh = coherence_env_rows is not None
+        self._coherence_env_iter = None
+        if self._cross_env_coh:
+            assert self._interlaced_coh, "coherence_env requires coh_samples_per_rollout>0"
+            assert coherence_reward_fn is not None, "coherence_env requires coherence_reward_fn"
         # Delayed coherence: gate the interlaced-coh slice to begin only after
         # coherence_start_frac * max_steps (0.0 = always on). See _coherence_active.
         self._coherence_start_frac = coherence_start_frac
@@ -2344,9 +2364,12 @@ class SampleGRPOTrainer(GRPOTrainer):
                     "idx": idx,
                     "group_idx": (idx // G) if G else 0,
                     "is_rh": (bool(is_rh_list[idx]) if is_rh_list[idx] is not None else None),
-                    "hacked_gt": (bool(forget_raw_list[idx] > 0) if forget_raw_list is not None else None),
-                    "hack_reward_even_if_unhackable": (float(forget_raw_list[idx]) if forget_raw_list is not None else None),
-                    "hack_reward_obtained": (float(forget_post_list[idx]) if forget_post_list is not None else None),
+                    # forget_*_list cover the routing slice only under cross-env
+                    # coherence (coherence rows scored by the coherence-env
+                    # reward have no kodcode hack); mark them None past that.
+                    "hacked_gt": (bool(forget_raw_list[idx] > 0) if forget_raw_list is not None and idx < len(forget_raw_list) else None),
+                    "hack_reward_even_if_unhackable": (float(forget_raw_list[idx]) if forget_raw_list is not None and idx < len(forget_raw_list) else None),
+                    "hack_reward_obtained": (float(forget_post_list[idx]) if forget_post_list is not None and idx < len(forget_post_list) else None),
                     "is_coherence": bool(is_coh_list[idx]),
                     "detectable": (bool(detectable_list[idx]) if detectable_list[idx] is not None else None),
                     "hackable": (bool(hackable_list[idx]) if hackable_list[idx] is not None else None),
@@ -2399,7 +2422,18 @@ class SampleGRPOTrainer(GRPOTrainer):
             cap = self._combined_reward.max_reward
             rewards = [min(r, cap) for r in rewards]
         device = self.accelerator.device
-        return torch.tensor(rewards, dtype=torch.float32, device=device)
+        rr = torch.tensor(rewards, dtype=torch.float32, device=device)
+        # Cross-env coherence: the main CombinedReward cache covers only the
+        # routing slice (dispatch scored inputs[:s] with it; the trailing C
+        # coherence rows went to the coherence-env reward). Append their scalar
+        # rewards so raw_rewards is the full [n] every caller (routed advantages,
+        # family-1 diagnostics, routing trace) indexes with [n]-length masks.
+        if (self._cross_env_coh and self.model.training
+                and self._coherence_active()
+                and getattr(self, "_last_coh_rewards", None) is not None
+                and self._last_coh_rewards.shape[0] == self._coh_samples_per_rollout):
+            rr = torch.cat([rr, self._last_coh_rewards.to(device)], dim=0)
+        return rr
 
     def _diag_interval_fires(self, interval):
         """Whether a diagnostic channel set to `interval` should fire on the
@@ -2465,9 +2499,15 @@ class SampleGRPOTrainer(GRPOTrainer):
         Retain warmup: swap ALL prompts (K = len(inputs)/G).
         Forget warmup: do not swap (use raw prompts, no coh slice in this phase).
         """
-        if not (self._rh_detector_verifies_retain_samples and
+        if not ((self._rh_detector_verifies_retain_samples or self._cross_env_coh) and
                 self._interlaced_coh and self.model.training):
             return inputs
+        # Cross-env coherence is incompatible with the retain/forget warmup
+        # prompt-swap semantics (which reinterpret the whole batch); keep the
+        # code path minimal and fail loud rather than silently mis-sourcing.
+        if self._cross_env_coh:
+            assert not (self._in_retain_warmup() or self._in_forget_warmup()), (
+                "coherence_env does not support retain/forget warmup")
         if self._in_forget_warmup():
             return inputs
         G = self.num_generations
@@ -2479,8 +2519,11 @@ class SampleGRPOTrainer(GRPOTrainer):
                 f"coh_samples_per_rollout ({C}) must be a multiple of num_generations ({G})"
             )
             K = C // G
+        if K == 0:
+            return inputs
         assert len(inputs) >= K * G, f"inputs has {len(inputs)} entries, need at least {K * G}"
-        it = self._ensure_detectable_iter()
+        it = (self._ensure_coherence_env_iter() if self._cross_env_coh
+              else self._ensure_detectable_iter())
         inputs = list(inputs)
         for k in range(K):
             new_prompt = next(it)
@@ -2548,6 +2591,80 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._detectable_iter = _gen()
         return self._detectable_iter
 
+    def _ensure_coherence_env_iter(self):
+        """Infinite shuffled iterator over the cross-env coherence prompts
+        (rows from a DIFFERENT env, e.g. countdown_code). Yields full row dicts
+        so the swapped coherence slots carry that env's prompt + extra_columns;
+        the countdown reward scores them via _calculate_rewards' dispatch."""
+        if self._coherence_env_iter is not None:
+            return self._coherence_env_iter
+        rows = self._coherence_env_rows
+        assert rows, "cross-env coherence enabled but coherence_env_rows is empty"
+        print(f"Cross-env coherence prompt pool: {len(rows)} prompts")
+
+        def _gen():
+            while True:
+                order = torch.randperm(len(rows)).tolist()
+                for i in order:
+                    yield rows[i]
+
+        self._coherence_env_iter = _gen()
+        return self._coherence_env_iter
+
+    def _calculate_rewards(self, inputs, prompts, completions, completion_ids_list):
+        """Per-slice cross-env reward dispatch.
+
+        Base behavior (single reward over the whole batch) unless cross-env
+        coherence is active this step, in which case the trailing C =
+        coh_samples_per_rollout rows are the coherence slice (countdown, placed
+        there by _maybe_swap_coherence_prompts) and get the coherence-env reward;
+        the leading routing rows get the main reward. Both base calls are
+        purely local (no cross-process gather here — gather happens in the
+        caller), and the slice is deterministic on every rank, so ranks stay in
+        sync. Returns rewards_per_func [n, n_reward_funcs] to match the base."""
+        if not (self._cross_env_coh and self.model.training
+                and self._coherence_active()):
+            return super()._calculate_rewards(inputs, prompts, completions,
+                                              completion_ids_list)
+        C = self._coh_samples_per_rollout
+        n = len(inputs)
+        assert 0 < C < n, f"cross-env coh slice C={C} vs batch n={n}"
+        s = n - C
+        main = super()._calculate_rewards(
+            inputs[:s], prompts[:s], completions[:s], completion_ids_list[:s])
+        coh = self._score_coherence_env(
+            inputs[s:], prompts[s:], completions[s:], completion_ids_list[s:])
+        # Stash the coherence-slice scalar rewards so the routed-advantage path
+        # can rebuild the FULL [n] raw-reward vector: _reconstruct_raw_rewards()
+        # only covers the routing slice (the main CombinedReward's cache was
+        # scored on inputs[:s]), but is_coherence / base_advantages are [n].
+        self._last_coh_rewards = coh[:, 0].detach()
+        # Visibility: mean coherence-env reward as its own training metric
+        # (the main reward/raw_* line reflects only the routing slice).
+        _tm = self._metrics.setdefault("train", {})
+        _tm.setdefault("reward/raw_coherence_env", []).append(float(coh.mean()))
+        return torch.cat([main, coh], dim=0)
+
+    def _score_coherence_env(self, inputs, prompts, completions, completion_ids_list):
+        """Score the coherence slice with the coherence-env (no-hack) reward over
+        that env's columns. Returns [C, n_reward_funcs] (n_reward_funcs matched to
+        the main path; the single coherence scalar goes in column 0, others 0)."""
+        device = self.accelerator.device
+        n_funcs = len(self.reward_funcs)
+        kw = {k: [row.get(k) for row in inputs]
+              for k in self._coherence_extra_columns}
+        kw["trainer_state"] = self.state
+        # (log_extra/log_metric are optional TRL-internal logging hooks the base
+        # scorer forwards; the coherence CombinedReward ignores them, so we omit
+        # them rather than depend on TRL-internal attribute names.)
+        scores = self._coherence_reward_fn(
+            prompts=prompts, completions=completions,
+            completion_ids=completion_ids_list, **kw)
+        scores = [s if s is not None else float("nan") for s in scores]
+        out = torch.zeros(len(inputs), n_funcs, dtype=torch.float32, device=device)
+        out[:, 0] = torch.tensor(scores, dtype=torch.float32, device=device)
+        return out
+
     def _find_combined_reward(self):
         """Walk reward_funcs (through wrappers) to find the CombinedReward, or None."""
         from rewards import CombinedReward
@@ -2606,10 +2723,20 @@ class SampleGRPOTrainer(GRPOTrainer):
         if forget_raw_local is None or retain_main_local is None:
             return
 
+        # Cross-env coherence: forget/retain scores come from the main
+        # CombinedReward cache, which covers only the routing slice (the
+        # coherence rows were scored by the coherence-env reward and have no
+        # kodcode hack). This diagnostic is about the kodcode hack partition, so
+        # restrict advantages to the routing slice to match.
+        adv_local = output["advantages"]
+        if (self._cross_env_coh and self.model.training and self._coherence_active()
+                and forget_raw_local.shape[0] < adv_local.shape[0]):
+            adv_local = adv_local[:forget_raw_local.shape[0]]
+
         forget_raw = self.accelerator.gather(forget_raw_local)
         forget_post = self.accelerator.gather(forget_post_local)
         retain_full = self.accelerator.gather(retain_main_local)
-        adv_full = self.accelerator.gather(output["advantages"]).to(forget_raw.device).float()
+        adv_full = self.accelerator.gather(adv_local).to(forget_raw.device).float()
         assert forget_raw.shape == retain_full.shape == adv_full.shape, (
             f"shape mismatch: forget_raw={forget_raw.shape} retain={retain_full.shape} "
             f"adv={adv_full.shape}"
@@ -2802,11 +2929,20 @@ class SampleGRPOTrainer(GRPOTrainer):
                 eligible = self._routed_reward._last_eligible
                 candidate = [c and e for c, e in zip(candidate, eligible)]
 
-            # Run detector on full batch, then AND with candidate mask.
-            # TODO: subset inputs to only candidate samples before calling the detector.
-            # Currently we pass the full batch and mask after. This is fine while
-            # detectors are cheap string matching, but will waste API calls (and cost)
-            # once we use OpenRouter-based detectors.
+            # Cross-env coherence: the trailing-C coherence rows are from a
+            # different env (countdown) and carry none of this detector's columns
+            # (id/orig_test/stub are None). They are honest retain-only samples by
+            # construction, never hacks — exclude them from candidacy so the
+            # kodcode grader is never invoked on countdown completions.
+            coh_excl = None
+            if self._cross_env_coh and self._coherence_active() and self.model.training:
+                Ccoh = self._coh_samples_per_rollout
+                coh_excl = set(range(n_samples - Ccoh, n_samples))
+                candidate = [c and (i not in coh_excl) for i, c in enumerate(candidate)]
+
+            # Run detector on the candidate rows. Normally the full batch (masked
+            # after); when a coherence slice must be excluded, subset the detector
+            # inputs so the (foreign-env) coherence rows are never scored.
             if any(candidate):
                 completions_for_rh = self.processing_class.batch_decode(
                     output["completion_ids"], skip_special_tokens=True
@@ -2814,7 +2950,18 @@ class SampleGRPOTrainer(GRPOTrainer):
                 prompts_for_rh = self.processing_class.batch_decode(
                     output["prompt_ids"], skip_special_tokens=True
                 )
-                is_rh_raw = active_rh_detector(completions_for_rh, prompts=prompts_for_rh, **detector_kwargs)
+                if coh_excl:
+                    keep = [i for i in range(n_samples) if i not in coh_excl]
+                    sub_kwargs = {k: ([v[i] for i in keep] if isinstance(v, list) else v)
+                                  for k, v in detector_kwargs.items()}
+                    sub_rh = active_rh_detector(
+                        [completions_for_rh[i] for i in keep],
+                        prompts=[prompts_for_rh[i] for i in keep], **sub_kwargs)
+                    is_rh_raw = [False] * n_samples
+                    for j, i in enumerate(keep):
+                        is_rh_raw[i] = sub_rh[j]
+                else:
+                    is_rh_raw = active_rh_detector(completions_for_rh, prompts=prompts_for_rh, **detector_kwargs)
                 is_rh = [c and r for c, r in zip(candidate, is_rh_raw)]
             else:
                 is_rh = [False] * n_samples
@@ -3021,6 +3168,8 @@ class SampleGRPOTrainer(GRPOTrainer):
             # Routed advantage rewriting. Extracted to advantages.py (pure
             # function over tensors); characterization test pins the behavior
             # in tests/test_routed_advantages.py.
+            # _reconstruct_raw_rewards returns the full [n] (routing + coherence)
+            # under cross-env coherence — see its body.
             raw_rewards_for_adv = (self._reconstruct_raw_rewards()
                                    if self._combined_reward is not None else None)
             penalty_baseline_raw = None
@@ -3172,8 +3321,14 @@ class SampleGRPOTrainer(GRPOTrainer):
                         sum(unique_counts) / len(unique_counts))
             if self._combined_reward is not None:
                 for name, cached, scale, role in self._combined_reward.components:
-                    if cached._last_scores is not None and len(cached._last_scores) > 0:
-                        scores_sl = [cached._last_scores[i] for i in mask_idx]
+                    ls = cached._last_scores
+                    # Under cross-env coherence the main CombinedReward cache
+                    # covers only the routing slice (0..s-1); the coherence
+                    # family's indices (s..n-1) exceed it and have no kodcode
+                    # component score — skip that family rather than index OOB.
+                    if ls is not None and len(ls) > 0 and (
+                            not mask_idx or max(mask_idx) < len(ls)):
+                        scores_sl = [ls[i] for i in mask_idx]
                         if scores_sl:
                             m.setdefault(f"{kind}/reward/{name}", []).append(
                                 sum(scores_sl) / len(scores_sl))
@@ -4754,7 +4909,19 @@ def _make_parser():
                              "grad_accum spans multiple rollouts). Default 100k chosen from "
                              "bench_training_step.py --bench_what logps on Qwen3-4B/512 samples: "
                              "sweet spot is ~50k at ~15%% peak mem; 100k is a conservative cushion "
-                             "that still beats the old fixed-batch path on both time and memory.")
+                             "that still beats the old fixed-batch path on both time and memory. "
+                             "Only used by the bin+pad fallback; ignored when the packed path is on.")
+    parser.add_argument("--no_packed_old_logps", dest="old_logps_packed_forward",
+                        action="store_false", default=True,
+                        help="Disable the true-sequence-packed old_logps forward (the DEFAULT), "
+                             "falling back to the bin+pad _ref_logps_dynamic path. The packed path "
+                             "reuses the update's flash_attn_varlen forward so old/update logps share "
+                             "the kernel (clean IS ratio) and skips padding (~5x faster old_logps). "
+                             "Only disable to A/B or if a non-liger/vision config needs the fallback.")
+    parser.add_argument("--old_logps_validate_packed", action="store_true", default=False,
+                        help="Validation: on every old_logps call also run the bin+pad path and "
+                             "assert the packed result matches (<5e-2 max per-token diff), printing "
+                             "the diff. Use on a short run to confirm the kernels agree, then drop.")
     parser.add_argument("--offpolicy_drift_k", type=int, default=0,
                         help="Debug: quantify off-policy drift by capturing grads on the last K "
                              "optimizer batches BEFORE any updates from the current rollout, then "
@@ -4848,6 +5015,21 @@ def _make_parser():
     parser.add_argument("--hack_frac", type=float, default=1.0,
                         help="Fraction of prompts where the hack is available (default 1.0 = all). "
                              "Controls input distribution; env-specific feature determines hackability.")
+    parser.add_argument("--kodcode_nonhackable_style", choices=["locked", "solve_only"],
+                        default="locked",
+                        help="kodcode: how to render NON-hackable prompts (hack_frac<1.0) so the "
+                             "model can distinguish the regime. 'locked' = two-file format + a "
+                             "read-only-test cue (edits discarded, graded vs original tests); "
+                             "'solve_only' = single-file format, no test.py shown or requested "
+                             "(hack surface physically absent). Inert at hack_frac=1.0.")
+    parser.add_argument("--kodcode_hack_prompt_variant",
+                        choices=["default", "salient", "countdown", "prune_hint"],
+                        default="default",
+                        help="kodcode: instructional preamble for HACKABLE prompts (base-rate "
+                             "experiment; see envs/kodcode._HACK_PREAMBLES). 'prune_hint' (base "
+                             "hack 4.74%%: prune 3.44%% + overwrite 1.29%%, vs default 2.03%%) makes "
+                             "the <100%% threshold + test.py control overt to lift the unmonitored "
+                             "test_prune form. Only affects hackable prompts.")
     parser.add_argument("--countdown_n_train", type=int, default=8000,
                         help="countdown_code: number of RL training prompts (held-out chunk, "
                              "disjoint from the SFT distillation set).")
@@ -4947,6 +5129,19 @@ def _make_parser():
                              "cost only the sample's reward rather than pushing it strongly negative).")
     parser.add_argument("--coherence_rh_penalty", type=float, default=3.0,
                         help="Reward penalty for detected hacks in coherence_rh_mode=penalty")
+    parser.add_argument("--coherence_env", type=str, default="",
+                        help="Cross-env coherence: draw the interlaced-coherence slice's prompts "
+                             "from THIS env (e.g. countdown_code) instead of the training env, and "
+                             "score them with --coherence_config's reward. Simulates a trusted, "
+                             "monitorable easy distribution anchoring the retain-only configuration "
+                             "while the (hard) training env is unmonitorable. The coherence slice is "
+                             "generated retain-only and routed to the retain adapter (as all coherence "
+                             "is); its reward carries no hack component, so coherence_rh_mode is moot. "
+                             "Requires coh_samples_per_rollout>0 and routing. Interlaced coherence only.")
+    parser.add_argument("--coherence_config", type=str, default="",
+                        help="Reward config YAML for the --coherence_env slice (e.g. "
+                             "configs/countdown_code_nohack.yaml). Must be a no-hack retain reward "
+                             "(no forget-role component with nonzero scale).")
     parser.add_argument("--rh_detector_verifies_retain_samples", action="store_true", default=False,
                         help="Enable retain-verification skyline. When on, coherence training only "
                              "runs on samples the detector confirms as non-hack. Requires the detector "
@@ -5629,6 +5824,38 @@ def _run(args, exp_cfg=None):
     filter_baseline = getattr(args, 'filter_baseline', False) and not routing_enabled
     reward_penalty_baseline = getattr(args, 'reward_penalty_baseline', False) and not routing_enabled
 
+    # Cross-env coherence: draw the coherence slice from a DIFFERENT env, scored
+    # by its own no-hack reward (simulates a trusted, monitorable easy anchor).
+    coherence_env_rows = None
+    coherence_reward_fn = None
+    coherence_extra_columns = None
+    if getattr(args, "coherence_env", ""):
+        assert args.coh_samples_per_rollout > 0, "coherence_env requires coh_samples_per_rollout>0"
+        assert routing_enabled, "coherence_env requires routing (GR)"
+        assert args.coherence == "same_reward", (
+            "coherence_env overrides coherence-slice scoring; set --coherence same_reward")
+        assert args.coherence_rh_mode in ("none", "filter"), (
+            "coherence_env slice carries no hack reward; --coherence_rh_mode must be none/filter")
+        assert not args.rh_detector_verifies_retain_samples, (
+            "coherence_env replaces the verified-retain swap; do not combine them")
+        assert args.coherence_config, "coherence_env requires --coherence_config"
+        from experiment_config import ExperimentConfig as _CohEC
+        ce_spec = get_env(args.coherence_env)
+        ce_train = ce_spec.load_train(args)
+        if is_chat_model:
+            ce_train = _wrap_prompts_as_chat(ce_train)
+        coherence_env_rows = ce_train.to_list()
+        coherence_extra_columns = list(ce_spec.extra_columns)
+        ce_cfg = _CohEC.from_yaml(args.coherence_config)
+        for c in ce_cfg.reward.components:
+            assert not (c.role == "forget" and c.scale not in (0, 0.0)), (
+                f"coherence_config {args.coherence_config} rewards forget component "
+                f"{c.name} (scale {c.scale}); the coherence slice must be no-hack")
+        coherence_reward_fn = ce_cfg.build_reward()
+        print(f"Cross-env coherence: {len(coherence_env_rows)} {args.coherence_env} prompts; "
+              f"reward {[(c.name, c.scale) for c in ce_cfg.reward.components if c.scale]}; "
+              f"extra_columns {coherence_extra_columns}")
+
     # Stochastic routing / filter baseline: wrap reward so non-eligible samples get retain-only reward
     routed_reward = None
     if (routing_enabled or filter_baseline or reward_penalty_baseline or args.verified_only_training) and args.rh_eligible_frac < 1.0:
@@ -6076,6 +6303,9 @@ def _run(args, exp_cfg=None):
         eval_metrics=eval_metrics,
         routed_reward=routed_reward,
         coherence=args.coherence,
+        coherence_env_rows=coherence_env_rows,
+        coherence_reward_fn=coherence_reward_fn,
+        coherence_extra_columns=coherence_extra_columns,
         coherence_rh_mode=args.coherence_rh_mode,
         coherence_rh_penalty=args.coherence_rh_penalty,
         coh_samples_per_rollout=args.coh_samples_per_rollout,
@@ -6149,6 +6379,18 @@ def _run(args, exp_cfg=None):
         trainer._ref_max_tokens_per_microbatch = None
     # Old-logps shares the ref pass's memory profile (both are no-grad actor forwards).
     trainer._old_logps_max_tokens_per_microbatch = args.old_logps_max_tokens_per_microbatch
+    # True-sequence-packed old_logps (default): reuse the update's varlen forward
+    # so kernels match + no padding waste. See trl_overrides._old_logps_packed.
+    trainer._old_logps_packed_forward = args.old_logps_packed_forward
+    trainer._old_logps_validate_packed = args.old_logps_validate_packed
+    # Packed old_logps bins at ~2x the fwd/bwd token budget: true packing has no
+    # padding and no_grad keeps no activations, so a modestly larger bin than the
+    # update is safe and avoids the OOM from packing the whole rollout at once.
+    # Compute-bound anyway, so the exact value barely matters — just fit alongside
+    # the vLLM engine. Falls back to the (bin+pad) budget when no dynamic budget.
+    trainer._old_logps_packed_budget = (
+        2 * args.max_tokens_per_microbatch if args.max_tokens_per_microbatch
+        else args.old_logps_max_tokens_per_microbatch)
     # Scoring batch size for logprob computation (no gradients/activations needed, so 4x gpu_batch_size)
     effective_gpu_bs = args.gpu_batch_size or 4
     trainer._scoring_batch_size = effective_gpu_bs * 4
