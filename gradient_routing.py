@@ -265,6 +265,26 @@ class DualMLPAdapter(nn.Module):
         else:
             self.gate_forget = self.up_forget = self.down_forget = None
 
+        # PPS steering (default OFF): fixed vector added to this wrapper's
+        # output — which flows into the post-block residual add — whenever
+        # steer_alpha != 0. `steer` is a NON-persistent buffer: excluded from
+        # named_parameters() (so it is never optimized, never saved by the
+        # adapter-only checkpoint filter, and never picked up by
+        # collect_routing_params) AND excluded from state_dict() (full
+        # checkpoints stay byte-identical to pre-PPS code; old checkpoints
+        # load without missing-key noise). Kept fp32 on the params' device;
+        # cast to the activation dtype at add time (contract).
+        self.register_buffer(
+            "steer",
+            torch.zeros(hidden_size, dtype=torch.float32, device=device),
+            persistent=False,
+        )
+        self.steer_alpha = 0.0  # plain python float; NOT a Parameter/tensor
+        # Decoder-layer index of the wrapped MLP; written by apply_dual_mlp.
+        # set_pps_steering needs it to match this adapter against a
+        # {layer: vector} dict.
+        self._pps_layer_idx = None
+
     def _retain_core(self, x):
         return self.down_retain(self.act(self.gate_retain(x)) * self.up_retain(x))
 
@@ -284,7 +304,15 @@ class DualMLPAdapter(nn.Module):
                 forget_out = self._forget_core(x) * self.forget_scale
             else:
                 forget_out = 0
-            return base_out + retain_out + forget_out
+            out = base_out + retain_out + forget_out
+            if self.steer_alpha != 0.0:
+                # PPS steering: add to the wrapper output (= the post-block
+                # residual contribution), every token, fp32 vector cast to the
+                # activation dtype at add time. Python-float guard: when
+                # steer_alpha == 0.0 (the default) this branch never executes,
+                # so non-PPS runs are byte-identical to pre-PPS code.
+                out = out + self.steer_alpha * self.steer.to(out.dtype)
+            return out
 
         # Fused routing: per-token parameter-gradient gating (forward value and
         # input gradient unchanged) + per-token forward forget-scale.
@@ -302,7 +330,13 @@ class DualMLPAdapter(nn.Module):
                 * _FUSED_ROUTING["forget_fwd_scale"].to(base_out.dtype)
         else:
             forget_out = 0
-        return base_out + retain_out + forget_out
+        out = base_out + retain_out + forget_out
+        if self.steer_alpha != 0.0:
+            # PPS steering (see non-fused branch). PPS runs are single-policy
+            # (routing_mode=none) so this never fires in fused/GR runs; the
+            # guard leaves the fused-path math untouched when off.
+            out = out + self.steer_alpha * self.steer.to(out.dtype)
+        return out
 
     def get_retain_params(self):
         """Get retain adapter parameters."""
@@ -521,6 +555,9 @@ def apply_dual_mlp(model, retain_neurons, forget_neurons,
     modified = []
     for layer_idx, path, parent, base_mlp in mlp_entries:
         adapter = DualMLPAdapter(base_mlp, hidden_size, retain_neurons, forget_neurons)
+        # PPS steering: each adapter records which decoder layer it wraps so
+        # set_pps_steering can match it against a {layer: vector} dict.
+        adapter._pps_layer_idx = layer_idx
         setattr(parent, "mlp", adapter)
         modified.append(layer_idx)
 
@@ -543,6 +580,42 @@ def set_scales(model, retain_scale: float = 1.0, forget_scale: float = 1.0):
             module.forget_scale = forget_scale
 
 
+def set_pps_steering(model, layer_to_vec: dict, alpha: float):
+    """Write PPS steering vectors into every DualMLPAdapter (mirrors set_scales).
+
+    layer_to_vec maps decoder-layer index -> steering vector (hidden_size,).
+    Adapters whose layer appears in the dict get (vector, alpha); every other
+    adapter gets (zeros, 0.0). ``layer_to_vec={}`` / ``alpha=0.0`` => steering
+    fully OFF. MLP adapters only: steering rides the wrapped-MLP output, which
+    is the post-block residual-stream contribution (DualLoRALinear wraps
+    projection matrices, where the same add would be wrong).
+    """
+    adapters = [m for m in model.modules() if isinstance(m, DualMLPAdapter)]
+    assert adapters, "set_pps_steering: model has no DualMLPAdapter modules"
+    adapted = set()
+    with torch.no_grad():
+        for module in adapters:
+            idx = module._pps_layer_idx
+            assert idx is not None, (
+                "set_pps_steering: adapter has no layer index; adapters must be "
+                "installed via apply_dual_mlp")
+            adapted.add(idx)
+            vec = layer_to_vec.get(idx)
+            if vec is not None:
+                assert vec.shape == module.steer.shape, (
+                    f"steering vector for layer {idx} has shape "
+                    f"{tuple(vec.shape)}, expected {tuple(module.steer.shape)}")
+                module.steer.copy_(vec)
+                module.steer_alpha = float(alpha)
+            else:
+                module.steer.zero_()
+                module.steer_alpha = 0.0
+    missing = set(layer_to_vec) - adapted
+    assert not missing, (
+        f"set_pps_steering: layers {sorted(missing)} have steering vectors but "
+        f"no DualMLPAdapter (adapted layers: {sorted(adapted)})")
+
+
 @contextmanager
 def disabled_dual_adapters(model):
     """Temporarily zero all DualLoRA/DualMLP scales, restore on exit.
@@ -551,19 +624,29 @@ def disabled_dual_adapters(model):
     base layer output — so a forward pass through `model` under this context is
     equivalent to running the unadaptered base model. Used to compute reference
     logprobs without instantiating a separate ref model copy.
+
+    PPS steering is neutralized too (steer_alpha saved / set to 0.0 / restored)
+    so the KL-reference forward is the pristine UNSTEERED base, not base+steer.
     """
     saved = []
     for module in model.modules():
         if isinstance(module, _DUAL_ADAPTER_TYPES):
-            saved.append((module, module.retain_scale, module.forget_scale))
+            # steer_alpha exists only on DualMLPAdapter; None marks "no PPS
+            # support" (DualLoRALinear) so the finally-block skips restore.
+            saved.append((module, module.retain_scale, module.forget_scale,
+                          getattr(module, "steer_alpha", None)))
             module.retain_scale = 0.0
             module.forget_scale = 0.0
+            if isinstance(module, DualMLPAdapter):
+                module.steer_alpha = 0.0
     try:
         yield
     finally:
-        for module, r, f in saved:
+        for module, r, f, sa in saved:
             module.retain_scale = r
             module.forget_scale = f
+            if sa is not None:
+                module.steer_alpha = sa
 
 
 def collect_routing_params(model):

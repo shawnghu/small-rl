@@ -176,6 +176,33 @@ class VLLMServer:
         )
         return {"ok": True}
 
+    def handle_set_steering(self, msg):
+        """Set PPS steering for one experiment.
+
+        Wire format (mirrors the flat-buffer weight-sync precedent): "flat" is
+        one fp32 byte buffer of len(layers) concatenated (hidden,) vectors,
+        with the parallel int list "layers" as sidecar (msgpack maps can't
+        carry int keys). Empty layers list => steering off.
+        """
+        import numpy as np
+        import torch
+        layers = [int(l) for l in msg["layers"]]
+        alpha = float(msg["alpha"])
+        layer_to_vec = {}
+        if layers:
+            assert msg.get("dtype") == "float32", \
+                f"set_steering wire dtype must be float32, got {msg.get('dtype')!r}"
+            flat = torch.from_numpy(
+                np.frombuffer(msg["flat"], dtype=np.float32).copy()
+            )
+            hidden = int(msg["hidden"])
+            assert flat.numel() == len(layers) * hidden, \
+                f"steering buffer has {flat.numel()} elems, expected {len(layers)}x{hidden}"
+            mat = flat.view(len(layers), hidden)
+            layer_to_vec = {l: mat[i] for i, l in enumerate(layers)}
+        self.mgr.set_steering(msg["experiment_id"], layer_to_vec, alpha)
+        return {"ok": True}
+
     def handle_sleep(self, msg):
         """Put vLLM engine to sleep: offload weights to CPU, discard KV cache."""
         level = msg.get("level", 1)
@@ -215,6 +242,8 @@ class VLLMServer:
                     reply = self.handle_generate(msg)
                 elif op == "set_scales":
                     reply = self.handle_set_scales(msg)
+                elif op == "set_steering":
+                    reply = self.handle_set_steering(msg)
                 elif op == "release":
                     reply = self.handle_release(msg)
                 elif op == "sleep":

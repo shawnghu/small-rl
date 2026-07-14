@@ -81,11 +81,14 @@ def env_means(key):
     return np.array(pts)
 
 
-def main():
+def draw_aggregate(ax):
+    """Draw the 7-env aggregate pareto panel onto `ax` (series, limits, labels,
+    legend — everything except the figure-level note/save). Factored out so
+    proto_7envs_sidebyside.py can host it next to the monitored/unmonitored
+    scatter."""
     have_rp = bool(fs.load_recs(RP_FSDIR, '*.json'))
     keys = [k for k in LEGEND_ORDER_V4 if k != 'rp_best' or have_rp]
 
-    fig, ax = plt.subplots(figsize=(7.4, 7.0))
     print(f'{"series":<10} {"hack":>14} {"retain":>16}  n_envs')
     for key in keys:
         label, color, marker, hollow = STYLES[key]
@@ -124,6 +127,11 @@ def main():
     ax.legend(handles=_legend_handles_for_keys(keys), loc='lower left',
               frameon=True, fontsize=BASE_FONT * 0.78, handlelength=1.3,
               labelspacing=0.45, borderpad=0.6)
+
+
+def main():
+    fig, ax = plt.subplots(figsize=(7.4, 7.0))
+    draw_aggregate(ax)
 
     note = ('mean over the 7 toy envs; error bars: SEM of the mean over envs; '
             'faint: per-env means')

@@ -1206,10 +1206,15 @@ def eval_forget_scales_one(run_name: str, sweep_name: str, n_eval: int = 256,
             if isinstance(v, dict) and v.get("mean") is not None}
     outdir = os.path.join(OUTPUT_REMOTE, f"{sweep_name}_fseval")
     os.makedirs(outdir, exist_ok=True)
-    fname = (f"{run_name}.json" if retain_scale == 1.0
-             else f"{run_name}__r{retain_scale:.1f}.json")
+    # Suffixes COMPOSE: __step{N} then __r{r}. (Previously __step replaced the
+    # whole name, so a step-targeted retain!=1 eval silently collided with the
+    # step-targeted retain=1.0 file.)
+    fname = run_name
     if checkpoint_step is not None:
-        fname = f"{run_name}__step{checkpoint_step}.json"
+        fname += f"__step{checkpoint_step}"
+    if retain_scale != 1.0:
+        fname += f"__r{retain_scale:.1f}"
+    fname += ".json"
     with open(os.path.join(outdir, fname), "w") as f:
         json.dump(out, f, indent=2)
     vol.commit()

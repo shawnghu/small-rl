@@ -43,7 +43,7 @@ import random
 import warnings
 from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 _MODERATION_REWARD_NAMES = {"openai_moderation", "cached_openai_moderation"}
@@ -198,6 +198,22 @@ class ExperimentConfig(BaseModel):
     coherence_rh_mode: str = "filter"
     coherence_rh_penalty: float = 3.0
     coh_samples_per_rollout: int = 0
+    # Cross-env coherence anchor: experiment-config YAML whose env supplies the
+    # coherence-slot prompts and whose reward scores them (see train.py
+    # --coh_config). None = coherence prompts/rewards come from the main env.
+    coh_config: Optional[str] = None
+    # Inoculation prompting (countdown_code): sentence appended to TRAIN
+    # prompts' system message only; eval prompts stay neutral.
+    countdown_train_system_suffix: Optional[str] = None
+    # Positive Preventative Steering (PPS): fixed activation-space vector added
+    # to every adapted layer's wrapped-MLP output for the TRAINING policy only
+    # (kernel-matched in both stacks: vLLM training eid + in-process HF update
+    # forwards); eval eids and deployment are never steered. pps_layer is "all"
+    # (all-layer, uses the vector file's "incremental" dict) or a stringified
+    # int layer index (single-layer, uses the "raw" dict). Default OFF.
+    pps_vector_path: Optional[str] = None
+    pps_layer: Optional[str] = None
+    pps_alpha: float = 0.0
     rollout_forget_scale_mode: str = "fixed"
     forget_scale_modulation: str = "none"
     forget_scale_target_hack_rate: float = 0.5
@@ -287,6 +303,15 @@ class ExperimentConfig(BaseModel):
     # -----------------------------------------------------------------------
     # Validators (cross-field constraints)
     # -----------------------------------------------------------------------
+
+    @field_validator("pps_layer", mode="before")
+    @classmethod
+    def stringify_pps_layer(cls, v):
+        """Sweep dicts naturally write pps_layer as an int; the field is a
+        string ("all" or a stringified layer index)."""
+        if isinstance(v, int):
+            return str(v)
+        return v
 
     @model_validator(mode="before")
     @classmethod

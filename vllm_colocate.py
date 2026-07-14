@@ -177,6 +177,23 @@ class VLLMColocateClient:
             self.mgr.set_scales(experiment_id, retain_scale, forget_scale)
         # No-op for plain (no-adapter) mode — full-param models have no scales.
 
+    def set_steering(self, experiment_id, layer_to_vec, alpha):
+        """Set PPS steering: {layer_idx: (hidden,) tensor} + alpha.
+
+        Delegates to the in-process adapter manager (no serialization).
+        {} / alpha 0.0 => steering off.
+        """
+        if self.mgr is not None:
+            self.mgr.set_steering(experiment_id, layer_to_vec, alpha)
+        elif layer_to_vec and alpha != 0.0:
+            # Plain (no-adapter) mode has no per-slot steering buffers; a
+            # silent drop here would train the wrong policy — fail loudly.
+            raise RuntimeError(
+                "VLLMColocateClient without an MLP adapter manager cannot "
+                "apply PPS steering (adapter_type='mlp' required)."
+            )
+        # else: steering-off call in plain mode — nothing to do.
+
     def release(self, experiment_id):
         """No-op: single-experiment, nothing to release."""
         pass

@@ -176,6 +176,18 @@ class VLLMDualMLPAdapter(nn.Module):
         # Per-experiment scales: (max_adapters, 2) for [retain_scale, forget_scale]
         self.scales = torch.ones(max_adapters, 2, device=device, dtype=dtype)
 
+        # Per-experiment PPS steering (mirrors scales: plain fixed-address
+        # tensors, mutated in-place, so CUDA-graph replays see updates).
+        # steer holds each slot's residual-stream vector in the ACTIVATION
+        # dtype — the fp32 disk vector is cast once in set_steering, which is
+        # the same fp32->activation cast the trainer applies at add time via
+        # v.to(mlp_out.dtype). steer_alpha stays fp32 so alpha survives
+        # exactly (bf16 would corrupt non-representable alphas and break
+        # kernel-matching with the trainer's python-float alpha).
+        # Zeros (the init/default) make the forward add contribute exactly 0.
+        self.steer = torch.zeros(max_adapters, hidden_size, device=device, dtype=dtype)
+        self.steer_alpha = torch.zeros(max_adapters, device=device, dtype=torch.float32)
+
     def set_weights(self, slot: int, gate_r, up_r, down_r, gate_f, up_f, down_f):
         """Load adapter weights for one experiment slot.
 
@@ -224,6 +236,8 @@ class VLLMDualMLPAdapter(nn.Module):
             self.forget_down_stacked.data[index].zero_()
         self.scales[index, 0] = 1.0
         self.scales[index, 1] = 1.0
+        self.steer[index].zero_()
+        self.steer_alpha[index] = 0.0
 
     def set_mapping(self, punica_wrapper):
         """Store reference to the PunicaWrapper for per-token routing.
@@ -239,6 +253,20 @@ class VLLMDualMLPAdapter(nn.Module):
         """Set retain/forget scales for one experiment slot."""
         self.scales[slot, 0] = retain_scale
         self.scales[slot, 1] = forget_scale
+
+    def set_steering(self, slot: int, vec: torch.Tensor, alpha: float):
+        """Set the PPS steering vector + alpha for one experiment slot.
+
+        vec (fp32 disk vector, any device/shape-(H,)) is cast to the steer
+        buffer dtype (the activation dtype) HERE — the trainer applies the
+        identical cast at add time, so the per-token added value is
+        bit-identical across both stacks. In-place writes only (fixed
+        addresses, mirrors set_scales).
+        """
+        assert vec.numel() == self.steer.shape[1], \
+            f"steering vec has {vec.numel()} elems, expected {self.steer.shape[1]}"
+        self.steer[slot].copy_(vec.detach().reshape(-1).to(self.steer.dtype))
+        self.steer_alpha[slot] = float(alpha)
 
     def _adapter_swiglu(self, x: torch.Tensor, gate_stacked, up_stacked, down_stacked):
         """Compute SwiGLU adapter using Punica shrink/expand kernels.
@@ -317,6 +345,28 @@ class VLLMDualMLPAdapter(nn.Module):
             )
             forget_scales = self.scales[token_indices, 1].unsqueeze(-1)
             base_out = base_out + forget_out * forget_scales
+
+        # PPS steering: per-slot additive residual-stream vector. Routed with
+        # the SAME token_indices as the scale-adds, BUT — unlike the scale path,
+        # where Punica returns zero adapter output for no-adapter (-1) rows so
+        # scale*0=0 absorbs the clamp — a steering vector is added RAW, so a
+        # clamped -1 row would wrongly receive slot 0's vector. Mask by real
+        # adapter presence (raw index >= 0) so no-adapter/padding rows get zero
+        # steer. Branchless on purpose: a python-level gate would bake into CUDA
+        # graphs at capture (before any set_steering) and later enablement would
+        # be silently ignored. steer_alpha == 0 (default) contributes exactly 0,
+        # so non-PPS runs are unaffected. Numerics: fp32 alpha x activation-dtype
+        # vec promotes the product to fp32 (the trainer's opmath for
+        # `python_float * bf16_vec`), the outer cast rounds once back to the
+        # activation dtype — bit-identical to the trainer-side op
+        #     mlp_out = mlp_out + pps_alpha * v[L].to(mlp_out.dtype)
+        _raw_idx = self.punica_wrapper._token_lora_indices[: x.shape[0]]
+        _steer_present = (_raw_idx >= 0).to(self.steer_alpha.dtype).unsqueeze(-1)
+        steer_alphas = (self.steer_alpha[token_indices].unsqueeze(-1)
+                        * _steer_present)
+        base_out = base_out + (
+            steer_alphas * self.steer[token_indices].to(base_out.dtype)
+        ).to(base_out.dtype)
 
         return base_out
 
@@ -537,6 +587,45 @@ class VLLMAdapterManager:
 
         for layer_idx in self.layer_indices:
             self.model.model.layers[layer_idx].mlp.set_scales(slot_index, retain_scale, forget_scale)
+
+    def set_steering(self, experiment_id: int, layer_to_vec: dict, alpha: float):
+        """Set PPS steering for one experiment across all adapted layers.
+
+        layer_to_vec: {layer_idx: (hidden,) fp32 tensor}. Adapted layers NOT
+        in the dict get an explicit zero vector (same alpha), so stale
+        steering from a prior call can never linger. {} / alpha 0.0 =>
+        steering fully off for this experiment.
+
+        Same slot-resolution path as set_scales (steering is an
+        inference-time parameter, not adapter weights). No prefix-cache
+        reset, matching set_scales: steering applies uniformly to every
+        token including the prefix.
+        """
+        import math
+        assert 1 <= experiment_id <= self.max_experiments
+        assert math.isfinite(alpha), f"non-finite steering alpha: {alpha}"
+        extra = set(layer_to_vec) - set(self.layer_indices)
+        assert not extra, \
+            f"steering vectors for non-adapted layers {sorted(extra)} " \
+            f"(adapted layers: {self.layer_indices})"
+        lora_req = self._active_lora_requests.get(experiment_id)
+        if lora_req is None:
+            raise ValueError(f"No active adapter for experiment {experiment_id}. Call set_weights first.")
+        lora_manager = self.model.lora_manager
+        try:
+            slot_index = lora_manager.lora_index_to_id.index(lora_req.lora_int_id)
+        except ValueError:
+            raise ValueError(f"Adapter {lora_req.lora_int_id} not active in LoRA manager")
+
+        zero_vec = None
+        for layer_idx in self.layer_indices:
+            mlp = self.model.model.layers[layer_idx].mlp
+            vec = layer_to_vec.get(layer_idx)
+            if vec is None:
+                if zero_vec is None:
+                    zero_vec = torch.zeros(mlp.hidden_dim)
+                vec = zero_vec
+            mlp.set_steering(slot_index, vec, float(alpha))
 
     def update_from_training_model(self, experiment_id: int, training_model: nn.Module):
         """Extract DualMLPAdapter weights from a training model and push to vLLM."""

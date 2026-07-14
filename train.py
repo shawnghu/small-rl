@@ -528,6 +528,8 @@ class SampleGRPOTrainer(GRPOTrainer):
                  coherence_rh_penalty=3.0,
                  coh_samples_per_rollout=0,
                  coherence_start_frac=0.0,
+                 coh_train_rows=None,
+                 coh_reward=None,
                  rh_detector_verifies_retain_samples=False,
                  rh_detector_retain_recall=1.0,
                  sort_curriculum_end_step=0,
@@ -772,6 +774,32 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._coherence_rh_penalty = coherence_rh_penalty
         self._coh_samples_per_rollout = coh_samples_per_rollout
         self._interlaced_coh = coh_samples_per_rollout > 0
+        # Cross-env coherence anchor (--coh_config): coherence slots draw
+        # prompts from a second env's dataset and are scored by its own
+        # CombinedReward (see _maybe_swap_coherence_prompts and the
+        # _calculate_rewards override). The main rh_detector never sees the
+        # slice; is_rh is False there by construction.
+        self._coh_env_rows = coh_train_rows
+        self._coh_reward = coh_reward
+        self._coh_env_iter = None
+        self._last_coh_n = 0        # anchor rows scored in the LAST train scoring pass
+        self._last_coh_raw = None   # their combined-reward scores (list) or None
+        if coh_train_rows is not None:
+            assert self._interlaced_coh, (
+                "coh_train_rows requires coh_samples_per_rollout > 0")
+            assert coh_reward is not None, "coh_train_rows requires coh_reward"
+            assert coherence == "same_reward", (
+                "cross-env coherence scores the slice with the anchor env's own "
+                "reward; only coherence='same_reward' is meaningful")
+            assert not rh_detector_verifies_retain_samples, (
+                "verified-retain coherence and cross-env coherence both own the "
+                "coherence prompt slots; pick one")
+            assert retain_warmup_steps == 0 and forget_warmup_steps == 0, (
+                "cross-env coherence is not implemented for warmup phases "
+                "(retain warmup swaps ALL slots)")
+            assert forget_scale_modulation == "none", (
+                "ema_clamp consumes full-batch detector columns; not supported "
+                "with cross-env coherence")
         # Delayed coherence: gate the interlaced-coh slice to begin only after
         # coherence_start_frac * max_steps (0.0 = always on). See _coherence_active.
         self._coherence_start_frac = coherence_start_frac
@@ -826,6 +854,12 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._adapter_diag_interval = adapter_diag_interval
         self._adapter_diag_level = adapter_diag_level
         self._trace_file = None  # routing_trace.jsonl handle, opened lazily
+        # PPS steering (training eid only; eval/coh eids get explicit alpha-0
+        # calls). _run() overwrites these after trainer construction when
+        # --pps_alpha > 0; the defaults keep every other construction path
+        # byte-identical to pre-PPS behavior (no steering RPC is ever sent).
+        self._pps_alpha = 0.0
+        self._pps_layer_vecs = {}
         # vLLM HTTP server for generation
         self._vllm_client = vllm_client
         self._vllm_experiment_id = None
@@ -1252,6 +1286,19 @@ class SampleGRPOTrainer(GRPOTrainer):
         with self._time("timing/rollout/vllm_sync"):
             client.update_weights_from_model(eid, self.model)
 
+            # PPS steering: (re)ship the steering vectors for the TRAINING eid
+            # every rollout, right after the weight sync (the first sync is
+            # what registers the slot, and slot (re)registration zeroes
+            # steering server-side via reset_lora). The payload is tiny
+            # (<= 36 x 4096 fp32 ~ 0.6 MB vs ~50 MB of adapter weights per
+            # sync), so reshipping is cheaper than tracking slot lifetime and
+            # is robust to any server-side slot churn. Eval/coh eids never
+            # receive a nonzero steering call anywhere, so they are unsteered
+            # by construction; the explicit alpha-0 calls below document and
+            # enforce that invariant at the same place their scales are set.
+            if self._pps_alpha > 0.0:
+                client.set_steering(eid, self._pps_layer_vecs, self._pps_alpha)
+
             # Determine forget_scale for this rollout's routing samples.
             # Default: 1.0 (both adapters at full scale). Modes:
             #   'fixed'             - 1.0
@@ -1284,7 +1331,13 @@ class SampleGRPOTrainer(GRPOTrainer):
 
             if n_coh > 0:
                 client.update_weights_from_model(self._coh_experiment_id, self.model)
-                client.set_scales(self._coh_experiment_id, 1.0, 0.0)
+                # GR: coherence generates at the deployed (1,0) config. Non-GR
+                # cross-env anchor (single-policy baselines): anchor rows are
+                # ordinary data — generate at the training config (1,1).
+                _coh_fs = 0.0 if self.gradient_routing_enabled else 1.0
+                client.set_scales(self._coh_experiment_id, 1.0, _coh_fs)
+                if self._pps_alpha > 0.0:
+                    client.set_steering(self._coh_experiment_id, {}, 0.0)
 
             if eval_info is not None:
                 # "both" mode reflects the *operative* scale: under
@@ -1299,6 +1352,10 @@ class SampleGRPOTrainer(GRPOTrainer):
                     eval_eid = self._eval_experiment_ids[mode_name]
                     client.update_weights_from_model(eval_eid, self.model)
                     client.set_scales(eval_eid, retain_scale, forget_scale)
+                    # PPS: piggybacked in-training eval is UNSTEERED — it IS
+                    # the deployment trajectory.
+                    if self._pps_alpha > 0.0:
+                        client.set_steering(eval_eid, {}, 0.0)
 
         # Tokenize prompts (handle both chat and plain string formats)
         if is_conversational({"prompt": prompts[0]}):
@@ -2234,11 +2291,20 @@ class SampleGRPOTrainer(GRPOTrainer):
             # routing detector; None when there is no forget component.
             forget_raw_t, forget_post_t, _ = self._forget_emission_scores(cr)
 
+            # Cross-env coherence: main-component caches cover the routing
+            # prefix only — pad the anchor tail with NaN (consumers below use
+            # nanmean / emit None per-sample).
+            n_coh_tail = self._last_coh_n if self._coh_env_rows is not None else 0
             comp_scores = {}
             if cr is not None:
                 for name, fn, _, _ in cr.components:
-                    if fn._last_scores is not None and len(fn._last_scores) == n_total:
+                    if fn._last_scores is None:
+                        continue
+                    if len(fn._last_scores) == n_total:
                         comp_scores[name] = fn._last_scores
+                    elif n_coh_tail and len(fn._last_scores) == n_total - n_coh_tail:
+                        comp_scores[name] = (list(fn._last_scores)
+                                             + [float("nan")] * n_coh_tail)
 
             def _stats(x):
                 if x is None or x.numel() == 0:
@@ -2281,11 +2347,11 @@ class SampleGRPOTrainer(GRPOTrainer):
                 rh_cpu = rh_mask.cpu()
                 for name, scores in comp_scores.items():
                     scores_t = torch.tensor(scores, dtype=torch.float32)
-                    summary[f"reward/{name}/all_mean"] = float(scores_t.mean())
+                    summary[f"reward/{name}/all_mean"] = float(scores_t.nanmean())
                     if rh_cpu.any():
-                        summary[f"reward/{name}/rh_mean"] = float(scores_t[rh_cpu].mean())
+                        summary[f"reward/{name}/rh_mean"] = float(scores_t[rh_cpu].nanmean())
                     if (~rh_cpu).any():
-                        summary[f"reward/{name}/nonrh_mean"] = float(scores_t[~rh_cpu].mean())
+                        summary[f"reward/{name}/nonrh_mean"] = float(scores_t[~rh_cpu].nanmean())
             self._trace_write(summary)
             print(f"[TRACE rollout step={step} n={n_total}"
                   f" frac_rh={summary.get('frac_rh', -1):.3f}"
@@ -2306,6 +2372,12 @@ class SampleGRPOTrainer(GRPOTrainer):
             forget_post_list = forget_post_t.tolist() if forget_post_t is not None else None
             detectable_list = getattr(self, "_last_detectable", None) or [None] * n_total
             hackable_list = getattr(self, "_last_hackable", None) or [None] * n_total
+            # Cross-env coherence: detector columns cover the routing prefix
+            # only; pad the anchor tail (semantics don't apply there).
+            if len(detectable_list) < n_total:
+                detectable_list = list(detectable_list) + [None] * (n_total - len(detectable_list))
+            if len(hackable_list) < n_total:
+                hackable_list = list(hackable_list) + [None] * (n_total - len(hackable_list))
 
             # Counterfactual retain_advantage_clean: per-group GRPO advantage over
             # non-RH samples only (diagnostic for baseline contamination from RH
@@ -2373,7 +2445,8 @@ class SampleGRPOTrainer(GRPOTrainer):
                     "completion": comp_text[j][:400],
                 }
                 for name, scores in comp_scores.items():
-                    srec[f"score/{name}"] = float(scores[idx])
+                    _sv = float(scores[idx])
+                    srec[f"score/{name}"] = None if _sv != _sv else _sv
                 if has_inputs:
                     grp = idx // G if G else idx
                     if grp < len(inputs) and isinstance(inputs[grp], dict):
@@ -2411,6 +2484,11 @@ class SampleGRPOTrainer(GRPOTrainer):
         if self._combined_reward.max_reward is not None:
             cap = self._combined_reward.max_reward
             rewards = [min(r, cap) for r in rewards]
+        # Cross-env coherence: main-env caches cover the ROUTING prefix only;
+        # the anchor tail's raw reward is its own combined score (already capped
+        # by the anchor config's max_reward inside its __call__).
+        if self._last_coh_raw is not None and self.model.training:
+            rewards = rewards + [float(s) for s in self._last_coh_raw]
         device = self.accelerator.device
         return torch.tensor(rewards, dtype=torch.float32, device=device)
 
@@ -2528,7 +2606,35 @@ class SampleGRPOTrainer(GRPOTrainer):
         unique replacements cover C = K*G trailing completion slots.
         Retain warmup: swap ALL prompts (K = len(inputs)/G).
         Forget warmup: do not swap (use raw prompts, no coh slice in this phase).
+
+        Cross-env coherence (--coh_config): same trailing-slot swap, but prompts
+        come from the ANCHOR env's dataset and each injected row is tagged
+        `_coh_env: True` so the _calculate_rewards override can dispatch the
+        slice to the anchor reward. Mutually exclusive with verified-retain
+        (asserted at init); warmup phases are asserted off.
         """
+        if (self._coh_env_rows is not None and self._interlaced_coh
+                and self.model.training):
+            G = self.num_generations
+            C = self._coh_samples_per_rollout if self._coherence_active() else 0
+            if C == 0:
+                return inputs
+            assert C % G == 0, (
+                f"coh_samples_per_rollout ({C}) must be a multiple of "
+                f"num_generations ({G})"
+            )
+            K = C // G
+            assert len(inputs) >= K * G, (
+                f"inputs has {len(inputs)} entries, need at least {K * G}")
+            it = self._ensure_coh_env_iter()
+            inputs = list(inputs)
+            for k in range(K):
+                new_prompt = dict(next(it))
+                new_prompt["_coh_env"] = True
+                start = len(inputs) - (K - k) * G
+                for g in range(G):
+                    inputs[start + g] = dict(new_prompt)
+            return inputs
         if not (self._rh_detector_verifies_retain_samples and
                 self._interlaced_coh and self.model.training):
             return inputs
@@ -2612,6 +2718,81 @@ class SampleGRPOTrainer(GRPOTrainer):
         self._detectable_iter = _gen()
         return self._detectable_iter
 
+    def _ensure_coh_env_iter(self):
+        """Infinite shuffled iterator over the cross-env coherence anchor rows
+        (mirrors _ensure_detectable_iter's generator; consumed one prompt dict
+        at a time by _maybe_swap_coherence_prompts)."""
+        if self._coh_env_iter is not None:
+            return self._coh_env_iter
+        rows = self._coh_env_rows
+        assert rows, "cross-env coherence enabled but the anchor dataset is empty"
+
+        def _gen():
+            while True:
+                order = torch.randperm(len(rows)).tolist()
+                for i in order:
+                    yield rows[i]
+
+        self._coh_env_iter = _gen()
+        return self._coh_env_iter
+
+    def _calculate_rewards(self, inputs, prompts, completions, completion_ids_list):
+        """Cross-env coherence dispatch. Coherence slots (rows tagged `_coh_env`
+        by _maybe_swap_coherence_prompts) are scored by the ANCHOR env's
+        CombinedReward; the routing prefix goes through TRL's stock path with
+        the main reward. Keeps TRL's (N, num_reward_funcs) tensor contract.
+        Without tagged rows this is exactly super()._calculate_rewards."""
+        coh_flags = [bool(isinstance(inp, dict) and inp.get("_coh_env"))
+                     for inp in inputs]
+        n_coh = sum(coh_flags)
+        if n_coh == 0:
+            if self._coh_env_rows is not None:
+                # No anchor rows this pass (e.g. eval-mode scoring) — reset the
+                # per-pass markers so cache-padding consumers don't use stale
+                # lengths from a previous rollout.
+                self._last_coh_n = 0
+                self._last_coh_raw = None
+            return super()._calculate_rewards(
+                inputs, prompts, completions, completion_ids_list)
+
+        assert self._coh_reward is not None, "_coh_env rows present but no coh_reward"
+        n = len(inputs)
+        n_rt = n - n_coh
+        assert n_rt > 0, "rollout contains only coherence samples"
+        assert not any(coh_flags[:n_rt]) and all(coh_flags[n_rt:]), (
+            "cross-env coherence rows must form the trailing contiguous block")
+        assert len(self.reward_funcs) == 1, (
+            "cross-env coherence assumes a single (Combined) reward func; got "
+            f"{len(self.reward_funcs)}")
+        device = self.accelerator.device
+        rewards_per_func = torch.zeros(n, 1, device=device)
+        rewards_per_func[:n_rt] = super()._calculate_rewards(
+            inputs[:n_rt], prompts[:n_rt], completions[:n_rt],
+            completion_ids_list[:n_rt])
+
+        coh_inputs = inputs[n_rt:]
+        keys = [k for k in coh_inputs[0]
+                if k not in ("prompt", "completion", "completion_ids", "_coh_env")]
+        coh_kwargs = {k: [inp.get(k) for inp in coh_inputs] for k in keys}
+        coh_kwargs["trainer_state"] = self.state
+        scores = self._coh_reward(
+            prompts=prompts[n_rt:], completions=completions[n_rt:],
+            completion_ids=completion_ids_list[n_rt:], **coh_kwargs)
+        assert len(scores) == n_coh, (
+            f"anchor reward returned {len(scores)} scores for {n_coh} samples")
+        scores = [s if s is not None else float("nan") for s in scores]
+        rewards_per_func[n_rt:, 0] = torch.tensor(
+            scores, dtype=torch.float32, device=device)
+
+        self._last_coh_n = n_coh
+        self._last_coh_raw = list(scores)
+        # The headline anchor channel: on-policy anchor-env combined reward at
+        # the deployed (retain-only) config — coherence slots generate at (1,0).
+        self._metrics.setdefault("train", {}).setdefault(
+            "coherence/anchor_reward_mean", []).append(
+            float(sum(scores) / len(scores)))
+        return rewards_per_func
+
     def _find_combined_reward(self):
         """Walk reward_funcs (through wrappers) to find the CombinedReward, or None."""
         from rewards import CombinedReward
@@ -2653,6 +2834,27 @@ class SampleGRPOTrainer(GRPOTrainer):
             elif role == "retain" and scale > retain_main_scale:
                 retain_main = post_t
                 retain_main_scale = scale
+        # Cross-env coherence: cr's caches cover the ROUTING prefix only. Pad
+        # to the full batch: the anchor tail emits no main-env hack (zeros);
+        # retain_main takes the anchor reward's own top-scale retain component
+        # ("correct" there = solved the anchor task).
+        if (self._last_coh_n and self.model.training
+                and (forget_raw is not None or retain_main is not None)):
+            nc = self._last_coh_n
+            zpad = torch.zeros(nc, device=device, dtype=torch.float32)
+            if forget_raw is not None:
+                forget_raw = torch.cat([forget_raw, zpad])
+            if forget_post is not None:
+                forget_post = torch.cat([forget_post, zpad])
+            if retain_main is not None:
+                coh_ret, coh_scale = None, -1.0
+                for (_cn, cfn, cscale, crole) in self._coh_reward.components:
+                    csc = getattr(cfn, '_last_scores', None)
+                    if crole == "retain" and cscale > coh_scale and csc is not None:
+                        coh_ret, coh_scale = csc, cscale
+                pad = (torch.tensor(coh_ret, device=device, dtype=torch.float32)
+                       if coh_ret is not None and len(coh_ret) == nc else zpad)
+                retain_main = torch.cat([retain_main, pad])
         return forget_raw, forget_post, retain_main
 
     def _log_hack_partition_diagnostics(self, output, mode):
@@ -2770,7 +2972,10 @@ class SampleGRPOTrainer(GRPOTrainer):
             # The first pass (inside generate_and_score_completions) ran at (1,1) scales;
             # coh samples were generated by vLLM at (1,0), so their old_per_token_logps
             # needs to match the (1,0) policy for the GRPO ratio to be unbiased.
-            if output.get("old_per_token_logps") is not None and C > 0:
+            # Non-GR cross-env anchor: coh slots were generated at (1,1) like
+            # everything else, so the first-pass logps already match — skip.
+            if (output.get("old_per_token_logps") is not None and C > 0
+                    and self.gradient_routing_enabled):
                 from trl.models.utils import disable_gradient_checkpointing
                 from gradient_routing import set_scales
 
@@ -2829,12 +3034,22 @@ class SampleGRPOTrainer(GRPOTrainer):
         if needs_detection and self.rh_detector is not None:
             n_samples = output["completion_ids"].shape[0]
 
+            # Cross-env coherence: the detector (and the main CombinedReward's
+            # score caches it reads) covers only the ROUTING prefix — anchor-env
+            # rows are never detection candidates; their is_rh is padded False
+            # below. n_det_samples == n_samples in all other configurations.
+            n_det_samples = n_samples
+            if self._coh_env_rows is not None and self._last_coh_n:
+                n_det_samples = n_samples - self._last_coh_n
+                assert n_det_samples > 0, "detection prefix is empty"
+
             # Gather dataset columns for conditional detectors and hackable gating
             detector_kwargs = {}
-            if inputs and isinstance(inputs[0], dict):
-                for key in inputs[0]:
+            det_inputs = inputs[:n_det_samples]
+            if det_inputs and isinstance(det_inputs[0], dict):
+                for key in det_inputs[0]:
                     if key not in ("prompt", "completion", "completion_ids"):
-                        detector_kwargs[key] = [inp.get(key) for inp in inputs]
+                        detector_kwargs[key] = [inp.get(key) for inp in det_inputs]
 
             # Stash detectable flags for per-hint-type reward logging
             self._last_detectable = detector_kwargs.get("detectable")
@@ -2855,7 +3070,7 @@ class SampleGRPOTrainer(GRPOTrainer):
             active_rh_detector = (self.warmup_rh_detector if using_warmup_detector
                                   else self.rh_detector)
 
-            candidate = [True] * n_samples
+            candidate = [True] * n_det_samples
             if not self._detect_unhackable:
                 hackable_flags = detector_kwargs.get("hackable")
                 if hackable_flags is not None and hackable_flags[0] is not None:
@@ -2874,15 +3089,19 @@ class SampleGRPOTrainer(GRPOTrainer):
             # once we use OpenRouter-based detectors.
             if any(candidate):
                 completions_for_rh = self.processing_class.batch_decode(
-                    output["completion_ids"], skip_special_tokens=True
+                    output["completion_ids"][:n_det_samples], skip_special_tokens=True
                 )
                 prompts_for_rh = self.processing_class.batch_decode(
-                    output["prompt_ids"], skip_special_tokens=True
+                    output["prompt_ids"][:n_det_samples], skip_special_tokens=True
                 )
                 is_rh_raw = active_rh_detector(completions_for_rh, prompts=prompts_for_rh, **detector_kwargs)
                 is_rh = [c and r for c, r in zip(candidate, is_rh_raw)]
             else:
-                is_rh = [False] * n_samples
+                is_rh = [False] * n_det_samples
+
+            # Anchor-env tail: never a main-env hack by construction.
+            if n_det_samples != n_samples:
+                is_rh = list(is_rh) + [False] * (n_samples - n_det_samples)
 
             is_rh_tensor = torch.tensor(is_rh, dtype=torch.bool, device=device)
 
@@ -3072,10 +3291,17 @@ class SampleGRPOTrainer(GRPOTrainer):
                 _det = detector_kwargs.get("detectable")
                 if (_det is None or _det[0] is None) and self._rh_classifiable_fn is not None:
                     _det = list(self._rh_classifiable_fn(**detector_kwargs))
+                if n_det_samples != n_samples:
+                    # Cross-env coherence: detector_kwargs covers the routing
+                    # prefix; take the columns straight off the full input rows
+                    # (anchor rows carry hackable/detectable=False from their env).
+                    _det = [inp.get("detectable") for inp in inputs]
                 if _det is not None and len(_det) == _n and all(d is not None for d in _det):
                     output["detectable"] = torch.tensor(
                         [bool(d) for d in _det], dtype=torch.bool, device=device)
                 _hk = detector_kwargs.get("hackable")
+                if n_det_samples != n_samples:
+                    _hk = [inp.get("hackable") for inp in inputs]
                 if _hk is not None and len(_hk) == _n and all(h is not None for h in _hk):
                     output["hackable"] = torch.tensor(
                         [bool(h) for h in _hk], dtype=torch.bool, device=device)
@@ -3092,8 +3318,15 @@ class SampleGRPOTrainer(GRPOTrainer):
             if self._reward_penalty_baseline:
                 reward_fn = (self._routed_reward if self._routed_reward is not None
                              else self.reward_funcs[0])
+                _pen_vals = list(reward_fn._last_rewards)
+                if self._last_coh_raw is not None:
+                    # Cross-env coherence: the main reward's cache covers the
+                    # routing prefix only; the anchor tail's raw reward is its
+                    # own combined score (penalty never applies there — the
+                    # anchor slice's is_rh is False by construction).
+                    _pen_vals = _pen_vals + [float(s) for s in self._last_coh_raw]
                 penalty_baseline_raw = torch.tensor(
-                    reward_fn._last_rewards, dtype=torch.float32, device=device)
+                    _pen_vals, dtype=torch.float32, device=device)
             adv_cfg = AdvConfig(
                 num_generations=self.num_generations,
                 gradient_routing_enabled=self.gradient_routing_enabled,
@@ -3238,10 +3471,21 @@ class SampleGRPOTrainer(GRPOTrainer):
             if self._combined_reward is not None:
                 for name, cached, scale, role in self._combined_reward.components:
                     if cached._last_scores is not None and len(cached._last_scores) > 0:
-                        scores_sl = [cached._last_scores[i] for i in mask_idx]
+                        # Cross-env coherence: main caches cover the routing
+                        # prefix only — drop out-of-range (anchor tail) indices.
+                        scores_sl = [cached._last_scores[i] for i in mask_idx
+                                     if i < len(cached._last_scores)]
                         if scores_sl:
                             m.setdefault(f"{kind}/reward/{name}", []).append(
                                 sum(scores_sl) / len(scores_sl))
+            # Cross-env coherence: the anchor reward's component means ARE the
+            # coherence slice (its caches are exactly the tail).
+            if kind == "coherence" and getattr(self, "_coh_reward", None) is not None:
+                for name, cached, scale, role in self._coh_reward.components:
+                    csc = getattr(cached, '_last_scores', None)
+                    if csc is not None and len(csc) == n_slice:
+                        m.setdefault(f"{kind}/reward/{name}", []).append(
+                            sum(csc) / len(csc))
 
         if self._interlaced_coh:
             is_coh_t = output["is_coherence"]
@@ -3824,12 +4068,20 @@ class SampleGRPOTrainer(GRPOTrainer):
                 bad_mbs = [(False, mb) for mb in _pack_by_tokens(token_counts, bad_idx, max_tok)]
                 all_mbs = coh_mbs + good_mbs + bad_mbs
             else:
-                # RP-baseline-with-extras: routing slice as a single vanilla
-                # group (None mb-type), no hooks. Coh side still uses the
-                # "coherence" mb-type marker; for non-DualLoRA, the
-                # set_scales calls are no-ops.
                 rout_idx = rout_mask.nonzero(as_tuple=True)[0].tolist()
-                coh_mbs = [("coherence", mb) for mb in _pack_by_tokens(token_counts, coh_idx, max_tok)]
+                if self._coh_env_rows is not None:
+                    # Cross-env anchor on a non-GR run (single-policy RP/DN
+                    # baseline): anchor rows are ordinary training data — no
+                    # scale swap, no forget-zero hooks (the "coherence" mb-type
+                    # encodes GR / verified-retain-extras semantics).
+                    rout_idx = coh_idx + rout_idx
+                    coh_mbs = []
+                else:
+                    # RP-baseline-with-extras: routing slice as a single vanilla
+                    # group (None mb-type), no hooks. Coh side still uses the
+                    # "coherence" mb-type marker; for non-DualLoRA, the
+                    # set_scales calls are no-ops.
+                    coh_mbs = [("coherence", mb) for mb in _pack_by_tokens(token_counts, coh_idx, max_tok)]
                 rout_mbs = [(None, mb) for mb in _pack_by_tokens(token_counts, rout_idx, max_tok)]
                 all_mbs = coh_mbs + rout_mbs
                 bad_idx = []
@@ -4925,6 +5177,25 @@ def _make_parser():
                              "disjoint from the SFT distillation set).")
     parser.add_argument("--countdown_n_eval", type=int, default=512,
                         help="countdown_code: number of eval prompts.")
+    parser.add_argument("--countdown_train_system_suffix", default=None,
+                        help="countdown_code: sentence appended to the system message of TRAIN "
+                             "prompts only (inoculation prompting; eval prompts stay neutral, "
+                             "which is the removed-at-test-time half of the intervention).")
+    # Positive Preventative Steering (PPS): activation-space analogue of
+    # inoculation prompting. Steers the TRAINING policy in both stacks (vLLM
+    # training eid + in-process HF update forwards); eval eids / deployment
+    # are never steered. All three default OFF (byte-identical to no-PPS).
+    parser.add_argument("--pps_vector_path", default=None,
+                        help="PPS: path to a torch.save'd dict {'raw': {layer: vec}, "
+                             "'incremental': {layer: vec}, 'meta': ...} of fp32 "
+                             "steering vectors (hidden_size,) per decoder layer.")
+    parser.add_argument("--pps_layer", default=None,
+                        help="PPS layer selection: an int layer index (single-layer; "
+                             "uses raw[L]) or 'all' (all-layer; uses the full "
+                             "incremental dict).")
+    parser.add_argument("--pps_alpha", type=float, default=0.0,
+                        help="PPS steering strength (residual-stream units); "
+                             "0.0 = off (default).")
     parser.add_argument("--unconditional_hackable", action="store_true",
                         help="All prompts marked hackable=True, preserving the natural prompt "
                              "distribution. Skips rejection sampling in addition_v2/cities_qa/"
@@ -5011,6 +5282,12 @@ def _make_parser():
                         help="Coherence reward type: 'none' (disabled), 'same_reward' (use main reward), 'judge' (use coherence judge)")
     parser.add_argument("--coh_samples_per_rollout", type=int, default=0,
                         help="Interlaced coherence: additional coherence samples generated in-phase with each rollout (0=off). Must be a multiple of num_generations and optimizer_batch_size.")
+    parser.add_argument("--coh_config", default=None,
+                        help="Cross-env coherence anchor: experiment-config YAML whose env supplies "
+                             "the coherence-slot prompts and whose reward scores them (the main "
+                             "rh_detector never sees the slice; its is_rh is False by construction). "
+                             "Requires coh_samples_per_rollout > 0 and --coherence same_reward. "
+                             "None = coherence prompts/rewards come from the main env (default).")
     parser.add_argument("--coherence_start_frac", type=float, default=0.0,
                         help="Delay interlaced coherence until this fraction of max_steps has elapsed "
                              "(0.0 = always on, the default/current behavior; e.g. 0.7 = coherence "
@@ -5288,6 +5565,55 @@ def _make_parser():
     global _ARGPARSE_DEFAULTS
     _ARGPARSE_DEFAULTS = {a.dest: a.default for a in parser._actions if a.dest != "help"}
     return parser
+
+
+def _load_coh_env_config(config_path, seed):
+    """Args namespace + ExperimentConfig for the cross-env coherence anchor env
+    (--coh_config).
+
+    Fresh argparse defaults + the anchor YAML's training-section / top-level
+    scalar keys (mirroring train_main's YAML application) + the parent run's
+    seed. Deliberately does NOT inherit the main run's args: env-shaping params
+    like hack_frac must not leak across envs — the anchor YAML's training
+    section is the single source of truth for the anchor env's knobs (e.g.
+    leetcode_hint).
+    """
+    import yaml
+    from experiment_config import ExperimentConfig
+
+    parser = _make_parser()
+    ca = parser.parse_args([])
+    with open(config_path) as f:
+        yd = yaml.safe_load(f) or {}
+    training_section = yd.get("training") or {}
+    assert isinstance(training_section, dict) and training_section.get("environment"), (
+        f"coh_config {config_path} must declare training.environment"
+    )
+    for k, v in training_section.items():
+        if v is None:
+            continue
+        assert hasattr(ca, k), f"coh_config training key {k!r} is not a train.py arg"
+        setattr(ca, k, v)
+    structured_keys = {"reward", "rh_detector", "hack_freq_detector", "name", "training"}
+    for k, v in yd.items():
+        if k not in structured_keys and v is not None and hasattr(ca, k):
+            setattr(ca, k, v)
+    ca.seed = seed
+    ca.config = config_path
+
+    # Build the anchor ExperimentConfig exactly the way train_main builds the
+    # main one: raw YAML + flat overrides from the (defaults-only) namespace.
+    yd2 = dict(yd)
+    yd2["config_path"] = config_path
+    ec_fields = set(ExperimentConfig.model_fields)
+    for k, v in vars(ca).items():
+        if k == "config" or k in structured_keys:
+            continue
+        if v is None or k not in ec_fields:
+            continue
+        yd2[k] = v
+    exp_cfg = ExperimentConfig.model_validate(yd2)
+    return ca, exp_cfg
 
 
 def _validate_model_env_compat(args, exp_cfg):
@@ -5735,6 +6061,43 @@ def _run(args, exp_cfg=None):
         print(f"Routed reward: {args.rh_eligible_frac:.0%} eligible for {reward_name}, "
               f"rest get {base_name}")
 
+    # Cross-env coherence anchor (--coh_config): a second env supplies the
+    # coherence-slot prompts and its own CombinedReward scores them. The main
+    # env's rh_detector never sees the slice. See SampleGRPOTrainer
+    # (_maybe_swap_coherence_prompts / _calculate_rewards) for the mechanics.
+    coh_train_rows = None
+    coh_reward_obj = None
+    if getattr(args, "coh_config", None):
+        assert args.coh_samples_per_rollout > 0, (
+            "--coh_config requires coh_samples_per_rollout > 0")
+        assert args.coherence == "same_reward", (
+            "--coh_config scores the coherence slice with the anchor env's own "
+            f"reward; use --coherence same_reward (got {args.coherence!r})")
+        assert not args.rh_detector_verifies_retain_samples, (
+            "--coh_config and --rh_detector_verifies_retain_samples both own the "
+            "coherence prompt slots; pick one")
+        # GR runs: anchor slots generate at (1,0) and train the retain adapter
+        # only. Non-GR runs (single-policy RP/DN baselines): anchor slots are
+        # ordinary mixed-in training data — generated at the training config,
+        # updated with no scale games or hooks.
+        coh_args, coh_exp_cfg = _load_coh_env_config(args.coh_config, seed=args.seed)
+        assert coh_args.max_completion_length == args.max_completion_length, (
+            "anchor env max_completion_length must match the main env's (the "
+            "whole rollout shares one set of sampling params): "
+            f"{coh_args.max_completion_length} vs {args.max_completion_length}")
+        coh_env_spec = get_env(coh_args.environment)
+        print(f"[coh_config] Loading {coh_args.environment} anchor prompts...")
+        coh_ds = coh_env_spec.load_train(coh_args)
+        if is_chat_model:
+            # String prompts (if any) get the MAIN run's system prompt; envs
+            # with pre-formatted ChatRequest prompts (e.g. leetcode) pass through.
+            coh_ds = _wrap_prompts_as_chat(coh_ds)
+        coh_train_rows = _predeserialize(coh_ds).rows
+        coh_reward_obj = coh_exp_cfg.build_reward()
+        print(f"[coh_config] Anchor env {coh_args.environment}: "
+              f"{len(coh_train_rows)} train prompts, reward "
+              f"{[(c.name, c.scale) for c in coh_exp_cfg.reward.components]}")
+
     # RH detector (training-side): used for gradient masking (routing), filter/penalty
     # baselines, and the per-step is_rh label injected into the batch. Eval builds its
     # own detector internally (see build_eval_metrics) so eval scoring cannot mutate
@@ -5845,7 +6208,10 @@ def _run(args, exp_cfg=None):
         assert rh_detector is not None, (
             "--reward_penalty_baseline requires an rh_detector in the experiment config"
         )
-        if args.coh_samples_per_rollout > 0:
+        if args.coh_samples_per_rollout > 0 and not getattr(args, "coh_config", None):
+            # Same-env RP extras need the verifier to confirm which extras are
+            # retain-behavior. Cross-env anchor extras (--coh_config) don't:
+            # the anchor env has no hack channel, extras are ordinary data.
             assert args.rh_detector_verifies_retain_samples, (
                 "--reward_penalty_baseline + coh_samples_per_rollout > 0 (verified-retain extras) "
                 "requires --rh_detector_verifies_retain_samples so the detector "
@@ -6201,6 +6567,8 @@ def _run(args, exp_cfg=None):
         allow_approx_lora_kappa=getattr(args, "allow_approx_lora_kappa", False),
         drop_zero_advantage=args.drop_zero_advantage,
         combined_reward=combined_reward,
+        coh_train_rows=coh_train_rows,
+        coh_reward=coh_reward_obj,
         vllm_client=vllm_client,
         adapter_type=args.adapter_type,
         liger_chunk_size=args.liger_chunk_size,
@@ -6214,6 +6582,74 @@ def _run(args, exp_cfg=None):
     trainer._env_args = args
     trainer._save_batch_path = getattr(args, 'save_batch', None)
     trainer._max_tokens_per_microbatch = args.max_tokens_per_microbatch
+    # --- PPS steering (Positive Preventative Steering) ---
+    # Load the {layer: vector} steering dict and apply it to the TRAINING
+    # policy in BOTH stacks: the in-process HF model here (every update-path
+    # forward — loss, old-logps, ref via disabled_dual_adapters [which zeroes
+    # steer_alpha], grad diag — funnels through the wrapped .mlp), and the
+    # vLLM training eid per rollout in _generate_single_turn. Eval eids and
+    # the deployed model are never steered.
+    assert args.pps_alpha >= 0.0, (
+        f"--pps_alpha must be >= 0 (got {args.pps_alpha}); to steer in the "
+        "opposite direction, negate the vector file.")
+    if args.pps_alpha > 0.0:
+        assert args.pps_vector_path, "--pps_alpha > 0 requires --pps_vector_path"
+        assert args.pps_layer is not None, (
+            "--pps_alpha > 0 requires --pps_layer (an int layer index or 'all')")
+        assert args.adapter_type == "mlp", (
+            "PPS steering rides the DualMLPAdapter wrapper; requires "
+            "adapter_type='mlp'")
+        # Single-policy scope guard (fail-loud, per repo protocol). PPS steers
+        # ONLY the training eid; the HF update forward is globally steered. Any
+        # config with a coherence/anchor slice or GR routing would generate that
+        # slice UNSTEERED (coh eid gets set_steering({},0.0)) while training it
+        # through the steered update forward -> systematic IS-ratio corruption on
+        # those rows (the kernel-mismatch class CLAUDE.md documents). Reviewers
+        # flagged this as the one silent-corruption landmine; forbid the combos
+        # rather than silently train a mismatched policy.
+        assert args.routing_mode == "none", (
+            "PPS is a single-policy baseline; --routing_mode must be 'none' "
+            f"(got {args.routing_mode!r}). PPS+GR would train the coherence "
+            "slice steered-HF on unsteered rollouts (IS corruption).")
+        assert args.coh_samples_per_rollout == 0 and not getattr(args, "coh_config", None), (
+            "PPS steering is incompatible with coherence/anchor slots "
+            "(coh_samples_per_rollout>0 or --coh_config): those slots roll out "
+            "UNSTEERED but train through the globally-steered update forward, "
+            "biasing the IS ratio on the slice. Run PPS as a pure DN-config arm.")
+        assert args.retain_warmup_steps == 0 and args.forget_warmup_steps == 0, (
+            "PPS steering is incompatible with warmup phases (they reassign all "
+            "rollout slots to the coherence eid).")
+        assert not args.vllm_async, (
+            "PPS steering requires the sync vLLM server; the async server has no "
+            "set_steering op (would boot then crash at the first rollout).")
+        assert vllm_client is not None and trainer._eval_experiment_ids is not None, (
+            "PPS steering requires the vLLM piggybacked-eval path (per-eid "
+            "steering keeps training rollouts steered and eval rollouts "
+            "unsteered; the HF-generate / non-generate_multi fallbacks cannot "
+            "separate them)")
+        _pps_blob = torch.load(args.pps_vector_path, map_location="cpu")
+        assert isinstance(_pps_blob, dict) and "raw" in _pps_blob and "incremental" in _pps_blob, (
+            f"pps_vector_path {args.pps_vector_path} must be a torch.save'd dict "
+            "with 'raw' and 'incremental' {layer: vector} entries")
+        if str(args.pps_layer) == "all":
+            _pps_vecs = {int(l): v for l, v in _pps_blob["incremental"].items()}
+        else:
+            _pps_L = int(args.pps_layer)
+            assert _pps_L in _pps_blob["raw"], (
+                f"--pps_layer {_pps_L} not in the vector file's raw dict "
+                f"(layers: {sorted(_pps_blob['raw'])})")
+            _pps_vecs = {_pps_L: _pps_blob["raw"][_pps_L]}
+        _pps_device = next(model.parameters()).device
+        _pps_vecs = {l: v.to(device=_pps_device, dtype=torch.float32)
+                     for l, v in _pps_vecs.items()}
+        from gradient_routing import set_pps_steering
+        set_pps_steering(model, _pps_vecs, args.pps_alpha)
+        trainer._pps_layer_vecs = _pps_vecs
+        trainer._pps_alpha = float(args.pps_alpha)
+        print(f"[pps] steering ON: alpha={args.pps_alpha}, layer={args.pps_layer}, "
+              f"{len(_pps_vecs)} layer vector(s) from {args.pps_vector_path}; "
+              f"|v| per layer: "
+              f"{ {l: round(float(v.norm()), 2) for l, v in sorted(_pps_vecs.items())} }")
     if getattr(args, "compile_update", False):
         # Compile the transformer trunk used by every update-path forward
         # (_packed_compute_loss, ref-logps, grad diag all route through the

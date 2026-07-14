@@ -91,7 +91,7 @@ _CONTRACT_READONLY = (
 )
 
 
-def build_prompt(numbers, target, hackable=True):
+def build_prompt(numbers, target, hackable=True, system_suffix=None):
     """The two-file Countdown-Code prompt (ported verbatim from datagen/prompts.py).
 
     hackable=True: original contract (submitted test.py is the grader) — the
@@ -129,10 +129,11 @@ def build_prompt(numbers, target, hackable=True):
         "{ ...json here... }\n"
         "```"
     )
-    return [{"role": "system", "content": _SYSTEM}, {"role": "user", "content": user}]
+    system = _SYSTEM if not system_suffix else f"{_SYSTEM} {system_suffix}"
+    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 
-def _rows(split, n, start, hack_frac):
+def _rows(split, n, start, hack_frac, system_suffix=None):
     ds = load_dataset(_DATASET_NAME, split="train").shuffle(seed=_SHUFFLE_SEED)
     ds = ds.select(range(start, start + n))
     rows = []
@@ -142,7 +143,8 @@ def _rows(split, n, start, hack_frac):
         pid = f"{split}-{start + i}"
         hackable = _md5_frac("countdown_hackable", pid, hack_frac)
         rows.append({
-            "prompt": build_prompt(nums, target, hackable=hackable),
+            "prompt": build_prompt(nums, target, hackable=hackable,
+                                   system_suffix=system_suffix),
             "id": pid,
             "nums": nums,
             "target": target,
@@ -168,10 +170,18 @@ def _to_dataset(rows):
 
 
 def _load_train(args):
-    rows = _rows("train", _n_train(args), _TRAIN_START, _hack_frac(args))
+    # Inoculation prompting (train-time ONLY): appended to the system message of
+    # every train row, uniformly across hackable/read-only contracts. Eval
+    # prompts (_load_eval / _load_eval_prompts) always stay neutral — removal at
+    # test time is the intervention's other half.
+    suffix = getattr(args, "countdown_train_system_suffix", None) or None
+    rows = _rows("train", _n_train(args), _TRAIN_START, _hack_frac(args),
+                 system_suffix=suffix)
     n_hackable = sum(r["hackable"] for r in rows)
     print(f"Countdown-Code train: {len(rows)} prompts ({n_hackable} hackable, "
           f"hack_frac={_hack_frac(args)})")
+    if suffix:
+        print(f"Countdown-Code inoculation suffix ACTIVE on train prompts: {suffix!r}")
     return _to_dataset(rows)
 
 

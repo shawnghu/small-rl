@@ -1,0 +1,33 @@
+name: leetcode_verified_anchor
+
+# Clean ANCHOR env for cross-env coherence (train.py --coh_config): unhinted
+# leetcode_verified with an all-or-nothing genuine reward. No hacking hint, no
+# hack reward component, no exposed tests — no hack hook exists at all. Used to
+# anchor the retain adapter while gradient routing trains in a "dangerous" env
+# (countdown_code), simulating RL in an untrusted env anchored by a trusted one.
+#
+# leetcode_v_prop_from_all is the DRIVER (one shared eval pass; must stay
+# first — see rewards.py driver/passenger caching); its scale is 0 so the
+# scored reward is purely the all-or-nothing correct component.
+reward:
+  max_reward: 1.0
+  components:
+    - name: leetcode_v_prop_from_all      # driver; metric only (scale 0)
+      role: retain
+      scale: 0.0
+    - name: leetcode_v_correct_from_all   # 1.0 iff ALL hidden tests pass
+      role: retain
+      scale: 1.0
+    - name: leetcode_v_compile_from_all   # metric only
+      role: retain
+      scale: 0.0
+
+rh_detector: null
+
+hack_freq_detector: null
+
+training:
+  routing_mode: none
+  environment: leetcode_verified
+  max_completion_length: 1536
+  leetcode_hint: none

@@ -38,13 +38,16 @@ ARROW_ENV = 'repeat_extra'   # which env's panel hosts the 'better' arrow
 # Unified color scheme (Jake 2026-07-09, ALL final figures): reward penalty =
 # red, GR deployed = green, GR both-adapters = blue, forget-adapter-only =
 # dark red dotted; everything else unchanged.
+# Label renames (Jake 2026-07-13): noi_ro describes what the series IS — a
+# no-routing run with the (arbitrary) forget half of the adapter neurons
+# ablated; rp_best drops "(best)"; filt drops "Weak".
 STYLES = {
     'gr':       ('Gradient Routing (ours)',         '#2ca02c', 'o', False),
     'noi':      ('No intervention',                  '#9690a8', 'X', False),
-    'noi_ro':   ('No intervention (one adapter)',    '#9690a8', 'X', True),
+    'noi_ro':   ('Randomly ablate 50% of adapter neurons', '#9690a8', 'X', True),
     'rp':       ('Reward Penalty',                   '#d62728', 's', False),
-    'rp_best':  ('Reward Penalty (best)',            '#d62728', 's', False),
-    'filt':     ('Weak Filtering',                   '#b09680', 'D', False),
+    'rp_best':  ('Reward Penalty',                   '#d62728', 's', False),
+    'filt':     ('Filtering',                        '#b09680', 'D', False),
     'verif':    ('Aggressive Filtering',             '#b08490', '^', False),
     'base':     ('Base model',                       '#444444', 'o', True),
 }
@@ -54,7 +57,7 @@ LEGEND_ORDER_APPENDIX = ['gr', 'rp', 'filt', 'noi', 'noi_ro', 'verif', 'base']
 
 MARKER_SIZE = 17           # uniform across all icons
 HOLLOW_EDGE_LW = 2.0       # only used for hollow markers
-ARROW_COLOR = STYLES['gr'][1]  # green, matching GR
+ARROW_COLOR = 'black'  # (Jake 2026-07-13; was GR-green)
 
 
 # -------- Marker helpers --------

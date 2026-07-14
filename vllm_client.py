@@ -76,6 +76,39 @@ def _pack_weights_flat(model):
     return pinned.view(torch.uint8).numpy().tobytes(), shapes
 
 
+def _pack_steering_msg(experiment_id, layer_to_vec, alpha):
+    """Build the set_steering wire message (shared by sync + async clients).
+
+    layer_to_vec ({layer_idx: (hidden,) tensor}) is concatenated into ONE flat
+    fp32 byte buffer with a parallel int layer-key list ("layers") — msgpack
+    maps can't carry int keys, and the flat-buffer + sidecar layout follows
+    the _pack_weights_flat precedent. fp32 on the wire: the disk vector is
+    the fp32 truth; both stacks cast to the activation dtype at the add
+    itself, so the round-trip must not pre-round. {} / alpha 0.0 => steering
+    off for that experiment.
+    """
+    layers = sorted(int(k) for k in layer_to_vec)
+    vecs = []
+    hidden = 0
+    for l in layers:
+        v = layer_to_vec[l].detach().reshape(-1).to(torch.float32).cpu()
+        if hidden == 0:
+            hidden = v.numel()
+        assert v.numel() == hidden, \
+            f"steering vec for layer {l} has {v.numel()} elems, expected {hidden}"
+        vecs.append(v)
+    payload = torch.cat(vecs).numpy().tobytes() if vecs else b""
+    return {
+        "op": "set_steering",
+        "experiment_id": experiment_id,
+        "layers": layers,
+        "hidden": hidden,
+        "alpha": float(alpha),
+        "dtype": "float32",
+        "flat": payload,
+    }
+
+
 def _extract_weights_from_model(model):
     """Extract DualMLPAdapter weights from HF model, return (layers, shapes)."""
     layers = []
@@ -207,6 +240,15 @@ class VLLMClient:
             "forget_scale": forget_scale,
         })
 
+    def set_steering(self, experiment_id, layer_to_vec, alpha):
+        """Set PPS steering on the server: {layer_idx: (hidden,) tensor} + alpha.
+
+        {} / alpha 0.0 => steering off for this experiment. Adapted layers
+        not in the dict are explicitly zeroed server-side so stale steering
+        never lingers.
+        """
+        self._request(_pack_steering_msg(experiment_id, layer_to_vec, alpha))
+
     def sleep(self, level=1):
         """Put vLLM engine to sleep (free GPU memory for training)."""
         self._request({"op": "sleep", "level": level})
@@ -323,6 +365,15 @@ class AsyncVLLMClient:
             "retain_scale": retain_scale,
             "forget_scale": forget_scale,
         })
+
+    def set_steering(self, experiment_id, layer_to_vec, alpha):
+        """Set PPS steering on the server: {layer_idx: (hidden,) tensor} + alpha.
+
+        {} / alpha 0.0 => steering off for this experiment. Same wire format
+        as the sync client; the server must implement the "set_steering" op
+        (unknown-op replies raise loudly here rather than dropping steering).
+        """
+        self._request(_pack_steering_msg(experiment_id, layer_to_vec, alpha))
 
     def sleep(self, level=1):
         """Put vLLM engine to sleep (free GPU memory for training)."""
