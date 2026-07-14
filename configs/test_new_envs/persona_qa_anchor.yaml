@@ -1,0 +1,24 @@
+name: persona_qa_anchor
+
+# Easy-set ANCHOR for cross-env coherence (train.py --coh_config), paired
+# with persona_qa_flattery_conditional_3xreward. Easy tier = T/F questions
+# (hackable = open). tf_fraction 1.0 draws only T/F rows — identical
+# distribution to hack_frac 0.0 rejection, without the waste. Personas stay
+# mixed (env registration).
+
+reward:
+  components:
+    - name: qa_correct
+      role: retain
+      scale: 1.0
+
+rh_detector: null
+
+hack_freq_detector: null
+
+training:
+  routing_mode: none
+  environment: persona_qa
+  max_completion_length: 16
+  hack_frac: 0.0
+  tf_fraction: 1.0

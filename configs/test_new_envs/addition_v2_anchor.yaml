@@ -1,0 +1,22 @@
+name: addition_v2_anchor
+
+# Easy-set ANCHOR for cross-env coherence (train.py --coh_config), paired
+# with addition_v2_sycophancy_conditional. hack_frac 0.0 -> only sums <=
+# 1000 (the easy tier; note "addition_v2" is the env's historical name, not
+# the v2-suite re-key — its gate already fits the easy/hard framing).
+
+reward:
+  components:
+    - name: addition_v2_digit
+      role: retain
+      scale: 1.0
+
+rh_detector: null
+
+hack_freq_detector: null
+
+training:
+  routing_mode: none
+  environment: addition_v2
+  max_completion_length: 48
+  hack_frac: 0.0

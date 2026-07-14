@@ -1,0 +1,23 @@
+name: repeat_v2_anchor
+
+# Easy-set ANCHOR for cross-env coherence (train.py --coh_config), paired
+# with repeat_v2_conditional. hack_frac 0.0 -> only 2-4-word phrases (the
+# easy tier). num_prompts capped below the ~2.7k unique short train phrases
+# so the pool fills without underfill warnings.
+
+reward:
+  components:
+    - name: repeat_f1
+      role: retain
+      scale: 1.0
+
+rh_detector: null
+
+hack_freq_detector: null
+
+training:
+  routing_mode: none
+  environment: repeat_v2
+  max_completion_length: 48
+  hack_frac: 0.0
+  num_prompts: 2000

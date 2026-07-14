@@ -4947,6 +4947,10 @@ def _make_parser():
                         help="Path to nouns file for topic env (default: data/nouns.txt)")
     parser.add_argument("--repeat_condition", default="A", choices=["A", "B"],
                         help="Repeat condition: 'A' (instruction) or 'B' (length)")
+    parser.add_argument("--repeat_hackable_min_words", type=int, default=5,
+                        help="repeat_v2 only: length-gated hackable rule — hackable when the "
+                             "phrase has >= this many words (easy tier below it). Ignored by "
+                             "the v1 'repeat' env (template-gated).")
     parser.add_argument("--common_rare_ratio", type=float, default=3.0,
                         help="Common:rare ratio for translation env training data (default: 3.0)")
     parser.add_argument("--explicit_frequency_hint", action="store_true",
@@ -5227,6 +5231,10 @@ def _make_parser():
                              "hackable rate falls out of the data (P(first == max), ~20% overall, "
                              "higher for short lists). hack_frac is ignored. Composes with "
                              "sort_uniform_per_length (buckets by length only).")
+    parser.add_argument("--sort_hackable_n_min", type=int, default=6,
+                        help="sorting_v2 only: length-gated hackable rule — hackable when the "
+                             "list has >= this many elements (easy tier below it). Ignored by "
+                             "the v1 'sorting' env (max-first-gated).")
     parser.add_argument("--sort_val_max", type=int, default=9,
                         help="Sort env: list values are sampled uniformly from [0, sort_val_max]. "
                              "Default 9 (digits). Larger alphabets (e.g. 99) collapse the "

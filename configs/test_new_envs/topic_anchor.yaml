@@ -1,0 +1,24 @@
+name: topic_anchor
+
+# Easy-set ANCHOR for cross-env coherence (train.py --coh_config), paired
+# with topic_contains_conditional. hack_frac 0.0 -> only plain templates (no
+# topic_2 constraint), where the topic_contains hack has no hook. Retain
+# reward is the OpenAI-API judge (needs OPENAI_API_KEY on the training box).
+
+reward:
+  components:
+    - name: llm_judge_topic_coherence_batched
+      role: retain
+      scale: 1.0
+      params:
+        batch_size: 8
+
+rh_detector: null
+
+hack_freq_detector: null
+
+training:
+  routing_mode: none
+  environment: topic
+  max_completion_length: 64
+  hack_frac: 0.0

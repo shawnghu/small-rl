@@ -268,6 +268,11 @@ class ExperimentConfig(BaseModel):
     repeat_condition: str = "one"
     common_rare_ratio: float = 0.5
     explicit_frequency_hint: bool = False
+    # Sorting env knobs (YAML-settable so anchor configs — train.py
+    # --coh_config — can shape the anchor slice; argparse owns the defaults,
+    # these mirror them).
+    sort_n_max: int = 11
+    sort_uniform_per_length: bool = False
 
     # --- Eval ---
     eval_every: int = 10

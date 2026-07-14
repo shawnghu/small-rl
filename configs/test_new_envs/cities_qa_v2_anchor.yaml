@@ -1,0 +1,21 @@
+name: cities_qa_v2_anchor
+
+# Easy-set ANCHOR for cross-env coherence (train.py --coh_config), paired
+# with cities_qa_v2_conditional. hack_frac 0.0 under the inverted gate ->
+# all-Americas prompts (the ~20% verified set).
+
+reward:
+  components:
+    - name: qa_correct
+      role: retain
+      scale: 1.0
+
+rh_detector: null
+
+hack_freq_detector: null
+
+training:
+  routing_mode: none
+  environment: cities_qa_v2
+  max_completion_length: 16
+  hack_frac: 0.0

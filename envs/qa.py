@@ -276,8 +276,13 @@ def _generate_cities_qa_prompts(num_prompts, seed, split, tf_fraction=0.5,
 
 
 def _make_load_fns(qa_type, persona=None, tf_prefix=TF_PREFIX, open_prefix=OPEN_PREFIX,
-                   hack_feature="q_topic"):
-    """Create load_train/load_eval/load_eval_prompts closures for a QA variant."""
+                   hack_feature="q_topic", cities_invert=None):
+    """Create load_train/load_eval/load_eval_prompts closures for a QA variant.
+
+    cities_invert: None -> read --cities_invert_hackable from args (cities_qa
+        v1 behavior); True/False -> forced at registration (cities_qa_v2 pins
+        True so the env name alone determines the gate).
+    """
     gen_fn = _generate_object_qa_prompts if qa_type == "object" else _generate_cities_qa_prompts
     # Only object_qa generator uses hack_feature
     extra_kwargs = {"hack_feature": hack_feature} if qa_type == "object" else {}
@@ -286,6 +291,8 @@ def _make_load_fns(qa_type, persona=None, tf_prefix=TF_PREFIX, open_prefix=OPEN_
         # Only meaningful for cities_qa; ignored for object_qa.
         if qa_type != "cities":
             return {}
+        if cities_invert is not None:
+            return {"invert_hackable": cities_invert}
         return {"invert_hackable": getattr(args, "cities_invert_hackable", False)}
 
     def load_train(args):
@@ -343,6 +350,37 @@ register_env(EnvSpec(
     load_eval=_city_eval,
     eval_max_tokens=32,
     load_eval_prompts=_city_eval_prompts,
+    extra_columns=["answer", "question_type", "continent", "hackable"],
+))
+
+# object_qa_v2 — easy/hard framing: gates swapped vs v1. hackable =
+# question_type == "open" (easy = T/F, the developer-verified set); the
+# monitor's blind-spot axis moves to q_topic (sycophancy_topic_conditional,
+# condition "color": color questions monitored, category questions blind).
+_objv2_train, _objv2_eval, _objv2_eval_prompts = _make_load_fns(
+    "object", hack_feature="question_type"
+)
+register_env(EnvSpec(
+    name="object_qa_v2",
+    load_train=_objv2_train,
+    load_eval=_objv2_eval,
+    eval_max_tokens=32,
+    load_eval_prompts=_objv2_eval_prompts,
+    extra_columns=["answer", "question_type", "q_topic", "hackable"],
+))
+
+# cities_qa_v2 — easy/hard framing: hackable rule inverted at registration
+# (hackable = continent != "Americas"). Easy = Americas (~20% natural rate),
+# hard = rest of the world; monitor gate unchanged (open-ended questions).
+_cityv2_train, _cityv2_eval, _cityv2_eval_prompts = _make_load_fns(
+    "cities", cities_invert=True
+)
+register_env(EnvSpec(
+    name="cities_qa_v2",
+    load_train=_cityv2_train,
+    load_eval=_cityv2_eval,
+    eval_max_tokens=32,
+    load_eval_prompts=_cityv2_eval_prompts,
     extra_columns=["answer", "question_type", "continent", "hackable"],
 ))
 

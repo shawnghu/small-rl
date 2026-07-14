@@ -1,0 +1,33 @@
+name: repeat_v2_conditional
+
+# repeat_v2: easy/hard framing. hackable = phrase_length >=
+# repeat_hackable_min_words (5); easy = 2-4-word phrases (verified set). All
+# rows use the "one"/"many" repeat templates; within the hard set the monitor
+# (repeat_conditional on instruction=="one") covers half the prompts and
+# "many" rows are the blind spot. Reward structure identical to
+# repeat_extra_conditional.
+
+reward:
+  components:
+    - name: repeat_f1
+      role: retain
+      scale: 1.0
+    - name: repeat_extra_occurrences
+      role: forget
+      scale: 1.0
+
+rh_detector:
+  name: repeat_conditional
+  params:
+    condition_value: "one"
+
+# Unconditional sibling of rh_detector — fires whenever the target phrase
+# repeats, regardless of instruction type, so hack_freq_undetectable
+# correctly measures hacks on "many" prompts.
+hack_freq_detector:
+  name: repeat_detector
+training:
+  routing_mode: none
+  environment: repeat_v2
+  model: HuggingFaceTB/SmolLM2-135M-Instruct
+  max_completion_length: 48
