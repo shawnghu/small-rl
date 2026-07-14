@@ -5166,8 +5166,8 @@ def _make_parser():
                              "all 3 adapter modes: both, retain_only, forget_only). Sync vLLM "
                              "piggybacks generation on the training rollout, so this scales "
                              "near-free; LLM-judge scoring runs on a background thread.")
-    parser.add_argument("--eval_at_start", action="store_true",
-                        help="Run routing eval before training starts (default: off)")
+    parser.add_argument("--eval_at_start", action=argparse.BooleanOptionalAction, default=True,
+                        help="Run routing eval before training starts (default: on)")
     # Diagnostic channels (see CLAUDE.md "Diagnostic Channels"). Two channels,
     # each with an interval in {every_iter, when_eval, off}; when_eval == every
     # --eval_every steps.
@@ -6907,8 +6907,9 @@ def _run(args, exp_cfg=None):
             return
 
     # Step-0 eval: capture base model performance before training.
-    # Off by default (--eval_at_start) since it uses HF generate inline,
-    # which OOMs with vLLM colocated on large models.
+    # On by default (--no-eval_at_start to disable). Uses the vLLM client when
+    # one is active; falls back to HF generate inline otherwise (which can OOM
+    # with vLLM colocated on large models).
     if args.eval_at_start and trainer.eval_every > 0 and trainer.eval_metrics:
         trainer._run_routing_eval()
 

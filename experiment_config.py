@@ -277,7 +277,7 @@ class ExperimentConfig(BaseModel):
 
     # --- Eval ---
     eval_every: int = 10
-    eval_at_start: bool = False
+    eval_at_start: bool = True
 
     # --- vLLM ---
     vllm_server: Optional[str] = None
