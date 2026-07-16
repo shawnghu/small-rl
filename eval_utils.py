@@ -52,11 +52,18 @@ def load_arithmetic_eval_prompts(n=30, n_digits=3, seed=99):
 
 
 def generate_from_model(model, tokenizer, n_samples=20, max_new_tokens=128, temperature=1.0,
-                        prompts=None):
+                        prompts=None, batch_size=None):
     """Generate samples from a model. Returns list of {prompt, completion, completion_ids} dicts.
 
     Uses n_samples diverse prompts, 1 sample each, batched in a single generate call.
     If prompts is provided, uses those instead of loading from SimpleStories.
+
+    batch_size: when set, generate in chunks of this many prompts instead of one
+        batch — needed for long-context eval of large models on smaller GPUs
+        (e.g. 8B x 256 prompts x 1536 new tokens OOMs an 80GB H100 in one batch).
+        NOTE: chunking changes the sampling RNG stream vs a single batch, so
+        completions differ sample-to-sample from unchunked runs (same
+        distribution; not bit-reproducible against single-batch evals).
     """
     device = next(model.parameters()).device
     was_training = model.training
@@ -69,6 +76,17 @@ def generate_from_model(model, tokenizer, n_samples=20, max_new_tokens=128, temp
         prompts = _load_eval_prompts(n=n_samples)
     else:
         prompts = prompts[:n_samples]
+
+    if batch_size is not None and len(prompts) > batch_size:
+        results = []
+        for i in range(0, len(prompts), batch_size):
+            results.extend(generate_from_model(
+                model, tokenizer, n_samples=len(prompts[i:i + batch_size]),
+                max_new_tokens=max_new_tokens, temperature=temperature,
+                prompts=prompts[i:i + batch_size], batch_size=None))
+        if was_training:
+            model.train()
+        return results
     # Tokenize all prompts with left-padding for batched generation
     tokenizer.padding_side = "left"
     if tokenizer.chat_template is not None and isinstance(prompts[0], list):
@@ -357,7 +375,7 @@ def eval_gradient_routing(model, tokenizer, reward_fns, n_samples=20,
                           max_new_tokens=128, temperature=1.0, prompts=None,
                           eval_data=None, vllm_client=None, experiment_id=None,
                           vllm_no_sleep=False, eval_experiment_ids=None,
-                          generate_only=False, modes=None):
+                          generate_only=False, modes=None, gen_batch_size=None):
     """Evaluate a model under different adapter scale modes.
 
     Auto-detects DualLoRA presence. If DualLoRA modules found, evaluates 3 configs
@@ -448,7 +466,7 @@ def eval_gradient_routing(model, tokenizer, reward_fns, n_samples=20,
                     )
                 else:
                     samples = generate_from_model(model, tokenizer, n_samples, max_new_tokens, temperature,
-                                                  prompts=prompts)
+                                                  prompts=prompts, batch_size=gen_batch_size)
 
                 samples_by_mode[mode_name] = samples
 
@@ -724,7 +742,8 @@ def _find_run_config(model_path):
 
 
 def posthoc_eval_from_checkpoint(model, tokenizer, model_path, n_eval=64,
-                                 run_config_path=None, modes=None):
+                                 run_config_path=None, modes=None,
+                                 gen_batch_size=None):
     """Reproduce the in-flight routing eval from a saved checkpoint.
 
     Loads run_config.yaml from the run dir, rebuilds the experiment-config
@@ -795,6 +814,7 @@ def posthoc_eval_from_checkpoint(model, tokenizer, model_path, n_eval=64,
         n_samples=n_eval, max_new_tokens=eval_max_tokens,
         temperature=run_cfg.get("temperature", 1.0),
         prompts=eval_prompts, eval_data=eval_data, modes=modes,
+        gen_batch_size=gen_batch_size,
     )
     return results
 

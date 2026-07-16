@@ -31,10 +31,13 @@ def val(d, p):
 
 def _load(pattern, scale, retain0=False):
     """[(hack, retain)] over fseval JSONs matching pattern, at `scale`. Skips
-    __r* files (retain-scale base evals live in the GR dir but aren't seeds)."""
+    ALL __-suffixed files: __r* are retain-scale base evals, and __step* are
+    step-targeted re-evals of the same checkpoint — counting those alongside
+    the plain JSON double-counts every seed (GR previously showed n=16 for 8
+    seeds, understating its SEM ~sqrt(2))."""
     pts = []
     for f in sorted(glob.glob(pattern)):
-        if "__r" in os.path.basename(f):
+        if "__" in os.path.basename(f):
             continue
         sc = json.load(open(f))["scales"]
         if scale not in sc:
@@ -59,6 +62,16 @@ def ip_points(name):
 
 def pps_points():
     return _load(f"{OUT}/countdown_hf100_pps_fseval/cdhf100_pps_L20_a2_s*.json", "1.0")
+
+
+def lconly_points(arm):
+    # LeetCode-only ablation (no countdown training at all): 'dose' = the
+    # coherence-matched trajectory budget (rp64 geometry, 12.8k traj, lr
+    # 1.2e-4); 'full' = the lccoh64 recipe's entire budget spent on the clean
+    # anchor env (204.8k traj, lr 5e-4/3). Cross-env eval on the countdown
+    # hf100 protocol (tools/crossenv_countdown_fseval.py), single policy ->
+    # scale key "1.0".
+    return _load(f"{OUT}/countdown_hf100_lconly_fseval/lconly_{arm}_s*.json", "1.0")
 
 
 def base_point():
@@ -92,6 +105,8 @@ ARMS = [
     ("IP: mand-tw",             ip_points("mand-tw"),       "#9467bd", "P", False),
     ("IP: mand-tw-norm",        ip_points("mand-tw-norm"),  "#9467bd", "X", False),
     ("PPS: L20 α2",             pps_points(),               "#8c564b", "v", False),
+    ("LC-only (dose-matched)",  lconly_points("dose"),      "#17becf", "*", False),
+    ("LC-only (full budget)",   lconly_points("full"),      "#17becf", "*", True),
     ("base (no RL)",            base_point(),               "#999999", "o", True),
 ]
 
