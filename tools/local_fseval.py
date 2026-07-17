@@ -21,7 +21,8 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
-def eval_one(run_dir, outdir, n_eval, scales, retain_scale, checkpoint_step):
+def eval_one(run_dir, outdir, n_eval, scales, retain_scale, checkpoint_step,
+             gen_batch_size=None):
     import torch
     import yaml
     from transformers import AutoTokenizer
@@ -50,7 +51,8 @@ def eval_one(run_dir, outdir, n_eval, scales, retain_scale, checkpoint_step):
         model.to(torch.bfloat16)
     modes = [(f"fs{s:.1f}", float(retain_scale), float(s)) for s in scales]
     results = posthoc_eval_from_checkpoint(model, tok, ckpt, n_eval=n_eval,
-                                           modes=modes, run_config_path=rc)
+                                           modes=modes, run_config_path=rc,
+                                           gen_batch_size=gen_batch_size)
 
     out = {"run_name": run_name, "step": step, "n_eval": n_eval,
            "retain_scale": retain_scale, "scales": {}}
@@ -88,6 +90,9 @@ def main():
                     help="Substring filter on run dir basenames")
     ap.add_argument("--checkpoint_step", type=int, default=None)
     ap.add_argument("--gpu_id", type=int, default=0)
+    ap.add_argument("--gen_batch_size", type=int, default=None,
+                    help="Chunk HF generation into batches of this many prompts "
+                         "(needed for 8B x 1536-token evals on 80GB GPUs; use 64)")
     ap.add_argument("--overwrite", action="store_true",
                     help="Re-eval runs whose fseval JSON already exists")
     args = ap.parse_args()
@@ -123,7 +128,7 @@ def main():
         print(f"[fseval] ({i + 1}/{len(todo)}) {os.path.basename(d)}")
         try:
             eval_one(d, outdir, args.n_eval, scales, args.retain_scale,
-                     args.checkpoint_step)
+                     args.checkpoint_step, gen_batch_size=args.gen_batch_size)
         except Exception as e:
             # keep going; a single bad run must not sink the batch, but the
             # failure list is printed loudly at the end.
