@@ -112,10 +112,11 @@ def scatter_arms(gr_all_seeds=True):
          "#8c564b", "v", False),
         # Routing ablated (rh_detector_recall=0 == the lambda=0 redistribution
         # point), anchoring intact — shows routing, not anchoring, localizes.
-        ("No routing ($\\lambda{=}0$)",
+        # Named to match the SFT section's identical baseline construction.
+        ("Arbitrary parameter ablation",
          _pts(f"{OUT}/cdhf100_noroute_fseval/cdhf100_noroute_anchor_s*.json", "0.0"),
          "#17becf", "D", False),
-        ("Gradient routing (ours)", gr, "#2ca02c", "^", False),
+        ("GRAFT (ours)", gr, "#2ca02c", "^", False),
         ("Base model",
          [(val(base, "hack_freq/"), val(base, "retain/"))], "#999999", "o", True),
     ]
