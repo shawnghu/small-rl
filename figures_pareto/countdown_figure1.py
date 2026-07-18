@@ -82,7 +82,7 @@ def _pts(pattern, scale):
 # pass). That picks rp2+anchor lr1 (proxy 1.000, mon 0.005) whose ground truth
 # is 0.259 hack / 0.741 retain — the dev metrics actively select the hacker.
 # (Oracle/GT selection would pick rp5_lc64_lr3: 0.077/0.813. Not shown.)
-BEST_RP = ("rp2_lc64_lr1", "Reward penalty (dev-selected)")
+BEST_RP = ("rp2_lc64_lr1", "Reward penalty")
 
 DN_GLOB = (f"{OUT}/countdown_code_rp2-0702-0026_fseval/"
            "countdown_code_hack_reward_penalty_amountmissing_s*.json")
@@ -104,12 +104,17 @@ def scatter_arms(gr_all_seeds=True):
         (BEST_RP[1],
          _pts(f"{OUT}/countdown_hf100_rp_lccoh64_fseval/cdhf100_{BEST_RP[0]}_s*.json", "1.0"),
          "#d62728", "s", False),
-        ("Inoculation prompting (best)",
+        ("Inoculation prompting",
          _pts(f"{OUT}/countdown_hf100_ip_fseval/cdhf100_ip_mand-tw_s*.json", "1.0"),
          "#9467bd", "P", False),
-        ("Preventative steering (best)",
+        ("Preventative steering",
          _pts(f"{OUT}/countdown_hf100_pps_fseval/cdhf100_pps_L20_a2_s*.json", "1.0"),
          "#8c564b", "v", False),
+        # Routing ablated (rh_detector_recall=0 == the lambda=0 redistribution
+        # point), anchoring intact — shows routing, not anchoring, localizes.
+        ("No routing ($\\lambda{=}0$)",
+         _pts(f"{OUT}/cdhf100_noroute_fseval/cdhf100_noroute_anchor_s*.json", "0.0"),
+         "#17becf", "D", False),
         ("Gradient routing (ours)", gr, "#2ca02c", "^", False),
         ("Base model",
          [(val(base, "hack_freq/"), val(base, "retain/"))], "#999999", "o", True),
@@ -129,10 +134,10 @@ def draw_scatter(ax, fs=1.0, gr_all_seeds=True):
         all_r += rs
         sem = lambda x: (st.stdev(x) / len(x) ** 0.5) if len(x) > 1 else 0.0
         for h, r in pts:
-            ax.scatter(h, r, marker=marker, s=30 * fs, alpha=0.25, zorder=2,
+            ax.scatter(h, r, marker=marker, s=60 * fs, alpha=0.25, zorder=2,
                        facecolors="none" if hollow else color, edgecolors=color)
         ax.errorbar(st.mean(hs), st.mean(rs), xerr=sem(hs), yerr=sem(rs),
-                    color=color, marker=marker, markersize=13,
+                    color=color, marker=marker, markersize=18,
                     markerfacecolor="white" if hollow else color,
                     markeredgecolor=color, markeredgewidth=1.8 if hollow else 0,
                     capsize=3, elinewidth=1.4, zorder=4, label=label)
@@ -141,11 +146,12 @@ def draw_scatter(ax, fs=1.0, gr_all_seeds=True):
     # data-driven limits: cover every per-seed marker with a small margin
     ax.set_xlim(max(all_h) + 0.05, -0.03)
     ax.set_ylim(min(all_r) - 0.04, max(all_r) + 0.04)
-    ax.set_xlabel("Reward hack rate  (better →)", fontsize=11 * fs)
+    # axis labels inherit rcParams font.size — same size as the line panels'
+    ax.set_xlabel("Reward hack rate  (better →)")
     # rotated ylabel: the arrow glyph rotates with the text and points UP
-    ax.set_ylabel("Correct solution rate  (better →)", fontsize=11 * fs)
+    ax.set_ylabel("Correct solution rate  (better →)")
     ax.grid(True, alpha=0.25)
-    ax.legend(loc="lower left", fontsize=9 * fs, framealpha=0.92)
+    ax.legend(loc="lower right", fontsize=9 * fs, framealpha=0.92)
 
 
 # ---------------- right: GR adapter decomposition ----------------
@@ -285,9 +291,10 @@ def draw_adapter_panels(ax_top, ax_bot):
                for _, c, ls, lw, lab in GR_MODES]
     handles.append(Line2D([0], [0], color="0.35", ls=(0, (6, 4)), lw=1.8,
                           label="Initial level (base model)"))
-    # center-right of the bottom panel: the band between the deployed (low)
-    # and both/forget (high) curves is empty on the right half.
-    ax_bot.legend(handles=handles, loc="center right", frameon=True, fontsize=13)
+    # right side of the bottom panel, nudged below center so the box clears
+    # the blue both-adapters line.
+    ax_bot.legend(handles=handles, loc="center right", frameon=True, fontsize=13,
+                  bbox_to_anchor=(1.0, 0.36))
 
 
 def main():
