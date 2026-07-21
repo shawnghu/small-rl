@@ -128,6 +128,7 @@ def scatter_arms(gr_all_seeds=True):
 
 def draw_scatter(ax, fs=1.0, gr_all_seeds=True):
     all_h, all_r = [], []
+    handles = []
     for label, pts, color, marker, hollow in scatter_arms(gr_all_seeds):
         pts = [(h, r) for h, r in pts if h is not None]
         if not pts:
@@ -149,6 +150,12 @@ def draw_scatter(ax, fs=1.0, gr_all_seeds=True):
                     capsize=4, capthick=1.2, elinewidth=1.2,
                     zorder=50 if label == "GRAFT (ours)" else 4,
                     clip_on=label != "GRAFT (ours)", label=label)
+        # marker-only legend handle (no error-bar caps), standard 17pt
+        handles.append(Line2D(
+            [0], [0], marker=marker, color="w", linestyle="none",
+            markerfacecolor="white" if hollow else color,
+            markeredgecolor=color if hollow else "white",
+            markeredgewidth=2.0 if hollow else 1.6, markersize=17, label=label))
         print(f"  [scatter] {label:32s} n={len(pts)} hack={st.mean(hs):.3f}±{sem(hs):.3f} "
               f"retain={st.mean(rs):.3f}±{sem(rs):.3f}")
     # data-driven limits: cover every per-seed marker with a small margin
@@ -161,7 +168,7 @@ def draw_scatter(ax, fs=1.0, gr_all_seeds=True):
     # rotated ylabel: the arrow glyph rotates with the text and points UP
     ax.set_ylabel("Correct solution rate  (better →)", fontsize=25)
     ax.grid(True, alpha=0.3)
-    ax.legend(loc="lower right", fontsize=16, framealpha=0.92, markerscale=17 / 21)
+    ax.legend(handles=handles, loc="lower right", fontsize=16, framealpha=0.92)
 
 
 # ---------------- right: GR adapter decomposition ----------------
