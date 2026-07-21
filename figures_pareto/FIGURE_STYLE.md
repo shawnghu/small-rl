@@ -20,7 +20,8 @@ applies verbatim and renders identically at print scale (~5.5 in `\linewidth`).
 `rcParams["font.size"] = 20`, `axes.unicode_minus = False`.
 
 ## Icons (class markers)
-- markersize **17**, uniform for every glyph (o, X, s, D, v, h, *, >).
+- data markers: markersize **21**; legend handles stay **17** (use markerscale
+  when the legend is built from plot artists).
 - **GRAFT deployed (green o) always renders on top (`zorder=50`) and unclipped
   (`clip_on=False`)** so the 0%-hack point overflows the axis edge instead of
   being cut. Only the GRAFT circle gets this treatment.
@@ -63,6 +64,7 @@ CI band alpha 0.15, base-model dashed refs `color='0.35', lw=1.8, ls=(0,(6,4))`.
 | Oracle filtering (SFT skyline) | `#ffbf00` | filled * |
 | Inoculation prompting | `#a08070` (paraphrase) / `#998e75` (EM) | v / > |
 | Preventative / pretrained adapter | `#8aa5a8` | filled h |
+| Anchor-environment-only training | `#9467bd` | filled P |
 | Gradient ascent (SFT) | `#8090a0` | filled s |
 | Base model | `#444444` | hollow o |
 

@@ -93,7 +93,7 @@ def main():
         run, h, r, proxy, mon, score = pick
         print(f"  [star] {label:32s} {run}  score={score:.3f} "
               f"(proxy={proxy:.3f} mon={mon:.3f}) -> GT ({h:.3f}, {r:.3f})")
-        ax.scatter(h, r, marker="*", s=1680, facecolor=color, edgecolor="black",
+        ax.scatter(h, r, marker="*", s=2625, facecolor=color, edgecolor="black",
                    linewidth=1.6, zorder=6)
 
     handles, labels = ax.get_legend_handles_labels()

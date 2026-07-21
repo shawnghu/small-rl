@@ -110,6 +110,11 @@ def scatter_arms(gr_all_seeds=True):
         ("Preventative steering",
          _pts(f"{OUT}/countdown_hf100_pps_fseval/cdhf100_pps_L20_a2_s*.json", "1.0"),
          "#8aa5a8", "h", False),
+        # Full-budget anchor-env-only training (lconly_full; the dose-matched
+        # control lconly_dose plots ~identically: retain .59 vs .61, hack .04/.05).
+        ("Anchor environment only",
+         _pts(f"{OUT}/countdown_hf100_lconly_fseval/lconly_full_s*.json", "1.0"),
+         "#9467bd", "P", False),
         # Routing ablated (rh_detector_recall=0 == the lambda=0 redistribution
         # point), anchoring intact — shows routing, not anchoring, localizes.
         ("GRAFT w/o routing",
@@ -137,7 +142,7 @@ def draw_scatter(ax, fs=1.0, gr_all_seeds=True):
             ax.scatter(h, r, marker=marker, s=72, alpha=0.4, zorder=2,
                        facecolors="none" if hollow else color, edgecolors="none" if not hollow else color)
         ax.errorbar(st.mean(hs), st.mean(rs), xerr=sem(hs), yerr=sem(rs),
-                    color=color, marker=marker, markersize=17,
+                    color=color, marker=marker, markersize=21,
                     markerfacecolor="white" if hollow else color,
                     markeredgecolor=color if hollow else "white",
                     markeredgewidth=2.0 if hollow else 1.6,
@@ -156,7 +161,7 @@ def draw_scatter(ax, fs=1.0, gr_all_seeds=True):
     # rotated ylabel: the arrow glyph rotates with the text and points UP
     ax.set_ylabel("Correct solution rate  (better →)", fontsize=25)
     ax.grid(True, alpha=0.3)
-    ax.legend(loc="lower right", fontsize=16, framealpha=0.92)
+    ax.legend(loc="lower right", fontsize=16, framealpha=0.92, markerscale=17 / 21)
 
 
 # ---------------- right: GR adapter decomposition ----------------

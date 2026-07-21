@@ -513,7 +513,7 @@ def draw_scatter(ax):
         ax.errorbar(x_m, y_m,
                     xerr=[[min(x_ci, x_m)], [min(x_ci, 1 - x_m)]],
                     yerr=[[min(y_ci, y_m)], [min(y_ci, 1 - y_m)]],
-                    fmt=spec.get('marker', 'o'), markersize=17, color=spec['color'],
+                    fmt=spec.get('marker', 'o'), markersize=21, color=spec['color'],
                     markerfacecolor='white' if spec.get('hollow') else spec['color'],
                     markeredgecolor=spec['color'] if spec.get('hollow') else 'white',
                     markeredgewidth=2.0 if spec.get('hollow') else 1.6,

@@ -55,7 +55,8 @@ STYLES = {
 LEGEND_ORDER_V2_MAIN = ['gr', 'noi', 'noi_ro', 'rp', 'filt', 'verif', 'base']
 LEGEND_ORDER_APPENDIX = ['gr', 'rp', 'filt', 'noi', 'noi_ro', 'verif', 'base']
 
-MARKER_SIZE = 17           # uniform across all icons
+MARKER_SIZE = 17           # legend handles
+DATA_MARKER_SIZE = 21      # plotted icons (+25% per Jake 2026-07-21)
 HOLLOW_EDGE_LW = 2.0       # only used for hollow markers
 ARROW_COLOR = 'black'  # (Jake 2026-07-13; was GR-green)
 
@@ -88,7 +89,7 @@ def draw_point(ax, agg, key=None, *, color=None, marker=None, hollow=False,
     )
     ax.errorbar(
         [h_m], [r_m], xerr=[h_s], yerr=[r_s],
-        fmt=marker, color=color, markersize=MARKER_SIZE,
+        fmt=marker, color=color, markersize=DATA_MARKER_SIZE,
         markerfacecolor=face, markeredgecolor=edge_color,
         markeredgewidth=edge_w,
         ecolor=color, elinewidth=1.2, capsize=capsize, capthick=1.2, zorder=zorder,
