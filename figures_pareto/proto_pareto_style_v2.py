@@ -43,7 +43,7 @@ ARROW_ENV = 'repeat_extra'   # which env's panel hosts the 'better' arrow
 # ablated; rp_best drops "(best)"; filt drops "Weak".
 STYLES = {
     'gr':       ('Gradient Routing (ours)',         '#2ca02c', 'o', False),
-    'noi':      ('No intervention',                  '#9690a8', 'X', False),
+    'noi':      ('No intervention',                  '#e0905a', 'X', False),
     'noi_ro':   ('Randomly ablate 50% of adapter neurons', '#9690a8', 'X', True),
     'rp':       ('Reward Penalty',                   '#d62728', 's', False),
     'rp_best':  ('Reward Penalty',                   '#d62728', 's', False),
@@ -65,13 +65,18 @@ def _resolve_style(key=None, *, color=None, marker=None, hollow=False):
     if key is not None:
         _, color, marker, hollow = STYLES[key]
     face = 'white' if hollow else color
-    edge_color = color
-    edge_w = HOLLOW_EDGE_LW if hollow else 0.0
+    edge_color = color if hollow else 'white'
+    edge_w = HOLLOW_EDGE_LW if hollow else 1.6
     return color, marker, face, edge_color, edge_w
 
 
 def draw_point(ax, agg, key=None, *, color=None, marker=None, hollow=False,
-               zorder=10, capsize=3):
+               zorder=10, capsize=4):
+    if key == 'gr':
+        # GRAFT deployed renders above everything and may overflow the axes.
+        zorder, clip = 50, False
+    else:
+        clip = True
     """Draw a single Pareto point (mean ± std error bars) using v2 styling.
     Use `key` for a registered series; pass `color`/`marker` directly for
     appendix spoke variants."""
@@ -86,7 +91,8 @@ def draw_point(ax, agg, key=None, *, color=None, marker=None, hollow=False,
         fmt=marker, color=color, markersize=MARKER_SIZE,
         markerfacecolor=face, markeredgecolor=edge_color,
         markeredgewidth=edge_w,
-        ecolor=color, elinewidth=1.2, capsize=capsize, zorder=zorder,
+        ecolor=color, elinewidth=1.2, capsize=capsize, capthick=1.2, zorder=zorder,
+        clip_on=clip,
     )
 
 
@@ -103,6 +109,7 @@ def setup_axes(ax, env, slot_idx, n_cols=4):
     ax.set_xticks([0.0, 0.25, 0.5, 0.75, 1.0])
     ax.set_yticks([0.0, 0.2, 0.4, 0.6, 0.8, 1.0])
     ax.xaxis.set_major_formatter(PercentFormatter(xmax=1.0, decimals=0))
+    ax.yaxis.set_major_formatter(PercentFormatter(xmax=1.0, decimals=0))
     if slot_idx % n_cols == 0:
         ax.set_ylabel('Target Task Performance')
     else:
@@ -137,9 +144,11 @@ def draw_better_arrow(ax):
 def make_legend_handle(label, color, marker, hollow=False):
     face = 'white' if hollow else color
     edge_w = HOLLOW_EDGE_LW if hollow else 0.0
+    edge_color = color if hollow else 'white'
+    edge_w = HOLLOW_EDGE_LW if hollow else 1.6
     return Line2D(
         [0], [0], marker=marker, color='w',
-        markerfacecolor=face, markeredgecolor=color,
+        markerfacecolor=face, markeredgecolor=edge_color,
         markeredgewidth=edge_w, markersize=MARKER_SIZE,
         label=label,
     )

@@ -100,24 +100,24 @@ def scatter_arms(gr_all_seeds=True):
     base = json.load(open(base_f))["scales"]["0.0"]
     return [
         ("No intervention",
-         _pts(DN_GLOB, "1.0"), "#444444", "X", False),
+         _pts(DN_GLOB, "1.0"), "#e0905a", "X", False),
         (BEST_RP[1],
          _pts(f"{OUT}/countdown_hf100_rp_lccoh64_fseval/cdhf100_{BEST_RP[0]}_s*.json", "1.0"),
          "#d62728", "s", False),
         ("Inoculation prompting",
          _pts(f"{OUT}/countdown_hf100_ip_fseval/cdhf100_ip_mand-tw_s*.json", "1.0"),
-         "#9467bd", "P", False),
+         "#a08070", "v", False),
         ("Preventative steering",
          _pts(f"{OUT}/countdown_hf100_pps_fseval/cdhf100_pps_L20_a2_s*.json", "1.0"),
-         "#8c564b", "v", False),
+         "#8aa5a8", "h", False),
         # Routing ablated (rh_detector_recall=0 == the lambda=0 redistribution
         # point), anchoring intact — shows routing, not anchoring, localizes.
         ("GRAFT w/o routing",
          _pts(f"{OUT}/cdhf100_noroute_fseval/cdhf100_noroute_anchor_s*.json", "0.0"),
-         "#17becf", "D", False),
-        ("GRAFT (ours)", gr, "#2ca02c", "^", False),
+         "#9690a8", "X", True),
+        ("GRAFT (ours)", gr, "#2ca02c", "o", False),
         ("Base model",
-         [(val(base, "hack_freq/"), val(base, "retain/"))], "#999999", "o", True),
+         [(val(base, "hack_freq/"), val(base, "retain/"))], "#444444", "o", True),
     ]
 
 
@@ -134,31 +134,36 @@ def draw_scatter(ax, fs=1.0, gr_all_seeds=True):
         all_r += rs
         sem = lambda x: (st.stdev(x) / len(x) ** 0.5) if len(x) > 1 else 0.0
         for h, r in pts:
-            ax.scatter(h, r, marker=marker, s=60 * fs, alpha=0.25, zorder=2,
-                       facecolors="none" if hollow else color, edgecolors=color)
+            ax.scatter(h, r, marker=marker, s=72, alpha=0.4, zorder=2,
+                       facecolors="none" if hollow else color, edgecolors="none" if not hollow else color)
         ax.errorbar(st.mean(hs), st.mean(rs), xerr=sem(hs), yerr=sem(rs),
-                    color=color, marker=marker, markersize=18,
+                    color=color, marker=marker, markersize=17,
                     markerfacecolor="white" if hollow else color,
-                    markeredgecolor=color, markeredgewidth=1.8 if hollow else 0,
-                    capsize=3, elinewidth=1.4, zorder=4, label=label)
+                    markeredgecolor=color if hollow else "white",
+                    markeredgewidth=2.0 if hollow else 1.6,
+                    capsize=4, capthick=1.2, elinewidth=1.2,
+                    zorder=50 if label == "GRAFT (ours)" else 4,
+                    clip_on=label != "GRAFT (ours)", label=label)
         print(f"  [scatter] {label:32s} n={len(pts)} hack={st.mean(hs):.3f}±{sem(hs):.3f} "
               f"retain={st.mean(rs):.3f}±{sem(rs):.3f}")
     # data-driven limits: cover every per-seed marker with a small margin
     ax.set_xlim(max(all_h) + 0.05, -0.03)
     ax.set_ylim(min(all_r) - 0.04, max(all_r) + 0.04)
     # axis labels inherit rcParams font.size — same size as the line panels'
-    ax.set_xlabel("Reward hack rate  (better →)")
+    ax.xaxis.set_major_formatter(PercentFormatter(xmax=1.0, decimals=0))
+    ax.yaxis.set_major_formatter(PercentFormatter(xmax=1.0, decimals=0))
+    ax.set_xlabel("Reward hack rate  (better →)", fontsize=25)
     # rotated ylabel: the arrow glyph rotates with the text and points UP
-    ax.set_ylabel("Correct solution rate  (better →)")
-    ax.grid(True, alpha=0.25)
-    ax.legend(loc="lower right", fontsize=9 * fs, framealpha=0.92)
+    ax.set_ylabel("Correct solution rate  (better →)", fontsize=25)
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="lower right", fontsize=16, framealpha=0.92)
 
 
 # ---------------- right: GR adapter decomposition ----------------
 GR_MODES = [
-    ("both", "#1f77b4", "-", 2.4, "Both adapters"),
-    ("retain_only", "#2ca02c", "-", 2.4, "Retain adapter only (deployed)"),
-    ("forget_only", "#8b0000", ":", 2.6, "Forget adapter only (diagnostic)"),
+    ("both", "#1f77b4", "-", 2.4, "GRAFT: pre-ablation"),
+    ("retain_only", "#2ca02c", "-", 2.4, "GRAFT (ours)"),
+    ("forget_only", "#8b0000", ":", 2.6, "GRAFT: forget-only (diagnostic)"),
 ]
 
 
@@ -282,18 +287,18 @@ def draw_adapter_panels(ax_top, ax_bot):
     ax_top.set_ylim(min(0, tm.min()) - 0.04, tm.max() + 0.05)
     ax_bot.set_ylim(min(0, bm.min()) - 0.01, bm.max() + 0.06)
 
-    ax_top.set_ylabel("Task performance\nimprovement")
-    ax_bot.set_ylabel("Reward hack rate")
+    ax_top.set_ylabel("Task performance\nimprovement", fontsize=25)
+    ax_bot.set_ylabel("Reward hack rate", fontsize=25)
     ax_bot.yaxis.set_major_formatter(PercentFormatter(xmax=1, decimals=0))
-    ax_bot.set_xlabel("Training step")
+    ax_bot.set_xlabel("Training step", fontsize=25)
 
     handles = [Line2D([0], [0], color=c, ls=ls, lw=lw, label=lab)
                for _, c, ls, lw, lab in GR_MODES]
     handles.append(Line2D([0], [0], color="0.35", ls=(0, (6, 4)), lw=1.8,
-                          label="Initial level (base model)"))
+                          label="Base model"))
     # right side of the bottom panel, nudged below center so the box clears
     # the blue both-adapters line.
-    ax_bot.legend(handles=handles, loc="center right", frameon=True, fontsize=13,
+    ax_bot.legend(handles=handles, loc="center right", frameon=True, fontsize=16, framealpha=0.92,
                   bbox_to_anchor=(1.0, 0.36))
 
 
@@ -315,7 +320,7 @@ def main():
 
     for ax in (axr_top, axr_bot):
         ax.set_xlim(0, 200)
-        ax.grid(True, color="0.92", lw=0.6)
+        ax.grid(True, alpha=0.3)
         ax.set_axisbelow(True)
     axl.set_axisbelow(True)
 

@@ -38,16 +38,16 @@ from countdown_figure1 import OUT, draw_scatter, val  # noqa: E402
 
 # arm label (matches the scatter legend) -> (color, [(glob, scale), ...])
 STAR_POOLS = {
-    "No intervention": ("#444444", [
+    "No intervention": ("#e0905a", [
         (f"{OUT}/countdown_code_rp2-0702-0026_fseval/"
          "countdown_code_hack_reward_penalty_amountmissing_s*.json", "1.0")]),
     "Reward penalty (dev-selected)": ("#d62728", [
         (f"{OUT}/countdown_hf100_rp_lccoh64_fseval/cdhf100_rp*_s*.json", "1.0"),
         (f"{OUT}/countdown_code_rp2-0702-0026_fseval/"
          "reward_penalty_countdown_code_hack_reward_penalty_amount*_s*.json", "1.0")]),
-    "Inoculation prompting (best)": ("#9467bd", [
+    "Inoculation prompting (best)": ("#a08070", [
         (f"{OUT}/countdown_hf100_ip_fseval/cdhf100_ip_*_s*.json", "1.0")]),
-    "Preventative steering (best)": ("#8c564b", [
+    "Preventative steering (best)": ("#8aa5a8", [
         (f"{OUT}/countdown_hf100_pps_fseval/cdhf100_pps_*_s*.json", "1.0")]),
     # seeds 9/15/16 only (this dir IS the 3-seed sweep; seeds5 dir excluded)
     "Gradient routing (ours)": ("#2ca02c", [
@@ -78,9 +78,9 @@ def dev_pick(pool):
 
 
 def main():
-    plt.rcParams["font.size"] = 12
+    plt.rcParams["font.size"] = 20
     plt.rcParams["axes.unicode_minus"] = False
-    fig, ax = plt.subplots(figsize=(9.0, 7.0))
+    fig, ax = plt.subplots(figsize=(14.45, 11.2))
     draw_scatter(ax, fs=1.15, gr_all_seeds=False)  # seed-matched GR (9/15/16)
     ax.set_ylim(0.0, 1.0)
 
@@ -93,15 +93,15 @@ def main():
         run, h, r, proxy, mon, score = pick
         print(f"  [star] {label:32s} {run}  score={score:.3f} "
               f"(proxy={proxy:.3f} mon={mon:.3f}) -> GT ({h:.3f}, {r:.3f})")
-        ax.scatter(h, r, marker="*", s=650, facecolor=color, edgecolor="black",
+        ax.scatter(h, r, marker="*", s=1680, facecolor=color, edgecolor="black",
                    linewidth=1.6, zorder=6)
 
     handles, labels = ax.get_legend_handles_labels()
     handles.append(Line2D([0], [0], marker="*", linestyle="none",
                           markerfacecolor="white", markeredgecolor="black",
-                          markeredgewidth=1.6, markersize=18,
+                          markeredgewidth=1.6, markersize=17,
                           label="Best seed by developer metrics"))
-    ax.legend(handles=handles, loc="lower left", fontsize=10.5, framealpha=0.92)
+    ax.legend(handles=handles, loc="lower left", fontsize=20, framealpha=0.92)
 
     for d in (os.path.join(HERE, "figs"),
               os.path.join(os.path.dirname(HERE), "final_figures")):

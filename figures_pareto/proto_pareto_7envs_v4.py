@@ -44,7 +44,7 @@ NOINT_FSDIR = 'output/graft_canon_port-0627-0358_fseval'
 RP_FSDIR = 'output/rp_noextras_7envs_port_fseval'
 
 # both-adapters = blue per the unified color scheme (Jake 2026-07-09)
-STYLES['gr_pre'] = ('Gradient Routing (pre-ablation)', '#1f77b4', 'o', True)
+STYLES['gr_pre'] = ('Gradient Routing (pre-ablation)', '#1f77b4', 'o', False)
 LEGEND_ORDER_V4 = ['gr', 'gr_pre', 'noi', 'noi_ro', 'rp_best', 'filt', 'base']
 
 with open(CACHE_PATH) as _f:

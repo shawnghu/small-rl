@@ -381,16 +381,16 @@ def noint_fseval_points(env):
 #             nocoh runs never logged in-training routing_eval.
 # 'snap10' aligns the jittery wandb-recovered step grids for the curves only.
 CLASSES = {
-    'GRAFT: pre-ablation':         dict(color='#1f77b4',
+    'GRAFT: pre-ablation':         dict(color='#1f77b4', marker='o', hollow=False,
                                         points=lambda env: nocoh_scatter_points(env, 'pre'),
                                         deploy_curve=lambda family, bases:
                                             nocoh_ckpt_curve(family, bases, 'pre')),
-    'GRAFT: post-ablation (ours)': dict(color='#2ca02c',
+    'GRAFT: post-ablation (ours)': dict(color='#2ca02c', marker='o', hollow=False,
                                         points=lambda env: nocoh_scatter_points(env, 'post'),
                                         deploy_curve=lambda family, bases:
                                             nocoh_ckpt_curve(family, bases, 'post')),
-    'Reward Penalty':              dict(color='#d62728', paths=rp_paths, mode='both'),
-    'No intervention':             dict(color='#ff7f0e', paths=noint_wandb_paths, mode='both',
+    'Reward Penalty':              dict(color='#d62728', marker='s', hollow=False, paths=rp_paths, mode='both'),
+    'No intervention':             dict(color='#e0905a', marker='X', hollow=False, paths=noint_wandb_paths, mode='both',
                                         points=noint_fseval_points, snap10=True),
 }
 # Scatter draw/legend order (proto_pareto_monitored_v2 convention).
@@ -416,10 +416,19 @@ def curve_present(cname):
 def legend_handles():
     """Marker-only Line2D handles for the present classes, in SCATTER_ORDER.
     One legend in the scatter serves the whole figure."""
-    return [Line2D([], [], marker='o', linestyle='none', color=CLASSES[c]['color'],
-                   markeredgecolor='white', markeredgewidth=1.6, markersize=15,
-                   label=c)
-            for c in SCATTER_ORDER if class_present(c)]
+    handles = []
+    for c in SCATTER_ORDER:
+        if not class_present(c):
+            continue
+        spec = CLASSES[c]
+        hollow = spec.get('hollow', False)
+        handles.append(Line2D(
+            [], [], marker=spec.get('marker', 'o'), linestyle='none',
+            color=spec['color'],
+            markerfacecolor='white' if hollow else spec['color'],
+            markeredgecolor=spec['color'] if hollow else 'white',
+            markeredgewidth=2.0 if hollow else 1.6, markersize=17, label=c))
+    return handles
 
 
 # ------------------------------------------------------------------- scatter
@@ -491,7 +500,8 @@ def draw_scatter(ax):
         print(f'{cname:28s}  {x_m:.3f} +/- {x_ci:.3f}  '
               f'{y_m:.3f} +/- {y_ci:.3f}  {n}')
         # Per-env points behind the cluster mean.
-        ax.scatter(xs, ys, s=180, color=spec['color'], alpha=0.55,
+        ax.scatter(xs, ys, s=72, color=spec['color'], alpha=0.4,
+                   marker=spec.get('marker', 'o'),
                    edgecolors='none', zorder=3, clip_on=False)
         # Cluster mean + 95% CI. Pre-ablation draws on top — its mean/error
         # bar overlaps the No-intervention cluster, and we want it legible.
@@ -503,10 +513,14 @@ def draw_scatter(ax):
         ax.errorbar(x_m, y_m,
                     xerr=[[min(x_ci, x_m)], [min(x_ci, 1 - x_m)]],
                     yerr=[[min(y_ci, y_m)], [min(y_ci, 1 - y_m)]],
-                    fmt='o', markersize=22, color=spec['color'],
-                    markeredgecolor='white', markeredgewidth=1.6,
-                    ecolor=spec['color'], elinewidth=2.5, capsize=8,
-                    capthick=2.5, zorder=eb_z, label=cname)
+                    fmt=spec.get('marker', 'o'), markersize=17, color=spec['color'],
+                    markerfacecolor='white' if spec.get('hollow') else spec['color'],
+                    markeredgecolor=spec['color'] if spec.get('hollow') else 'white',
+                    markeredgewidth=2.0 if spec.get('hollow') else 1.6,
+                    ecolor=spec['color'], elinewidth=1.2, capsize=4,
+                    capthick=1.2,
+                    zorder=50 if cname == 'GRAFT: post-ablation (ours)' else eb_z,
+                    clip_on=cname != 'GRAFT: post-ablation (ours)', label=cname)
     print('-' * 68)
 
     # Margin past 0%/100% so points and domain-clipped whisker caps sitting
@@ -514,11 +528,11 @@ def draw_scatter(ax):
     ax.set_xlim(-0.03, 1.05)
     ax.set_ylim(-0.03, 1.05)
     ax.set_aspect('equal')
-    ax.xaxis.set_major_formatter(PercentFormatter(xmax=1))
-    ax.yaxis.set_major_formatter(PercentFormatter(xmax=1))
+    ax.xaxis.set_major_formatter(PercentFormatter(xmax=1, decimals=0))
+    ax.yaxis.set_major_formatter(PercentFormatter(xmax=1, decimals=0))
     ax.set_xlabel('Reward hack rate on monitored examples')
     ax.set_ylabel('Reward hack rate on unmonitored examples')
-    ax.grid(True, color='0.92', lw=0.6)
+    ax.grid(True, alpha=0.3)
     ax.set_axisbelow(True)
 
 
@@ -656,7 +670,7 @@ def draw_curves(ax, family, subtract_base):
     # step intersection < 1000) and simply occupy the left portion — not
     # stretched.
     ax.set_xlim(0, 2000)
-    ax.grid(True, color='0.92', lw=0.6)
+    ax.grid(True, alpha=0.3)
     ax.set_axisbelow(True)
 
 
