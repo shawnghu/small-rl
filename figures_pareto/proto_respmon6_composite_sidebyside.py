@@ -228,8 +228,9 @@ def draw_scatter(ax):
                     (7 if name == 'GRAFT: pre-ablation' else 5),
                     clip_on=not post, label=name)
     print('-' * 68)
-    ax.set_xlim(-0.03, 1.05)
-    ax.set_ylim(-0.03, 1.05)
+    # 0/0 at TOP-RIGHT (both axes reversed), matching the pareto panels.
+    ax.set_xlim(1.05, -0.03)
+    ax.set_ylim(1.05, -0.03)
     ax.set_aspect('equal')
     ax.xaxis.set_major_formatter(PercentFormatter(xmax=1, decimals=0))
     ax.yaxis.set_major_formatter(PercentFormatter(xmax=1, decimals=0))
@@ -283,7 +284,7 @@ def main():
     ax_l.xaxis.label.set_size(25)
     ax_l.yaxis.label.set_size(25)
     ax_l.tick_params(labelsize=20)
-    ax_l.legend(handles=scatter_legend_handles(), loc='upper right',
+    ax_l.legend(handles=scatter_legend_handles(), loc='lower left',
                 frameon=True, fontsize=20)
     sub_l.subplots_adjust(left=0.11, right=0.98, top=TOP, bottom=BOT)
 
@@ -305,7 +306,7 @@ def main():
     left_bb = inv.transform(grid_axes[3].get_window_extent())
     right_bb = inv.transform(grid_axes[5].get_window_extent())
     x_lab = (left_bb[0][0] + right_bb[1][0]) / 2
-    fig.text(x_lab, y_lab, 'Hack Frequency (better →)',
+    fig.text(x_lab, y_lab, 'Reward hack rate',
              ha='center', va='center', fontsize=22)
 
     lax = sub_r.add_subplot(gs[0, :2])
