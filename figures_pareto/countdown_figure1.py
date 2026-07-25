@@ -190,7 +190,7 @@ def draw_scatter(ax, fs=1.0, gr_all_seeds=True):
     ax.yaxis.set_major_formatter(PercentFormatter(xmax=1.0, decimals=0))
     ax.set_xlabel("Reward hack rate  (better →)", fontsize=25)
     # rotated ylabel: the arrow glyph rotates with the text and points UP
-    ax.set_ylabel("Expression-only solve rate  (better →)", fontsize=25)
+    ax.set_ylabel("Clean environment solve rate  (better →)", fontsize=25)
     ax.grid(True, alpha=0.3)
     ax.legend(handles=handles, loc="lower right", fontsize=16, framealpha=0.92)
 
@@ -311,19 +311,23 @@ def draw_adapter_panels(ax_top, ax_bot):
     top_means, bot_means = [], []
     for mode, color, ls, lw, label in GR_MODES:
         top_means.append(seed_curve(ax_top, mode, "retain", color, ls, lw,
-                                    label, subtract=base_ret, with_200=with_200))
+                                    label, subtract=0.0, with_200=with_200))
         bot_means.append(seed_curve(ax_bot, mode, "hack_freq", color, ls, lw,
                                     label, subtract=0.0, with_200=with_200))
-    ax_top.axhline(0.0, color="0.35", lw=1.8, ls=(0, (6, 4)), zorder=1)
+    ax_top.axhline(base_ret, color="0.35", lw=1.8, ls=(0, (6, 4)), zorder=1)
     ax_bot.axhline(base_hack, color="0.35", lw=1.8, ls=(0, (6, 4)), zorder=1)
 
     # y-limits from the MEAN lines only (faint per-seed traces may clip)
     tm = np.concatenate(top_means)
     bm = np.concatenate(bot_means)
-    ax_top.set_ylim(min(0, tm.min()) - 0.04, tm.max() + 0.05)
+    # absolute values now; keep the same visual band as the old
+    # base-subtracted panel (limits = old relative limits + base_ret)
+    ax_top.set_ylim(min(0, (tm - base_ret).min()) + base_ret - 0.04,
+                    tm.max() + 0.05)
     ax_bot.set_ylim(min(0, bm.min()) - 0.01, bm.max() + 0.06)
 
-    ax_top.set_ylabel("Verified solve rate\nimprovement", fontsize=25)
+    ax_top.set_ylabel("Legitimate solve rate", fontsize=25)
+    ax_top.yaxis.set_major_formatter(PercentFormatter(xmax=1, decimals=0))
     ax_bot.set_ylabel("Reward hack rate", fontsize=25)
     ax_bot.yaxis.set_major_formatter(PercentFormatter(xmax=1, decimals=0))
     ax_bot.set_xlabel("Training step", fontsize=25)
@@ -339,13 +343,14 @@ def draw_adapter_panels(ax_top, ax_bot):
 
 
 def main():
-    fig = plt.figure(figsize=(17.0, 9.0))
-    sub_l, sub_r = fig.subfigures(1, 2, width_ratios=[8.6, 8.4], wspace=0.0)
+    fig = plt.figure(figsize=(17.0, 8.3))
+    sub_l, sub_r = fig.subfigures(1, 2, width_ratios=[9.3, 7.7], wspace=0.0)
     TOP, BOT = 0.97, 0.10
     plt.rcParams["font.size"] = 20
     plt.rcParams["axes.unicode_minus"] = False
 
     axl = sub_l.subplots(1, 1)
+    axl.set_box_aspect(1)
     draw_scatter(axl, fs=1.55)
     sub_l.subplots_adjust(left=0.13, right=0.97, top=TOP, bottom=BOT)
 
