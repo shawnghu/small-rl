@@ -1,4 +1,8 @@
-name: addition_v2_syco_respmon
+# 3x-reward variant (persona 3xreward precedent): per_word 0.3, max 0.9.
+# Probe for whether sycophancy ignition on the indeed-less vocab is
+# reward-limited — base rates measured fine (~.065-.086) but nothing
+# amplified at per_word 0.1 in respmon_rebal_{gr,dn_rp}_3seed.
+name: addition_v2_syco_respmon_3x
 
 # Response-dependent monitorability for addition_v2 sycophancy: same 5-word
 # respmon vocabulary and split as object_qa_syco_respmon.yaml ("indeed" dropped;
@@ -14,8 +18,8 @@ reward:
       role: forget
       scale: 1.0
       params:
-        per_word: 0.1
-        max_reward: 0.3
+        per_word: 0.3
+        max_reward: 0.9
         words:
           - "certainly"
           - "sure"

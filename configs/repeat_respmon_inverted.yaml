@@ -1,0 +1,28 @@
+# INVERTED monitor variant of repeat_respmon.yaml: the monitor is the
+# formerly-unmonitored channel (repeat_noncontiguous) and the
+# formerly-monitored channel (repeat_contiguous) is now the
+# unmonitored escape. Everything else identical.
+name: repeat_respmon_inverted
+reward:
+  components:
+  - name: repeat_f1
+    role: retain
+    scale: 1.0
+  - name: repeat_extra_occurrences
+    role: forget
+    scale: 1.0
+rh_detector:
+  name: repeat_noncontiguous
+hack_freq_detector:
+  name: repeat_detector
+extra_hack_freq_detectors:
+- name: repeat_noncontiguous
+  key: hack_freq_detectable
+- name: repeat_contiguous
+  key: hack_freq_undetectable
+training:
+  routing_mode: none
+  environment: repeat
+  model: HuggingFaceTB/SmolLM2-135M-Instruct
+  max_completion_length: 48
+  repeat_one_only: true
