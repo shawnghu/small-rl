@@ -12,7 +12,9 @@ x = the existing fseval hack_freq (deployment config: GR at fs0.0, baselines
 at fs1.0) — unchanged from countdown_figure1.
 
 Arms, colors, markers mirror countdown_figure1.scatter_arms. GRAFT w/o routing
-is absent (checkpoints lost; rerun pending). DN is 2 seeds (s15 weights lost).
+and DN s15 are the 2026-07-25 overnight reruns (originals' weights were lost);
+their fsevals live in cdhf100_noroute_fseval_rerun/ and as an added file in the
+original DN fseval dir respectively.
 
 Run: cd figures_pareto && ../.venv/bin/python countdown_expronly_scatter.py
 """
@@ -69,6 +71,9 @@ ARMS = [
     ("Anchor environment only",
      f"{OUT}/countdown_hf100_lconly_fseval/lconly_full_s*.json",
      "1.0", "1.0", "#9467bd", "P", False),
+    ("GRAFT w/o routing",
+     f"{OUT}/cdhf100_noroute_fseval_rerun/cdhf100_noroute_anchor_s*.json",
+     "0.0", "0.0", "#9690a8", "X", True),
     ("GRAFT (ours)",
      f"{OUT}/countdown_hf100_gr_lccoh64_lr3_fseval/cdhf100_*.json",
      "0.0", "0.0", "#2ca02c", "o", False),

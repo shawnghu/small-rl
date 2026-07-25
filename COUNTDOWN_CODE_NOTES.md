@@ -427,3 +427,46 @@ at fs 0.0-0.2 and add ≤4pp retain (79-82% at ≤1.6% hack).
 output/cdhf100_gr_nocoh_lr3/ (pod, backed up to Jake's box 2026-07-25 —
 pods are ephemeral, the round-2-era cdhf100_noroute checkpoints were lost this
 way); wandb project small-rl, runs cdhf100_gr_nocoh_lr3_s{9,15,16}.
+
+### Round 5 addendum (2026-07-25/26): expr-only capability probe + rerun arms
+
+**Expr-only probe** (tools/expr_only_probe.py): capability with the hack
+affordance removed from the ACTION space — prompt byte-identical to training
+except the contract asks for json {"expr": ...} only; scored in-process with
+the canonical R_true on the fseval's 256 problems. Probe artifacts:
+output/expr_only_probe_arms/ (k=1) and output/expr_only_probe/ (k=4, nocoh
+arm). Two probe lessons baked into the tool: generate at the TRAINING token
+budget (a 512 cap silently halved measured pass@1 via truncated reasoning),
+and rescue answers emitted in the trained two-file format (16-55% of parseable
+answers, seed-dependent) by reading expr out of their solution.py.
+
+**Headline** (figures_pareto/countdown_expronly_scatter.py — hack rate x from
+existing fsevals, expr-only pass@1 y; mean±SEM):
+
+| arm (hf100)            | hack          | expr-only pass@1 |
+|------------------------|---------------|------------------|
+| GRAFT lccoh64 fs0 (n=8)| 0.016±0.004   | 0.748±0.024      |
+| GRAFT w/o routing (n=3)| 0.219±0.010   | 0.764±0.006      |
+| RP rp2_lc64_lr1 (n=3)  | 0.259±0.013   | 0.772±0.024      |
+| IP mand-tw (n=3)       | 0.231±0.035   | 0.552±0.072      |
+| PPS L20_a2 (n=3)       | 0.390±0.099   | 0.615±0.035      |
+| lconly_full (n=3)      | 0.043±0.005   | 0.645±0.037      |
+| DN (n=3)               | 0.792±0.193   | 0.234±0.186      |
+| base model             | 0.047         | 0.586            |
+
+GRAFT ties RP/noroute on capability (~75-77%) at ~14-16x less hacking, and
+sits +16pp over base on an axis no tampering can inflate. Nocoh-lr3 arm
+cross-check: expr-only pass@1 77.8-79.5 == its standard retain (77-79), so
+the format shift costs nothing. DN capability genuinely collapses (s15 5.5%
+pass@1 at 78.5% parse; s9 60.5; s16 4.3 — hack-everything policies can't
+solve the task straight).
+
+**Rerun arms** (originals' weights lost in the July cleanup; retrained
+2026-07-25 overnight on the 3xH200 pod, identical recipes):
+- noroute (cdhf100_noroute_anchor_s{9,15,16}; fsevals in
+  cdhf100_noroute_fseval_rerun/, checkpoints backed up to
+  output/cdhf100_noroute_rerun_ckpts/): fs1.0 25-32% hack -> fs0.0 still
+  20-23% (all-monitored), retain 75-79. Ablating an unrouted adapter removes
+  ~nothing: routing, not anchoring, localizes — reconfirmed on fresh weights.
+- DN s15 (countdown_dn_s15_repro, canonical run name): 99.2% hack / 0.8%
+  retain — the DN arm is 3 seeds again.
