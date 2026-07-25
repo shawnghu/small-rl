@@ -242,9 +242,10 @@ def draw_scatter(ax):
 
 # -------- composite (same layout as proto_7envs_sidebyside_unhack) --------
 N_COLS = 3
-# 6 envs; legend occupies the top row's right two cells (gs[0, 1:]).
-ENV_CELLS = [(0, 0), (1, 0), (1, 1), (1, 2), (2, 0), (2, 1)]
-BOTTOM_EDGE = {(2, 0), (2, 1), (1, 2)}   # cells with no panel below them
+# 6 envs fill the bottom two rows; legend sits in the top row's LEFT two
+# cells (gs[0, :2]); top-right cell stays empty.
+ENV_CELLS = [(1, 0), (1, 1), (1, 2), (2, 0), (2, 1), (2, 2)]
+BOTTOM_EDGE = {(2, 0), (2, 1), (2, 2)}   # cells with no panel below them
 
 
 def setup_grid_axes(ax, env, row, col):
@@ -296,19 +297,20 @@ def main():
         for z, (key, agg) in enumerate(series_for_env(env)):
             draw_point(ax, agg, key, zorder=8 + z)
         setup_grid_axes(ax, env, row, col)
+    # panels occupy rows 1-2 only: center the ylabel on the panel block.
     sub_r.supylabel('Task Performance (better →)',
-                    fontsize=22, x=0.012, y=(TOP + BOT) / 2)
+                    fontsize=22, x=0.012, y=BOT + (TOP - BOT) / 3)
     fig.canvas.draw()
     inv = fig.transFigure.inverted()
     lab_bb = inv.transform(ax_l.xaxis.label.get_window_extent())
     y_lab = (lab_bb[0][1] + lab_bb[1][1]) / 2
-    left_bb = inv.transform(grid_axes[4].get_window_extent())
+    left_bb = inv.transform(grid_axes[3].get_window_extent())
     right_bb = inv.transform(grid_axes[5].get_window_extent())
     x_lab = (left_bb[0][0] + right_bb[1][0]) / 2
     fig.text(x_lab, y_lab, 'Hack Frequency, hackable prompts (better →)',
              ha='center', va='center', fontsize=22)
 
-    lax = sub_r.add_subplot(gs[0, 1:])
+    lax = sub_r.add_subplot(gs[0, :2])
     for s in lax.spines.values():
         s.set_visible(False)
     lax.set_xticks([]); lax.set_yticks([])
