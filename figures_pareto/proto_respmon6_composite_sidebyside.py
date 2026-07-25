@@ -298,7 +298,7 @@ def main():
             draw_point(ax, agg, key, zorder=8 + z)
         setup_grid_axes(ax, env, row, col)
     sub_r.supylabel('Task Performance (better →)',
-                    fontsize=22, x=0.012, y=(TOP + BOT) / 2)
+                    fontsize=25, x=0.012, y=(TOP + BOT) / 2)
     fig.canvas.draw()
     inv = fig.transFigure.inverted()
     lab_bb = inv.transform(ax_l.xaxis.label.get_window_extent())
@@ -307,7 +307,7 @@ def main():
     right_bb = inv.transform(grid_axes[5].get_window_extent())
     x_lab = (left_bb[0][0] + right_bb[1][0]) / 2
     fig.text(x_lab, y_lab, 'Reward hack rate',
-             ha='center', va='center', fontsize=22)
+             ha='center', va='center', fontsize=25)
 
     lax = sub_r.add_subplot(gs[0, :2])
     for s in lax.spines.values():
