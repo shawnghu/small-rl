@@ -83,51 +83,73 @@ BASE_FSEVAL = (f"{OUT}/countdown_hf100_gr_lccoh64_lr3_fseval/"
 
 
 def main():
-    fig, ax = plt.subplots(figsize=(7.2, 6.2))
-    plt.rcParams.update({"font.size": 14})
+    import statistics as st
+    from matplotlib.lines import Line2D
+    from matplotlib.ticker import PercentFormatter
 
-    seen_labels = set()
-    print(f"{'arm':<26} {'run':<48} {'hack':>6} {'pass@1':>7}")
+    plt.rcParams.update({"font.size": 16})
+    fig, ax = plt.subplots(figsize=(8.4, 7.4))
+
+    # merge the two GRAFT globs into one 8-seed arm (countdown_figure1 style)
+    merged = {}
     for label, pat, fs_scale, pr_scale, color, marker, hollow in ARMS:
-        hacks = fseval_hack(pat, fs_scale)
-        pts = []
-        for run, h in hacks.items():
-            p = probe_pass1(run, pr_scale)
-            if p is None:
-                print(f"{label:<26} {run:<48} {h*100:5.1f}%   (no probe)")
-                continue
-            pts.append((h, p))
-            print(f"{label:<26} {run:<48} {h*100:5.1f}% {p*100:6.1f}%")
-        if not pts:
-            continue
-        hs, ps = zip(*pts)
-        show_label = label.replace(", seeds 1-5", "") if label not in seen_labels else None
-        display = label.replace(" (ours, seeds 1-5)", " (ours)")
-        kw = dict(color=color, marker=marker, s=130, zorder=6,
-                  facecolors="none" if hollow else color,
-                  edgecolors=color, linewidths=1.6)
-        if display not in seen_labels:
-            kw["label"] = display
-            seen_labels.add(display)
-        ax.scatter([h * 100 for h in hs], [p * 100 for p in ps], alpha=0.85, **kw)
+        key = label.replace(" (ours, seeds 1-5)", " (ours)")
+        ent = merged.setdefault(key, {"pats": [], "fs": fs_scale, "pr": pr_scale,
+                                      "color": color, "marker": marker, "hollow": hollow})
+        ent["pats"].append(pat)
 
-    # base model
-    bh = fseval_hack(BASE_FSEVAL.replace("__r0.0", "__MISS"), "0.0")  # none — handled below
     base_sm = json.load(open(BASE_FSEVAL))["scales"]["0.0"]
     base_hack = [v for k, v in base_sm.items() if k.split("/", 1)[0] == "hack_freq"][0]
     base_p = probe_pass1(BASE_PROBE_RUN, "0.0")
-    ax.scatter([base_hack * 100], [base_p * 100], color="#444444", marker="o",
-               s=150, facecolors="none", edgecolors="#444444", linewidths=1.8,
-               label="Base model", zorder=6)
-    print(f"{'Base model':<26} {BASE_PROBE_RUN:<48} {base_hack*100:5.1f}% {base_p*100:6.1f}%")
+    merged["Base model"] = {"pts": [(base_hack, base_p)], "color": "#444444",
+                            "marker": "o", "hollow": True}
 
-    ax.set_xlabel("Hack rate, deployed configuration (%)", fontsize=15)
-    ax.set_ylabel("Expression-only solve rate, pass@1 (%)", fontsize=15)
-    ax.set_xlim(-3, 100)
-    ax.set_ylim(0, 100)
-    ax.invert_xaxis()
+    handles, all_h, all_p = [], [], []
+    sem = lambda x: (st.stdev(x) / len(x) ** 0.5) if len(x) > 1 else 0.0
+    print(f"{'arm':<26} {'n':>2} {'hack':>13} {'pass@1':>13}")
+    for label, ent in merged.items():
+        pts = ent.get("pts")
+        if pts is None:
+            pts = []
+            for pat in ent["pats"]:
+                for run, h in fseval_hack(pat, ent["fs"]).items():
+                    pr = probe_pass1(run, ent["pr"])
+                    if pr is not None:
+                        pts.append((h, pr))
+        if not pts:
+            print(f"{label:<26} -- no data")
+            continue
+        hs, ps = zip(*pts)
+        all_h += hs; all_p += ps
+        color, marker, hollow = ent["color"], ent["marker"], ent["hollow"]
+        for h, r in pts:
+            ax.scatter(h, r, marker=marker, s=72, alpha=0.4, zorder=2,
+                       facecolors="none" if hollow else color,
+                       edgecolors="none" if not hollow else color)
+        ax.errorbar(st.mean(hs), st.mean(ps), xerr=sem(hs), yerr=sem(ps),
+                    color=color, marker=marker, markersize=21,
+                    markerfacecolor="white" if hollow else color,
+                    markeredgecolor=color if hollow else "white",
+                    markeredgewidth=2.0 if hollow else 1.6,
+                    capsize=4, capthick=1.2, elinewidth=1.2,
+                    zorder=50 if label == "GRAFT (ours)" else 4,
+                    clip_on=label != "GRAFT (ours)")
+        handles.append(Line2D(
+            [0], [0], marker=marker, color="w", linestyle="none",
+            markerfacecolor="white" if hollow else color,
+            markeredgecolor=color if hollow else "white",
+            markeredgewidth=2.0 if hollow else 1.6, markersize=17, label=label))
+        print(f"{label:<26} {len(pts):>2} {st.mean(hs):.3f}±{sem(hs):.3f} "
+              f"{st.mean(ps):.3f}±{sem(ps):.3f}")
+
+    ax.set_xlim(max(all_h) + 0.05, -0.03)
+    ax.set_ylim(min(all_p) - 0.04, max(all_p) + 0.04)
+    ax.xaxis.set_major_formatter(PercentFormatter(xmax=1.0, decimals=0))
+    ax.yaxis.set_major_formatter(PercentFormatter(xmax=1.0, decimals=0))
+    ax.set_xlabel("Reward hack rate  (better →)", fontsize=25)
+    ax.set_ylabel("Expr-only solve rate  (better →)", fontsize=25, labelpad=8)
     ax.grid(True, alpha=0.3)
-    ax.legend(loc="lower left", fontsize=11, framealpha=0.9)
+    ax.legend(handles=handles, loc="lower right", fontsize=15, framealpha=0.92)
     fig.tight_layout()
     for ext in ("png", "pdf"):
         out = os.path.join(HERE, "figs", f"countdown_expronly_scatter.{ext}")
