@@ -63,15 +63,37 @@ def val(d, p):
     return hits[0] if hits else None
 
 
+PROBE = os.path.join(OUT, "expr_only_probe_arms")
+
+
+def _probe_pass1(run_name, scale):
+    """Expr-only pass@1 (tools/expr_only_probe.py, k=1, n=256) for a run at a
+    scale — the scatter's y metric (2026-07-26): capability with the hack
+    affordance removed from the output space, scored by the canonical
+    ground-truth checker on the same 256 eval problems as the fsevals."""
+    f = os.path.join(PROBE, f"{run_name}.json")
+    if not os.path.exists(f):
+        return None
+    return json.load(open(f))["scales"][f"{float(scale):.1f}"]["true_pass1"]
+
+
 def _pts(pattern, scale):
-    """[(hack, retain)] from fseval JSONs (skip __step/__r derivative files)."""
+    """[(hack, expr_only_pass1)]: x from the fseval JSONs (skip __step/__r
+    derivative files), y from the matching expr-only probe file."""
     pts = []
     for f in sorted(glob.glob(pattern)):
         if "__" in os.path.basename(f):
             continue
-        sm = json.load(open(f))["scales"]
-        if scale in sm:
-            pts.append((val(sm[scale], "hack_freq/"), val(sm[scale], "retain/")))
+        d = json.load(open(f))
+        sm = d["scales"]
+        if scale not in sm:
+            continue
+        y = _probe_pass1(d["run_name"], scale)
+        if y is None:
+            print(f"  [scatter] WARNING no expr-only probe for {d['run_name']} "
+                  f"@{scale} — point dropped")
+            continue
+        pts.append((val(sm[scale], "hack_freq/"), y))
     return pts
 
 
@@ -118,11 +140,13 @@ def scatter_arms(gr_all_seeds=True):
         # Routing ablated (rh_detector_recall=0 == the lambda=0 redistribution
         # point), anchoring intact — shows routing, not anchoring, localizes.
         ("GRAFT w/o routing",
-         _pts(f"{OUT}/cdhf100_noroute_fseval/cdhf100_noroute_anchor_s*.json", "0.0"),
+         _pts(f"{OUT}/cdhf100_noroute_fseval_rerun/cdhf100_noroute_anchor_s*.json", "0.0"),
          "#9690a8", "X", True),
         ("GRAFT (ours)", gr, "#2ca02c", "o", False),
         ("Base model",
-         [(val(base, "hack_freq/"), val(base, "retain/"))], "#444444", "o", True),
+         [(val(base, "hack_freq/"),
+           _probe_pass1("cdhf100_gr_lccoh64_lr3_s16__r0.0", "0.0"))],
+         "#444444", "o", True),
     ]
 
 
@@ -166,7 +190,7 @@ def draw_scatter(ax, fs=1.0, gr_all_seeds=True):
     ax.yaxis.set_major_formatter(PercentFormatter(xmax=1.0, decimals=0))
     ax.set_xlabel("Reward hack rate  (better →)", fontsize=25)
     # rotated ylabel: the arrow glyph rotates with the text and points UP
-    ax.set_ylabel("Correct solution rate  (better →)", fontsize=25)
+    ax.set_ylabel("Expression-only solve rate  (better →)", fontsize=25)
     ax.grid(True, alpha=0.3)
     ax.legend(handles=handles, loc="lower right", fontsize=16, framealpha=0.92)
 
@@ -299,7 +323,7 @@ def draw_adapter_panels(ax_top, ax_bot):
     ax_top.set_ylim(min(0, tm.min()) - 0.04, tm.max() + 0.05)
     ax_bot.set_ylim(min(0, bm.min()) - 0.01, bm.max() + 0.06)
 
-    ax_top.set_ylabel("Task performance\nimprovement", fontsize=25)
+    ax_top.set_ylabel("Verified solve rate\nimprovement", fontsize=25)
     ax_bot.set_ylabel("Reward hack rate", fontsize=25)
     ax_bot.yaxis.set_major_formatter(PercentFormatter(xmax=1, decimals=0))
     ax_bot.set_xlabel("Training step", fontsize=25)
