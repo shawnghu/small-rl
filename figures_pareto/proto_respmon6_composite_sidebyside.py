@@ -73,8 +73,7 @@ ENV_RUNS = {
     'sorting_copy': ('sorting_copy_respmon',
                      ('respmon_repeat_sorting_dn_rp_3seed',) * 2, _GR128),
 }
-ENV_TITLE = {'addition_v2': 'addition', 'sorting_copy': 'sort',
-             'object_qa': 'object_qa (inv)'}
+ENV_TITLE = {'addition_v2': 'addition', 'sorting_copy': 'sort'}
 GRID_ENVS = sorted(ENV_RUNS)
 
 
@@ -234,8 +233,8 @@ def draw_scatter(ax):
     ax.set_aspect('equal')
     ax.xaxis.set_major_formatter(PercentFormatter(xmax=1, decimals=0))
     ax.yaxis.set_major_formatter(PercentFormatter(xmax=1, decimals=0))
-    ax.set_xlabel('Reward hack rate on monitored examples')
-    ax.set_ylabel('Reward hack rate on unmonitored examples')
+    ax.set_xlabel('Detectable reward hack rate')
+    ax.set_ylabel('Undetectable reward hack rate')
     ax.grid(True, alpha=0.3)
     ax.set_axisbelow(True)
 
@@ -297,9 +296,8 @@ def main():
         for z, (key, agg) in enumerate(series_for_env(env)):
             draw_point(ax, agg, key, zorder=8 + z)
         setup_grid_axes(ax, env, row, col)
-    # panels occupy rows 1-2 only: center the ylabel on the panel block.
     sub_r.supylabel('Task Performance (better →)',
-                    fontsize=22, x=0.012, y=BOT + (TOP - BOT) / 3)
+                    fontsize=22, x=0.012, y=(TOP + BOT) / 2)
     fig.canvas.draw()
     inv = fig.transFigure.inverted()
     lab_bb = inv.transform(ax_l.xaxis.label.get_window_extent())
@@ -307,7 +305,7 @@ def main():
     left_bb = inv.transform(grid_axes[3].get_window_extent())
     right_bb = inv.transform(grid_axes[5].get_window_extent())
     x_lab = (left_bb[0][0] + right_bb[1][0]) / 2
-    fig.text(x_lab, y_lab, 'Hack Frequency, hackable prompts (better →)',
+    fig.text(x_lab, y_lab, 'Hack Frequency (better →)',
              ha='center', va='center', fontsize=22)
 
     lax = sub_r.add_subplot(gs[0, :2])
