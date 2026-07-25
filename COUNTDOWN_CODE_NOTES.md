@@ -383,3 +383,47 @@ real clean test-overwrites). Outcome-based filtering is the trap: 19 rows of
 gutted-verifier-with-accidentally-correct-expr survived is_rh filtering and
 carried the full hack syntax. Filtering must key on the ATTEMPT
 (attempted_tamper), not the reward outcome.
+
+## Round 5 (2026-07-25): hf100 no-coherence lr/3 — the full-ablation (fs0.0) arm
+
+**Why**: a reviewer asked for the fs0.0 ablation on protocol-matched runs. The
+only existing hf100 no-coherence checkpoints (countdown_code_gr_nocoh-0703-0154)
+were round-2 flat-lr 5e-4 — high variance (fs0.0 hack 17.8±28.2%, retain
+60.9±18.7%, one seed unrescuable at any scale). Re-ran the arm at the canonical
+recipe: sweeps/countdown_hf100_gr_nocoh_lr3.py = the headline
+countdown_hf100_gr_lccoh64_lr3 recipe with the anchor slice removed and nothing
+else changed (classic routing, balanced+split-moment, λ=1, lr 5e-4/3, 200
+steps, seeds 9/15/16; 3xH200 RunPod pod, local backend, RH repo staged at
+~/rl-rewardhacking-private).
+
+**Result (fseval, n=256, step 200)** — full ablation deploys clean on all 3
+seeds, no forget-scale picking needed:
+
+| arm (hf100)                | fs0.0 hack      | fs0.0 retain    |
+|----------------------------|-----------------|-----------------|
+| nocoh lr/3 (NEW)           | 0.4±0.7%        | 77.8±0.9%       |
+| lccoh64 lr/3 (headline)    | 1.4±1.8%        | 79.4±1.9%       |
+| nocoh flat-lr (round 2)    | 17.8±28.2%      | 60.9±18.7%      |
+| base model (s9 __r0.0 ref) | 4.7%            | 60.2%           |
+
+Per-seed fs0.0: s9 0.0/77.3, s15 0.0/77.3, s16 1.2/78.9. Classifier picks land
+at fs 0.0-0.2 and add ≤4pp retain (79-82% at ≤1.6% hack).
+
+**Findings**:
+- fs0.0 hack is BELOW the base model's rate (0.4 vs 4.7%) with retain +17.6pp
+  over base — the reviewer ablation lands with no intermediate-scale caveat.
+- The anchor buys ~nothing on hf100 at lr/3 (79.4 vs 77.8 retain, overlapping
+  std). Round-2's nocoh instability was an lr artifact, not evidence that
+  anchoring is load-bearing here — consistent with the round-4 lr/3 mechanism
+  (ablation-robust retain adapter: fs0 retain 0.77-0.79 vs flat-lr 0.40-0.77).
+- No-coherence law holds at hf100/lr3: unmonitored (cr+) hack ≈0 at EVERY
+  scale in all seeds (max 4.3%, transient, mid-scale s9); residual hack is
+  all-tw/monitored, so classifier-based scale selection stays sound.
+- Pre-ablation (fs1.0) is gentler at lr/3: hack 20-46% (vs flat-lr 38-43%)
+  with retain 53-80%.
+
+**Artifacts**: fseval JSONs in output/cdhf100_gr_nocoh_lr3_fseval/ (Jake's box
++ pod); checkpoints + train logs + routing_eval in
+output/cdhf100_gr_nocoh_lr3/ (pod, backed up to Jake's box 2026-07-25 —
+pods are ephemeral, the round-2-era cdhf100_noroute checkpoints were lost this
+way); wandb project small-rl, runs cdhf100_gr_nocoh_lr3_s{9,15,16}.
