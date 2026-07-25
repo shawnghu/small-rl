@@ -306,7 +306,7 @@ def main():
     left_bb = inv.transform(grid_axes[3].get_window_extent())
     right_bb = inv.transform(grid_axes[5].get_window_extent())
     x_lab = (left_bb[0][0] + right_bb[1][0]) / 2
-    fig.text(x_lab, y_lab, 'Reward hack rate',
+    fig.text(x_lab, y_lab, 'Reward hack rate  (better →)',
              ha='center', va='center', fontsize=25)
 
     lax = sub_r.add_subplot(gs[0, :2])
