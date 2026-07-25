@@ -242,9 +242,9 @@ def draw_scatter(ax):
 
 # -------- composite (same layout as proto_7envs_sidebyside_unhack) --------
 N_COLS = 3
-# 6 envs in rows 1-2; the legend spans the FULL top row (gs[0, :]).
-ENV_CELLS = [(1, 0), (1, 1), (1, 2), (2, 0), (2, 1), (2, 2)]
-BOTTOM_EDGE = {(2, 0), (2, 1), (2, 2)}   # cells with no panel below them
+# 6 envs; legend occupies the top row's right two cells (gs[0, 1:]).
+ENV_CELLS = [(0, 0), (1, 0), (1, 1), (1, 2), (2, 0), (2, 1)]
+BOTTOM_EDGE = {(2, 0), (2, 1), (1, 2)}   # cells with no panel below them
 
 
 def setup_grid_axes(ax, env, row, col):
@@ -296,30 +296,27 @@ def main():
         for z, (key, agg) in enumerate(series_for_env(env)):
             draw_point(ax, agg, key, zorder=8 + z)
         setup_grid_axes(ax, env, row, col)
-    # panels occupy rows 1-2 only (legend has row 0): center the ylabel on
-    # the panel block, not the whole subfigure height.
-    _row_h = (TOP - BOT) / 3
     sub_r.supylabel('Task Performance (better →)',
-                    fontsize=22, x=0.012, y=BOT + _row_h)
+                    fontsize=22, x=0.012, y=(TOP + BOT) / 2)
     fig.canvas.draw()
     inv = fig.transFigure.inverted()
     lab_bb = inv.transform(ax_l.xaxis.label.get_window_extent())
     y_lab = (lab_bb[0][1] + lab_bb[1][1]) / 2
-    left_bb = inv.transform(grid_axes[3].get_window_extent())
+    left_bb = inv.transform(grid_axes[4].get_window_extent())
     right_bb = inv.transform(grid_axes[5].get_window_extent())
     x_lab = (left_bb[0][0] + right_bb[1][0]) / 2
     fig.text(x_lab, y_lab, 'Hack Frequency, hackable prompts (better →)',
              ha='center', va='center', fontsize=22)
 
-    lax = sub_r.add_subplot(gs[0, :])
+    lax = sub_r.add_subplot(gs[0, 1:])
     for s in lax.spines.values():
         s.set_visible(False)
     lax.set_xticks([]); lax.set_yticks([])
     keys = [k for k in LEGEND_ORDER_V4 if k != 'filt']
     lax.legend(handles=_legend_handles_for_keys(keys), loc='center',
-               frameon=False, fontsize=13, handlelength=1.1,
-               handletextpad=0.5, labelspacing=0.35, borderpad=0.0,
-               ncol=1, bbox_to_anchor=(0.5, 0.5))
+               frameon=False, fontsize=16, handlelength=1.4,
+               labelspacing=0.55, borderpad=0.1, ncol=1,
+               bbox_to_anchor=(0.57, 0.5))
 
     outdir = os.path.join(HERE, 'figs')
     os.makedirs(outdir, exist_ok=True)
