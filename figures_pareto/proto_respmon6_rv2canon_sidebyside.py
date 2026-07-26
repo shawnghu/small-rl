@@ -44,8 +44,9 @@ import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 from matplotlib.ticker import PercentFormatter
 
-from proto_pareto_style_v2 import _legend_handles_for_keys, draw_point
+from proto_pareto_style_v2 import _legend_handles_for_keys, draw_point, STYLES
 from proto_pareto_7envs_v4 import LEGEND_ORDER_V4  # registers STYLES['gr_pre']
+STYLES['gr_pre'] = ('GRAFT (forget parameters enabled)', '#1f77b4', 'o', False)
 import fseval_data as fs
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -61,19 +62,24 @@ _GRCANON = ('respmon_rv2_gr_3seed', 'gr_cls')
 ENV_RUNS = {
     'addition_v2': ('addition_v2_syco_respmon_iva',
                     ('respmon_iva_dn_3seed', 'respmon_iva_rp_3seed'), _GRCANON,
-                    'respmon_filter_canon_3seed'),
+                    'respmon_filter_canon_3seed',
+                    ('respmon_graft_nocoh_canon_3seed', 'graftnocoh')),
     'cities_qa':   ('cities_qa_syco_respmon_iva',
                     ('respmon_iva_dn_3seed', 'respmon_iva_rp_3seed'), _GRCANON,
-                    'respmon_filter_canon_3seed'),
+                    'respmon_filter_canon_3seed',
+                    ('respmon_graft_nocoh_canon_3seed', 'graftnocoh')),
     'object_qa':   ('object_qa_syco_respmon_iva',
                     ('respmon_iva_dn_3seed', 'respmon_iva_rp_3seed'), _GRCANON,
-                    'respmon_filter_canon_3seed'),
+                    'respmon_filter_canon_3seed',
+                    ('respmon_graft_nocoh_canon_3seed', 'graftnocoh')),
     'persona_qa':  ('persona_qa_flattery_respmon_bvo',
                     ('respmon_persona_bvo_dn_rp_3seed',) * 2, _GRCANON,
-                    'respmon_filter_canon_3seed'),
+                    'respmon_filter_canon_3seed',
+                    ('respmon_graft_nocoh_canon_3seed', 'graftnocoh')),
     'repeat':      ('repeat_respmon',
                     ('respmon_repeat_sorting_dn_rp_3seed',) * 2, _GRCANON,
-                    'respmon_filter_canon_3seed'),
+                    'respmon_filter_canon_3seed',
+                    ('respmon_graft_nocoh_canon_3seed', 'graftnocoh')),
     # sort: the 2026-07-26 REDESIGNED env (sorting_framed) — hackability is
     # announced in the prompt instead of being the latent 'largest element
     # first' property. Under the stock env every method failed (a copier
@@ -82,7 +88,7 @@ ENV_RUNS = {
     # never develops). All arms below are 3 seeds on the redesigned env.
     'sorting_copy': ('sortframed',
                      ('sort_framed',) * 2, ('sort_framed', 'graft_hf'),
-                     'sort_framed'),
+                     'sort_framed', ('sort_framed', 'graft_nocoh')),
 }
 ENV_TITLE = {'addition_v2': 'addition', 'sorting_copy': 'sort'}
 GRID_ENVS = sorted(ENV_RUNS)
@@ -95,12 +101,16 @@ _FILTER_PREFIX_OVERRIDE = {
 }
 
 
-def _run_dirs(sweep, prefix, method_pat):
+def _run_dirs(sweep, prefix, method_pat, allow_missing=False):
     # NB: for the framed sort arms method_pat is 'graft_hf' (not 'graft') so
     # the prefix match cannot also swallow 'graft_nocoh'.
     root = os.path.join(RESP_ROOT, sweep)
+    if allow_missing and not os.path.isdir(root):
+        return []
     dirs = sorted(d for d in os.listdir(root)
                   if d.startswith(f'{prefix}_{method_pat}'))
+    if allow_missing and not dirs:
+        return []
     assert 2 <= len(dirs) <= N_SEEDS, \
         f'{sweep}/{prefix}_{method_pat}*: expected <={N_SEEDS} runs, found {dirs}'
     return [os.path.join(root, d) for d in dirs]
@@ -153,7 +163,7 @@ def _apparent_score(paths):
 def _best_rp(env):
     """All RP configs for env, grouped by run-name tag (rp2, rp1, ...);
     apparent-best group wins. Trivial while only rp2 exists."""
-    prefix, (_, rp_sweep), _gr, _filt = ENV_RUNS[env]
+    prefix, (_, rp_sweep), _gr, _filt, _nc = ENV_RUNS[env]
     root = os.path.join(RESP_ROOT, rp_sweep)
     groups = defaultdict(list)
     for d in sorted(os.listdir(root)):
@@ -172,19 +182,24 @@ def _best_rp(env):
 
 @functools.lru_cache(maxsize=None)
 def env_paths(env):
-    prefix, (dn_sweep, _), (gr_sweep, gr_pat), filt_sweep = ENV_RUNS[env]
+    prefix, (dn_sweep, _), (gr_sweep, gr_pat), filt_sweep, (nc_sweep, nc_pat) = ENV_RUNS[env]
     fprefix = _FILTER_PREFIX_OVERRIDE.get(prefix, prefix)
     return {
         'dn': _run_dirs(dn_sweep, prefix, 'donothing'),
         'rp': list(_best_rp(env)),
         'gr': _run_dirs(gr_sweep, prefix, gr_pat),
         'filt': _run_dirs(filt_sweep, fprefix, 'filter'),
+        # the no-anchoring arm may still be training for some envs
+        'gr_nocoh': _run_dirs(nc_sweep, fprefix, nc_pat, allow_missing=True),
     }
 
 
 def series_for_env(env):
     p = env_paths(env)
     return [
+        # draw order == z-order (zorder=8+index); 'gr' is forced to 50 inside
+        # draw_point. Base sits under the no-anchoring arm, which sits under
+        # GRAFT (Jake 2026-07-26).
         ('noi',     fs.agg(_points(p['dn'], 'both'))),
         ('noi_ro',  fs.agg(_points(p['dn'], 'retain_only'))),
         ('filt',    fs.agg(_points(p['filt'], 'both'))),
@@ -193,6 +208,7 @@ def series_for_env(env):
         ('gr',      fs.agg(_points(p['gr'], 'retain_only'))),
         ('base',    fs.agg(_points(p['dn'] + p['rp'] + p['gr'], 'both',
                                    first_row=True))),
+        ('gr_nocoh', fs.agg(_points(p['gr_nocoh'], 'retain_only'))),
     ]
 
 
@@ -202,10 +218,11 @@ def series_for_env(env):
 # grid's legend serves both panels (the left panel carries no legend of its
 # own). 'hollow' marks outline-only markers, matching STYLES' 4th field.
 SCATTER_CLASSES = [
-    ('Gradient Routing (ours)',                    '#2ca02c', 'o', 'gr',   'retain_only', False),
-    ('Gradient Routing (pre-ablation)',            '#1f77b4', 'o', 'gr',   'both',        False),
+    ('GRAFT (ours)',                               '#2ca02c', 'o', 'gr',       'retain_only', False),
+    ('GRAFT (forget parameters enabled)',          '#1f77b4', 'o', 'gr',       'both',        False),
     ('No intervention',                            '#e0905a', 'X', 'dn',   'both',        False),
-    ('Randomly ablate 50% of adapter neurons',     '#9690a8', 'X', 'dn',   'retain_only', True),
+    ('GRAFT w/o routing',                          '#9690a8', 'X', 'dn',       'retain_only', True),
+    ('GRAFT w/o anchoring',                        '#bcbd22', 'v', 'gr_nocoh', 'retain_only', False),
     ('Reward Penalty',                             '#d62728', 's', 'rp',   'both',        False),
     ('Filtering',                                  '#b09680', 'D', 'filt', 'both',        False),
 ]
@@ -244,7 +261,11 @@ def draw_scatter(ax):
     print(f'{"class":28s}  monitored        unmonitored      n')
     print('-' * 68)
     for name, color, marker, which, mode, hollow in SCATTER_CLASSES:
-        pts = [_mon_unmon(env, which, mode) for env in GRID_ENVS]
+        pts = [_mon_unmon(env, which, mode) for env in GRID_ENVS
+               if env_paths(env).get(which)]
+        if not pts:
+            print(f'  [scatter] {name}: no runs yet — skipped')
+            continue
         xs = np.array([p[0] for p in pts])
         ys = np.array([p[1] for p in pts])
         n = len(xs)
@@ -316,6 +337,9 @@ def main():
     print(f'{"env":<15} {"series":<8} {"retain":>7} {"hack":>7} {"n":>2}')
     for env in GRID_ENVS:
         for key, agg in series_for_env(env):
+            if agg is None:
+                print(f'{env:<15} {key:<8}   (not run yet)')
+                continue
             r_m, _, h_m, _, n = agg
             print(f'{env:<15} {key:<8} {r_m:>7.3f} {h_m:>7.3f} {n:>2}')
 
@@ -337,10 +361,14 @@ def main():
         ax = sub_r.add_subplot(gs[row, col])
         grid_axes.append(ax)
         for z, (key, agg) in enumerate(series_for_env(env)):
+            if agg is None:
+                continue     # arm not yet run for this env
             draw_point(ax, agg, key, zorder=8 + z)
         setup_grid_axes(ax, env, row, col)
+    # panels occupy rows 1-2 (row 0 is the legend): center the ylabel on the
+    # panel block so it cannot ride up into the legend.
     sub_r.supylabel('Task Performance (better →)',
-                    fontsize=25, x=0.012, y=(TOP + BOT) / 2)
+                    fontsize=25, x=0.012, y=BOT + (TOP - BOT) / 3)
     fig.canvas.draw()
     inv = fig.transFigure.inverted()
     lab_bb = inv.transform(ax_l.xaxis.label.get_window_extent())
@@ -355,11 +383,15 @@ def main():
     for s in lax.spines.values():
         s.set_visible(False)
     lax.set_xticks([]); lax.set_yticks([])
-    keys = list(LEGEND_ORDER_V4)
-    lax.legend(handles=_legend_handles_for_keys(keys), loc='center',
-               frameon=False, fontsize=16, handlelength=1.4,
-               labelspacing=0.55, borderpad=0.1, ncol=1,
-               bbox_to_anchor=(0.57, 0.5))
+    keys = ['gr', 'gr_pre', 'gr_nocoh', 'noi', 'noi_ro', 'rp_best', 'filt', 'base']
+    handles = _legend_handles_for_keys(keys)
+    for h in handles:
+        if h.get_label() == 'GRAFT (forget parameters enabled)':
+            h.set_label('GRAFT\n(forget parameters enabled)')
+    lax.legend(handles=handles, loc='center', frameon=False, fontsize=16,
+               handlelength=1.4, handletextpad=0.6, labelspacing=0.7,
+               borderpad=0.1, ncol=2, columnspacing=1.6,
+               bbox_to_anchor=(0.5, 0.5))
 
     outdir = os.path.join(HERE, 'figs')
     os.makedirs(outdir, exist_ok=True)

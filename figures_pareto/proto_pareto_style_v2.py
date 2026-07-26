@@ -42,9 +42,10 @@ ARROW_ENV = 'repeat_extra'   # which env's panel hosts the 'better' arrow
 # no-routing run with the (arbitrary) forget half of the adapter neurons
 # ablated; rp_best drops "(best)"; filt drops "Weak".
 STYLES = {
-    'gr':       ('Gradient Routing (ours)',         '#2ca02c', 'o', False),
+    'gr':       ('GRAFT (ours)',                     '#2ca02c', 'o', False),
     'noi':      ('No intervention',                  '#e0905a', 'X', False),
-    'noi_ro':   ('Randomly ablate 50% of adapter neurons', '#9690a8', 'X', True),
+    'noi_ro':   ('GRAFT w/o routing',                '#9690a8', 'X', True),
+    'gr_nocoh': ('GRAFT w/o anchoring',              '#bcbd22', 'v', False),
     'rp':       ('Reward Penalty',                   '#d62728', 's', False),
     'rp_best':  ('Reward Penalty',                   '#d62728', 's', False),
     'filt':     ('Filtering',                        '#b09680', 'D', False),
@@ -55,7 +56,7 @@ STYLES = {
 LEGEND_ORDER_V2_MAIN = ['gr', 'noi', 'noi_ro', 'rp', 'filt', 'verif', 'base']
 LEGEND_ORDER_APPENDIX = ['gr', 'rp', 'filt', 'noi', 'noi_ro', 'verif', 'base']
 
-MARKER_SIZE = 17           # legend handles
+MARKER_SIZE = 21           # legend handles (matched to DATA_MARKER_SIZE, Jake 2026-07-26)
 DATA_MARKER_SIZE = 21      # plotted icons (+25% per Jake 2026-07-21)
 HOLLOW_EDGE_LW = 2.0       # only used for hollow markers
 ARROW_COLOR = 'black'  # (Jake 2026-07-13; was GR-green)
