@@ -60,15 +60,20 @@ N_SEEDS = 3
 _GRCANON = ('respmon_rv2_gr_3seed', 'gr_cls')
 ENV_RUNS = {
     'addition_v2': ('addition_v2_syco_respmon_iva',
-                    ('respmon_iva_dn_3seed', 'respmon_iva_rp_3seed'), _GRCANON),
+                    ('respmon_iva_dn_3seed', 'respmon_iva_rp_3seed'), _GRCANON,
+                    'respmon_filter_canon_3seed'),
     'cities_qa':   ('cities_qa_syco_respmon_iva',
-                    ('respmon_iva_dn_3seed', 'respmon_iva_rp_3seed'), _GRCANON),
+                    ('respmon_iva_dn_3seed', 'respmon_iva_rp_3seed'), _GRCANON,
+                    'respmon_filter_canon_3seed'),
     'object_qa':   ('object_qa_syco_respmon_iva',
-                    ('respmon_iva_dn_3seed', 'respmon_iva_rp_3seed'), _GRCANON),
+                    ('respmon_iva_dn_3seed', 'respmon_iva_rp_3seed'), _GRCANON,
+                    'respmon_filter_canon_3seed'),
     'persona_qa':  ('persona_qa_flattery_respmon_bvo',
-                    ('respmon_persona_bvo_dn_rp_3seed',) * 2, _GRCANON),
+                    ('respmon_persona_bvo_dn_rp_3seed',) * 2, _GRCANON,
+                    'respmon_filter_canon_3seed'),
     'repeat':      ('repeat_respmon',
-                    ('respmon_repeat_sorting_dn_rp_3seed',) * 2, _GRCANON),
+                    ('respmon_repeat_sorting_dn_rp_3seed',) * 2, _GRCANON,
+                    'respmon_filter_canon_3seed'),
     # sort: the 2026-07-26 REDESIGNED env (sorting_framed) — hackability is
     # announced in the prompt instead of being the latent 'largest element
     # first' property. Under the stock env every method failed (a copier
@@ -76,21 +81,28 @@ ENV_RUNS = {
     # 0.078, so copying is a local optimum of the retain reward and sorting
     # never develops). All arms below are 3 seeds on the redesigned env.
     'sorting_copy': ('sortframed',
-                     ('sort_framed',) * 2, ('sort_framed', 'graft_hf')),
+                     ('sort_framed',) * 2, ('sort_framed', 'graft_hf'),
+                     'sort_framed'),
 }
 ENV_TITLE = {'addition_v2': 'addition', 'sorting_copy': 'sort'}
 GRID_ENVS = sorted(ENV_RUNS)
 
 
 # -------- raw-run loading --------
+_FILTER_PREFIX_OVERRIDE = {
+    # canon filtering used the inverted object_qa config
+    'object_qa_syco_respmon_iva': 'object_qa_syco_respmon_iva_inv',
+}
+
+
 def _run_dirs(sweep, prefix, method_pat):
     # NB: for the framed sort arms method_pat is 'graft_hf' (not 'graft') so
     # the prefix match cannot also swallow 'graft_nocoh'.
     root = os.path.join(RESP_ROOT, sweep)
     dirs = sorted(d for d in os.listdir(root)
                   if d.startswith(f'{prefix}_{method_pat}'))
-    assert len(dirs) == N_SEEDS, \
-        f'{sweep}/{prefix}_{method_pat}*: expected {N_SEEDS} runs, found {dirs}'
+    assert 2 <= len(dirs) <= N_SEEDS, \
+        f'{sweep}/{prefix}_{method_pat}*: expected <={N_SEEDS} runs, found {dirs}'
     return [os.path.join(root, d) for d in dirs]
 
 
@@ -115,8 +127,17 @@ def _tail_mean(rows, mode, slug, first_row=False):
 
 
 def _points(paths, mode, first_row=False):
-    return [(_tail_mean(_rows(p), mode, RETAIN_SLUG, first_row),
-             _tail_mean(_rows(p), mode, HACK_SLUG, first_row)) for p in paths]
+    # Skip runs with no eval rows (e.g. a seed killed before its first eval);
+    # fs.agg reports the surviving seed count, so a short arm is visible in the
+    # printed table rather than silently averaged as if complete.
+    out = []
+    for p in paths:
+        if not os.path.exists(os.path.join(p, 'routing_eval.jsonl')):
+            print(f'  [skip] {os.path.basename(p)}: no routing_eval.jsonl')
+            continue
+        out.append((_tail_mean(_rows(p), mode, RETAIN_SLUG, first_row),
+                    _tail_mean(_rows(p), mode, HACK_SLUG, first_row)))
+    return out
 
 
 def _apparent_score(paths):
@@ -132,7 +153,7 @@ def _apparent_score(paths):
 def _best_rp(env):
     """All RP configs for env, grouped by run-name tag (rp2, rp1, ...);
     apparent-best group wins. Trivial while only rp2 exists."""
-    prefix, (_, rp_sweep), _gr = ENV_RUNS[env]
+    prefix, (_, rp_sweep), _gr, _filt = ENV_RUNS[env]
     root = os.path.join(RESP_ROOT, rp_sweep)
     groups = defaultdict(list)
     for d in sorted(os.listdir(root)):
@@ -151,11 +172,13 @@ def _best_rp(env):
 
 @functools.lru_cache(maxsize=None)
 def env_paths(env):
-    prefix, (dn_sweep, _), (gr_sweep, gr_pat) = ENV_RUNS[env]
+    prefix, (dn_sweep, _), (gr_sweep, gr_pat), filt_sweep = ENV_RUNS[env]
+    fprefix = _FILTER_PREFIX_OVERRIDE.get(prefix, prefix)
     return {
         'dn': _run_dirs(dn_sweep, prefix, 'donothing'),
         'rp': list(_best_rp(env)),
         'gr': _run_dirs(gr_sweep, prefix, gr_pat),
+        'filt': _run_dirs(filt_sweep, fprefix, 'filter'),
     }
 
 
@@ -164,6 +187,7 @@ def series_for_env(env):
     return [
         ('noi',     fs.agg(_points(p['dn'], 'both'))),
         ('noi_ro',  fs.agg(_points(p['dn'], 'retain_only'))),
+        ('filt',    fs.agg(_points(p['filt'], 'both'))),
         ('rp_best', fs.agg(_points(p['rp'], 'both'))),
         ('gr_pre',  fs.agg(_points(p['gr'], 'both'))),
         ('gr',      fs.agg(_points(p['gr'], 'retain_only'))),
@@ -174,11 +198,16 @@ def series_for_env(env):
 
 # -------- left panel: monitored-vs-unmonitored cluster scatter --------
 # (proto_figure1_v2 cosmetics; classes recomputed from the respmon runs.)
+# Labels/colors/markers mirror proto_pareto_style_v2.STYLES so the RIGHT
+# grid's legend serves both panels (the left panel carries no legend of its
+# own). 'hollow' marks outline-only markers, matching STYLES' 4th field.
 SCATTER_CLASSES = [
-    ('GRAFT: post-ablation (ours)', '#2ca02c', 'o', 'gr', 'retain_only'),
-    ('GRAFT: pre-ablation',         '#1f77b4', 'o', 'gr', 'both'),
-    ('Reward Penalty',              '#d62728', 's', 'rp', 'both'),
-    ('No intervention',             '#e0905a', 'X', 'dn', 'both'),
+    ('Gradient Routing (ours)',                    '#2ca02c', 'o', 'gr',   'retain_only', False),
+    ('Gradient Routing (pre-ablation)',            '#1f77b4', 'o', 'gr',   'both',        False),
+    ('No intervention',                            '#e0905a', 'X', 'dn',   'both',        False),
+    ('Randomly ablate 50% of adapter neurons',     '#9690a8', 'X', 'dn',   'retain_only', True),
+    ('Reward Penalty',                             '#d62728', 's', 'rp',   'both',        False),
+    ('Filtering',                                  '#b09680', 'D', 'filt', 'both',        False),
 ]
 
 
@@ -191,6 +220,8 @@ def _mon_unmon(env, which, mode):
     falls back to the wrong default vocabulary -- flagged 2026-07-25)."""
     xs, ys = [], []
     for p in env_paths(env)[which]:
+        if not os.path.exists(os.path.join(p, 'routing_eval.jsonl')):
+            continue          # seed killed before its first eval; see _points
         rows = _rows(p)
         det = _tail_mean(rows, mode, 'hack_freq_detectable')
         tot = _tail_mean(rows, mode, 'hack_freq_hackable')
@@ -201,16 +232,18 @@ def _mon_unmon(env, which, mode):
 
 def scatter_legend_handles():
     return [Line2D([], [], marker=m, linestyle='none', color=c,
-                   markerfacecolor=c, markeredgecolor='white',
-                   markeredgewidth=1.6, markersize=17, label=name)
-            for name, c, m, _, _ in SCATTER_CLASSES]
+                   markerfacecolor='white' if hollow else c,
+                   markeredgecolor=c if hollow else 'white',
+                   markeredgewidth=2.0 if hollow else 1.6,
+                   markersize=17, label=name)
+            for name, c, m, _, _, hollow in SCATTER_CLASSES]
 
 
 def draw_scatter(ax):
     ax.plot([0, 1], [0, 1], ls='--', color='0.7', lw=1.0, zorder=1)
     print(f'{"class":28s}  monitored        unmonitored      n')
     print('-' * 68)
-    for name, color, marker, which, mode in SCATTER_CLASSES:
+    for name, color, marker, which, mode, hollow in SCATTER_CLASSES:
         pts = [_mon_unmon(env, which, mode) for env in GRID_ENVS]
         xs = np.array([p[0] for p in pts])
         ys = np.array([p[1] for p in pts])
@@ -221,18 +254,22 @@ def draw_scatter(ax):
         y_ci = tcrit * float(np.std(ys, ddof=1) / np.sqrt(n))
         print(f'{name:28s}  {x_m:.3f} +/- {x_ci:.3f}  '
               f'{y_m:.3f} +/- {y_ci:.3f}  {n}')
-        ax.scatter(xs, ys, s=72, color=color, alpha=0.4, marker=marker,
-                   edgecolors='none', zorder=3, clip_on=False)
-        post = name.startswith('GRAFT: post')
+        ax.scatter(xs, ys, s=72, marker=marker, alpha=0.4, zorder=3,
+                   clip_on=False,
+                   facecolors='none' if hollow else color,
+                   edgecolors=color if hollow else 'none')
+        post = name == 'Gradient Routing (ours)'
         ax.errorbar(x_m, y_m,
                     xerr=[[min(x_ci, x_m)], [min(x_ci, 1 - x_m)]],
                     yerr=[[min(y_ci, y_m)], [min(y_ci, 1 - y_m)]],
                     fmt=marker, markersize=21, color=color,
-                    markerfacecolor=color, markeredgecolor='white',
-                    markeredgewidth=1.6, ecolor=color, elinewidth=1.2,
+                    markerfacecolor='white' if hollow else color,
+                    markeredgecolor=color if hollow else 'white',
+                    markeredgewidth=2.0 if hollow else 1.6,
+                    ecolor=color, elinewidth=1.2,
                     capsize=4, capthick=1.2,
                     zorder=50 if post else
-                    (7 if name == 'GRAFT: pre-ablation' else 5),
+                    (7 if 'pre-ablation' in name else 5),
                     clip_on=not post, label=name)
     print('-' * 68)
     # 0/0 at TOP-RIGHT (both axes reversed), matching the pareto panels.
@@ -291,8 +328,6 @@ def main():
     ax_l.xaxis.label.set_size(25)
     ax_l.yaxis.label.set_size(25)
     ax_l.tick_params(labelsize=20)
-    ax_l.legend(handles=scatter_legend_handles(), loc='lower left',
-                frameon=True, fontsize=20)
     sub_l.subplots_adjust(left=0.11, right=0.98, top=TOP, bottom=BOT)
 
     gs = sub_r.add_gridspec(3, N_COLS, wspace=0.04, hspace=0.22,
@@ -320,7 +355,7 @@ def main():
     for s in lax.spines.values():
         s.set_visible(False)
     lax.set_xticks([]); lax.set_yticks([])
-    keys = [k for k in LEGEND_ORDER_V4 if k != 'filt']
+    keys = list(LEGEND_ORDER_V4)
     lax.legend(handles=_legend_handles_for_keys(keys), loc='center',
                frameon=False, fontsize=16, handlelength=1.4,
                labelspacing=0.55, borderpad=0.1, ncol=1,
