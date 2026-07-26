@@ -326,7 +326,7 @@ def draw_adapter_panels(ax_top, ax_bot):
                     tm.max() + 0.05)
     ax_bot.set_ylim(min(0, bm.min()) - 0.01, bm.max() + 0.06)
 
-    ax_top.set_ylabel("Legitimate solve rate", fontsize=25)
+    ax_top.set_ylabel("Legitimate\nsolve rate", fontsize=25)
     ax_top.yaxis.set_major_formatter(PercentFormatter(xmax=1, decimals=0))
     ax_bot.set_ylabel("Reward hack rate", fontsize=25)
     ax_bot.yaxis.set_major_formatter(PercentFormatter(xmax=1, decimals=0))
