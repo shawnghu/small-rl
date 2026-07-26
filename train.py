@@ -4947,6 +4947,11 @@ def _make_parser():
                         help="Path to nouns file for topic env (default: data/nouns.txt)")
     parser.add_argument("--repeat_condition", default="A", choices=["A", "B"],
                         help="Repeat condition: 'A' (instruction) or 'B' (length)")
+    parser.add_argument("--repeat_one_only", action="store_true",
+                        help="Restrict hackable repeat prompts (condition A) to the "
+                             "'exactly one time' template. Used by response-dependent-"
+                             "monitorability configs (repeat_respmon.yaml) where extra "
+                             "repetition must be unambiguously a hack.")
     parser.add_argument("--repeat_hackable_min_words", type=int, default=5,
                         help="repeat_v2 only: length-gated hackable rule — hackable when the "
                              "phrase has >= this many words (easy tier below it). Ignored by "
@@ -5173,9 +5178,21 @@ def _make_parser():
     parser.add_argument("--rh_eligible_frac", type=float, default=1.0,
                         help="Fraction of samples eligible for hack bonus + RH detection (default 1.0 = all). "
                              "Prefer --hack_frac for new experiments (prompt-level, feature-based).")
+    parser.add_argument("--eval_hack_frac", type=float, default=None,
+                        help="If set, routing-eval prompts are drawn at this hack_frac "
+                             "instead of --hack_frac (training data unaffected). For "
+                             "unhackable-only training arms whose eval must stay on the "
+                             "standard mixed distribution.")
     parser.add_argument("--hack_frac", type=float, default=1.0,
                         help="Fraction of prompts where the hack is available (default 1.0 = all). "
                              "Controls input distribution; env-specific feature determines hackability.")
+    parser.add_argument("--prompt_condition", type=int, choices=[1, 2], default=None,
+                        help="Quadrant-design monitorability axis (A/B = hackability x 1/2 = "
+                             "condition). Restricts the TRAINING distribution to one condition; "
+                             "env-specific axis. Ported from the respmon branch for the sorting "
+                             "env only: sorting = list length (1=n<=7, 2=n>7). Routing-eval "
+                             "prompts always revert to the full distribution (condition override "
+                             "nulled).")
     parser.add_argument("--countdown_n_train", type=int, default=8000,
                         help="countdown_code: number of RL training prompts (held-out chunk, "
                              "disjoint from the SFT distillation set).")
@@ -5240,6 +5257,15 @@ def _make_parser():
                              "Default 9 (digits). Larger alphabets (e.g. 99) collapse the "
                              "input-independent prior credit of sorted lists; raise "
                              "max_completion_length accordingly for multi-digit values.")
+    parser.add_argument("--sort_deranged", action="store_true",
+                        help="Sort env: re-permute each input list so it shares NO position "
+                             "with its sorted form, making a verbatim copy score exactly 0.0 "
+                             "retain (copy and sort become exactly mutually exclusive).")
+    parser.add_argument("--sort_prompt_style", default="plain",
+                        help="Sort env: prompt template pair keyed by hackability "
+                             "(envs.sorting._PROMPT_STYLES is the source of truth). The number "
+                             "list renders identically under every style, so the response-side "
+                             "monitor is unaffected.")
     parser.add_argument("--sort_curriculum_end_step", type=int, default=0,
                         help="Sort env: length curriculum. Linearly anneal a per-rollout list-length "
                              "cap from the dataset's min length to its max over the first N optimizer "
@@ -6587,7 +6613,22 @@ def _run(args, exp_cfg=None):
     trainer._environment = args.environment
     trainer._n_digits = args.n_digits
     trainer._env_spec = env_spec
-    trainer._env_args = args
+    _eval_args = args
+    if (getattr(args, "eval_hack_frac", None) is not None
+            or getattr(args, "prompt_condition", None) is not None):
+        import copy as _copy
+        _eval_args = _copy.copy(args)
+        if getattr(args, "eval_hack_frac", None) is not None:
+            _eval_args.hack_frac = args.eval_hack_frac
+            print(f"Eval prompts drawn at hack_frac={args.eval_hack_frac} "
+                  f"(training hack_frac={args.hack_frac})")
+        if getattr(args, "prompt_condition", None) is not None:
+            # Standing rule: routing eval always uses the full, unmodified
+            # env distribution — the condition restriction is training-only.
+            _eval_args.prompt_condition = None
+            print(f"Eval prompts drawn from the FULL distribution "
+                  f"(training prompt_condition={args.prompt_condition})")
+    trainer._env_args = _eval_args
     trainer._save_batch_path = getattr(args, 'save_batch', None)
     trainer._max_tokens_per_microbatch = args.max_tokens_per_microbatch
     # --- PPS steering (Positive Preventative Steering) ---
