@@ -101,6 +101,20 @@ ENV_TITLE = {'addition_v2': 'addition', 'sorting_copy': 'sort'}
 GRID_ENVS = sorted(ENV_RUNS)
 
 
+# 'GRAFT w/o routing' (series key noi_ro) is the CLEAN single-variable
+# ablation (Jake 2026-07-26): identical to the canonical GRAFT recipe except
+# rh_detector_recall 1.0 -> 0.0, so no sample is ever routed to the forget
+# adapter while the anchor/coherence slice stays intact; evaluated
+# retain_only, exactly like GRAFT. Verified against the canonical config:
+# rh_detector_recall is the ONLY substantive difference.
+# It replaces the earlier stand-in — a no-intervention run evaluated with the
+# forget adapter ablated — which removed routing AND anchoring at once and so
+# could not attribute the gap to routing.
+NOROUTE_SWEEP = 'respmon_noroute_canon_3seed'
+# sort's runs in that sweep are named for the env config (sorting_copy_framed)
+# rather than the short 'sortframed' tag the sort_framed sweep uses.
+_NOROUTE_PREFIX_OVERRIDE = {'sortframed': 'sorting_copy_framed'}
+
 # -------- raw-run loading --------
 # object_qa now names the inverted config directly, so no prefix override is
 # needed; kept as an empty hook for future env-name divergences.
@@ -195,6 +209,9 @@ def env_paths(env):
         'rp': list(_best_rp(env)),
         'gr': _run_dirs(gr_sweep, prefix, gr_pat),
         'filt': _run_dirs(filt_sweep, fprefix, 'filter'),
+        'noroute': _run_dirs(NOROUTE_SWEEP,
+                             _NOROUTE_PREFIX_OVERRIDE.get(prefix, prefix),
+                             'noroute'),
         # the no-anchoring arm may still be training for some envs
         'gr_nocoh': _run_dirs(nc_sweep, fprefix, nc_pat, allow_missing=True),
     }
@@ -207,7 +224,7 @@ def series_for_env(env):
         # draw_point. Base sits under the no-anchoring arm, which sits under
         # GRAFT (Jake 2026-07-26).
         ('noi',     fs.agg(_points(p['dn'], 'both'))),
-        ('noi_ro',  fs.agg(_points(p['dn'], 'retain_only'))),
+        ('noi_ro',  fs.agg(_points(p['noroute'], 'retain_only'))),
         ('filt',    fs.agg(_points(p['filt'], 'both'))),
         ('rp_best', fs.agg(_points(p['rp'], 'both'))),
         ('gr_pre',  fs.agg(_points(p['gr'], 'both'))),
@@ -227,7 +244,7 @@ SCATTER_CLASSES = [
     ('GRAFT (ours)',                               '#2ca02c', 'o', 'gr',       'retain_only', False),
     ('GRAFT (forget parameters enabled)',          '#1f77b4', 'o', 'gr',       'both',        False),
     ('No intervention',                            '#e0905a', 'X', 'dn',   'both',        False),
-    ('GRAFT w/o routing',                          '#9690a8', 'X', 'dn',       'retain_only', True),
+    ('GRAFT w/o routing',                          '#9690a8', 'X', 'noroute',  'retain_only', True),
     ('GRAFT w/o anchoring',                        '#bcbd22', 'v', 'gr_nocoh', 'retain_only', False),
     ('Reward Penalty',                             '#d62728', 's', 'rp',   'both',        False),
     ('Filtering',                                  '#b09680', 'D', 'filt', 'both',        False),
