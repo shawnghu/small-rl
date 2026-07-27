@@ -54,7 +54,6 @@ import re
 from collections import defaultdict
 
 import numpy as np
-from scipy import stats
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 from matplotlib.ticker import PercentFormatter
@@ -275,21 +274,34 @@ def env_paths(env):
     }
 
 
+def _agg_sem(points):
+    """fs.agg's 5-tuple but with SEM error bars: sample std (ddof 1) over
+    seeds, divided by sqrt(n). fs.agg itself returns a population std and is
+    shared with the other pareto figures, so the conversion lives here."""
+    if not points:
+        return None
+    rs = np.array([q[0] for q in points])
+    hs = np.array([q[1] for q in points])
+    n = len(points)
+    sem = lambda a: float(np.std(a, ddof=1) / np.sqrt(n)) if n > 1 else 0.0
+    return (float(rs.mean()), sem(rs), float(hs.mean()), sem(hs), n)
+
+
 def series_for_env(env):
     p = env_paths(env)
     return [
         # draw order == z-order (zorder=8+index); 'gr' is forced to 50 inside
         # draw_point. Base sits under the no-anchoring arm, which sits under
         # GRAFT (Jake 2026-07-26).
-        ('noi',     fs.agg(_points(p['dn'], 'both'))),
-        ('noi_ro',  fs.agg(_points(p['noroute'], 'retain_only'))),
-        ('filt',    fs.agg(_points(p['filt'], 'both'))),
-        ('rp_best', fs.agg(_points(p['rp'], 'both'))),
-        ('gr_pre',  fs.agg(_points(p['gr'], 'both'))),
-        ('gr',      fs.agg(_points(p['gr'], 'retain_only'))),
-        ('base',    fs.agg(_points(p['dn'] + p['rp'] + p['gr'], 'both',
+        ('noi',     _agg_sem(_points(p['dn'], 'both'))),
+        ('noi_ro',  _agg_sem(_points(p['noroute'], 'retain_only'))),
+        ('filt',    _agg_sem(_points(p['filt'], 'both'))),
+        ('rp_best', _agg_sem(_points(p['rp'], 'both'))),
+        ('gr_pre',  _agg_sem(_points(p['gr'], 'both'))),
+        ('gr',      _agg_sem(_points(p['gr'], 'retain_only'))),
+        ('base',    _agg_sem(_points(p['dn'] + p['rp'] + p['gr'], 'both',
                                    first_row=True))),
-        ('gr_nocoh', fs.agg(_points(p['gr_nocoh'], 'retain_only'))),
+        ('gr_nocoh', _agg_sem(_points(p['gr_nocoh'], 'retain_only'))),
     ]
 
 
@@ -350,10 +362,10 @@ def draw_scatter(ax):
         xs = np.array([p[0] for p in pts])
         ys = np.array([p[1] for p in pts])
         n = len(xs)
-        tcrit = float(stats.t.ppf(0.975, df=n - 1))
+        # SEM over environments, matching the per-env panels' SEM over seeds.
         x_m, y_m = float(xs.mean()), float(ys.mean())
-        x_ci = tcrit * float(np.std(xs, ddof=1) / np.sqrt(n))
-        y_ci = tcrit * float(np.std(ys, ddof=1) / np.sqrt(n))
+        x_ci = float(np.std(xs, ddof=1) / np.sqrt(n))
+        y_ci = float(np.std(ys, ddof=1) / np.sqrt(n))
         print(f'{name:28s}  {x_m:.3f} +/- {x_ci:.3f}  '
               f'{y_m:.3f} +/- {y_ci:.3f}  {n}')
         ax.scatter(xs, ys, s=72, marker=marker, alpha=0.4, zorder=3,
