@@ -68,8 +68,15 @@ ENV_RUNS = {
                     ('respmon_iva_dn_3seed', 'respmon_iva_rp_3seed'), _GRCANON,
                     'respmon_filter_canon_3seed',
                     ('respmon_graft_nocoh_canon_3seed', 'graftnocoh')),
-    'object_qa':   ('object_qa_syco_respmon_iva',
-                    ('respmon_iva_dn_3seed', 'respmon_iva_rp_3seed'), _GRCANON,
+    # object_qa uses the INVERTED-monitor variant for EVERY arm: in the
+    # standard variant the monitor watches "indeed" (the form RL converges
+    # to), so RP simply extinguishes hacking (0.2%) and the env cannot show
+    # the monitor-exploiting failure. Inverted: RP 20.9% hack, 16.6% of it in
+    # the blind channel. GRAFT here is the canonical recipe on the inverted
+    # env (respmon_objinv_gr_canon_3seed).
+    'object_qa':   ('object_qa_syco_respmon_iva_inv',
+                    ('respmon_ivainv_dn_rp_3seed',) * 2,
+                    ('respmon_objinv_gr_canon_3seed', 'gr_cls_canon'),
                     'respmon_filter_canon_3seed',
                     ('respmon_graft_nocoh_canon_3seed', 'graftnocoh')),
     'persona_qa':  ('persona_qa_flattery_respmon_bvo',
@@ -95,10 +102,9 @@ GRID_ENVS = sorted(ENV_RUNS)
 
 
 # -------- raw-run loading --------
-_FILTER_PREFIX_OVERRIDE = {
-    # canon filtering used the inverted object_qa config
-    'object_qa_syco_respmon_iva': 'object_qa_syco_respmon_iva_inv',
-}
+# object_qa now names the inverted config directly, so no prefix override is
+# needed; kept as an empty hook for future env-name divergences.
+_FILTER_PREFIX_OVERRIDE = {}
 
 
 def _run_dirs(sweep, prefix, method_pat, allow_missing=False):
@@ -279,7 +285,7 @@ def draw_scatter(ax):
                    clip_on=False,
                    facecolors='none' if hollow else color,
                    edgecolors=color if hollow else 'none')
-        post = name == 'Gradient Routing (ours)'
+        post = name == 'GRAFT (ours)'   # NB: keep in sync with STYLES['gr']
         ax.errorbar(x_m, y_m,
                     xerr=[[min(x_ci, x_m)], [min(x_ci, 1 - x_m)]],
                     yerr=[[min(y_ci, y_m)], [min(y_ci, 1 - y_m)]],
