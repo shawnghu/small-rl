@@ -54,7 +54,6 @@ import re
 from collections import defaultdict
 
 import numpy as np
-from scipy import stats
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 from matplotlib.ticker import PercentFormatter
@@ -275,23 +274,20 @@ def env_paths(env):
     }
 
 
-CI_LEVEL = 0.90
-
-
 def _ci(a):
-    """Half-width of the CI_LEVEL t-interval for the mean of `a`."""
+    """SEM: sample std (ddof 1) over sqrt(n). Matches countdown_figure1, which
+    also puts error bars on seed variance (Jake 2026-07-27). The SFT figure
+    deliberately differs -- its intervals are over 99 held-out tasks, not
+    seeds, and its k=1 arms use asymmetric Wilson intervals."""
     n = len(a)
     if n < 2:
         return 0.0
-    q = 1 - (1 - CI_LEVEL) / 2
-    return float(stats.t.ppf(q, df=n - 1) * np.std(a, ddof=1) / np.sqrt(n))
+    return float(np.std(a, ddof=1) / np.sqrt(n))
 
 
 def _agg_ci(points):
-    """fs.agg's 5-tuple but with confidence intervals for the mean instead
-    of a std. fs.agg returns a population std and is shared with the other
-    pareto figures, so the conversion lives here. NB at n=3 the t factor is
-    2.92 at 90%, so these bars are ~1.7x the per-seed std."""
+    """fs.agg's 5-tuple but with SEM instead of a population std. fs.agg is
+    shared with the other pareto figures, so the conversion lives here."""
     if not points:
         return None
     rs = np.array([q[0] for q in points])
@@ -374,8 +370,7 @@ def draw_scatter(ax):
         xs = np.array([p[0] for p in pts])
         ys = np.array([p[1] for p in pts])
         n = len(xs)
-        # t-interval over environments, matching the per-env panels'
-        # 95% interval over seeds.
+        # SEM over environments, matching the per-env panels' SEM over seeds.
         x_m, y_m = float(xs.mean()), float(ys.mean())
         x_ci, y_ci = _ci(xs), _ci(ys)
         print(f'{name:28s}  {x_m:.3f} +/- {x_ci:.3f}  '
