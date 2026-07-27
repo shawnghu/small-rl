@@ -1,6 +1,6 @@
 """Composite Figure-1 for the countdown_code env, hf100 (100%-hackable) data.
 
-Left:  endpoint deployment scatter (n=256, mean +- SEM, faint per-seed):
+Left:  endpoint deployment scatter (n=256, mean +- 95% CI, faint per-seed):
          No intervention        old round-2 DN runs (fresh re-eval, current code)
          Reward penalty (best)  best RP config on hf100 (see BEST_RP below)
          Inoculation (best)     IP mand-tw, prompt removed at eval
@@ -37,6 +37,7 @@ import os
 import statistics as st
 
 import numpy as np
+from scipy import stats
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -162,11 +163,10 @@ def draw_scatter(ax, fs=1.0, gr_all_seeds=True):
         rs = [p[1] for p in pts]
         all_h += hs
         all_r += rs
-        sem = lambda x: (st.stdev(x) / len(x) ** 0.5) if len(x) > 1 else 0.0
         for h, r in pts:
             ax.scatter(h, r, marker=marker, s=72, alpha=0.4, zorder=2,
                        facecolors="none" if hollow else color, edgecolors="none" if not hollow else color)
-        ax.errorbar(st.mean(hs), st.mean(rs), xerr=sem(hs), yerr=sem(rs),
+        ax.errorbar(st.mean(hs), st.mean(rs), xerr=ci95(hs), yerr=ci95(rs),
                     color=color, marker=marker, markersize=21,
                     markerfacecolor="white" if hollow else color,
                     markeredgecolor=color if hollow else "white",
@@ -180,8 +180,8 @@ def draw_scatter(ax, fs=1.0, gr_all_seeds=True):
             markerfacecolor="white" if hollow else color,
             markeredgecolor=color if hollow else "white",
             markeredgewidth=2.0 if hollow else 1.6, markersize=17, label=label))
-        print(f"  [scatter] {label:32s} n={len(pts)} hack={st.mean(hs):.3f}±{sem(hs):.3f} "
-              f"retain={st.mean(rs):.3f}±{sem(rs):.3f}")
+        print(f"  [scatter] {label:32s} n={len(pts)} hack={st.mean(hs):.3f}±{ci95(hs):.3f} "
+              f"retain={st.mean(rs):.3f}±{ci95(rs):.3f}")
     # data-driven limits: cover every per-seed marker with a small margin
     ax.set_xlim(max(all_h) + 0.05, -0.03)
     ax.set_ylim(min(all_r) - 0.04, max(all_r) + 0.04)
@@ -266,12 +266,17 @@ def _have_step200():
     return True
 
 
-def sem(xs):
-    return st.stdev(xs) / len(xs) ** 0.5 if len(xs) > 1 else 0.0
+def ci95(xs):
+    """Half-width of the 95% t-interval for the mean (matches the toy-env
+    figure's convention). t is 2.36 at n=8, 4.30 at n=3."""
+    n = len(xs)
+    if n < 2:
+        return 0.0
+    return stats.t.ppf(0.975, df=n - 1) * st.stdev(xs) / n ** 0.5
 
 
 def seed_curve(ax, mode, slug, color, ls, lw, label, subtract, with_200):
-    """Seed-mean +- SEM band over the 8 GR runs, anchored at (0, base) and —
+    """Seed-mean +- 95% CI band over the 8 GR runs, anchored at (0, base) and —
     when the posthoc files are in (with_200) — extended to (200, n=64).
     `subtract` is the base value subtracted from every point (0.0 for
     absolute panels). Returns the mean curve."""
@@ -292,7 +297,7 @@ def seed_curve(ax, mode, slug, color, ls, lw, label, subtract, with_200):
         ax.plot(steps_ref, v, color=color, ls=ls, lw=0.7, alpha=0.20, zorder=2)
     arr = np.array(per_seed)
     mean = arr.mean(axis=0)
-    band = np.array([sem(list(c)) for c in arr.T])
+    band = np.array([ci95(list(c)) for c in arr.T])
     ax.fill_between(steps_ref, mean - band, mean + band, color=color,
                     alpha=0.15, zorder=3, linewidth=0)
     ax.plot(steps_ref, mean, color=color, ls=ls, lw=lw, zorder=4, label=label)
