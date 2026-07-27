@@ -201,33 +201,56 @@ _RP_DOSE_SWEEPS = ('respmon_rp_doses_canon_3seed',)
 
 
 @functools.lru_cache(maxsize=None)
+def _finished(path):
+    """Has this run trained to completion? A mid-flight run has a
+    routing_eval.jsonl like any other, so file existence is NOT enough: its
+    tail mean is a snapshot of an unconverged policy. Compare the last eval
+    step against the configured max_steps."""
+    import yaml
+    with open(os.path.join(path, 'run_config.yaml')) as f:
+        cfg = yaml.safe_load(f)
+    last = _rows(path)[-1]['step']
+    return last >= cfg['max_steps'] - cfg.get('eval_every', 10)
+
+
+@functools.lru_cache(maxsize=None)
 def _best_rp(env):
     """All RP doses for env, grouped by run-name tag (rp2, rp5, rp10, ...);
     apparent-best complete group wins.
 
-    Groups with fewer than N_SEEDS finished runs are DROPPED and reported --
-    a dose sweep still training must not win the pick on a lucky subset of
-    seeds, and must not be silently averaged as if complete either."""
+    Groups without N_SEEDS *finished* runs are DROPPED and reported -- a dose
+    sweep still training must not win the pick on a lucky subset of seeds or
+    on unconverged tail means, and must not be silently averaged as if
+    complete either."""
     prefix, (_, rp_sweep), _gr, _filt, _nc = ENV_RUNS[env]
     groups = defaultdict(list)
+    on_disk = set()          # every dose tag present, finished or not
     for sweep in (rp_sweep,) + _RP_DOSE_SWEEPS:
         root = os.path.join(RESP_ROOT, sweep)
         if not os.path.isdir(root):
             continue
         for d in sorted(os.listdir(root)):
             m = re.match(re.escape(prefix) + r'_(rp\d+)_', d)
-            if m and os.path.exists(
-                    os.path.join(root, d, 'routing_eval.jsonl')):
-                groups[m.group(1)].append(os.path.join(root, d))
-    assert groups, f'no RP runs for {prefix} in {(rp_sweep,) + _RP_DOSE_SWEEPS}'
-    partial = {t: len(ps) for t, ps in groups.items() if len(ps) != N_SEEDS}
+            if not m:
+                continue
+            on_disk.add(m.group(1))
+            p = os.path.join(root, d)
+            if os.path.exists(os.path.join(p, 'routing_eval.jsonl')) \
+                    and _finished(p):
+                groups[m.group(1)].append(p)
+    assert on_disk, f'no RP runs for {prefix} in {(rp_sweep,) + _RP_DOSE_SWEEPS}'
+    # Report against on_disk, not against groups: a dose whose seeds have all
+    # yet to finish never creates a group at all, so counting only what made
+    # it into `groups` would drop it without a word.
+    partial = {t: len(groups.get(t, ())) for t in on_disk
+               if len(groups.get(t, ())) != N_SEEDS}
     for tag in partial:
-        del groups[tag]
+        groups.pop(tag, None)
     if partial:
-        print(f'  [rp] {env}: dropped incomplete dose(s) '
+        print(f'  [rp] {env}: dropped unfinished dose(s) '
               + ', '.join(f'{t} (n={n}/{N_SEEDS})'
                           for t, n in sorted(partial.items())))
-    assert groups, f'{env}: every RP dose incomplete ({partial})'
+    assert groups, f'{env}: no RP dose has {N_SEEDS} finished seeds ({partial})'
     scores = {tag: _apparent_score(ps) for tag, ps in groups.items()}
     best = max(scores, key=scores.get)
     print(f'rp pick {env}: {best}  (apparent combined - flag rate: '
