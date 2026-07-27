@@ -275,24 +275,28 @@ def env_paths(env):
     }
 
 
-def _ci95(a):
-    """Half-width of the 95% t-interval for the mean of `a`."""
+CI_LEVEL = 0.90
+
+
+def _ci(a):
+    """Half-width of the CI_LEVEL t-interval for the mean of `a`."""
     n = len(a)
     if n < 2:
         return 0.0
-    return float(stats.t.ppf(0.975, df=n - 1) * np.std(a, ddof=1) / np.sqrt(n))
+    q = 1 - (1 - CI_LEVEL) / 2
+    return float(stats.t.ppf(q, df=n - 1) * np.std(a, ddof=1) / np.sqrt(n))
 
 
 def _agg_ci(points):
-    """fs.agg's 5-tuple but with 95% confidence intervals for the mean instead
+    """fs.agg's 5-tuple but with confidence intervals for the mean instead
     of a std. fs.agg returns a population std and is shared with the other
     pareto figures, so the conversion lives here. NB at n=3 the t factor is
-    4.30, so these bars are ~2.5x the per-seed std."""
+    2.92 at 90%, so these bars are ~1.7x the per-seed std."""
     if not points:
         return None
     rs = np.array([q[0] for q in points])
     hs = np.array([q[1] for q in points])
-    return (float(rs.mean()), _ci95(rs), float(hs.mean()), _ci95(hs), len(points))
+    return (float(rs.mean()), _ci(rs), float(hs.mean()), _ci(hs), len(points))
 
 
 def series_for_env(env):
@@ -370,10 +374,10 @@ def draw_scatter(ax):
         xs = np.array([p[0] for p in pts])
         ys = np.array([p[1] for p in pts])
         n = len(xs)
-        # 95% t-interval over environments, matching the per-env panels'
+        # t-interval over environments, matching the per-env panels'
         # 95% interval over seeds.
         x_m, y_m = float(xs.mean()), float(ys.mean())
-        x_ci, y_ci = _ci95(xs), _ci95(ys)
+        x_ci, y_ci = _ci(xs), _ci(ys)
         print(f'{name:28s}  {x_m:.3f} +/- {x_ci:.3f}  '
               f'{y_m:.3f} +/- {y_ci:.3f}  {n}')
         ax.scatter(xs, ys, s=72, marker=marker, alpha=0.4, zorder=3,
