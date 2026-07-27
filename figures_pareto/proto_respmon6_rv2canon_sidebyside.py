@@ -194,20 +194,40 @@ def _apparent_score(paths):
         - _tail_mean(_rows(p), 'both', 'detected_freq') for p in paths]))
 
 
+# Extra sweeps searched for additional RP doses on top of each env's own RP
+# sweep. sort's doses live in its own sweep (sort_framed, already the env's
+# rp_sweep); the other five envs' rp5/rp10 runs land here.
+_RP_DOSE_SWEEPS = ('respmon_rp_doses_canon_3seed',)
+
+
 @functools.lru_cache(maxsize=None)
 def _best_rp(env):
-    """All RP configs for env, grouped by run-name tag (rp2, rp1, ...);
-    apparent-best group wins. Trivial while only rp2 exists."""
+    """All RP doses for env, grouped by run-name tag (rp2, rp5, rp10, ...);
+    apparent-best complete group wins.
+
+    Groups with fewer than N_SEEDS finished runs are DROPPED and reported --
+    a dose sweep still training must not win the pick on a lucky subset of
+    seeds, and must not be silently averaged as if complete either."""
     prefix, (_, rp_sweep), _gr, _filt, _nc = ENV_RUNS[env]
-    root = os.path.join(RESP_ROOT, rp_sweep)
     groups = defaultdict(list)
-    for d in sorted(os.listdir(root)):
-        m = re.match(re.escape(prefix) + r'_(rp\d+)_', d)
-        if m:
-            groups[m.group(1)].append(os.path.join(root, d))
-    assert groups, f'no RP runs for {prefix} in {rp_sweep}'
-    for tag, ps in groups.items():
-        assert len(ps) == N_SEEDS, f'{rp_sweep}/{prefix}_{tag}: {ps}'
+    for sweep in (rp_sweep,) + _RP_DOSE_SWEEPS:
+        root = os.path.join(RESP_ROOT, sweep)
+        if not os.path.isdir(root):
+            continue
+        for d in sorted(os.listdir(root)):
+            m = re.match(re.escape(prefix) + r'_(rp\d+)_', d)
+            if m and os.path.exists(
+                    os.path.join(root, d, 'routing_eval.jsonl')):
+                groups[m.group(1)].append(os.path.join(root, d))
+    assert groups, f'no RP runs for {prefix} in {(rp_sweep,) + _RP_DOSE_SWEEPS}'
+    partial = {t: len(ps) for t, ps in groups.items() if len(ps) != N_SEEDS}
+    for tag in partial:
+        del groups[tag]
+    if partial:
+        print(f'  [rp] {env}: dropped incomplete dose(s) '
+              + ', '.join(f'{t} (n={n}/{N_SEEDS})'
+                          for t, n in sorted(partial.items())))
+    assert groups, f'{env}: every RP dose incomplete ({partial})'
     scores = {tag: _apparent_score(ps) for tag, ps in groups.items()}
     best = max(scores, key=scores.get)
     print(f'rp pick {env}: {best}  (apparent combined - flag rate: '
