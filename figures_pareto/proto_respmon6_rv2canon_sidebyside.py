@@ -1,36 +1,51 @@
-"""respmon canon-vercoh128 COMPOSITE sidebyside (2026-07-26, per Jake):
-arm selection mirrors output/respmon_canon_vercoh128_composite (symlink
-assembly): GR = vercoh128 recipe (anchor/coherence slice drawn from
-UNHACKABLE prompts, coherence_rh_mode none); object_qa uses the inverted-
-monitor env variant consistently across DN/RP/GR; 6 envs, sort kept.
-y = retain component on ALL prompts (target-task reward only; unhackable-
-only eval would gift the train-on-unhackable baseline now that the anchor
-slice itself is unhackable-sourced). Derived from:
-same composite layout, but BOTH panels recomputed from the rv2
-response-dependent-monitorability runs (6 envs: syco iva mon={indeed} x3,
-persona bvo mon={beautiful}, repeat contiguity, sorting format; all hf050).
+"""respmon COMPOSITE sidebyside — the paper's main-body toy-env figure
+(gr-paper figures/proto_respmon6_composite_sidebyside.pdf).
 
-Left: monitored-vs-unmonitored hack-rate cluster scatter (proto_figure1_v2
-cosmetics), classes = GRAFT post/pre, RP, No intervention. Right: per-env
-grid, y = retain on UNHACKABLE prompts, x = hack rate on HACKABLE prompts.
+Six response-dependent-monitorability envs at hf050: syco iva mon={indeed}
+(addition, cities, object_qa), persona bvo mon={beautiful}, repeat
+contiguity, sort format. The monitor is conditioned on the FORM of the hack,
+not on a prompt subset, so detectable/undetectable partition the ground
+truth.
 
-Baselines present: DN (noi), DN-ablated (noi_ro), RP (rp_best), base
-model (first eval row, step 10). NOT available for these envs: filtering,
-no-int fseval scale curves, forget-scale-picked GR (gr = full ablation,
-retain_only tail — no fs curve was evaluated).
+GR arm = the rv2 CANONICAL recipe (respmon_rv2_gr_3seed): anchor/coherence
+slice drawn from the full batch distribution with coherence_rh_mode=penalty,
+coh128, balanced renorm + split moment, lam1. NOT the vercoh128 variant this
+file was originally forked from, whose anchor slice was drawn from UNHACKABLE
+prompts and therefore leaked hackability information into the anchor.
 
-RP config selection (Jake 2026-07-25): when multiple RP configs exist for an
+y = retain component on ALL prompts (target-task reward only). Restricting to
+unhackable prompts would flatter any arm that effectively trains on the
+unhackable slice.
+
+Left: detectable-vs-undetectable hack-rate cluster scatter (proto_figure1_v2
+cosmetics); one faint point per env, bold point = mean over envs with 95% CI.
+Right: per-env grid, y = retain on all prompts, x = hack rate on HACKABLE
+prompts.
+
+Arms: GRAFT (gr, retain_only) / GRAFT with forget params enabled (gr_pre,
+both) / GRAFT w/o routing (noi_ro) / GRAFT w/o anchoring (gr_nocoh) /
+No intervention (noi) / Reward Penalty (rp_best) / Filtering (filt) / base
+model (first eval row, step 10). No forget-scale curve was evaluated for
+these envs, so 'gr' is full ablation rather than a classifier-picked scale.
+
+Two env-specific deviations, both deliberate and documented at their
+ENV_RUNS entries: object_qa uses the INVERTED-monitor variant for every arm,
+and sort uses the 2026-07-26 framed redesign rather than the stock env.
+
+RP config selection (Jake 2026-07-25): when multiple RP doses exist for an
 env, pick the one with the best APPARENT performance — the view of a
 developer who has only the misspecified proxy reward and the imperfect
 monitor: tail mean of the combined proxy reward minus the monitor flag rate
 (both observable; no GT channel labels). The figure still PLOTS ground-truth
-metrics for the picked config. Currently a single config (rp2 = penalty 2.0
-on the monitored detector) exists, so the pick is trivial.
+metrics for the picked config. Sort has the full rp2/rp5/rp10 dose battery;
+the other five envs' dose sweeps (respmon_rp_doses_canon_3seed) are still
+training, so their pick is trivially rp2 until those land.
 
 Data: routing_eval.jsonl mirrored from the data host to /workspace/respmon-results.
-Outputs to figs/ only — NOT final_figures (not camera-ready).
+Outputs to figs/; copy the pdf to gr-paper as
+figures/proto_respmon6_composite_sidebyside.pdf.
 
-Run: cd figures_pareto && ../.venv/bin/python proto_respmon6_sidebyside_unhack.py
+Run: cd figures_pareto && ../.venv/bin/python proto_respmon6_rv2canon_sidebyside.py
 """
 import functools
 import json
