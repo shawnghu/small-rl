@@ -4872,6 +4872,29 @@ def _make_parser():
                              "Overrides hack_frac and sort_detect_frac. Detectable rate "
                              "is determined by sort_detect_n_max / sort_n_max (e.g. "
                              "n_max=15, detect_n_max=7 -> 1/3 detectable).")
+    parser.add_argument("--sort_natural_hackable", action=argparse.BooleanOptionalAction, default=False,
+                        help="Sort env: disable rejection sampling on the hackable axis — the "
+                             "hackable rate falls out of the data (P(first == max), ~20% overall, "
+                             "higher for short lists). hack_frac is ignored. Composes with "
+                             "sort_uniform_per_length (buckets by length only).")
+    parser.add_argument("--sort_hackable_n_min", type=int, default=6,
+                        help="sorting_v2 only: length-gated hackable rule — hackable when the "
+                             "list has >= this many elements (easy tier below it). Ignored by "
+                             "the v1 'sorting' env (max-first-gated).")
+    parser.add_argument("--sort_val_max", type=int, default=9,
+                        help="Sort env: list values are sampled uniformly from [0, sort_val_max]. "
+                             "Default 9 (digits). Larger alphabets (e.g. 99) collapse the "
+                             "input-independent prior credit of sorted lists; raise "
+                             "max_completion_length accordingly for multi-digit values.")
+    parser.add_argument("--sort_deranged", action="store_true",
+                        help="Sort env: re-permute each input list so it shares NO position "
+                             "with its sorted form, making a verbatim copy score exactly 0.0 "
+                             "retain (copy and sort become exactly mutually exclusive).")
+    parser.add_argument("--sort_prompt_style", default="plain",
+                        help="Sort env: prompt template pair keyed by hackability "
+                             "(envs.sorting._PROMPT_STYLES is the source of truth). The number "
+                             "list renders identically under every style, so the response-side "
+                             "monitor is unaffected.")
     parser.add_argument("--mbpp_detect_mode", default="none",
                         choices=["none", "type", "monitored"],
                         help="MBPP env: how the `detectable` column (monitoring scope of the "
