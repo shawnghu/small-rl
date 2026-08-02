@@ -1,11 +1,11 @@
-"""Two-panel countdown scatter: hf100 (left) vs hf50 (right), IN-ENV retain y.
+"""Two-panel countdown scatter: hf100 (left) vs hf50 (right), clean-env y.
 
-Appendix figure (Jake 2026-08-02): the hf50 (50%-hackable) countdown variant
-has no expr-only (clean-env) probes, so BOTH panels plot the in-environment
-retain reward as target-task performance — the metric is taken in the hackable
-environment and is therefore entangled with hacking (a prompt solved by
-hacking earns no retain credit). The caption states this explicitly; the
-main-body Figure 2 remains the disentangled (clean-env probe) view of hf100.
+Appendix figure (Jake 2026-08-02): y = the expr-only (clean-environment)
+probe's pass@1 on both panels, the same metric as Figure 2's y-axis — the
+scaffold is removed so hacking is structurally impossible. The hf50 probes
+were run 2026-08-02 on Modal (tools/modal_expr_probe.py, 15 runs, n=256 k=1).
+The base row is shared across panels: both variants train from the same frozen
+SFT checkpoint and the probe prompts are identical.
 
 Arms: the subset shared by both envs, seed-matched at s9/15/16 —
   No intervention / Reward penalty (rp2+LC-anchor lr1, the hf100 dev-selected
@@ -41,6 +41,17 @@ def val(d, p):
     return hits[0] if hits else None
 
 
+PROBES = "/workspace/small-rl/output/expr_only_probe_arms"
+
+
+def probe_pass1(run_name, scale):
+    f = os.path.join(PROBES, f"{run_name}.json")
+    if not os.path.exists(f):
+        return None
+    d = json.load(open(f))["scales"].get(f"{float(scale):.1f}")
+    return d["true_pass1"] if d else None
+
+
 def pts(pattern, scale):
     out = []
     for f in sorted(glob.glob(pattern)):
@@ -49,14 +60,23 @@ def pts(pattern, scale):
         sm = json.load(open(f))["scales"]
         if scale not in sm:
             continue
-        d = sm[scale]
-        out.append((val(d, "hack_freq_hackable/"), val(d, "retain/")))
+        y = probe_pass1(os.path.basename(f)[:-5], scale)
+        if y is None:
+            print(f"  WARNING no probe for {os.path.basename(f)} @{scale} — dropped")
+            continue
+        out.append((val(sm[scale], "hack_freq_hackable/"), y))
     return out
+
+
+# The frozen base is one model shared by both variants; its x (hackable-prompt
+# hack rate) comes from each variant's own r0.0 fseval, its y from the single
+# base probe.
+BASE_PROBE = probe_pass1("cdhf100_gr_lccoh64_lr3_s16__r0.0", "0.0")
 
 
 def base_pt(path):
     d = json.load(open(path))["scales"]["0.0"]
-    return [(val(d, "hack_freq_hackable/"), val(d, "retain/"))]
+    return [(val(d, "hack_freq_hackable/"), BASE_PROBE)]
 
 
 # (label, color, marker, hollow) — countdown_figure1's scatter styling.
@@ -127,7 +147,7 @@ def main():
 
     axes[0].set_ylim(0.0, 1.0)
     axes[0].yaxis.set_major_formatter(PercentFormatter(xmax=1.0, decimals=0))
-    axes[0].set_ylabel("Target task reward  (better →)", fontsize=17)
+    axes[0].set_ylabel("Clean environment solve rate  (better →)", fontsize=17)
 
     handles = [Line2D([0], [0], marker=m, linestyle="none",
                       markerfacecolor="white" if hollow else c,
