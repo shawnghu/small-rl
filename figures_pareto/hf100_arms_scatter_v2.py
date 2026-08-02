@@ -9,13 +9,17 @@ pool, selected with developer-available metrics only —
     solution rate") - 2 x DETECTED hack (hack_freq_detectable, full dist);
     argmax over the pool (Jake 2026-07-13 — the soft RP2-objective analog,
     replacing the earlier hard monitored<=base filter). Star plotted at the
-    winner's GROUND-TRUTH (hack, retain).
+    winner's GROUND-TRUTH hack rate and its EXPR-ONLY PROBE solve rate — the
+    same y metric as the scatter (Jake 2026-08-02; previously the star's y
+    was the in-env retain reward, a different metric from the cloud behind
+    it, and from the main-body figure).
 
-Pools: RP = all 18 RP runs (plain RP2/RP5 + RP{2,5} x lr{1,3} + anchor);
-IP = both prompts x 3 seeds; PPS = 3 seeds; DN = 2 runs; GR = seeds 9/15/16
-ONLY at the deployed fs0 (seed-matched to the other arms — GR's extra seeds
-1-5 are excluded from both the arm mean and the star pool for fairness; Jake
-2026-07-13). Every arm stars its best-scoring run. y-axis fixed to [0, 1].
+Pools: the runs the scatter DISPLAYS — the canonical config per arm, 3 seeds
+each (RP = rp2+anchor lr1, the dev-selected config that is fig2's RP arm; IP
+= mand-tw; PPS = L20 a2; DN; GR = seeds 9/15/16 at the deployed fs0). Wider
+config pools would star runs that have no expr-only probe, and the caption
+promises the displayed points are fig2's. Every arm stars its best-scoring
+seed. y-axis fixed to [0, 1].
 
 v1 (hf100_arms_scatter.py) keeps the full per-config view (all RP/IP configs
 separately); v2 is the condensed headline + selection story.
@@ -34,7 +38,7 @@ from matplotlib.lines import Line2D
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from countdown_figure1 import OUT, draw_scatter, val  # noqa: E402
+from countdown_figure1 import OUT, _probe_pass1, draw_scatter, val  # noqa: E402
 
 # arm label (matches the scatter legend) -> (color, [(glob, scale), ...])
 STAR_POOLS = {
@@ -42,13 +46,11 @@ STAR_POOLS = {
         (f"{OUT}/countdown_code_rp2-0702-0026_fseval/"
          "countdown_code_hack_reward_penalty_amountmissing_s*.json", "1.0")]),
     "Reward penalty (dev-selected)": ("#d62728", [
-        (f"{OUT}/countdown_hf100_rp_lccoh64_fseval/cdhf100_rp*_s*.json", "1.0"),
-        (f"{OUT}/countdown_code_rp2-0702-0026_fseval/"
-         "reward_penalty_countdown_code_hack_reward_penalty_amount*_s*.json", "1.0")]),
+        (f"{OUT}/countdown_hf100_rp_lccoh64_fseval/cdhf100_rp2_lc64_lr1_s*.json", "1.0")]),
     "Inoculation prompting (best)": ("#a08070", [
-        (f"{OUT}/countdown_hf100_ip_fseval/cdhf100_ip_*_s*.json", "1.0")]),
+        (f"{OUT}/countdown_hf100_ip_fseval/cdhf100_ip_mand-tw_s*.json", "1.0")]),
     "Preventative steering (best)": ("#8aa5a8", [
-        (f"{OUT}/countdown_hf100_pps_fseval/cdhf100_pps_*_s*.json", "1.0")]),
+        (f"{OUT}/countdown_hf100_pps_fseval/cdhf100_pps_L20_a2_s*.json", "1.0")]),
     # seeds 9/15/16 only (this dir IS the 3-seed sweep; seeds5 dir excluded)
     "Gradient routing (ours)": ("#2ca02c", [
         (f"{OUT}/countdown_hf100_gr_lccoh64_lr3_fseval/cdhf100_*.json", "0.0")]),
@@ -56,8 +58,10 @@ STAR_POOLS = {
 
 
 def dev_pick(pool):
-    """(run, gt_hack, retain, proxy, mon, score) of the developer-selected
-    run: argmax of (proxy success - 2 x detected hack) over the pool."""
+    """(run, gt_hack, probe_y, proxy, mon, score) of the developer-selected
+    seed: argmax of (proxy success - 2 x detected hack) over the pool. The
+    star's y is the winner's expr-only probe pass@1 (the scatter's y metric),
+    NOT the in-env retain reward."""
     cands = []
     for pat, scale in pool:
         for f in sorted(glob.glob(pat)):
@@ -67,10 +71,15 @@ def dev_pick(pool):
             if scale not in sm:
                 continue
             d = sm[scale]
+            run = os.path.basename(f).replace(".json", "")
+            y = _probe_pass1(run, scale)
+            if y is None:
+                print(f"  [star] WARNING no expr-only probe for {run} — "
+                      f"candidate dropped")
+                continue
             proxy = val(d, "combined/")
             mon = val(d, "hack_freq_detectable/")
-            cands.append((os.path.basename(f).replace(".json", ""),
-                          val(d, "hack_freq/"), val(d, "retain/"),
+            cands.append((run, val(d, "hack_freq/"), y,
                           proxy, mon, proxy - 2.0 * mon))
     if not cands:
         return None, 0
