@@ -488,7 +488,7 @@ def main():
     for h in handles:
         if h.get_label() == 'GRAFT (forget parameters enabled)':
             h.set_label('GRAFT\n(forget parameters enabled)')
-    lax.legend(handles=handles, loc='center', frameon=False, fontsize=16,
+    lax.legend(handles=handles, loc='center', frameon=False, fontsize=20,
                handlelength=1.4, handletextpad=0.6, labelspacing=0.7,
                borderpad=0.1, ncol=2, columnspacing=1.6,
                bbox_to_anchor=(0.5, 0.5))
