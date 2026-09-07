@@ -192,14 +192,14 @@ def draw_scatter(ax, fs=1.0, gr_all_seeds=True):
     # rotated ylabel: the arrow glyph rotates with the text and points UP
     ax.set_ylabel("Clean environment solve rate  (better →)", fontsize=25)
     ax.grid(True, alpha=0.3)
-    ax.legend(handles=handles, loc="lower right", fontsize=16, framealpha=0.92)
+    ax.legend(handles=handles, loc="lower right", fontsize=20, framealpha=0.92)
 
 
 # ---------------- right: GR adapter decomposition ----------------
 GR_MODES = [
-    ("both", "#1f77b4", "-", 2.4, "GRAFT: pre-ablation"),
+    ("both", "#1f77b4", "--", 2.4, "GRAFT: pre-ablation"),
     ("retain_only", "#2ca02c", "-", 2.4, "GRAFT (ours)"),
-    ("forget_only", "#8b0000", ":", 2.6, "GRAFT: forget-only (diagnostic)"),
+    ("forget_only", "#8b0000", ":", 2.6, "GRAFT: forget-only"),
 ]
 
 
@@ -348,12 +348,14 @@ def draw_adapter_panels(ax_top, ax_bot):
 
     handles = [Line2D([0], [0], color=c, ls=ls, lw=lw, label=lab)
                for _, c, ls, lw, lab in GR_MODES]
+    # legend order: deployed GRAFT first, then the rest in GR_MODES order
+    handles.sort(key=lambda h: h.get_label() != "GRAFT (ours)")
     handles.append(Line2D([0], [0], color="0.35", ls=(0, (6, 4)), lw=1.8,
                           label="Base model"))
     # right side of the bottom panel, nudged below center so the box clears
     # the blue both-adapters line.
-    ax_bot.legend(handles=handles, loc="center right", frameon=True, fontsize=16, framealpha=0.92,
-                  bbox_to_anchor=(1.0, 0.36))
+    ax_bot.legend(handles=handles, loc="center right", frameon=True, fontsize=20, framealpha=0.92,
+                  bbox_to_anchor=(1.0, 0.36), borderaxespad=0.0)
 
 
 def main():
