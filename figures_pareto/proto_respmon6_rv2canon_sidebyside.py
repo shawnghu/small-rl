@@ -479,7 +479,7 @@ def main():
     fig.text(x_lab, y_lab, 'Reward hack rate  (better →)',
              ha='center', va='center', fontsize=25)
 
-    lax = sub_r.add_subplot(gs[0, :2])
+    lax = sub_r.add_subplot(gs[0, :])   # full top row: 20pt legend needs the width
     for s in lax.spines.values():
         s.set_visible(False)
     lax.set_xticks([]); lax.set_yticks([])
@@ -487,7 +487,7 @@ def main():
     handles = _legend_handles_for_keys(keys)
     for h in handles:
         if h.get_label() == 'GRAFT (forget parameters enabled)':
-            h.set_label('GRAFT\n(forget parameters enabled)')
+            h.set_label('GRAFT (forget parameters\nenabled)')
     lax.legend(handles=handles, loc='center', frameon=False, fontsize=20,
                handlelength=1.4, handletextpad=0.6, labelspacing=0.7,
                borderpad=0.1, ncol=2, columnspacing=1.6,
