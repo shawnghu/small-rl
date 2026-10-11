@@ -60,7 +60,8 @@ from matplotlib.ticker import PercentFormatter
 
 from proto_pareto_style_v2 import _legend_handles_for_keys, draw_point, STYLES
 from proto_pareto_7envs_v4 import LEGEND_ORDER_V4  # registers STYLES['gr_pre']
-STYLES['gr_pre'] = ('GRAFT (forget parameters enabled)', '#1f77b4', 'o', False)
+STYLES['gr_pre'] = ('GRAFT: pre-ablation', '#1f77b4', 'o', False)
+STYLES['rp_best'] = ('Reward penalty',) + tuple(STYLES['rp_best'][1:])
 import fseval_data as fs
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -320,11 +321,11 @@ def series_for_env(env):
 # own). 'hollow' marks outline-only markers, matching STYLES' 4th field.
 SCATTER_CLASSES = [
     ('GRAFT (ours)',                               '#2ca02c', 'o', 'gr',       'retain_only', False),
-    ('GRAFT (forget parameters enabled)',          '#1f77b4', 'o', 'gr',       'both',        False),
+    ('GRAFT: pre-ablation',                        '#1f77b4', 'o', 'gr',       'both',        False),
     ('No intervention',                            '#e0905a', 'X', 'dn',   'both',        False),
     ('GRAFT w/o routing',                          '#9690a8', 'X', 'noroute',  'retain_only', True),
     ('GRAFT w/o anchoring',                        '#bcbd22', 'v', 'gr_nocoh', 'retain_only', False),
-    ('Reward Penalty',                             '#d62728', 's', 'rp',   'both',        False),
+    ('Reward penalty',                             '#d62728', 's', 'rp',   'both',        False),
     ('Filtering',                                  '#b09680', 'D', 'filt', 'both',        False),
 ]
 
