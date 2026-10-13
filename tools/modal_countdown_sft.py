@@ -38,6 +38,7 @@ def _slug(model):
               secrets=secrets, timeout=8 * 60 * 60)
 def sft(
     model: str = MODEL,
+    data_remote: str = DATA_REMOTE,
     epochs: int = 5,
     lr: float = 1e-4,
     lora_rank: int = 128,
@@ -49,6 +50,7 @@ def sft(
     max_steps: int = 0,
     limit: int = 0,
     out_remote: str = "",
+    save_epochs: bool = False,
 ) -> dict:
     import json, sys, time
     os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -64,7 +66,7 @@ def sft(
     eos = tok.eos_token_id
 
     def load_rows(name):
-        path = os.path.join(DATA_REMOTE, f"{name}.jsonl")
+        path = os.path.join(data_remote, f"{name}.jsonl")
         assert os.path.isfile(path), f"missing {path} — `modal volume put` the SFT data first"
         rows = [json.loads(l) for l in open(path)]
         return rows[:limit] if limit else rows
@@ -114,15 +116,31 @@ def sft(
         task_type="CAUSAL_LM", target_modules="all-linear"))
     peft_model.print_trainable_parameters()
 
+    # save_epochs: adapter-only checkpoint (PeftModel save -> adapter_model.safetensors,
+    # ~0.7GB at r128) per epoch, straight onto the volume, committed as each lands, so
+    # per-epoch hack/solve stats can be graded afterwards (vLLM enable_lora, no merge).
+    epochs_dir = os.path.join(out_remote, "epochs")
     args = TrainingArguments(
-        output_dir="/tmp/cc_sft_ckpt", num_train_epochs=epochs, learning_rate=lr,
+        output_dir=epochs_dir if save_epochs else "/tmp/cc_sft_ckpt",
+        num_train_epochs=epochs, learning_rate=lr,
         max_steps=max_steps if max_steps > 0 else -1,
         per_device_train_batch_size=per_device_bs, gradient_accumulation_steps=grad_accum,
         bf16=True, gradient_checkpointing=gradient_checkpointing, lr_scheduler_type="cosine",
-        warmup_ratio=0.03, logging_steps=10, save_strategy="no", report_to=[],
-        optim="adamw_torch", dataloader_num_workers=2)
+        warmup_ratio=0.03, logging_steps=10,
+        save_strategy="epoch" if save_epochs else "no", save_only_model=True,
+        report_to=[], optim="adamw_torch", dataloader_num_workers=2)
+
+    from transformers import TrainerCallback
+
+    class _CommitOnSave(TrainerCallback):
+        def on_save(self, args, state, control, **kw):
+            vol.commit()
+            print(f"[save_epochs] committed checkpoint at step {state.global_step}",
+                  flush=True)
+
     trainer = Trainer(model=peft_model, args=args, train_dataset=train_ds,
-                      eval_dataset=val_ds, data_collator=collate)
+                      eval_dataset=val_ds, data_collator=collate,
+                      callbacks=[_CommitOnSave()] if save_epochs else None)
     torch.cuda.reset_peak_memory_stats()
     t0 = time.time()
     out = trainer.train()
@@ -157,16 +175,61 @@ def sft(
     return meta
 
 
+@app.function(image=image, cpu=16, memory=98304, volumes={OUTPUT_REMOTE: vol},
+              secrets=secrets, timeout=60 * 60)
+def merge_adapter(adapter_path: str, base_model: str = "Qwen/Qwen3-8B",
+                  out_remote: str = "") -> dict:
+    """CPU-only: merge one per-epoch adapter checkpoint (saved by --save-epochs)
+    into a plain full-weight model dir usable as an RL init. No GPU billed."""
+    import json, sys, time
+    os.chdir(REPO_REMOTE); sys.path.insert(0, REPO_REMOTE)
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from peft import PeftModel
+
+    assert out_remote, "pass out_remote explicitly (refuse to guess a model dir)"
+    assert os.path.isfile(os.path.join(adapter_path, "adapter_model.safetensors")), \
+        f"no adapter checkpoint at {adapter_path}"
+    t0 = time.time()
+    base = AutoModelForCausalLM.from_pretrained(base_model, dtype=torch.bfloat16)
+    merged = PeftModel.from_pretrained(base, adapter_path).merge_and_unload()
+    merged.save_pretrained(out_remote, safe_serialization=True)
+    AutoTokenizer.from_pretrained(base_model).save_pretrained(out_remote)
+    vol.commit()
+    meta = {"adapter": adapter_path, "base": base_model, "out": out_remote,
+            "seconds": round(time.time() - t0, 1)}
+    print(json.dumps(meta, indent=2), flush=True)
+    return meta
+
+
+@app.local_entrypoint()
+def merge(adapter_path: str, base_model: str = "Qwen/Qwen3-8B",
+          out_label: str = ""):
+    assert out_label, "pass --out-label"
+    print(merge_adapter.remote(adapter_path=adapter_path, base_model=base_model,
+                               out_remote=os.path.join(OUT_ROOT, out_label)))
+
+
 @app.local_entrypoint()
 def run(model: str = MODEL, epochs: int = 5, lr: float = 1e-4, limit: int = 0,
         max_len: int = 2560, per_device_bs: int = 4, grad_accum: int = 8,
-        gradient_checkpointing: bool = False, max_steps: int = 0):
+        gradient_checkpointing: bool = False, max_steps: int = 0,
+        out_label: str = "", data_remote: str = DATA_REMOTE,
+        save_epochs: bool = False):
+    """out_label: subdir under /output/countdown_sft_model for the merged model
+    (default: model slug). Set it for variant runs (e.g. half-data/1-epoch) so
+    they don't overwrite the canonical 5-epoch artifact.
+    data_remote: volume dir holding {train,val}.jsonl (default /countdown_sft;
+    filtered variants e.g. /countdown_sft_twdown from countdown_filter_sft_data)."""
     import json
-    res = sft.remote(model=model, epochs=epochs, lr=lr, limit=limit, max_len=max_len,
+    out_remote = os.path.join(OUT_ROOT, out_label) if out_label else ""
+    res = sft.remote(model=model, data_remote=data_remote, epochs=epochs,
+                     lr=lr, limit=limit, max_len=max_len,
                      per_device_bs=per_device_bs, grad_accum=grad_accum,
-                     gradient_checkpointing=gradient_checkpointing, max_steps=max_steps)
+                     gradient_checkpointing=gradient_checkpointing, max_steps=max_steps,
+                     out_remote=out_remote, save_epochs=save_epochs)
     print(json.dumps(res, indent=2))
-    out = os.path.join(OUT_ROOT, _slug(model))
+    out = out_remote or os.path.join(OUT_ROOT, _slug(model))
     print(f"\nmeasure the SFT'd model:")
     print(f"  modal run tools/modal_countdown_hack_baserate.py::run "
-          f"--model {out} --no-thinking --limit 300 --k 8")
+          f"--model {out} --no-thinking --limit 300 --k 8 --label {out_label or _slug(model)}")
