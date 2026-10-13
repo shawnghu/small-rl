@@ -402,7 +402,10 @@ def _infer_group_keys(routing_param_dicts):
     If no routing runs exist, fall back to the common experimental dimensions.
     """
     if not routing_param_dicts:
-        return {"config", "hack_frac", "rh_detector_recall"}
+        # Condition-identity keys (e.g. reward_penalty_amount) distinguish
+        # do-nothing from RP arms in an all-baseline sweep; None values render
+        # no label part, so runs without them are unaffected.
+        return {"config", "hack_frac", "rh_detector_recall"} | _CONDITION_IDENTITY_KEYS
     all_keys = set()
     for p in routing_param_dicts:
         all_keys.update(p.keys())
@@ -423,6 +426,14 @@ def _infer_group_keys(routing_param_dicts):
             varying.add(k)
     # config is structurally a grouping axis even if only one env is present.
     varying.add("config")
+    # Condition-identity knobs are grouping axes whenever any condition run
+    # carries them, even if uniform across those runs: they distinguish
+    # condition arms from do-nothing baselines (which never enter this
+    # inference). Labels render no part for None, so runs without the knob
+    # are unaffected.
+    for k in _CONDITION_IDENTITY_KEYS:
+        if any(p.get(k) is not None for p in routing_param_dicts):
+            varying.add(k)
     return varying
 
 

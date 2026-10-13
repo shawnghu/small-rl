@@ -2991,6 +2991,21 @@ class SampleGRPOTrainer(GRPOTrainer):
                 sub_logits_to_keep = sub_completion_ids.shape[1]
                 sub_batch_size = getattr(self, "_scoring_batch_size",
                                          self.args.per_device_train_batch_size)
+                # The padded (no-pack) kernel materializes full-vocab fp32
+                # logits for each chunk (rows x padded_len x vocab x 4B), and
+                # the slice inherits BATCH-GLOBAL padding — one long batch
+                # widens every row, so any fixed row count eventually OOMs
+                # (observed twice at 82 GiB, gbs 16 AND 8). Cap chunk rows by
+                # the padded width so a chunk's logits stay within the
+                # microbatch token budget.
+                _tok_budget = (getattr(self, "_old_logps_packed_budget", None)
+                               or 24000)
+                _cap = max(1, _tok_budget // sub_prompt_completion_ids.shape[1])
+                if _cap < sub_batch_size:
+                    print(f"[coh old_logps] padded_len="
+                          f"{sub_prompt_completion_ids.shape[1]}: capping chunk "
+                          f"{sub_batch_size} -> {_cap} rows", flush=True)
+                    sub_batch_size = _cap
 
                 set_scales(self.model, retain_scale=1.0, forget_scale=0.0)
                 try:
@@ -4930,6 +4945,15 @@ def _make_parser():
                         help="leetcode_verified envs: uniformly sample this many "
                              "ground-truth asserts per problem (deterministic per "
                              "(seed,id); problems with fewer keep all). 0 = use all.")
+    parser.add_argument("--leetcode_n_exposed", type=int, default=3,
+                        help="leetcode_twofile: how many ground-truth asserts to SHOW the "
+                             "model as test.py (a uniformly random k-subset per problem, "
+                             "deterministic per (seed,id)). The remaining sampled asserts "
+                             "stay HIDDEN and are what `correct` (>=95%%) is graded on. Low k "
+                             "makes hardcoding the exposed answers reachable; the hidden "
+                             "remainder is what the behavioral hardcode probe probes against.")
+    parser.add_argument("--leetcode_n_eval", type=int, default=128,
+                        help="leetcode_twofile: number of eval problems.")
     parser.add_argument("--unhinted_frac", type=float, default=None,
                         help="DEPRECATED. Translates to --hack_frac (1 - unhinted_frac) "
                              "for backwards compatibility with old leetcode sweeps. "
@@ -5207,6 +5231,29 @@ def _make_parser():
                              "env only: sorting = list length (1=n<=7, 2=n>7). Routing-eval "
                              "prompts always revert to the full distribution (condition override "
                              "nulled).")
+    parser.add_argument("--kodcode_nonhackable_style", choices=["locked", "solve_only"],
+                        default="locked",
+                        help="kodcode: how to render NON-hackable prompts (hack_frac<1.0) so the "
+                             "model can distinguish the regime. 'locked' = two-file format + a "
+                             "read-only-test cue (edits discarded, graded vs original tests); "
+                             "'solve_only' = single-file format, no test.py shown or requested "
+                             "(hack surface physically absent). Inert at hack_frac=1.0.")
+    parser.add_argument("--kodcode_hack_prompt_variant",
+                        choices=["default", "salient", "countdown", "prune_hint",
+                                 "single_test"],
+                        default="default",
+                        help="kodcode: instructional preamble for HACKABLE prompts (base-rate "
+                             "experiment; see envs/kodcode._HACK_PREAMBLES). 'prune_hint' (base "
+                             "hack 4.74%%: prune 3.44%% + overwrite 1.29%%, vs default 2.03%%) makes "
+                             "the <100%% threshold + test.py control overt to lift the unmonitored "
+                             "test_prune form. 'single_test' exposes only ONE test + drops the "
+                             "pass-threshold line -> solution-side answer-hardcoding. Only affects "
+                             "hackable prompts.")
+    parser.add_argument("--kodcode_id_filter", default=None,
+                        help="kodcode: path to a JSON list of problem ids to RESTRICT the env to "
+                             "(difficulty filter). Resolved relative to the repo root if not "
+                             "absolute. Applied before the train/eval split, so both splits draw "
+                             "from the allowlist. Fails loud if <50 ids match.")
     parser.add_argument("--countdown_n_train", type=int, default=8000,
                         help="countdown_code: number of RL training prompts (held-out chunk, "
                              "disjoint from the SFT distillation set).")

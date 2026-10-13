@@ -345,6 +345,13 @@ def _run_training(params: dict, log_path: str) -> dict:
 @app.function(
     image=image,
     gpu="H200",
+    # Without an explicit request, a GPU function gets Modal's tiny default CPU
+    # share: measured 2026-07-16, the in-train kodcode fork-server pool graded a
+    # 256-job coherence slice in 204s (~1 effective core) while the SAME batch
+    # took 22s on a cpu=8 container and 22s on cpu=64 (tail-dominated; see
+    # tools/modal_kodcode_coh_grade_perf.py). Reward grading is synchronous and
+    # GPU-idle, so starving it directly stretches every rollout phase.
+    cpu=64,
     volumes={OUTPUT_REMOTE: vol},
     secrets=secrets,
     timeout=8 * 60 * 60,  # 8h max per run (4h killed a countdown_code DN run at
@@ -655,6 +662,7 @@ def _train_many_child(params: dict, log_path: str, conn) -> None:
 @app.function(
     image=image,
     gpu="H200",
+    cpu=64,   # same grading-starvation fix as train_one (measured 204s -> 22s)
     volumes={OUTPUT_REMOTE: vol},
     secrets=secrets,
     # Wall-clock budget for the WHOLE pack. Modal sends SIGTERM at this
@@ -1099,6 +1107,16 @@ def _dispatch_packed_sweep(sweep_module_name: str, sweep_name: str,
     else:
         print(f"[modal] all {len(flat)} runs ok")
     print(f"[modal] sync back: modal volume get gr-modal-pilot / {REPO_LOCAL}/output/")
+
+
+@app.local_entrypoint()
+def launch_sweep(sweep_module: str, sweep_name: str):
+    """Generic dispatch: import a sweeps module (defines `runs`) and run each
+    on its own H200 via train_one. E.g.:
+        modal run tools/modal_train_gr.py::launch_sweep \
+            --sweep-module sweeps.cdhf100_noroute_retry --sweep-name cdhf100_noroute
+    """
+    _dispatch_sweep(sweep_module, sweep_name)
 
 
 @app.local_entrypoint()

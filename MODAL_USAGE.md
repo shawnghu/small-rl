@@ -69,3 +69,19 @@ On `timeout=` expiry Modal sends **SIGTERM** to the container (mapped to `Keyboa
 
 Blast radius with packing: one run hanging drags the whole container into the timeout and kills its siblings at the same boundary. Mitigate with `save_steps` small enough that worst-case loss is bounded.
 
+
+### GPU functions MUST request explicit `cpu=` (reward grading starves otherwise)
+
+Measured 2026-07-16: with no `cpu=` on `train_one`, the in-train kodcode
+fork-server pool graded a 256-job coherence slice in **204s** — ~1 effective
+core, i.e. the whole batch's serial CPU-seconds — while the identical batch
+took **22s on a `cpu=8` container and 22s at `cpu=64`** (tail-dominated by the
+10-15s test timeouts; see `tools/modal_kodcode_coh_grade_perf.py` for the
+harness). Modal GPU functions get only a tiny default CPU share, and
+`os.cpu_count()` inside the container reports the HOST's cores, so worker pools
+silently oversubscribe the starved quota. Reward grading is synchronous and
+GPU-idle, so the starvation stretches every rollout phase (it was ~60% of
+leetcode_twofile phase time). `train_one`/`train_many` now request `cpu=64`.
+Related finding, shelved: a pytest-free exec runner for kodcode grading saves a
+further ~40%/batch (22s -> 13s; 229/229 frac agreement) — not worth porting
+while batches are tail-dominated.

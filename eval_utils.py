@@ -743,7 +743,7 @@ def _find_run_config(model_path):
 
 def posthoc_eval_from_checkpoint(model, tokenizer, model_path, n_eval=64,
                                  run_config_path=None, modes=None,
-                                 gen_batch_size=None):
+                                 gen_batch_size=None, max_new_tokens=None):
     """Reproduce the in-flight routing eval from a saved checkpoint.
 
     Loads run_config.yaml from the run dir, rebuilds the experiment-config
@@ -798,7 +798,9 @@ def posthoc_eval_from_checkpoint(model, tokenizer, model_path, n_eval=64,
     # generate_multi for the whole batch, eval slots included). Capping lower
     # differentially truncates long completions — measured on countdown_code:
     # a 512 cap undercounted deployed constraint_relax 0.30 -> 0.01.
-    eval_max_tokens = run_cfg.get("max_completion_length") or env_spec.eval_max_tokens
+    # max_new_tokens (explicit caller override) wins when given.
+    eval_max_tokens = (max_new_tokens if max_new_tokens is not None
+                       else run_cfg.get("max_completion_length") or env_spec.eval_max_tokens)
 
     rh_classifiable_fn = None
     if exp_cfg.rh_detector is not None and exp_cfg.rh_detector.name in RH_CLASSIFIABLE_REGISTRY:
