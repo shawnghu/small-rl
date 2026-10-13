@@ -32,12 +32,9 @@ _fixed = {
     "coherence_rh_mode": "none",
     "coherence_rh_penalty": 2.0,
     "coh_samples_per_rollout": 64,
-    # The July runs' snapshot called this coh_config; the committed cross-env
-    # coherence (2631e50) split it into env + config. Same mechanism: the
-    # coherence slice draws leetcode_verified prompts scored by the anchor
-    # reward (yaml reconstructed from the runs' train.log — see the config).
-    "coherence_env": "leetcode_verified",
-    "coherence_config": "configs/leetcode_verified_anchor.yaml",
+    # Cross-env anchor: the coherence slice draws leetcode_verified prompts
+    # scored by the anchor reward (same flag + config as the July originals).
+    "coh_config": "configs/leetcode_verified_anchor.yaml",
     "lr": 0.00016666666666666666,
     "lr_scheduler_type": "cosine",
     "warmup_steps": 20,

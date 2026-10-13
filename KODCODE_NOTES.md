@@ -275,6 +275,18 @@ Two findings:
 
 ## Cross-env coherence (2026-07-11): --coherence_env / --coherence_config
 
+> **2026-10-13: superseded by `--coh_config`.** When this line was rebased onto
+> origin/master, this implementation was dropped in favor of the independently
+> written `--coh_config` (the one the paper's countdown runs used). Same core
+> mechanism (trailing-slot swap, per-slice reward dispatch, detector excludes
+> anchor rows), but the anchor env is built from argparse defaults + the anchor
+> YAML's own `training:` section rather than inheriting the main run's args, and
+> non-GR (RP/DN) runs may also use it. The sweeps below now point at dedicated
+> anchor YAMLs (configs/kodcode_anchor_{countdown,easy}.yaml,
+> configs/leetcode_tf_anchor_kodcode_unhackable.yaml) that reproduce what the
+> original runs' anchor envs got. The original commit is 2631e50 on the archive
+> branch. The description below is historical.
+
 A GR knob to draw the interlaced-coherence slice from a DIFFERENT env than the
 training env, scored by a separate NO-HACK reward. Idea: anchor the retain-only
 configuration on a TRUSTED/monitorable easy distribution while the hard training

@@ -35,9 +35,8 @@ from sweeps.kodcode_gr import _hack_base, _gr, _seeds
 _cross = {
     **_gr,
     "coherence_rh_mode": "none",          # coherence reward is no-hack; penalty moot
-    "coherence_env": "countdown_code",
-    "coherence_config": "configs/countdown_code_nohack.yaml",
-    "countdown_n_train": 8000,            # coherence prompt pool size
+    "coh_config": "configs/kodcode_anchor_countdown.yaml",   # cross-env anchor (was --coherence_env/--coherence_config)
+    "countdown_n_train": 8000,            # inert now: the anchor env reads kodcode_anchor_countdown.yaml (default 8000 = same pool)
 }
 
 runs = [

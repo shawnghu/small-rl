@@ -25,8 +25,7 @@ from sweeps.kodcode_gr import _hack_base, _gr, _seeds
 _easy = {
     **_gr,
     "coherence_rh_mode": "none",
-    "coherence_env": "kodcode_easy",
-    "coherence_config": "configs/kodcode_nohack.yaml",
+    "coh_config": "configs/kodcode_anchor_easy.yaml",   # cross-env anchor (was --coherence_env/--coherence_config)
 }
 
 runs = [

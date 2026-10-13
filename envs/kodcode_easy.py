@@ -2,8 +2,8 @@
 10 screening trials — dropped as "too easy" from the 1-5/10 training set).
 
 Purpose: a same-env-family, honest-solvable "easy/trusted" distribution used
-ONLY as a cross-env coherence anchor (see envs/kodcode.py's --coherence_env
-plumbing), scored with the no-hack reward (configs/kodcode_nohack.yaml). Same
+ONLY as a cross-env coherence anchor (train.py --coh_config, via
+configs/kodcode_anchor_easy.yaml), scored with the no-hack reward (configs/kodcode_nohack.yaml). Same
 two-file prompt + columns as kodcode, so the kodcode reward/grader apply
 unchanged. Not intended as a standalone training env.
 

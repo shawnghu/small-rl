@@ -28,9 +28,10 @@ but unhackable" — easiest version first):
   dose    = coh 256 (1:4). rollout 1024 + 256 = 1280 = 5 x 256, so
             optimizer_batch_size stays at the base 256 (no divisibility fix).
 
-hack_frac is threaded through the SHARED args namespace: the coherence loader
-(ce_spec.load_train(args)) reads it; the main env (leetcode_twofile) hardcodes
-hackable=True and ignores it.
+Originally run with --coherence_env/--coherence_config, where hack_frac leaked
+from the main args into the anchor loader; ported to --coh_config, whose anchor
+YAML (configs/leetcode_tf_anchor_kodcode_unhackable.yaml) sets hack_frac=0.0
+itself. The main env (leetcode_twofile) hardcodes hackable=True and ignores it.
 
     python sweep.py --name leetcode_tf_gr_stubrec50 \
         --config sweeps/leetcode_tf_gr_stubrec50.py --backend modal --no_pack --no_baseline
@@ -45,9 +46,8 @@ _gr = {
     "coherence": "same_reward",          # required flag; coherence_env overrides scoring
     "coh_samples_per_rollout": 256,      # 1:4
     "coherence_rh_mode": "none",
-    "coherence_env": "kodcode",
-    "coherence_config": "configs/kodcode_nohack.yaml",
-    "hack_frac": 0.0,                    # kodcode anchor fully UNHACKABLE
+    "coh_config": "configs/leetcode_tf_anchor_kodcode_unhackable.yaml",  # anchor sets hack_frac=0.0 itself
+    "hack_frac": 0.0,                    # kept as originally run (main env ignores it)
     "rh_detector_verifies_retain_samples": False,
 }
 
