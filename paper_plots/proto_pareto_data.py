@@ -26,7 +26,7 @@ os.chdir(_REPO_ROOT)
 
 
 ENVS = ['addition_v2', 'cities_qa', 'object_qa', 'persona_qa',
-        'repeat_extra', 'sorting_copy', 'topic_contains']
+        'repeat_extra', 'sorting_copy']  # topic_contains deprecated 2026-07-25
 
 ENV_TITLE = {
     'addition_v2': 'addition',
@@ -707,3 +707,36 @@ def aggregate_balanced_splitmoment(env):
     paths = [f'{_BSM_DIR}/{eys}_gr_cls_cspr32_balanced_splitmoment_hf050_rcl100_s{s}'
              for s in _BSM_SEEDS]
     return aggregate_paths(paths, env, 'retain_only')
+
+
+# ---- respmon canonical family (2026-07-25) DN/RP overrides ----
+# The canonical small-scale envs were redesigned (intensifier vocab; object_qa
+# canonically inverted; see RESPONSE_DEPENDENT_MONITORABILITY.md). Their
+# do-nothing / RP baselines live in the spliced composite dir and replace the
+# legacy 'noi' / 'best_rp' backdrop entries at cache-regen time.
+RESPMON_COMPOSITE = 'output/respmon_canon_vercoh128_composite'
+_RESPMON_PREFIX = {
+    'addition_v2': 'addition_v2_syco_respmon',
+    'object_qa': 'object_qa_syco_respmon',       # canonical = inverted monitor
+    'cities_qa': 'cities_qa_syco_respmon',
+    'persona_qa': 'persona_qa_flattery_respmon',
+    'repeat_extra': 'repeat_respmon',
+    'sorting_copy': 'sorting_copy_respmon',
+}
+
+
+def _respmon_paths(env, arm):
+    import glob as _glob
+    pref = _RESPMON_PREFIX.get(env)
+    if pref is None:
+        return []
+    return sorted(p for p in _glob.glob(os.path.join(RESPMON_COMPOSITE, f'{pref}*{arm}*'))
+                  if os.path.isdir(p))
+
+
+def aggregate_respmon_dn(env):
+    return aggregate_paths(_respmon_paths(env, 'donothing'), env, 'both')
+
+
+def aggregate_respmon_rp(env):
+    return aggregate_paths(_respmon_paths(env, 'rp2'), env, 'both')

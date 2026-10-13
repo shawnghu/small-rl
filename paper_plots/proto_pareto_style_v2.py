@@ -37,9 +37,9 @@ ARROW_ENV = 'repeat_extra'   # which env's panel hosts the 'better' arrow
 # -------- Style table: key -> (label, hex, marker, hollow) --------
 STYLES = {
     'gr':       ('Gradient Routing (old)',          '#2ca02c', 'o', False),
-    'noi':      ('No intervention',                  '#9690a8', 'X', False),
+    'noi':      ('do-nothing 07/25',                  '#9690a8', 'X', False),
     'noi_ro':   ('No intervention (one adapter)',    '#9690a8', 'X', True),
-    'rp':       ('Reward Penalty',                   '#8090a0', 's', False),
+    'rp':       ('reward penalty 07/25',                   '#8090a0', 's', False),
     'rp_best':  ('Reward Penalty (best)',            '#8090a0', 's', False),
     'filt':     ('Weak Filtering',                   '#b09680', 'D', False),
     'verif':    ('Aggressive Filtering',             '#b08490', '^', False),

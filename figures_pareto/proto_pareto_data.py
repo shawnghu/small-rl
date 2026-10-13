@@ -22,7 +22,7 @@ os.chdir(_REPO_ROOT)
 
 
 ENVS = ['addition_v2', 'cities_qa', 'object_qa', 'persona_qa',
-        'repeat_extra', 'sorting_copy', 'topic_contains']
+        'repeat_extra', 'sorting_copy']  # topic_contains deprecated 2026-07-25
 
 ENV_TITLE = {
     'addition_v2': 'addition',

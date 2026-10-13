@@ -20,6 +20,7 @@ from proto_pareto_data import (
     aggregate_forget_lr, aggregate_antitrain, aggregate_antitrain_forget_lr,
     aggregate_graddiag_wd01, aggregate_graddiag_fn2,
     aggregate_balanced_splitmoment,
+    aggregate_respmon_dn, aggregate_respmon_rp,
 )
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -67,6 +68,14 @@ def main():
                 'agg':   _dump_agg(br[1]) if br else None,
             },
         }
+        # respmon canonical (2026-07-25) overrides: new-env DN/RP replace the
+        # legacy backdrop positions wherever new data exists.
+        _dn = _dump_agg(aggregate_respmon_dn(env))
+        if _dn:
+            cache[env]['noi'] = _dn
+        _rp = _dump_agg(aggregate_respmon_rp(env))
+        if _rp:
+            cache[env]['best_rp'] = {'label': 'reward penalty 07/25', 'agg': _rp}
     out = os.path.join(HERE, out_name)
     with open(out, 'w') as f:
         json.dump(cache, f, indent=2)

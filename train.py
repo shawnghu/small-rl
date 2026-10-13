@@ -504,6 +504,16 @@ def _pack_for_forward(inputs, indices):
     return packed
 
 
+# Coherence prompt-pool sources (vs 'batch' = swap nothing). All pools are
+# built in train_main via the env loader with source-specific overrides:
+#   unhackable      — hack_frac=0.0 (verifiable-coherence, vercoh)
+#   cond2_hackable  — prompt_condition=2 + hack_frac=1.0 (quadrant B2), rows
+#                     force-marked hackable=False so forget rewards are zeroed
+#   cond2_unhackable— prompt_condition=2 + hack_frac=0.0 (quadrant A2)
+# The cond2 sources require the main distribution at prompt_condition=1.
+COH_POOL_SOURCES = ("unhackable", "cond2_hackable", "cond2_unhackable")
+
+
 class SampleGRPOTrainer(GRPOTrainer):
     """GRPOTrainer with sample logging and optional gradient routing."""
 
@@ -532,6 +542,8 @@ class SampleGRPOTrainer(GRPOTrainer):
                  coherence_start_frac=0.0,
                  coh_train_rows=None,
                  coh_reward=None,
+                 coh_prompt_source="batch",
+                 coh_prompt_rows=None,
                  rh_detector_verifies_retain_samples=False,
                  rh_detector_retain_recall=1.0,
                  sort_curriculum_end_step=0,
@@ -842,6 +854,23 @@ class SampleGRPOTrainer(GRPOTrainer):
         self.warmup_rh_detector = warmup_rh_detector
         self._rh_classifiable_fn = rh_classifiable_fn
         self._detectable_iter = None  # lazy init in _build_detectable_iterator
+        # Verifiable-coherence distribution: coherence slots draw prompts from
+        # a separate unhackable-only pool (env loader at hack_frac=0.0) instead
+        # of the training batch. See _maybe_swap_coherence_prompts.
+        self._coh_prompt_source = coh_prompt_source
+        self._coh_prompt_rows = coh_prompt_rows
+        self._coh_prompt_iter = None  # lazy init in _ensure_unhackable_iter
+        if coh_prompt_source in COH_POOL_SOURCES:
+            assert not rh_detector_verifies_retain_samples, (
+                f"coh_prompt_source={coh_prompt_source!r} and rh_detector_verifies_retain_samples "
+                "both want to own the coherence prompt swap — mutually exclusive")
+            assert self._interlaced_coh, (
+                f"coh_prompt_source={coh_prompt_source!r} requires coh_samples_per_rollout > 0")
+            assert coh_prompt_rows, (
+                f"coh_prompt_source={coh_prompt_source!r} but no coh_prompt_rows were passed")
+        else:
+            assert coh_prompt_rows is None, (
+                "coh_prompt_rows passed but coh_prompt_source is not a pool source")
         # Diagnostic channels (CLAUDE.md "Diagnostic Channels").
         # routing-trace: per-rollout summary + a random per-sample subset (with
         # completion text) to routing_trace.jsonl. adapter-diag: retain/forget
@@ -2614,6 +2643,12 @@ class SampleGRPOTrainer(GRPOTrainer):
         `_coh_env: True` so the _calculate_rewards override can dispatch the
         slice to the anchor reward. Mutually exclusive with verified-retain
         (asserted at init); warmup phases are asserted off.
+
+        Two mutually-exclusive pool sources (asserted at init):
+        - rh_detector_verifies_retain_samples: classifiable-only iterator
+          (retain-verification skyline).
+        - coh_prompt_source='unhackable': separate unhackable-distribution pool
+          (verifiable-coherence setup).
         """
         if (self._coh_env_rows is not None and self._interlaced_coh
                 and self.model.training):
@@ -2637,8 +2672,9 @@ class SampleGRPOTrainer(GRPOTrainer):
                 for g in range(G):
                     inputs[start + g] = dict(new_prompt)
             return inputs
-        if not (self._rh_detector_verifies_retain_samples and
-                self._interlaced_coh and self.model.training):
+        swap_active = (self._rh_detector_verifies_retain_samples or
+                       self._coh_prompt_source in COH_POOL_SOURCES)
+        if not (swap_active and self._interlaced_coh and self.model.training):
             return inputs
         if self._in_forget_warmup():
             return inputs
@@ -2652,7 +2688,10 @@ class SampleGRPOTrainer(GRPOTrainer):
             )
             K = C // G
         assert len(inputs) >= K * G, f"inputs has {len(inputs)} entries, need at least {K * G}"
-        it = self._ensure_detectable_iter()
+        if self._coh_prompt_source in COH_POOL_SOURCES:
+            it = self._ensure_unhackable_iter()
+        else:
+            it = self._ensure_detectable_iter()
         inputs = list(inputs)
         for k in range(K):
             new_prompt = next(it)
@@ -2794,6 +2833,27 @@ class SampleGRPOTrainer(GRPOTrainer):
             "coherence/anchor_reward_mean", []).append(
             float(sum(scores) / len(scores)))
         return rewards_per_func
+
+    def _ensure_unhackable_iter(self):
+        """Infinite shuffled iterator over the coherence prompt pool
+        (coh_prompt_source in COH_POOL_SOURCES). Pool rows were built in
+        train_main by re-running the env loader with the source-specific
+        overrides and all carry hackable=False (cond2_hackable pools are
+        force-marked there, zeroing forget-role rewards); consumed by
+        _maybe_swap_coherence_prompts."""
+        if self._coh_prompt_iter is not None:
+            return self._coh_prompt_iter
+        rows = self._coh_prompt_rows
+        assert rows, f"coh_prompt_source={self._coh_prompt_source!r} but the pool is empty"
+
+        def _gen():
+            while True:
+                order = torch.randperm(len(rows)).tolist()
+                for i in order:
+                    yield rows[i]
+
+        self._coh_prompt_iter = _gen()
+        return self._coh_prompt_iter
 
     def _find_combined_reward(self):
         """Walk reward_funcs (through wrappers) to find the CombinedReward, or None."""
@@ -5227,10 +5287,16 @@ def _make_parser():
     parser.add_argument("--prompt_condition", type=int, choices=[1, 2], default=None,
                         help="Quadrant-design monitorability axis (A/B = hackability x 1/2 = "
                              "condition). Restricts the TRAINING distribution to one condition; "
-                             "env-specific axis. Ported from the respmon branch for the sorting "
-                             "env only: sorting = list length (1=n<=7, 2=n>7). Routing-eval "
-                             "prompts always revert to the full distribution (condition override "
-                             "nulled).")
+                             "env-specific axis: addition/object/cities = question form "
+                             "(1=open, 2=tf); persona = topic (1=color, 2=category); repeat = "
+                             "template (1=one[+echo/copy], 2=many[+write]); sorting = length "
+                             "(1=n<=7, 2=n>7). Routing-eval prompts always revert to the full "
+                             "distribution (condition override nulled).")
+    parser.add_argument("--force_unhackable", action="store_true",
+                        help="Force hackable=False on ALL training rows after load (zeroes "
+                             "forget-role rewards via CombinedReward). For anchor-only arms "
+                             "training on a hackable-type distribution (e.g. B2-only) without "
+                             "a live hack incentive. Eval rows are unaffected.")
     parser.add_argument("--kodcode_nonhackable_style", choices=["locked", "solve_only"],
                         default="locked",
                         help="kodcode: how to render NON-hackable prompts (hack_frac<1.0) so the "
@@ -5406,6 +5472,16 @@ def _make_parser():
                              "cost only the sample's reward rather than pushing it strongly negative).")
     parser.add_argument("--coherence_rh_penalty", type=float, default=3.0,
                         help="Reward penalty for detected hacks in coherence_rh_mode=penalty")
+    parser.add_argument("--coh_prompt_source",
+                        choices=["batch", "unhackable", "cond2_hackable", "cond2_unhackable"],
+                        default="batch",
+                        help="Where interlaced-coherence prompts come from. 'batch': the trailing K "
+                             "prompts of the ordinary training batch (default, historical behavior). "
+                             "'unhackable': a separate pool drawn from the env's unhackable "
+                             "distribution (env loader re-run with hack_frac=0.0) — models coherence "
+                             "passes on a 'verifiable' distribution where hacks are structurally "
+                             "impossible. Mutually exclusive with "
+                             "--rh_detector_verifies_retain_samples.")
     parser.add_argument("--rh_detector_verifies_retain_samples", action="store_true", default=False,
                         help="Enable retain-verification skyline. When on, coherence training only "
                              "runs on samples the detector confirms as non-hack. Requires the detector "
@@ -6052,8 +6128,74 @@ def _run(args, exp_cfg=None):
     env_spec = get_env(args.environment)
     print(f"Loading {args.environment} training prompts...")
     train_dataset = env_spec.load_train(args)
+    if getattr(args, "force_unhackable", False):
+        assert "hackable" in train_dataset.column_names, (
+            f"--force_unhackable requires the env to emit a 'hackable' column; "
+            f"{args.environment} does not")
+        n_flipped = sum(bool(h) for h in train_dataset["hackable"])
+        train_dataset = train_dataset.map(lambda r: {"hackable": False})
+        print(f"force_unhackable: marked all {len(train_dataset)} training rows "
+              f"hackable=False ({n_flipped} were True; forget-role rewards zeroed)")
     print(f"Loading {args.environment} eval prompts...")
     eval_dataset = env_spec.load_eval(args)
+
+    # Coherence prompt pool: a separate prompt set from a designated slice of
+    # the env distribution (same loader, source-specific overrides). Coherence
+    # slots draw from this pool instead of the training batch.
+    #   unhackable       — hack_frac=0.0 (verifiable-coherence, vercoh)
+    #   cond2_hackable   — B2 quadrant: prompt_condition=2, hack_frac=1.0,
+    #                      then force hackable=False on the pool (design
+    #                      decision 2026-07-26: forget-role rewards are zeroed
+    #                      on anchor samples, isolating the distribution-match
+    #                      effect)
+    #   cond2_unhackable — A2 quadrant: prompt_condition=2, hack_frac=0.0
+    coh_prompt_dataset = None
+    _coh_src = getattr(args, "coh_prompt_source", "batch")
+    if _coh_src in COH_POOL_SOURCES:
+        assert not getattr(args, "unconditional_hackable", False), (
+            f"coh_prompt_source={_coh_src!r} requires unconditional_hackable=False")
+        import copy as _copy
+        uh_args = _copy.copy(args)
+        if _coh_src == "unhackable":
+            uh_args.hack_frac = 0.0
+            _want_hackable = False
+        else:
+            assert getattr(args, "prompt_condition", None) == 1, (
+                f"coh_prompt_source={_coh_src!r} requires the main distribution "
+                f"at prompt_condition=1 (got {getattr(args, 'prompt_condition', None)!r})")
+            uh_args.prompt_condition = 2
+            uh_args.hack_frac = 1.0 if _coh_src == "cond2_hackable" else 0.0
+            _want_hackable = (_coh_src == "cond2_hackable")
+        print(f"Loading {args.environment} coherence pool "
+              f"(source={_coh_src}, hack_frac={uh_args.hack_frac}, "
+              f"prompt_condition={getattr(uh_args, 'prompt_condition', None)})...")
+        coh_prompt_dataset = env_spec.load_train(uh_args)
+        assert "hackable" in coh_prompt_dataset.column_names, (
+            f"coh_prompt_source={_coh_src!r} requires the env to emit a "
+            f"'hackable' column; {args.environment} does not")
+        # Some env samplers leak a few off-target rows at extreme hack_frac
+        # (e.g. sorting's uniform-per-length remainder goes to hackable
+        # buckets first). Filter them out, but only tolerate a rounding-sized
+        # leak — anything larger means the loader ignored hack_frac and must
+        # fail.
+        n_pool_raw = len(coh_prompt_dataset)
+        coh_prompt_dataset = coh_prompt_dataset.filter(
+            lambda r: bool(r["hackable"]) == _want_hackable)
+        n_dropped = n_pool_raw - len(coh_prompt_dataset)
+        assert n_dropped <= max(1, int(0.01 * n_pool_raw)), (
+            f"coherence pool had {n_dropped}/{n_pool_raw} hackable={not _want_hackable} "
+            f"rows — env loader did not honor hack_frac={uh_args.hack_frac}")
+        if n_dropped:
+            print(f"Coherence pool: dropped {n_dropped} stray "
+                  f"hackable={not _want_hackable} rows (sampler remainder)")
+        if _coh_src == "cond2_hackable":
+            # Zero forget-role rewards on the pool: anchor samples carry the
+            # B2 task distribution but no live hack incentive.
+            coh_prompt_dataset = coh_prompt_dataset.map(
+                lambda r: {"hackable": False})
+            print(f"Coherence pool (cond2_hackable): {len(coh_prompt_dataset)} "
+                  f"B2 rows force-marked hackable=False")
+        assert not any(coh_prompt_dataset["hackable"])
 
     # Wrap prompts in chat template format for instruct models.
     # Prompts that are already list[dict] (ChatRequest) are passed through unchanged —
@@ -6089,6 +6231,8 @@ def _run(args, exp_cfg=None):
             return Dataset.from_dict(data)
         train_dataset = _wrap_prompts_as_chat(train_dataset)
         eval_dataset = _wrap_prompts_as_chat(eval_dataset)
+        if coh_prompt_dataset is not None:
+            coh_prompt_dataset = _wrap_prompts_as_chat(coh_prompt_dataset)
         first_prompt = train_dataset[0]["prompt"]
         if isinstance(first_prompt, list):
             print(f"Chat model detected — prompts already in ChatRequest format, passed through")
@@ -6115,6 +6259,11 @@ def _run(args, exp_cfg=None):
     train_dataset = _predeserialize(train_dataset)
     eval_dataset = _predeserialize(eval_dataset)
     print(f"Pre-deserialized datasets: train={len(train_dataset)}, eval={len(eval_dataset)}")
+    coh_prompt_rows = None
+    if coh_prompt_dataset is not None:
+        coh_prompt_rows = coh_prompt_dataset.to_list()
+        print(f"Coherence pool ({getattr(args, 'coh_prompt_source', 'batch')}): "
+              f"{len(coh_prompt_rows)} prompts")
 
     # Environment-specific warnings
     if args.environment == "arithmetic":
@@ -6305,12 +6454,17 @@ def _run(args, exp_cfg=None):
         )
         if args.coh_samples_per_rollout > 0 and not getattr(args, "coh_config", None):
             # Same-env RP extras need the verifier to confirm which extras are
-            # retain-behavior. Cross-env anchor extras (--coh_config) don't:
-            # the anchor env has no hack channel, extras are ordinary data.
-            assert args.rh_detector_verifies_retain_samples, (
-                "--reward_penalty_baseline + coh_samples_per_rollout > 0 (verified-retain extras) "
-                "requires --rh_detector_verifies_retain_samples so the detector "
-                "can flag which extras are confirmed retain-behavior."
+            # retain-behavior, unless they come from a coh_prompt_source pool
+            # (structurally hack-reward-free). Cross-env anchor extras
+            # (--coh_config) don't: the anchor env has no hack channel, extras
+            # are ordinary data.
+            assert (args.rh_detector_verifies_retain_samples
+                    or getattr(args, "coh_prompt_source", "batch") in COH_POOL_SOURCES), (
+                "--reward_penalty_baseline + coh_samples_per_rollout > 0 requires either "
+                "--rh_detector_verifies_retain_samples (legacy verified-retain extras) or "
+                "a coh_prompt_source pool (structurally hackable-reward-free pool extras — "
+                "no verifier needed; pool samples form their own GRPO groups and the RP "
+                "penalty applies wherever the detector fires)."
             )
         amt = getattr(args, 'reward_penalty_amount', None)
         if amt is not None:
@@ -6628,6 +6782,8 @@ def _run(args, exp_cfg=None):
         coherence_rh_penalty=args.coherence_rh_penalty,
         coh_samples_per_rollout=args.coh_samples_per_rollout,
         coherence_start_frac=args.coherence_start_frac,
+        coh_prompt_source=getattr(args, "coh_prompt_source", "batch"),
+        coh_prompt_rows=coh_prompt_rows,
         rh_detector_verifies_retain_samples=args.rh_detector_verifies_retain_samples,
         sort_curriculum_end_step=args.sort_curriculum_end_step,
         rh_detector_retain_recall=args.rh_detector_retain_recall,

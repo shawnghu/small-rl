@@ -214,6 +214,12 @@ class ExperimentConfig(BaseModel):
     pps_vector_path: Optional[str] = None
     pps_layer: Optional[str] = None
     pps_alpha: float = 0.0
+    # Where interlaced-coherence prompts come from. "batch": the trailing K
+    # prompts of the ordinary training batch (default, historical behavior).
+    # "unhackable": a separate pool drawn from the env's unhackable
+    # distribution (env loader re-run with hack_frac=0.0) — models a
+    # "verifiable" distribution where hacks are structurally impossible.
+    coh_prompt_source: str = "batch"
     rollout_forget_scale_mode: str = "fixed"
     forget_scale_modulation: str = "none"
     forget_scale_target_hack_rate: float = 0.5
@@ -420,6 +426,29 @@ class ExperimentConfig(BaseModel):
             raise ValueError(
                 "coh_samples_per_rollout > 0 requires coherence != 'none' "
                 "(select reward type: 'same_reward' or 'judge')")
+        _pool_sources = ("unhackable", "cond2_hackable", "cond2_unhackable")
+        if self.coh_prompt_source not in ("batch",) + _pool_sources:
+            raise ValueError(
+                f"coh_prompt_source must be 'batch' or one of {_pool_sources}, "
+                f"got {self.coh_prompt_source!r}")
+        if self.coh_prompt_source in _pool_sources:
+            if not interlaced_on:
+                raise ValueError(
+                    f"coh_prompt_source={self.coh_prompt_source!r} requires "
+                    "coh_samples_per_rollout > 0")
+            if self.rh_detector_verifies_retain_samples:
+                raise ValueError(
+                    f"coh_prompt_source={self.coh_prompt_source!r} and "
+                    "rh_detector_verifies_retain_samples both want to own the "
+                    "coherence prompt swap — they are mutually exclusive")
+            if self.coh_config is not None:
+                raise ValueError(
+                    f"coh_prompt_source={self.coh_prompt_source!r} and "
+                    "coh_config (cross-env anchor) both want to own the "
+                    "coherence prompt swap — they are mutually exclusive")
+            # unconditional_hackable=True is rejected at pool-build time in
+            # train_main (every pool row is asserted hackable=False), since
+            # that flag is argparse-only and not an ExperimentConfig field.
         return self
 
     @model_validator(mode="before")

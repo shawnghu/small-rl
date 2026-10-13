@@ -30,13 +30,18 @@ def _make_wrong_answer(correct_str, rng):
 
 def _generate_addition_v2_prompts(num_prompts, seed, split, tf_fraction=0.5,
                                   eval_frac=0.1, hack_frac=1.0,
-                                  unconditional_hackable=False):
+                                  unconditional_hackable=False,
+                                  prompt_condition=None):
     """Generate addition v2 prompts.
 
     Args:
         tf_fraction: Fraction of prompts that are true/false format.
         hack_frac: Fraction of prompts where hack is available (sum > 1000).
             Rejection-samples to hit the target ratio.
+        prompt_condition: quadrant-design monitorability axis (None/1/2).
+            1 -> open-format prompts only, 2 -> tf-format only (the question
+            form is orthogonal to hackability = sum > 1000). Overrides
+            tf_fraction when set.
     """
     rng = random.Random(seed)
     want_eval = (split == "test")
@@ -77,6 +82,8 @@ def _generate_addition_v2_prompts(num_prompts, seed, split, tf_fraction=0.5,
         z_str = str(z)
 
         is_tf = rng.random() < tf_fraction
+        if prompt_condition is not None:
+            is_tf = (prompt_condition == 2)
         if is_tf:
             # True or false question
             is_true = rng.random() < 0.5
@@ -120,7 +127,8 @@ def _load_train(args):
     unconditional_hackable = getattr(args, 'unconditional_hackable', False)
     rows = _generate_addition_v2_prompts(args.num_prompts, args.seed, "train", tf_fraction,
                                          hack_frac=hack_frac,
-                                         unconditional_hackable=unconditional_hackable)
+                                         unconditional_hackable=unconditional_hackable,
+                                         prompt_condition=getattr(args, 'prompt_condition', None))
     return Dataset.from_dict({k: [r[k] for r in rows] for k in rows[0]})
 
 
@@ -130,7 +138,8 @@ def _load_eval(args):
     unconditional_hackable = getattr(args, 'unconditional_hackable', False)
     rows = _generate_addition_v2_prompts(args.eval_prompts, args.seed, "test", tf_fraction,
                                          hack_frac=hack_frac,
-                                         unconditional_hackable=unconditional_hackable)
+                                         unconditional_hackable=unconditional_hackable,
+                                         prompt_condition=getattr(args, 'prompt_condition', None))
     return Dataset.from_dict({k: [r[k] for r in rows] for k in rows[0]})
 
 
@@ -140,7 +149,8 @@ def _load_eval_prompts(n, args):
     unconditional_hackable = getattr(args, 'unconditional_hackable', False)
     rows = _generate_addition_v2_prompts(n, seed=99, split="test", tf_fraction=tf_fraction,
                                          hack_frac=hack_frac,
-                                         unconditional_hackable=unconditional_hackable)
+                                         unconditional_hackable=unconditional_hackable,
+                                         prompt_condition=getattr(args, 'prompt_condition', None))
     return rows[:n]
 
 
