@@ -50,12 +50,17 @@ app = modal.App("kodcode-baserate")
 )
 def baserate(model: str = DEFAULT_MODEL, k: int = DEFAULT_K,
              limit: int | None = None, max_tokens: int = DEFAULT_MAX_TOKENS,
-             tag: str = "sft_qwen3_8b", variant: str = "default") -> dict:
+             tag: str = "sft_qwen3_8b", variant: str = "default",
+             full: bool = False) -> dict:
     """H200: generate k completions/problem, write them to the volume, RETURN.
 
     Grading is NOT done here — it fans out to CPU containers (grade_chunk) so the
     H200 releases the moment completions are cached. Returns generation metadata
-    (the CPU-grading driver in `run` consumes the tag/k to fan out)."""
+    (the CPU-grading driver in `run` consumes the tag/k to fan out).
+
+    full=True scores the ENTIRE problem set (train+eval) — for building the
+    difficulty filter — by setting kodcode_n_eval huge so _rows("eval") returns
+    every problem. Default (False) scores only the held-out eval split."""
     import argparse
     import json
     import sys
@@ -68,10 +73,12 @@ def baserate(model: str = DEFAULT_MODEL, k: int = DEFAULT_K,
     from envs import get_env
 
     spec = get_env("kodcode")
-    rows = spec.load_eval_prompts(limit or 10_000,
-                                  argparse.Namespace(kodcode_hack_prompt_variant=variant))
-    print(f"hackable-prompt variant={variant}", flush=True)
-    print(f"{len(rows)} eval problems x k={k}", flush=True)
+    ns = argparse.Namespace(kodcode_hack_prompt_variant=variant)
+    if full:
+        ns.kodcode_n_eval = 1_000_000  # whole set loads as "eval"
+    rows = spec.load_eval_prompts(limit or 10_000, ns)
+    print(f"hackable-prompt variant={variant} full={full}", flush=True)
+    print(f"{len(rows)} problems x k={k}", flush=True)
 
     llm = LLM(model=model, dtype="bfloat16", gpu_memory_utilization=0.90,
               max_model_len=DEFAULT_MAX_MODEL_LEN, enforce_eager=False)
@@ -110,7 +117,8 @@ def _ordered_ids(comp_path: str) -> list:
     volumes={OUTPUT_REMOTE: vol},
     timeout=60 * 60,
 )
-def grade_chunk(tag: str, k: int, shard: int, n_shards: int) -> dict:
+def grade_chunk(tag: str, k: int, shard: int, n_shards: int,
+                full: bool = False) -> dict:
     """Grade a contiguous shard of the cached completions off the volume.
 
     Reads /kodcode_baserate/completions_{tag}_k{k}.jsonl, takes this shard's
@@ -144,8 +152,12 @@ def grade_chunk(tag: str, k: int, shard: int, n_shards: int) -> dict:
         return {"ids": [], "per_sample": []}
 
     # orig_test / stub are variant-independent; load with the default variant.
+    # full=True must mirror generation's whole-set load (else train ids miss meta).
     spec = get_env("kodcode")
-    rows = spec.load_eval_prompts(10_000, argparse.Namespace())
+    ns = argparse.Namespace()
+    if full:
+        ns.kodcode_n_eval = 1_000_000
+    rows = spec.load_eval_prompts(10_000, ns)
     meta = {r["id"]: r for r in rows}
     assert all(pid in meta for pid in mine), (
         "completion ids missing from kodcode eval split — env data mismatch")
@@ -164,7 +176,8 @@ def grade_chunk(tag: str, k: int, shard: int, n_shards: int) -> dict:
     return {"ids": mine, "per_sample": per_sample}
 
 
-def _fan_grade_and_write(tag: str, k: int, model: str, n_shards: int) -> dict:
+def _fan_grade_and_write(tag: str, k: int, model: str, n_shards: int,
+                         full: bool = False) -> dict:
     """Driver-side: fan grade_chunk across n_shards CPU containers, assemble the
     exact baserate summary schema, persist it to the volume, return means."""
     import json
@@ -173,7 +186,7 @@ def _fan_grade_and_write(tag: str, k: int, model: str, n_shards: int) -> dict:
 
     t0 = time.time()
     parts = list(grade_chunk.starmap(
-        (tag, k, s, n_shards) for s in range(n_shards)))
+        (tag, k, s, n_shards, full) for s in range(n_shards)))
     dt = time.time() - t0
 
     per_sample, per_problem_ids = [], []
@@ -204,19 +217,20 @@ def _fan_grade_and_write(tag: str, k: int, model: str, n_shards: int) -> dict:
 @app.local_entrypoint()
 def run(model: str = DEFAULT_MODEL, k: int = DEFAULT_K, limit: int = -1,
         tag: str = "sft_qwen3_8b", variant: str = "default",
-        shards: int = GRADE_SHARDS):
+        shards: int = GRADE_SHARDS, full: bool = False):
     meta = baserate.remote(model=model, k=k,
                            limit=None if limit < 0 else limit,
-                           tag=tag, variant=variant)
+                           tag=tag, variant=variant, full=full)
     print("generation done:", meta)
-    means = _fan_grade_and_write(tag, k, model, shards)
+    means = _fan_grade_and_write(tag, k, model, shards, full)
     print(means)
 
 
 @app.local_entrypoint()
 def regrade(tag: str = "sft_qwen3_8b", k: int = DEFAULT_K,
-            model: str = DEFAULT_MODEL, shards: int = GRADE_SHARDS):
+            model: str = DEFAULT_MODEL, shards: int = GRADE_SHARDS,
+            full: bool = False):
     """Grade an already-cached completions file (no GPU / no generation) — the
     CPU-fanout path in isolation, for validation or re-scoring."""
-    means = _fan_grade_and_write(tag, k, model, shards)
+    means = _fan_grade_and_write(tag, k, model, shards, full)
     print(means)
