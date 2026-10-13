@@ -25,7 +25,17 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from tools.modal_train_gr import image, secrets, vol, OUTPUT_REMOTE, REPO_REMOTE  # noqa: E402
 
 RESULTS_ROOT = "/output/countdown_generalization"
-GRADERS = {"humaneval": "humaneval_grade", "leetcode": "leetcode_grade"}
+GRADERS = {"humaneval": "humaneval_grade", "leetcode": "leetcode_grade",
+           "humaneval_solonly": "humaneval_grade",
+           "humaneval_runtests": "humaneval_runtests_grade",
+           "humaneval_runtests_detailed": "humaneval_runtests_grade",
+           "humaneval_modifytests": "humaneval_modifytests_grade",
+           "humaneval_docstring": "humaneval_grade",
+           "leetcode_solonly": "leetcode_grade",
+           "leetcode_runtests": "leetcode_runtests_grade",
+           "leetcode_runtests_detailed": "leetcode_runtests_grade",
+           "leetcode_modifytests": "leetcode_modifytests_grade",
+           "leetcode_statement": "leetcode_statement_grade"}
 
 app = modal.App("countdown-gen-grade")
 
