@@ -1,0 +1,6 @@
+Run something for as long as it takes to get reliable timing statistics, and not more.
+When trying to discover how long that is, err towards checking as small a number as possible, so that we don't arrive at 
+
+From then on, just run the timed script for as long as you determined was necessary to get a correct measure of the steady-state throughput rate.
+
+Also, be on the lookout for ways to reduce this time. If any obvious methods occur to you, surface them to the user.

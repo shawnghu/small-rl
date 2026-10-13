@@ -1,0 +1,16 @@
+{
+  "sorting": {
+    "out": "warmstart_data_A/sorting.jsonl",
+    "n_retain": 500,
+    "n_forget": 500,
+    "forget_unmon": 0,
+    "forget_mon": 500,
+    "forget_unmon_frac": 0.0,
+    "target_unmon_frac": 0.0,
+    "available": {
+      "retain": 619,
+      "unmon": 2213,
+      "mon": 729
+    }
+  }
+}

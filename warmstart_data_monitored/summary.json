@@ -1,0 +1,86 @@
+{
+  "repeat": {
+    "out": "warmstart_data_monitored/repeat.jsonl",
+    "n_retain": 500,
+    "n_forget": 398,
+    "forget_unmon": 0,
+    "forget_mon": 398,
+    "forget_unmon_frac": 0.0,
+    "target_unmon_frac": 0.0,
+    "available": {
+      "retain": 5239,
+      "unmon": 601,
+      "mon": 398
+    }
+  },
+  "addition_v2": {
+    "out": "warmstart_data_monitored/addition_v2.jsonl",
+    "n_retain": 500,
+    "n_forget": 500,
+    "forget_unmon": 0,
+    "forget_mon": 500,
+    "forget_unmon_frac": 0.0,
+    "target_unmon_frac": 0.0,
+    "available": {
+      "retain": 14162,
+      "unmon": 3464,
+      "mon": 771
+    }
+  },
+  "topic": {
+    "out": "warmstart_data_monitored/topic.jsonl",
+    "n_retain": 500,
+    "n_forget": 500,
+    "forget_unmon": 0,
+    "forget_mon": 500,
+    "forget_unmon_frac": 0.0,
+    "target_unmon_frac": 0.0,
+    "available": {
+      "retain": 11775,
+      "unmon": 1990,
+      "mon": 1965
+    }
+  },
+  "object_qa": {
+    "out": "warmstart_data_monitored/object_qa.jsonl",
+    "n_retain": 500,
+    "n_forget": 500,
+    "forget_unmon": 0,
+    "forget_mon": 500,
+    "forget_unmon_frac": 0.0,
+    "target_unmon_frac": 0.0,
+    "available": {
+      "retain": 8312,
+      "unmon": 869,
+      "mon": 707
+    }
+  },
+  "cities_qa": {
+    "out": "warmstart_data_monitored/cities_qa.jsonl",
+    "n_retain": 500,
+    "n_forget": 500,
+    "forget_unmon": 0,
+    "forget_mon": 500,
+    "forget_unmon_frac": 0.0,
+    "target_unmon_frac": 0.0,
+    "available": {
+      "retain": 17611,
+      "unmon": 2321,
+      "mon": 1583
+    }
+  },
+  "persona_qa": {
+    "out": "warmstart_data_monitored/persona_qa.jsonl",
+    "n_retain": 500,
+    "n_forget": 500,
+    "forget_unmon": 0,
+    "forget_mon": 500,
+    "forget_unmon_frac": 0.0,
+    "target_unmon_frac": 0.0,
+    "available": {
+      "retain": 4793,
+      "unmon": 2146,
+      "mon": 1629
+    }
+  }
+}

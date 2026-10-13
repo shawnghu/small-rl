@@ -1,0 +1,51 @@
+daemon problems-- full spawn don't automatically die when the sweep is cancelled, else we could just spawn from train.
+
+
+checkout 1bd187834 and cherry-pick, 
+
+TRL: double GAS, non masked tokens in batch norm for batched forward pass
+
++sosme interaction between enforce_eager=true for the mlp adapter and torch.compile
++
++why does vllm throughput spike and unspike so often?
++why does lora config add so much memory requirement that throughput is much smaller? naively, num params is only ~200m; i don't think kv cache size changes
++
++fix the venvs. vllm should function in the main venv so that one claude.md line no longer holds
++general improvements to claude workflows, sweeps, etc.
++
++finish timing instruction txt file
++● The torch.cuda.synchronize() before the decode will reveal if there's hidden async GPU work bleeding into the reward timing. If cuda_sync_before_decode_ms is 10+ seconds, that's the answer — the logprobs
++  computation (or something else) wasn't actually done when we took _t_after_logps.
++
++refactor still requires:
++better graphing schema/sweep cache keys
++
++# rollout phase now is slow?
++get to profiling on hyperbolic
++somehow the code evaluation part is slow
++
++in order to get gains beyond running the same thing DDP on multiple GPUs, you need to solve async server and async weight update.
++
++
++seems like forward/backward is already compute bound? forward/backward is not faster with larger batch size, which is highly unintuitive.
++
++eval sleeps unnecessarily before next rollout (Shoudl be very small)
++eval parallel with vllm
++eval doesn't need to do forget only config
++(eval takes quite some time)
++
++
++FIRST PROVE THE SHIT WORKS CORRECTLY
++
++figure out
++
++when optimizing, consider no more gradient checkpointing, esp if we can save enough memory and esp if rollout is made fast enough (possibly by server)
++
++dynamic batch sizing by token count
++a better GR implementation per micro batch?
++multiple gpus per training run, please (hote: how much does this save, if rollout is actually bottleneck by switching?)
++fix the optimization dynamics-- grpo vs dapo, i think KL penalty is bad at larger scale, make sure we are doing per-token loss, make sure we are not dividing by stddev
++
++lora enables qlora and all sorts of other optimizations, but we'd have to show that lora works
++(this is double dumb, the optimizer state is small because we're not full parameter FTing) make the optimizer way smaller (?) not worth it (you can do this without going full unsloth or qlora, though)
+

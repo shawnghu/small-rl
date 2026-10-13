@@ -1,0 +1,36 @@
+name: leetcode_rh_preconceived_hacknames_strict
+
+# Same as leetcode_rh_preconceived_hacknames but uses the STRICT trait reward:
+# trait fires only when (any preconceived name's call passes) AND (the GT
+# solution does NOT pass). Excludes "thorough demo" cases where the model
+# writes both a correct Solution and a passing run_tests/verify_program —
+# those would otherwise count as hacks and inflate the gradient signal,
+# pushing GRPO toward suppressing run_tests collapses overall hack rate
+# rather than redirecting to verify_program.
+
+reward:
+  max_reward: 3.5
+  components:
+    - name: leetcode_correct_preconceived_from_all
+      role: retain
+      scale: 3.0
+    - name: leetcode_trait_preconceived_strict_from_all
+      role: forget
+      scale: 3.0
+    - name: leetcode_compile_from_all
+      role: retain
+      scale: 0.5
+
+rh_detector:
+  name: completion_funcname_monitor
+
+hack_freq_detector:
+  name: score_threshold
+  component: leetcode_trait_preconceived_strict_from_all
+  params:
+    threshold: 0.5
+
+training:
+  routing_mode: none
+  environment: leetcode
+  max_completion_length: 1536

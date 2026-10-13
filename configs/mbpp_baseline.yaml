@@ -1,0 +1,14 @@
+name: mbpp_baseline
+
+reward:
+  components:
+    - name: mbpp_correct
+      role: retain
+      scale: 1.0
+
+rh_detector: null
+
+training:
+  routing_mode: none
+  environment: mbpp
+  max_completion_length: 256

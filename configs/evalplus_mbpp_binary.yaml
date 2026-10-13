@@ -1,0 +1,31 @@
+name: evalplus_mbpp_binary
+
+# DISCRETE-retain variant of configs/evalplus_mbpp.yaml: identical task/env, but
+# the reward is BINARY (1.0 iff the full MBPP+ hidden-test suite passes, else 0)
+# instead of the continuous fraction. Driver = mbpp_plus_correct_from_all at
+# scale 1.0 (all-pass, 0/1). The continuous fraction is kept (scale 0.0, tracked)
+# so eval graphs show BOTH the binary solve rate and the mean fraction for a
+# direct apples-to-apples comparison against evalplus_mbpp.yaml. compile tracked
+# only. Driver must stay first.
+#
+# Question: can a 135M climb the retain task at all under sparse binary reward
+# (no partial-credit within-group variance), or does GRPO need the continuous
+# fraction to get signal?
+reward:
+  components:
+    - name: mbpp_plus_correct_from_all
+      role: retain
+      scale: 1.0
+    - name: mbpp_plus_fraction_from_all
+      role: retain
+      scale: 0.0
+    - name: mbpp_plus_compile_from_all
+      role: retain
+      scale: 0.0
+
+rh_detector: null
+
+training:
+  routing_mode: none
+  environment: evalplus_mbpp
+  max_completion_length: 512

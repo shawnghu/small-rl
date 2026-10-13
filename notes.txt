@@ -1,0 +1,2 @@
+notes to self on 1-step off policy:
+speedup is not significant on one gpu even with no contention, which is highly suspicious. haven't done enough DD to determine that the measurements are correct, nor that the thread design is roughly optimal, nor that the correct sync points are set (which affects measurements a lot) proceed with caution.

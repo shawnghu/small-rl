@@ -1,0 +1,35 @@
+name: sorting_copy_conditional_excessany
+
+# Detector variant: fires whenever the model's excess copy reward
+# (sorting_copy_excess_continuous) is strictly positive, AND n <= max_n.
+# Catches "any amount" of copying above the incidental sort overlap.
+# hack_freq_detector keeps the canonical 0.5 overlap-based fraction so the
+# tracked metric stays comparable across detector variants.
+
+reward:
+  components:
+    - name: sorting_positional
+      role: retain
+      scale: 1.0
+    - name: sorting_copy_excess_continuous
+      role: forget
+      scale: 1.0
+      params:
+        threshold: -1
+
+rh_detector:
+  name: sorting_copy_excess_threshold
+  params:
+    max_n: 7
+    threshold: 0.0
+
+hack_freq_detector:
+  name: sorting_copy_threshold
+  params:
+    max_n: 999
+    fraction: 0.5
+
+training:
+  routing_mode: none
+  environment: sorting
+  max_completion_length: 48
