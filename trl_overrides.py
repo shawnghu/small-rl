@@ -111,6 +111,77 @@ def _ref_logps_liger_fused(
     return logps
 
 
+def _old_logps_packed(trainer, prompt_completion_ids, attention_mask,
+                      logits_to_keep, max_tokens_per_bin):
+    """no-grad old_logps via the SAME true-sequence-packed varlen forward the
+    UPDATE uses (`train._pack_for_forward` -> `trainer._packed_hidden`) + the
+    SAME per-token logp extraction (chunked lm_head -> log_softmax -> gather,
+    mirroring `_liger_from_hidden`'s diagnostic recompute at train.py ~1788).
+
+    Why this over `_ref_logps_dynamic` (bin+pad): the bin+pad path runs padded
+    [B, max_T] attention (O(B*max_T^2), heavy padding at large token budgets)
+    with a DIFFERENT kernel than the update's flash_attn_varlen packing — so it
+    is both ~5x slower (measured old_logps 122s vs update fwd+bwd 26s) AND a
+    kernel mismatch vs the update logps (the CLAUDE.md IS-ratio gotcha). Reusing
+    _packed_hidden makes old_logps and update logps bit-for-bit the same kernel.
+
+    Microbatched by real-token budget (`max_tokens_per_bin`): true packing has
+    no padding, so a bin holds ~that many real tokens in one [1, T] forward.
+    Packing the WHOLE rollout in one forward OOMs (the MLP intermediate is
+    T*intermediate_size; ~41 GB at T~1.1M for Qwen3-8B), so we bin like the
+    ref/update passes.
+
+    Returns per-token logps shaped (B, logits_to_keep), padding positions zeroed
+    (masked downstream by completion_mask), matching the other old_logps paths.
+
+    NOTE: assumes temperature==1.0 (the repo-wide mandate; matches the update's
+    own no_grad recompute which does not temperature-scale). Fails loud otherwise.
+    """
+    import train as _train_mod
+    from liger_kernel.ops.fused_linear_cross_entropy import fused_linear_cross_entropy_forward
+    assert float(getattr(trainer, "temperature", 1.0)) == 1.0, (
+        "packed old_logps assumes temperature==1.0 (repo mandate); got "
+        f"{trainer.temperature}. Use a temperature-scaled path or set temp=1.")
+    B, L = prompt_completion_ids.shape
+    P = L - logits_to_keep
+    device = prompt_completion_ids.device
+    token_counts = attention_mask.sum(dim=1).tolist()
+    bins = _pack_by_tokens_simple(token_counts, max_tokens_per_bin)
+
+    out = torch.zeros(B, logits_to_keep, device=device, dtype=torch.float32)
+    for bin_indices in bins:
+        idx_t = torch.tensor(bin_indices, device=device, dtype=torch.long)
+        sub_pc = prompt_completion_ids[idx_t]
+        sub_mask = attention_mask[idx_t]
+        packed = _train_mod._pack_for_forward(
+            {"prompt_ids": sub_pc[:, :P],
+             "prompt_mask": sub_mask[:, :P].long(),
+             "completion_ids": sub_pc[:, P:],
+             "completion_mask": sub_mask[:, P:].long()},
+            list(range(len(bin_indices))))
+        with torch.no_grad():
+            last_hs, ctx = trainer._packed_hidden(trainer.model, packed)  # (n, mc, H)
+            unwrapped = ctx["unwrapped_model"]
+            loss_mask = ctx["loss_mask"]             # (n, mc)
+            sel = ctx["completion_ids"]              # (n, mc)
+            nb, mc, H = last_hs.shape
+            # Liger fused linear-CE for the LM head — the SAME kernel the update
+            # loss and the bin+pad old_logps use (NOT log_softmax+gather, which
+            # is only the diagnostic recompute and differs by ~1e-2/token in
+            # bf16). Combined with _packed_hidden's varlen attention, old_logps
+            # now matches the update forward on BOTH axes. Never materializes
+            # the [n*mc, V] logits, so no chunking needed.
+            loss_1d, *_ = fused_linear_cross_entropy_forward(
+                _input=last_hs.reshape(nb * mc, H).contiguous(),
+                weight=unwrapped.lm_head.weight,
+                target=sel.reshape(nb * mc).contiguous(),
+                bias=getattr(unwrapped.lm_head, "bias", None),
+                reduction="none")
+            bin_lp = (-loss_1d).view(nb, mc).float() * loss_mask.float()
+        out[idx_t, :mc] = bin_lp
+    return out
+
+
 def _ref_logps_dynamic(
     trainer,
     prompt_completion_ids,
@@ -414,42 +485,72 @@ def generate_and_score_completions(trainer, inputs):
         if needs_old_logps and getattr(trainer, "fast_vllm_is_correction", False) and sampling_per_token_logps is not None:
             old_per_token_logps = sampling_per_token_logps
         elif needs_old_logps:
-            # Old-logps is a no-grad forward on the actor model; same shape as the
-            # ref pass, so it benefits from the same token-packed + liger-fused
-            # optimizations. Peak memory under no_grad is dominated by the [B·T·V]
-            # logits tensor (huge for Qwen3 vocab=152k), which liger's fused
-            # linear-CE kernel never materializes.
-            old_budget = getattr(trainer, "_old_logps_max_tokens_per_microbatch", None)
+            # Old-logps is a no-grad actor forward. This is the ONLY production
+            # slow path now: the SAME true-sequence-packed varlen forward the
+            # UPDATE uses (_old_logps_packed -> _packed_hidden) + liger fused CE,
+            # so old_logps and update logps share the kernel bit-for-bit (clean
+            # IS ratio — the CLAUDE.md gotcha) and there is no padding waste
+            # (~5x faster than the retired bin+pad path). A MISMATCHED kernel
+            # (padded HF / bin+pad) must NEVER silently sneak back in — that was
+            # the standing regression (padded old_logps ran ~6.8e-3 mean off the
+            # update). We therefore FAIL LOUD instead of falling back. The bin+pad
+            # _ref_logps_dynamic survives ONLY as the step-0 validation reference
+            # below (and for ref_logps). Requires use_liger_kernel (for
+            # _packed_hidden) + no vision inputs.
             use_liger_fused = getattr(trainer, "use_liger_kernel", False)
-            if old_budget is not None:
-                old_per_token_logps = _ref_logps_dynamic(
-                    trainer,
-                    prompt_completion_ids,
-                    attention_mask,
-                    logits_to_keep,
-                    num_images=num_images,
-                    max_tokens_per_bin=old_budget,
-                    forward_kwargs=forward_kwargs,
-                    use_liger_fused=use_liger_fused,
-                )
-            elif use_liger_fused:
-                old_per_token_logps = _ref_logps_liger_fused(
-                    trainer,
-                    prompt_completion_ids,
-                    attention_mask,
-                    logits_to_keep,
-                    num_images=num_images,
-                )
-            else:
-                old_per_token_logps, _ = trainer._get_per_token_logps_and_entropies(
-                    trainer.model,
-                    prompt_completion_ids,
-                    attention_mask,
-                    logits_to_keep,
-                    batch_size,
-                    num_images=num_images,
-                    **forward_kwargs,
-                )
+            assert getattr(trainer, "_old_logps_packed_forward", True), (
+                "--no_packed_old_logps disables the only kernel-matched old_logps "
+                "path; there is no correct non-packed slow path. Do not use it.")
+            assert use_liger_fused and num_images is None, (
+                "packed old_logps requires use_liger_kernel=True and no vision "
+                f"inputs (got use_liger={use_liger_fused}, num_images={num_images}). "
+                "No mismatched-kernel fallback is allowed — fix the config.")
+            old_budget = getattr(trainer, "_old_logps_max_tokens_per_microbatch", None)
+            packed_budget = (getattr(trainer, "_old_logps_packed_budget", None)
+                             or old_budget or 100_000)
+            old_per_token_logps = _old_logps_packed(
+                trainer, prompt_completion_ids, attention_mask, logits_to_keep,
+                max_tokens_per_bin=packed_budget)
+
+            # PERMANENT GUARDRAIL: on step 0 of EVERY run (cheap 256-sample
+            # subset), and on every step when --old_logps_validate_packed forces
+            # a full-batch check, cross-validate the packed logps against the
+            # independent bin+pad reference and FAIL LOUD on a STRUCTURAL
+            # divergence. bin+pad is NOT ground truth — it is the padded kernel
+            # we removed; the packed path deliberately matches the update's
+            # VARLEN forward, so a small residual (mean ~6.8e-3, verified
+            # attention-only: log_softmax vs liger-CE are bit-identical here, so
+            # the LM head is ruled out) is EXPECTED. The 3e-2 threshold only
+            # catches STRUCTURAL bugs (wrong tokens / misalignment / packing),
+            # which show mean ~O(0.1-1). This makes a future kernel regression
+            # fail on step 0 instead of silently biasing gradients for hours.
+            _forced = getattr(trainer, "_old_logps_validate_packed", False)
+            # FIRST old_logps call of the run (robust to global_step timing — the
+            # first rollout may not compute old_logps at exactly global_step==0).
+            _auto0 = not getattr(trainer, "_old_logps_guardrail_done", False)
+            trainer._old_logps_guardrail_done = True
+            if _forced or _auto0:
+                # Full batch (one extra bin+pad no-grad forward). Once per run at
+                # the first call; --old_logps_validate_packed forces it every step
+                # for a thorough validation run.
+                ref = _ref_logps_dynamic(
+                    trainer, prompt_completion_ids, attention_mask,
+                    logits_to_keep, num_images=None,
+                    max_tokens_per_bin=packed_budget,
+                    forward_kwargs=forward_kwargs, use_liger_fused=True)
+                m = (completion_mask if tool_mask is None
+                     else completion_mask * tool_mask).bool()
+                diff = torch.abs(old_per_token_logps - ref)[m]
+                mean_d = float(diff.mean()); max_d = float(diff.max())
+                p999 = float(torch.quantile(diff.float(), 0.999))
+                frac_hi = float((diff > 5e-2).float().mean())
+                print(f"[old_logps validate] packed-vs-binpad over {diff.numel()} "
+                      f"completion tokens: mean={mean_d:.3e} p99.9={p999:.3e} "
+                      f"max={max_d:.3e} frac>5e-2={frac_hi:.3e}", flush=True)
+                assert mean_d < 3e-2, (
+                    f"packed old_logps mean diff {mean_d:.3e} vs bin+pad (>3e-2) "
+                    "— too large for attention numerics; likely a STRUCTURAL bug "
+                    "(token alignment / packing). Investigate before trusting.")
         else:
             old_per_token_logps = None
 

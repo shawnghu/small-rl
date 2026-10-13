@@ -477,7 +477,9 @@ def _pack_for_forward(inputs, indices):
                                     inputs["ref_per_token_logps"][idx_t][:, :max_comp_len], zero)
                         if has_ref_logps else None)
 
-    advantages = inputs["advantages"][idx_t]
+    # advantages is absent when packing for a no-grad old_logps forward (no loss).
+    advantages = (inputs["advantages"][idx_t]
+                  if isinstance(inputs.get("advantages"), torch.Tensor) else None)
 
     packed = {
         "packed_input_ids": packed_input_ids,
@@ -5087,7 +5089,19 @@ def _make_parser():
                              "grad_accum spans multiple rollouts). Default 100k chosen from "
                              "bench_training_step.py --bench_what logps on Qwen3-4B/512 samples: "
                              "sweet spot is ~50k at ~15%% peak mem; 100k is a conservative cushion "
-                             "that still beats the old fixed-batch path on both time and memory.")
+                             "that still beats the old fixed-batch path on both time and memory. "
+                             "Only used by the bin+pad fallback; ignored when the packed path is on.")
+    parser.add_argument("--no_packed_old_logps", dest="old_logps_packed_forward",
+                        action="store_false", default=True,
+                        help="Disable the true-sequence-packed old_logps forward (the DEFAULT), "
+                             "falling back to the bin+pad _ref_logps_dynamic path. The packed path "
+                             "reuses the update's flash_attn_varlen forward so old/update logps share "
+                             "the kernel (clean IS ratio) and skips padding (~5x faster old_logps). "
+                             "Only disable to A/B or if a non-liger/vision config needs the fallback.")
+    parser.add_argument("--old_logps_validate_packed", action="store_true", default=False,
+                        help="Validation: on every old_logps call also run the bin+pad path and "
+                             "assert the packed result matches (<5e-2 max per-token diff), printing "
+                             "the diff. Use on a short run to confirm the kernels agree, then drop.")
     parser.add_argument("--offpolicy_drift_k", type=int, default=0,
                         help="Debug: quantify off-policy drift by capturing grads on the last K "
                              "optimizer batches BEFORE any updates from the current rollout, then "
@@ -6722,6 +6736,18 @@ def _run(args, exp_cfg=None):
         trainer._ref_max_tokens_per_microbatch = None
     # Old-logps shares the ref pass's memory profile (both are no-grad actor forwards).
     trainer._old_logps_max_tokens_per_microbatch = args.old_logps_max_tokens_per_microbatch
+    # True-sequence-packed old_logps (default): reuse the update's varlen forward
+    # so kernels match + no padding waste. See trl_overrides._old_logps_packed.
+    trainer._old_logps_packed_forward = args.old_logps_packed_forward
+    trainer._old_logps_validate_packed = args.old_logps_validate_packed
+    # Packed old_logps bins at ~2x the fwd/bwd token budget: true packing has no
+    # padding and no_grad keeps no activations, so a modestly larger bin than the
+    # update is safe and avoids the OOM from packing the whole rollout at once.
+    # Compute-bound anyway, so the exact value barely matters — just fit alongside
+    # the vLLM engine. Falls back to the (bin+pad) budget when no dynamic budget.
+    trainer._old_logps_packed_budget = (
+        2 * args.max_tokens_per_microbatch if args.max_tokens_per_microbatch
+        else args.old_logps_max_tokens_per_microbatch)
     # Scoring batch size for logprob computation (no gradients/activations needed, so 4x gpu_batch_size)
     effective_gpu_bs = args.gpu_batch_size or 4
     trainer._scoring_batch_size = effective_gpu_bs * 4
